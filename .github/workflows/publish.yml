@@ -1,0 +1,198 @@
+name: Release Docker Images
+
+# 本 fork 只发布到 GHCR（ghcr.io/<owner 小写>/nekro-agent-byakiyo 与 nekro-agent-byakiyo-sandbox），
+# 只用内置的 GITHUB_TOKEN，不依赖任何 Docker Hub / PyPI 密钥。
+# 镜像 tag = 本 fork 的展示版本号 FORK_VERSION（nekro_agent/tools/common_util.py），
+# 不是 pyproject.toml 的 version：后者是上游版本，驱动云端插件兼容判定，不能改（见 common_util.py 里的说明）。
+
+on:
+  push:
+    tags:
+      - v*.*.*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  setup-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get Version
+        id: get_version
+        run: |
+          VERSION=$(sed -n 's/^FORK_VERSION = "\([0-9][0-9.]*\)"$/\1/p' nekro_agent/tools/common_util.py)
+          if [ -z "${VERSION}" ]; then
+            echo "无法从 nekro_agent/tools/common_util.py 读到 FORK_VERSION" >&2
+            exit 1
+          fi
+          # 打 tag 触发时，tag 必须与代码里的版本号一致，否则镜像 tag 与 git tag 对不上
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "git tag ${GITHUB_REF_NAME} 与 FORK_VERSION v${VERSION} 不一致" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+  build-and-push-agent:
+    name: Build and Push Nekro Agent Image
+    runs-on: ubuntu-latest
+    needs: setup-version
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:qemu-v7.0.0-28
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get lowercase repository owner
+        id: repo
+        run: echo "owner=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Multi-arch Images
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo:${{ needs.setup-version.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Docker Logout
+        run: |
+          docker logout ghcr.io
+
+  build-and-push-sandbox:
+    name: Build and Push Sandbox Image
+    runs-on: ubuntu-latest
+    needs: setup-version
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:qemu-v7.0.0-28
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get lowercase repository owner
+        id: repo
+        run: echo "owner=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Multi-arch Images
+        uses: docker/build-push-action@v6
+        with:
+          context: ./sandbox
+          file: sandbox/dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo-sandbox:${{ needs.setup-version.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo-sandbox:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Docker Logout
+        run: |
+          docker logout ghcr.io
+
+  # ---------------------------------------------------------------------------------------
+  # 以下两个 PyPI 发布任务是从上游继承来的，本 fork **不启用**（`if: ${{ false }}`）：
+  #   - publish-main-to-pypi：会把本 fork 以上游的包名 `nekro-agent` 发到 PyPI，需要 PYPI_TOKEN；
+  #   - publish-sdk-to-pypi：发布 SSE SDK，同样需要 PYPI_TOKEN。
+  # 要启用必须先确认包名归属与令牌来源，再把 `if` 去掉；不要在没想清楚时顺手打开。
+  # ---------------------------------------------------------------------------------------
+  publish-main-to-pypi:
+    name: Publish Main Package to PyPI (disabled in this fork)
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    needs: setup-version
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build main package
+        run: uv build
+
+      - name: Publish main package to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: uv publish
+
+  publish-sdk-to-pypi:
+    name: Publish SSE SDK to PyPI (disabled in this fork)
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    needs: setup-version
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install toml parser
+        run: pip install toml
+
+      - name: Get SDK version
+        id: sdk_version
+        run: |
+          cd nekro_agent/adapters/sse/sdk
+          SDK_VERSION=$(python3 -c 'import toml; print(toml.load("pyproject.toml")["project"]["version"])')
+          echo "sdk_version=${SDK_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build SDK package
+        run: |
+          cd nekro_agent/adapters/sse/sdk
+          uv build
+
+      - name: Publish SDK to PyPI
+        continue-on-error: true  # SDK 版本未更新时不报错
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          cd nekro_agent/adapters/sse/sdk
+          uv publish

@@ -1,0 +1,71 @@
+{
+  "title": "好感度",
+  "subtitle": "Bot 对每个人的感觉，按实例隔离",
+  "scopeBanner": "只显示并调整该实例下的好感度，其他实例的数据互不可见",
+  "filters": {
+    "searchPlaceholder": "搜索昵称或用户 ID",
+    "clearSearch": "清空搜索",
+    "stage": "关系",
+    "allStages": "全部关系",
+    "sort": "排序"
+  },
+  "sort": {
+    "score_desc": "从最亲近起",
+    "score_asc": "从最疏远起",
+    "recent": "最近有变化",
+    "interaction": "聊得最多"
+  },
+  "columns": {
+    "person": "谁",
+    "relation": "关系",
+    "feeling": "TA 在 Bot 眼里",
+    "feelingEmpty": "还没什么印象",
+    "interactions": "互动",
+    "actions": "操作",
+    "mergedInto": "已并入 {{person}}，这一行是休眠数据，改它不生效"
+  },
+  "empty": {
+    "title": "还没有谁被记住",
+    "hint": "好感度会在对话进行中自动积累；若尚未开启，请先在系统设置里启用好感度系统"
+  },
+  "actions": {
+    "detail": "看看经过",
+    "adjust": "手动调整",
+    "reset": "重置"
+  },
+  "detail": {
+    "title": "这段关系",
+    "timeline": "都发生过什么",
+    "timelineEmpty": "还没有留下记录",
+    "source": {
+      "llm": "自然变化",
+      "manual": "人工调整",
+      "reset": "重置",
+      "merge": "并入账号",
+      "unmerge": "撤销合并",
+      "domain_merge": "入域并入"
+    },
+    "sourceAccount": "来自账号 {{account}}",
+    "scopeLine": "这份好感属于：域 {{domain}} / 人设 {{preset}}",
+    "presetDeleted": "该人设已被删除，这份数据保留成孤儿（不会级联删除，可在「总后台 → 身份与域」手动清理）",
+    "mergedAccounts": "已并入这个人的账号：{{accounts}}"
+  },
+  "adjustDialog": {
+    "title": "手动调整好感度",
+    "description": "直接把好感度设成指定数值。描述文本由 Bot 自己写，这里改不了；不合适的内容请用重置抹掉。",
+    "score": "好感度数值",
+    "scoreHelper": "取值范围 -100 ~ 200，超出会被自动收敛",
+    "scoreInvalid": "请填写整数",
+    "reason": "备注",
+    "reasonHelper": "会记进变化记录，便于日后追溯"
+  },
+  "resetDialog": {
+    "title": "重置好感度",
+    "description": "将把「{{name}}」的好感度归零，并清空 Bot 写下的印象。下一次对话后会重新积累。",
+    "submit": "确认重置"
+  },
+  "messages": {
+    "loadFailed": "好感度列表加载失败",
+    "resetDone": "已重置"
+  }
+}

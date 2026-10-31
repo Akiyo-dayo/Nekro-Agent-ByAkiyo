@@ -1,0 +1,74 @@
+{
+  "title": "实例配额",
+  "subtitle": "按实例查看并设置每频道每日 AI 回复上限，同时看清此刻的沙盒并发占用。",
+  "stats": {
+    "globalCapacity": "全局并发容量",
+    "globalActive": "并发占用",
+    "globalQueued": "排队中"
+  },
+  "actions": {
+    "refresh": "刷新",
+    "batchEdit": "批量设置",
+    "edit": "设置配额"
+  },
+  "columns": {
+    "instance": "实例",
+    "dailyLimit": "每日上限",
+    "ceiling": "平台上限",
+    "usedToday": "今日已用",
+    "concurrency": "并发",
+    "actions": "操作"
+  },
+  "selectAllAria": "选择全部实例",
+  "selectRowAria": "选择实例 {{name}}",
+  "value": {
+    "unlimited": "不限制",
+    "noCeiling": "未设置",
+    "infinite": "∞"
+  },
+  "source": {
+    "instance": "实例层",
+    "adapter": "适配器层",
+    "system": "全局"
+  },
+  "usage": {
+    "activeChannels": "{{count}} 个活跃频道",
+    "channelsAtLimit": "{{count}} 个频道已撞上限",
+    "peakChannel": "单频道最高 {{count}} 条",
+    "queued": "排队 {{count}}",
+    "rejected": "被拒 {{count}}",
+    "concurrencyHint": "占用 {{active}} / 上限 {{max}}，累计放行 {{admitted}}，最长等待 {{wait}} 秒"
+  },
+  "list": {
+    "empty": "还没有可管理的实例",
+    "emptyHint": "在「实例管理」里创建或认领实例后，它的配额会出现在这里。",
+    "loadFailed": "配额列表加载失败",
+    "selected": "已选择 {{count}} 个实例",
+    "disabled": "已停用"
+  },
+  "dialog": {
+    "titleSingle": "设置实例配额",
+    "titleBatch": "批量设置实例配额",
+    "batchTargets": "本次改动会逐个套用到已选的 {{count}} 个实例，某个实例失败不影响其余实例。",
+    "dailyLimitLabel": "每日上限",
+    "dailyLimitHelper": "每个频道每日的 AI 回复上限，0 表示不限制；设在实例层即对该实例的所有频道生效。留空表示不改动配额。",
+    "clearOverrideLabel": "清除覆盖，回落到继承值 {{value}}",
+    "clearOverrideLabelBatch": "清除覆盖，回落到各实例各自的继承值",
+    "clearOverrideHelper": "清除实例层覆盖后，配额由适配器层或全局配置决定，上面填写的每日上限会被忽略。",
+    "setCeilingLabel": "设置平台上限",
+    "ceilingLabel": "平台上限",
+    "ceilingHelper": "只有平台方能设置。租户可以把配额往下调，但不能超过这个值；填 0 表示取消上限。",
+    "ceilingLockedHint": "平台方为该实例设定的上限是 {{ceiling}}，配额不可突破，也不能设为不限制。",
+    "ceilingLockedHintBatch": "已选实例中最严的平台方上限是 {{ceiling}}，配额不可突破，也不能设为不限制。",
+    "errors": {
+      "invalid": "请填写有效的整数。",
+      "negative": "每日上限不能为负数。",
+      "overCeiling": "每日上限不得超过平台方设定的 {{ceiling}}。",
+      "unlimitedBlocked": "该实例有平台方上限 {{ceiling}}，不能设为不限制（0）。",
+      "ceilingInvalid": "平台上限请填写不小于 0 的整数。"
+    }
+  },
+  "messages": {
+    "updateSuccess": "配额已更新"
+  }
+}

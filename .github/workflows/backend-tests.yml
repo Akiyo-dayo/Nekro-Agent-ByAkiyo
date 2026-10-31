@@ -1,0 +1,186 @@
+name: Backend Tests
+
+# 后端全量 pytest，带一个真实的 PostgreSQL service 容器。
+#
+# 为什么要有这个工作流：本仓库的测试默认跑 SQLite，而生产是 PostgreSQL。两者对原生 SQL 的占位符、
+# 类型宽松度、DDL 行为都不一样——#64 守卫里的 `WHERE "id" = ?` 就是这样在 5400+ 条全绿的
+# 测试下带着语法错误上线的（PROJECT_STATE §2「SQLite 测试掩盖 Postgres 行为」）。
+# 这里设 NA_TEST_PG_DSN，让「用 NA_TEST_PG_DSN 开门」的真 PG 用例在 PR 上真的跑起来，
+# 而不是永远 skip。
+#
+# 不动 preview.yml / publish.yml：它们管镜像构建与发布，与测试门禁是两件事。
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    # 镜像与生产 compose 同一个主版本（PG 14）：在更新的版本上绿，不代表在生产的版本上绿
+    name: Run Backend Tests (PostgreSQL 14)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: natest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d natest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # 真 PG 用例的门：没设就 skip（本地默认）。库是上面 service 容器里专为测试建的一次性库。
+      # 吃 NA_TEST_PG_DSN 的用例（test_model_group_postgres_dialect / test_alias_request_gate）
+      # 在自己建的随机 schema 里读写，结束时整个 DROP SCHEMA。
+      NA_TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/natest
+      # 同一个库也喂给早先只认旧变量名的那条迁移双执行用例（tests/test_password_generation_revocation.py）；
+      # 它**不**用随机 schema，直接在 public 里建/删 `user` 表——所以这个库只能是一次性的测试库，
+      # 绝不能把这两个变量指向有真实数据的库。
+      NA54_TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/natest
+      # 测试里有一批对回环地址的 TCP 连接；runner 上若带系统代理，会把 127.0.0.1 的流量也劫走
+      # （PROJECT_STATE §2.41，本机踩过）。显式声明回环不走代理。
+      NO_PROXY: 127.0.0.1,localhost
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # python-magic 在 Linux 上要系统库 libmagic（PROJECT_STATE §2.8）
+      - name: Install libmagic
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmagic1
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true
+
+      # pytest / pytest-asyncio 在 pyproject 的 `dev` 可选依赖里，单独 `uv sync` 不会装它们
+      - name: Install Dependencies
+        run: uv sync --all-extras
+
+      # pytest 打印完摘要、写完 junit 之后，进程偶尔不退出（本仓库本机复现过，PROJECT_STATE 记过），
+      # 会把这一步拖到 30 分钟超时、整个任务红在「超时」上而不是测试结果上。
+      # 因此这一步**自己不以 pytest 的退出码失败**：后台跑 pytest，看到 junit 报告写出后给进程 60 秒
+      # 自行退出，不退就强杀；但退出码与「是否被我们强杀」都落盘，由下一步连同 junit 一起判定——
+      # 只放行两种情形：pytest 自己退出 0；或写完报告后被强杀且 pytest 自己落盘的会话状态是 0
+      # （conftest 的 pytest_sessionfinish 写的，强杀之后 shell 拿到的码是杀出来的）。
+      # 光看 junit 不够：pytest 被中途中断（Interrupted）时也会写出报告，里面可以一个 failure 都没有。
+      - name: Run Backend Tests
+        env:
+          NA_PYTEST_SESSION_STATUS_FILE: pytest-session-status.txt
+        run: |
+          set +e
+          rm -f pytest-report.xml pytest-exit-code.txt pytest-killed.txt pytest-session-status.txt
+          uv run pytest tests/ -p no:cacheprovider -rfEsx --junitxml=pytest-report.xml &
+          pid=$!
+          deadline=$((SECONDS + 1500))
+          while kill -0 "$pid" 2>/dev/null; do
+            if [ -s pytest-report.xml ]; then
+              sleep 60
+              if kill -0 "$pid" 2>/dev/null; then
+                echo "::warning::pytest 写完报告后 60 秒仍未退出，强制结束（结果以 junit 与会话状态为准）"
+                echo "killed-after-report" > pytest-killed.txt
+                pkill -KILL -P "$pid"
+                kill -KILL "$pid" 2>/dev/null
+              fi
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::pytest 在 25 分钟内没有产出 junit 报告，强制结束"
+              pkill -KILL -P "$pid"
+              kill -KILL "$pid" 2>/dev/null
+              break
+            fi
+            sleep 5
+          done
+          wait "$pid" 2>/dev/null
+          code=$?
+          echo "$code" > pytest-exit-code.txt
+          echo "pytest 退出码: $code（通过与否见下一步的判定）"
+          exit 0
+
+      # 判定通过：先看退出状态，再看 junit。
+      # 退出状态：没被强杀 → pytest 自己的退出码必须是 0；写完报告后被强杀 → 以 pytest 自己落盘的会话状态为准，
+      # 必须是 0。其余（含 Interrupted=2、测试失败=1、无用例=5、没有落盘文件）一律失败。
+      # junit：报告必须存在、用例数 > 0、failures + errors 全为 0。报告缺失（崩在收集阶段 / 被超时杀掉）按失败处理。
+      - name: Assert tests passed according to junit
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+
+          def read(name):
+              try:
+                  with open(name, encoding="utf-8") as handle:
+                      return handle.read().strip()
+              except OSError:
+                  return None
+
+
+          if read("pytest-killed.txt") is not None:
+              status = read("pytest-session-status.txt")
+              print(f"pytest 写完报告后被强杀，会话状态={status}")
+              if status != "0":
+                  print("会话状态不是 0（被中断 / 有失败 / 没落盘），按失败处理")
+                  sys.exit(1)
+          else:
+              code = read("pytest-exit-code.txt")
+              print(f"pytest 退出码={code}")
+              if code != "0":
+                  print("pytest 退出码不是 0，按失败处理")
+                  sys.exit(1)
+
+          try:
+              root = ET.parse("pytest-report.xml").getroot()
+          except (OSError, ET.ParseError) as error:
+              print(f"junit 报告缺失或损坏，按失败处理: {error}")
+              sys.exit(1)
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          print(f"junit: tests={total} failures={failures} errors={errors}")
+          if total == 0 or failures or errors:
+              sys.exit(1)
+          PY
+
+      # 防止「env 名写错 / service 没起来 → 真 PG 用例静默 skip → 全绿」：
+      # 任何因为缺 PostgreSQL 而被跳过的用例都算失败。
+      - name: Assert PostgreSQL tests were not skipped
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          skipped = []
+          for case in ET.parse("pytest-report.xml").getroot().iter("testcase"):
+              for node in case.findall("skipped"):
+                  if "PostgreSQL" in (node.get("message") or ""):
+                      skipped.append(f"{case.get('classname')}::{case.get('name')}")
+          if skipped:
+              print("以下真 PostgreSQL 用例被跳过（NA_TEST_PG_DSN / service 容器没生效）:")
+              print("\n".join(skipped))
+              sys.exit(1)
+          print("真 PostgreSQL 用例均已执行")
+          PY

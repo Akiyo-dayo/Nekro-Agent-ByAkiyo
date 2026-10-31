@@ -1,0 +1,162 @@
+# NekroAgent 硬化部署（opt-in）：NA 容器不再直接持有宿主 docker.sock，
+# 改由一个独立的 docker-guard 边车按「NA 实际用到的动作 + 安全形状」放行。
+#
+# 背景（RK3 / PROJECT_STATE.md §3 #19，详细边界见 docs/docker-guard.md）：
+#   直接把 /var/run/docker.sock 挂进 NA = 给 NA 进程宿主 root。任何能在 NA 内执行代码的路径
+#   一旦被突破，攻击者就能 `POST /containers/create` 起一个 Privileged + 挂载宿主 / 的容器，
+#   直接读走宿主 /etc/shadow、写宿主 /root。tecnativa/docker-socket-proxy 的 `CONTAINERS=1`
+#   只按 URL 路径放行、不看请求体，**挡不住这条**（已实测）。docker-guard 补上了请求体判据。
+#
+# guard 挡住什么 / 挡不住什么（**这不是完整沙箱**，务必读 docs/docker-guard.md）：
+#   挡住：create 里的 Privileged / host PID·IPC·userns / Devices / 越界能力 / 越界 bind /
+#         Mounts 绕过 / 非 iptables 的 host 网络容器 / build / archive 偷文件 /
+#         **exec·inspect·logs·stop 进不属于本部署的容器**（否则可 exec 进挂了 docker.sock 的
+#         兄弟容器拿宿主 root，或 inspect 兄弟 postgres 读 POSTGRES_PASSWORD）。
+#   挡不住：它只收敛“已知的 Docker API 调用形状”，不是完整沙箱。边界、缓解措施与建议配置见 docs/docker-guard.md。
+#
+# ⚠️ 镜像：guard 边车跑的是 `python -m nekro_agent.services.docker_guard`，这个模块**只在本 fork**
+#    里有——上游 kromiose/nekro-agent 镜像没有它，直接用会 ModuleNotFoundError 退出。所以
+#    `NEKRO_IMAGE` **必须**指向 fork 镜像：本 fork 的 CI 发布的 `ghcr.io/akiyo-dayo/nekro-agent-byakiyo:<版本>`，
+#    或你自己构建的（`docker build -t <tag> .` 后 export 它）。
+#
+# 与标准 compose 的差异**仅三处**（数据/网络/卷名完全一致，可原地切换）：
+#   1) 新增 nekro_docker_guard 边车，唯一持有真实 docker.sock（:ro）
+#   2) nekro_agent **移除** docker.sock 直挂，改挂共享卷拿到 guard 的 socket
+#   3) nekro_agent 增加 DOCKER_HOST=unix:///run/nekro-guard/guard.sock
+# guard 与 NA 之间走 unix socket（承载在共享卷上），**不监听任何 TCP 端口**。若确有跨主机需求
+# 改用 `NEKRO_DOCKER_GUARD_LISTEN_HOST/PORT` 走 TCP，务必绑 `127.0.0.1`：这个口等于宿主 Docker 的
+# 半个控制面，绝不能对外。
+#
+# 从标准部署升级：
+#   export NEKRO_DATA_DIR=... NEKRO_IMAGE=<你的 fork 镜像>
+#   docker compose -f docker/docker-compose.yml down
+#   docker compose -f docker/docker-compose-x-hardened.yml up -d
+#   （命名卷 nekro_postgres_data / nekro_qdrant_data 沿用，历史数据不丢；
+#     NapCat 协议端容器由 NA 通过 guard 动态创建，无需在此声明）
+
+version: "3"
+
+services:
+  # PostgreSQL 服务
+  nekro_postgres:
+    image: postgres:14
+    container_name: ${INSTANCE_NAME:-}nekro_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    volumes:
+      - nekro_postgres_data:/var/lib/postgresql/data
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # Qdrant 服务
+  nekro_qdrant:
+    image: qdrant/qdrant:v1.17.1
+    container_name: ${INSTANCE_NAME:-}nekro_qdrant
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - nekro_qdrant_data:/qdrant/storage:z
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # docker-guard 边车：唯一持有宿主 docker.sock，对 NA 按动作放行
+  nekro_docker_guard:
+    # 必须是本 fork 构建的镜像（含 nekro_agent.services.docker_guard），不是上游镜像
+    image: ${NEKRO_IMAGE:?请设置 NEKRO_IMAGE 为本 fork 构建的镜像（含 docker_guard 模块）}
+    container_name: ${INSTANCE_NAME:-}nekro_docker_guard
+    # ⚠️ 解释器必须写 `/app/.venv/bin/python`，**不能写裸 `python`**。
+    #    镜像里 `uv sync` 把依赖装在 `/app/.venv`，而 `PATH` 里的 `python` 是基础镜像自带的
+    #    系统解释器（`/usr/local/bin/python`），那儿没有 aiohttp、没有 loguru、没有 nonebot——
+    #    裸 `python -m …` 会在 import 阶段 ModuleNotFoundError 退出，边车起不来。
+    #    dockerfile 的 CMD 写的也是 `/app/.venv/bin/bot`，同一个理由。
+    command: ["/app/.venv/bin/python", "-m", "nekro_agent.services.docker_guard"]
+    environment:
+      # 合法 bind source 的根：沙盒/CC/NapCat 的挂载都在其下；越界的一律拒绝
+      - NEKRO_DATA_DIR=${NEKRO_DATA_DIR}
+      - NEKRO_DOCKER_GUARD_LISTEN_SOCKET=/run/nekro-guard/guard.sock
+    volumes:
+      # :ro 只是防止边车替换 socket 文件本身；连接/读写 socket 流不受影响（与 tecnativa 同）
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nekro_guard_sock:/run/nekro-guard
+    restart: unless-stopped
+
+  # 主服务
+  nekro_agent:
+    image: ${NEKRO_IMAGE:?请设置 NEKRO_IMAGE 为本 fork 构建的镜像（含 docker_guard 模块）}
+    container_name: ${INSTANCE_NAME:-}nekro_agent
+    # 归属标签：guard 的归属门只放行带 `nekro.*` 标签的容器，而 **NA 自己这个容器不是 NA 建的**
+    # （是这份 compose 建的），没有任何代码会给它打标签。而 NA 有三条路径要碰自己这个容器：
+    #   - tools/docker_util.py:restart_self          → 后台「重启系统」
+    #   - sandbox/network_guard.py:resolve_self_container → 取自身镜像起 iptables 临时容器；
+    #                                                  认不出就退化成告警，网络隔离静默失效
+    #   - console/container_manager.py:_resolve_nekro_network → 探测自身所在网络；认不出就回落到
+    #                                                  硬编码的 `nekro_network`，NapCat 接错网络
+    # 少了这三行，硬化部署一开就把这三条一起打断。标签值不参与判定（只认 `nekro.` 前缀），
+    # 写成作用域值只是为了将来能把归属门收紧到「按部署匹配」。
+    labels:
+      nekro.owner.scope: "${INSTANCE_NAME:-}"
+      nekro.owner.role: "app"
+    environment:
+      # 与 docker-compose.yml 同一条：应用层的宿主全局命名（iptables 标记 / 沙盒与工作区
+      # 专用网络 / 网桥名 / 沙盒容器归属标签）跟着它走。此前本文件**漏了这一行**，
+      # 于是硬化部署根本没法把运维给的实例名传到应用层。
+      # 留空时应用从 NEKRO_DATA_DIR 派生稳定后缀，同宿主两套部署不会撞
+      # （详见 docker-compose.yml 里那段说明与 docs/multi-deploy-same-host.md）。
+      - NEKRO_INSTANCE_NAME=${INSTANCE_NAME:-}
+      # NA 自己的 DNS 主机名（#47）；与 docker-compose.yml 那一行同源同理由：
+      # 默认值逐字等于本文件里 NA 的 container_name，运维零配置、可在 docker/.env 显式覆盖。
+      # ⚠️ 不要加进 .env.prod（run_bot.py 会无条件覆盖 NEKRO_ 前缀的键）。
+      - NEKRO_SELF_HOSTNAME=${NEKRO_SELF_HOSTNAME:-${INSTANCE_NAME:-}nekro_agent}
+      - NEKRO_DATA_DIR=${NEKRO_DATA_DIR}
+      - NEKRO_EXPOSE_PORT=${NEKRO_EXPOSE_PORT:-8021}
+      - NEKRO_POSTGRES_HOST=${POSTGRES_HOST:-nekro_postgres}
+      - NEKRO_POSTGRES_PORT=5432
+      - NEKRO_POSTGRES_USER=${POSTGRES_USER:-nekro_agent}
+      - NEKRO_POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-nekro_agent}
+      - NEKRO_POSTGRES_DATABASE=${POSTGRES_DATABASE:-nekro_agent}
+      - NEKRO_RUN_IN_DOCKER=true
+      - NEKRO_ADMIN_PASSWORD=${NEKRO_ADMIN_PASSWORD:-}
+      # JWT 两把签名密钥；与 docker-compose.yml 那两行同源同理由（白名单透传、留空回落随机）。
+      # ⚠️ 同样**不要**传给 nekro_docker_guard 边车（它不签票、不验票，多给一份只是多一个泄漏面）
+      - NEKRO_JWT_SECRET_KEY=${NEKRO_JWT_SECRET_KEY:-}
+      - NEKRO_JWT_REFRESH_SECRET_KEY=${NEKRO_JWT_REFRESH_SECRET_KEY:-}
+      # 模型组 api_key 的静态加密主密钥；与 docker-compose.yml 那一行同源同理由。
+      # ⚠️ **不要**传给 nekro_docker_guard 边车：那个进程只做请求形状判定，
+      #    不碰数据库也不需要解密任何东西，多给它一份密钥只是多一个泄漏面
+      - NEKRO_CREDENTIAL_SECRET_KEY=${NEKRO_CREDENTIAL_SECRET_KEY:-}
+      - ONEBOT_ACCESS_TOKEN=${ONEBOT_ACCESS_TOKEN:-}
+      - NEKRO_QDRANT_URL=${QDRANT_URL:-http://nekro_qdrant:6333}
+      - NEKRO_QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      # 所有 Docker 调用（aiodocker 与 CLI）改走 guard，不再直连宿主 socket
+      - DOCKER_HOST=unix:///run/nekro-guard/guard.sock
+    volumes:
+      # 注意：这里**没有** /var/run/docker.sock 直挂 —— 这正是硬化的关键
+      - nekro_guard_sock:/run/nekro-guard
+      - ${NEKRO_DATA_DIR}:${NEKRO_DATA_DIR}:rw
+    depends_on:
+      - nekro_postgres
+      - nekro_qdrant
+      - nekro_docker_guard
+    ports:
+      - "${NEKRO_EXPOSE_PORT:-8021}:8021"
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+volumes:
+  nekro_postgres_data:
+    name: ${INSTANCE_NAME:-}nekro_postgres_data
+  nekro_qdrant_data:
+    name: ${INSTANCE_NAME:-}nekro_qdrant_data
+  # guard 与 NA 之间共享 unix socket 的卷（无状态，仅承载 socket 文件）
+  nekro_guard_sock:
+    name: ${INSTANCE_NAME:-}nekro_guard_sock
+
+networks:
+  nekro_network:
+    name: ${INSTANCE_NAME:-}nekro_network
+    driver: bridge

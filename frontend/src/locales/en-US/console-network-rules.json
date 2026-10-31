@@ -1,0 +1,44 @@
+{
+  "title": "Isolation Rules",
+  "subtitle": "Inventory the sandbox / CC workspace isolation rules on the host's iptables chains and safely clean up the ones nobody owns any more.",
+  "scopeLine": "Current deployment scope: {{scope}} ({{source}}). Only markers outside this scope that pass every check can be cleaned up.",
+  "empty": "No isolation rule markers from this project were found on the chains.",
+  "ruleCount": "{{count}} rules",
+  "chains": "Chains",
+  "rulesTitle": "Rule text ({{count}})",
+  "verdict": {
+    "orphan": "Cleanable",
+    "blocked": "Blocked",
+    "self": "In use by this deployment"
+  },
+  "section": {
+    "orphan": {
+      "title": "Cleanable ({{count}})",
+      "hint": "Every check passed: not this deployment's, no containers on the old bridge, no container claims the scope, and nothing is listening on the allowed endpoints."
+    },
+    "blocked": {
+      "title": "Blocked ({{count}})",
+      "hint": "There is evidence it is still in use, or this process cannot tell. When in doubt it stays — deleting too little is always the safer error."
+    },
+    "self": {
+      "title": "In use by this deployment ({{count}})",
+      "hint": "Markers this deployment is currently using. They never appear in the cleanable list."
+    }
+  },
+  "network": {
+    "none": "(no matching network)",
+    "empty": "Old network {{network}} (bridge {{bridge}}) has no containers.",
+    "occupied": "Old network {{network}} (bridge {{bridge}}) still has {{count}} container(s): {{containers}}. CC workspace containers are long-lived and never switch networks on restart; removing this rule set's catch-all DROP lets them reach the host's internal network with no error and no log entry."
+  },
+  "actions": {
+    "cleanup": "Clean up these rules"
+  },
+  "confirmDialog": {
+    "title": "Clean up orphaned isolation rules",
+    "warning": "About to delete all {{count}} rules carrying marker {{marker}} from the host's iptables chains. This cannot be undone.",
+    "recheck": "The backend re-evaluates the verdict before executing: if a container has re-joined the old bridge or the old deployment came back in the meantime, this request is rejected rather than carried out.",
+    "label": "Type the marker to confirm",
+    "helper": "Please type {{marker}}",
+    "mismatch": "Does not match the marker being cleaned up"
+  }
+}

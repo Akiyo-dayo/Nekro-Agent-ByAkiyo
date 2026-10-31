@@ -1,0 +1,74 @@
+{
+  "title": "Instance Quota",
+  "subtitle": "Review and set the per-channel daily AI reply limit for each instance, alongside live sandbox concurrency usage.",
+  "stats": {
+    "globalCapacity": "Global Capacity",
+    "globalActive": "In Use",
+    "globalQueued": "Queued"
+  },
+  "actions": {
+    "refresh": "Refresh",
+    "batchEdit": "Batch Edit",
+    "edit": "Set Quota"
+  },
+  "columns": {
+    "instance": "Instance",
+    "dailyLimit": "Daily Limit",
+    "ceiling": "Platform Ceiling",
+    "usedToday": "Used Today",
+    "concurrency": "Concurrency",
+    "actions": "Actions"
+  },
+  "selectAllAria": "Select all instances",
+  "selectRowAria": "Select instance {{name}}",
+  "value": {
+    "unlimited": "Unlimited",
+    "noCeiling": "Not set",
+    "infinite": "∞"
+  },
+  "source": {
+    "instance": "Instance",
+    "adapter": "Adapter",
+    "system": "Global"
+  },
+  "usage": {
+    "activeChannels": "{{count}} active channels",
+    "channelsAtLimit": "{{count}} channels at limit",
+    "peakChannel": "Peak channel {{count}} replies",
+    "queued": "Queued {{count}}",
+    "rejected": "Rejected {{count}}",
+    "concurrencyHint": "In use {{active}} / limit {{max}}, admitted {{admitted}} in total, longest wait {{wait}}s"
+  },
+  "list": {
+    "empty": "No manageable instances yet",
+    "emptyHint": "Create or claim an instance under Instances, and its quota shows up here.",
+    "loadFailed": "Failed to load the quota list",
+    "selected": "{{count}} instances selected",
+    "disabled": "Disabled"
+  },
+  "dialog": {
+    "titleSingle": "Set Instance Quota",
+    "titleBatch": "Batch Set Instance Quota",
+    "batchTargets": "The change is applied to each of the {{count}} selected instances one by one; a failure on one does not affect the others.",
+    "dailyLimitLabel": "Daily limit",
+    "dailyLimitHelper": "Daily AI reply limit per channel, 0 means unlimited. Setting it on the instance applies to every channel of that instance. Leave empty to keep the quota unchanged.",
+    "clearOverrideLabel": "Clear the override and fall back to the inherited value {{value}}",
+    "clearOverrideLabelBatch": "Clear the override and fall back to each instance's own inherited value",
+    "clearOverrideHelper": "Once the instance-level override is cleared, the quota comes from the adapter level or the global config, and the daily limit typed above is ignored.",
+    "setCeilingLabel": "Set platform ceiling",
+    "ceilingLabel": "Platform ceiling",
+    "ceilingHelper": "Only the platform owner can set this. Tenants may lower their quota but never exceed it; enter 0 to remove the ceiling.",
+    "ceilingLockedHint": "The platform owner set a ceiling of {{ceiling}} for this instance. The quota cannot exceed it, nor be set to unlimited.",
+    "ceilingLockedHintBatch": "The strictest platform ceiling among the selected instances is {{ceiling}}. The quota cannot exceed it, nor be set to unlimited.",
+    "errors": {
+      "invalid": "Please enter a valid integer.",
+      "negative": "The daily limit cannot be negative.",
+      "overCeiling": "The daily limit must not exceed the platform ceiling of {{ceiling}}.",
+      "unlimitedBlocked": "This instance has a platform ceiling of {{ceiling}}, so it cannot be set to unlimited (0).",
+      "ceilingInvalid": "The platform ceiling must be an integer no smaller than 0."
+    }
+  },
+  "messages": {
+    "updateSuccess": "Quota updated"
+  }
+}

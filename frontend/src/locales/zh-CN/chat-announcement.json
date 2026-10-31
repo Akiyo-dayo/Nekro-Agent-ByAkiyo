@@ -1,0 +1,101 @@
+{
+  "title": "机器人公告",
+  "subtitle": "向多个频道发送统一消息，不写入 AI 上下文，也不显示在 WebUI 对话历史中。任务在服务端后台执行，关闭页面也不会中断。",
+  "search": {
+    "placeholder": "搜索频道名称或 chat_key"
+  },
+  "filters": {
+    "type": "类型",
+    "status": "状态",
+    "all": "全部",
+    "group": "群聊",
+    "private": "私聊",
+    "observe": "旁观中",
+    "active": "激活中",
+    "inactive": "已停用"
+  },
+  "scope": {
+    "title": "发送范围",
+    "all": "全部",
+    "instances": "按实例",
+    "channels": "按会话",
+    "allHint": "将发送到 {{instances}} 个实例的 {{channels}} 个活跃会话",
+    "instancesEmpty": "暂无可用的适配器实例",
+    "instanceChannels": "{{count}} 个活跃会话"
+  },
+  "selector": {
+    "title": "频道选择",
+    "selectVisible": "选择当前页",
+    "clearSelection": "清空选择",
+    "visibleCount": "当前页 {{count}} 个频道",
+    "selectedCount": "已选 {{count}} 个频道",
+    "empty": "当前筛选条件下没有可选频道",
+    "messageCount": "{{count}} 条消息",
+    "noActivity": "暂无活跃记录",
+    "chatKey": "频道标识"
+  },
+  "summary": {
+    "title": "已选频道",
+    "empty": "还没有选择任何频道",
+    "clear": "清空",
+    "count": "{{count}} 个频道"
+  },
+  "composer": {
+    "title": "公告内容",
+    "help": "公告说明",
+    "messageLabel": "公告消息",
+    "messagePlaceholder": "输入要发送的公告内容...",
+    "helper": "公告在服务端按适配器实例并发发送，同一实例内保持随机间隔以规避风控。",
+    "length": "已输入 {{count}} 字",
+    "selectionSummary": "已选 {{selected}} 个频道，当前筛选结果 {{filtered}} 个频道。",
+    "actionTitle": "确认后点击这里发送",
+    "actionHint": {
+      "all": "将发送到全部启用实例的全部活跃会话，提交前会再次确认。",
+      "instances": "将发送到所选实例的全部活跃会话，提交前会再次确认。",
+      "channels": "将发送到所选会话，提交前会再次确认。"
+    },
+    "send": "提交公告任务",
+    "sending": "任务进行中...",
+    "submitted": "公告任务已提交，共 {{count}} 个会话",
+    "messageRequired": "请输入要发送的消息",
+    "selectionRequired": "请先选择至少一个频道",
+    "instanceRequired": "请先选择至少一个实例"
+  },
+  "confirm": {
+    "title": "确认发送公告",
+    "loading": "正在计算影响范围...",
+    "impact": "将发送到 {{instances}} 个实例的 {{channels}} 个会话",
+    "exceedsLimit": "本次范围超过单任务上限 {{max}} 个会话，请缩小范围",
+    "messagePreview": "公告内容预览",
+    "irreversible": "群发属于账号风控高危操作，已发出的消息无法撤回。",
+    "cancel": "再想想",
+    "submit": "确认发送"
+  },
+  "status": {
+    "pending": "待开始",
+    "running": "进行中",
+    "completed": "已完成",
+    "failed": "已失败",
+    "cancelled": "已取消"
+  },
+  "progress": {
+    "title": "公告任务进度",
+    "count": "已完成 {{completed}} / {{total}}",
+    "summary": "成功 {{success}} · 失败 {{failure}}",
+    "cancel": "取消任务",
+    "dismiss": "关闭",
+    "reconnecting": "连接中断，正在重连",
+    "backgroundHint": "任务在服务端执行，关闭页面不会中断发送。",
+    "failedList": "失败会话"
+  },
+  "history": {
+    "title": "历史公告",
+    "empty": "还没有公告记录",
+    "meta": "{{time}} · {{scope}} · 成功 {{success}} / 失败 {{failure}} / 共 {{total}}",
+    "noDeliveries": "该任务没有产生任何投递记录"
+  },
+  "result": {
+    "ok": "发送成功",
+    "failed": "发送失败"
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "title": "用量与费用",
+  "subtitle": "按实例、模型组、模型与场景查看 token 消耗与折算费用；失败与中断的请求同样计入（它们也真的花了钱）。",
+  "stats": {
+    "cost": "折算费用",
+    "tokens": "Token 合计",
+    "records": "请求条数",
+    "wasted": "白花的钱 / 成功率"
+  },
+  "filters": {
+    "window": "时间窗",
+    "lastDays": "最近 {{count}} 天",
+    "instance": "实例",
+    "instancePlaceholder": "留空 = 全部可见实例",
+    "scene": "场景",
+    "status": "收尾形态",
+    "all": "全部"
+  },
+  "actions": {
+    "refresh": "刷新"
+  },
+  "breakdown": {
+    "byInstance": "按实例",
+    "byModelGroup": "按模型组",
+    "byModel": "按模型",
+    "byScene": "按场景",
+    "byTenant": "按租户"
+  },
+  "columns": {
+    "time": "时间",
+    "instance": "实例",
+    "modelGroup": "模型组",
+    "model": "模型",
+    "scene": "场景",
+    "status": "形态",
+    "records": "条数",
+    "tokens": "Token",
+    "input": "输入",
+    "output": "输出",
+    "cost": "费用",
+    "tenant": "租户"
+  },
+  "records": {
+    "title": "流水明细"
+  },
+  "scene": {
+    "chat": "对话",
+    "embedding": "向量化",
+    "history_plan": "上下文规划",
+    "affection_eval": "好感度评估",
+    "memory_consolidate": "记忆整合",
+    "vision_describe": "图片描述",
+    "plugin": "插件调用",
+    "plugin_generate": "插件代码生成",
+    "model_test": "连通性测试",
+    "command": "聊天命令",
+    "unattributed": "未归属"
+  },
+  "status": {
+    "success": "成功",
+    "failed": "失败",
+    "aborted": "中断"
+  },
+  "value": {
+    "empty": "该时间窗内没有记录",
+    "unattributed": "（未归属）",
+    "fallback": "备用组",
+    "attempt": "第 {{index}}/{{total}} 次"
+  },
+  "hint": {
+    "noBilling": "本页只是账本与视图，不做扣费；费用按请求发生时那个模型组的倍率折算，倍率随流水落库，日后调整倍率不会改写历史账单。"
+  }
+}

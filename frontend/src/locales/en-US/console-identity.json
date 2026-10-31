@@ -1,0 +1,152 @@
+{
+  "title": "Identity & Domains",
+  "subtitle": "Affection and memory are isolated by (memory domain, person, preset). This page owns the first two: which instances share, and which two accounts are the same person.",
+  "readOnlyHint": "You are a read-only member: none of the write actions on this page are open to you, so their buttons are not rendered (the server would reject them anyway).",
+  "tabs": {
+    "domains": "Memory domains",
+    "merge": "Account merge",
+    "orphans": "Orphaned preset data"
+  },
+  "scopePicker": "Locate the domain by instance",
+  "needScope": "Pick an instance scope first — merging and orphan cleanup both operate on a domain.",
+  "actions": {
+    "refresh": "Refresh",
+    "create": "New domain",
+    "delete": "Delete",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "preview": "Preview",
+    "merge": "Confirm merge",
+    "revoke": "Undo",
+    "cleanup": "Clean up"
+  },
+  "domain": {
+    "intro": "By default every instance is its own domain — with nothing configured the behaviour is byte-for-byte today's. Put several instances in one domain to let their memory and affection flow between them. The affection domain follows the memory domain; it is not configured separately.",
+    "listTitle": "Domains (instance groups)",
+    "listHint": "The name is display only and need not be unique; a group's identity is its ID",
+    "empty": "No domain configured yet — every instance is its own domain (fully isolated).",
+    "columns": {
+      "domain": "Domain",
+      "members": "Member instances",
+      "note": "Note",
+      "actions": "Actions"
+    },
+    "ownerPlatform": "Platform",
+    "ownerTenant": "Tenant #{{id}}",
+    "emptyGroup": "(empty group)",
+    "bindTitle": "Domain membership per instance",
+    "bindHint": "Each instance belongs to exactly one domain; \"own domain\" means unconfigured (no row is stored)",
+    "bindColumns": {
+      "instance": "Instance",
+      "domainId": "Domain id",
+      "domain": "Domain"
+    },
+    "selfDomain": "Own domain (default)",
+    "optionLabel": "{{name}} (g:{{id}})",
+    "createTitle": "New domain",
+    "createHint": "A domain's ownership cannot be changed after creation, and only instances with matching ownership can join — that is the first gate against pulling another tenant's instance into your domain. Under a tenant identity the ownership is always your own tenant.",
+    "ownerLabel": "Owning tenant",
+    "ownerHint": "Only instances with matching ownership can join. To set up a domain for a customer you must pick their tenant here, otherwise the group you create cannot hold a single one of their instances.",
+    "nameLabel": "Domain name",
+    "noteLabel": "Note",
+    "created": "Domain \"{{name}}\" created",
+    "joined": "{{instance}} joined domain \"{{domain}}\"",
+    "joinedMigrated": "{{instance}} joined \"{{domain}}\": {{rows}} affection row(s) moved ({{folded}} folded), {{aliases}} merge(s) carried over",
+    "left": "{{instance}} is its own domain again",
+    "joinTitle": "Join domain",
+    "joinLine": "\"{{instance}}\" will join domain \"{{domain}}\".",
+    "joinConfirm": "Join",
+    "migrateLabel": "Bring over this instance's own-domain affection, event log and account merges",
+    "deleteTitle": "Delete domain",
+    "deleteWarning": "Deleting domain \"{{name}}\" returns its {{count}} instance(s) to their own domains (no longer shared). Existing affection and memory are NOT deleted, but they live on the group domain — you would have to put the same instances back into one group to see them again.",
+    "deleted": "Domain deleted"
+  },
+  "requests": {
+    "title": "Pending self-reported requests",
+    "hint": "Users file \"that account is also me\" via the merge_request bot command; approving merges it (same path as a manual merge), rejecting only leaves a record",
+    "empty": "No pending requests",
+    "columns": {
+      "reporter": "Reporter",
+      "claimed": "Claimed account",
+      "time": "Filed at",
+      "actions": "Actions"
+    },
+    "approve": "Approve",
+    "reject": "Reject",
+    "approveTitle": "Approve merge request",
+    "rejectTitle": "Reject merge request",
+    "approveLine": "Approving merges {{alias}} into reporter {{reporter}} (affection compensated by \"take the higher\", the merge can be undone later).",
+    "rejectLine": "Reject {{reporter}}'s request to merge in {{alias}}: no data is merged, only the record is kept.",
+    "reviewNoteLabel": "Review note (sent back to the reporter on rejection)",
+    "approved": "Approved: {{alias}} merged in",
+    "rejected": "Request #{{id}} rejected"
+  },
+  "merge": {
+    "intro": "A merge writes a single alias row and touches no data row: the secondary account keeps its own affection and event log, and undoing restores the state before the merge. The merge applies to the domain of the current instance{{domain}}.",
+    "formTitle": "Merge two accounts",
+    "formHint": "Preview first (what each side has, which value will be adopted), then execute",
+    "aliasLabel": "Secondary account (the old one)",
+    "personLabel": "Primary account (this person's id)",
+    "noteLabel": "Note",
+    "previewTitle": "Merge preview · domain {{domain}}",
+    "columns": {
+      "account": "Account",
+      "bestScore": "Best score",
+      "affectionRows": "Affection rows",
+      "eventRows": "Events",
+      "interactions": "Interactions"
+    },
+    "sideAlias": "Secondary",
+    "sidePerson": "Primary",
+    "memoryLine": "Memories in this domain: {{count}} · {{note}}",
+    "transferTitle": "Which value wins (per preset, the higher of the two)",
+    "transferColumns": {
+      "preset": "Preset",
+      "alias": "Secondary",
+      "person": "Primary",
+      "delta": "Granted",
+      "after": "After merge"
+    },
+    "presetDeleted": "deleted",
+    "done": "Merged: {{alias}} → {{person}}, {{delta}} points granted",
+    "aliasesTitle": "Merges in effect",
+    "aliasesHint": "Deleting a row undoes it: the secondary account returns to its own data",
+    "aliasesEmpty": "No account merge in this domain yet.",
+    "aliasColumns": {
+      "alias": "Secondary account",
+      "person": "Person",
+      "source": "Source",
+      "operator": "Operator",
+      "actions": "Actions"
+    },
+    "sourceManual": "Console",
+    "sourceSelfReport": "Self-reported",
+    "revokeTitle": "Undo account merge",
+    "revokeWarning": "After undoing, {{alias}} returns to its own affection and event log (they were never modified), and the points granted to {{person}} under \"take the higher one\" are deducted again. Points earned during the merge stay with {{person}}.",
+    "revoked": "Undone: {{alias}} returned to its own data ({{delta}} points deducted)"
+  },
+  "orphan": {
+    "empty": "No orphaned data: every affection row hangs off a preset that still exists.",
+    "columns": {
+      "preset": "Deleted preset",
+      "domain": "Domain",
+      "affectionRows": "Affection rows",
+      "people": "People",
+      "eventRows": "Events",
+      "actions": "Actions"
+    },
+    "cleanupTitle": "Clean up orphaned data",
+    "cleanupWarning": "This permanently deletes {{rows}} affection row(s) covering {{people}} people and {{events}} event(s) under preset #{{preset}}. It cannot be undone; if that preset was deleted by mistake, recreate it first.",
+    "cleaned": "Removed {{rows}} affection row(s) and {{events}} event(s)"
+  },
+  "presetSwitch": {
+    "title": "Confirm preset change",
+    "confirm": "Change preset",
+    "cancel": "Cancel",
+    "line": "The preset of {{scope}} will change from \"{{from}}\" to \"{{to}}\".",
+    "impact": "This affects the affection and memory of {{people}} people. After the switch they will look like strangers here.",
+    "impactChannels": "This affects the affection and memory of {{people}} people across {{channels}} channels. After the switch they will look like strangers here.",
+    "returning": "The target preset \"{{to}}\" already has records for {{people}} people — that set comes back after the switch.",
+    "domainLine": "Domain: {{domain}} · memories in this domain: {{memories}}"
+  }
+}

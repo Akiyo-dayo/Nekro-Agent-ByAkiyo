@@ -1,0 +1,80 @@
+{
+  "scope": {
+    "global": "Global view",
+    "globalHint": "Platform view, manages data across all instances"
+  },
+  "switcher": {
+    "title": "Switch management scope",
+    "ariaLabel": "Switch instance scope",
+    "searchPlaceholder": "Search key / name / account",
+    "clearSearch": "Clear search",
+    "listAriaLabel": "Selectable instances",
+    "recentBadge": "Recent",
+    "attentionFilter": "Needs attention {{attention}}",
+    "unboundAccount": "No account bound",
+    "noResults": "No matching instance",
+    "noResultsHint": "Search by instance key, display name or account id",
+    "summary": "{{shown}} of {{total}} instances shown"
+  },
+  "banner": {
+    "default": "You are inside this instance's scope; data and actions apply to this instance only",
+    "channels": "Only channels belonging to this instance are shown",
+    "plugins": "Toggling writes an instance-level override and does not affect other instances",
+    "presets": "Shows globally shared presets plus this instance's private ones; new presets belong to this instance",
+    "settings": "You are editing this instance's config overrides; fields without an override inherit the global config",
+    "logs": "Logs are requested within this instance's scope",
+    "sandbox": "Only sandbox executions of this instance are counted"
+  },
+  "layer": {
+    "global": "Global",
+    "system": "Global",
+    "adapter": "Adapter",
+    "instance": "Instance",
+    "session": "Session",
+    "channel": "Session"
+  },
+  "override": {
+    "effective": "Effective",
+    "inheritedBadge": "Inherited from {{layer}}",
+    "overriddenBadge": "{{layer}} override",
+    "tooltipInherited": "The current value is inherited from the \"{{layer}}\" layer; no override is set here",
+    "tooltipOverridden": "The current value comes from a \"{{layer}}\" layer override, shadowing upper layers",
+    "restoreInherit": "Restore inheritance",
+    "restoreSuccess": "Restored inheritance from the upper layer",
+    "overrideSuccess": "Instance-level override saved"
+  },
+  "unavailable": {
+    "title": "This backend endpoint is not ready yet",
+    "plugins": "The instance-level plugin toggle endpoint is not available yet, so plugin state cannot be changed in instance scope. Switch back to the global view to manage global toggles.",
+    "settings": "The instance-level config override endpoint is not available yet, so config cannot be edited in instance scope.",
+    "backToGlobal": "Back to global view",
+    "retry": "Retry"
+  },
+  "tenantScope": {
+    "noInstanceTitle": "No manageable instance",
+    "noInstanceHint": "This page edits the config overrides of a single instance; the global config is maintained by the platform owner and is not exposed here. There is currently no instance under your account — please contact your service provider.",
+    "readOnlyTitle": "Tenant administrator permission required",
+    "readOnlyHint": "Reading and changing instance config both require tenant administrator permission, and this account is a read-only member. Ask an administrator on your team, or contact your service provider to adjust the permission.",
+    "listFailedTitle": "Instance list could not be loaded",
+    "listFailedHint": "There are instances under your account, but the instance list did not come back this time. Please retry; contact your service provider if it keeps failing."
+  },
+  "warning": {
+    "serverFilterPending": "Server-side instance filtering is not ready yet; the list still contains data from other instances"
+  },
+  "presets": {
+    "ownerGlobal": "Globally shared",
+    "ownerInstance": "Instance private",
+    "instanceDefault": "Instance default",
+    "setInstanceDefault": "Set as this instance's default preset",
+    "clearInstanceDefault": "Clear this instance's default preset",
+    "setDefaultSuccess": "Set as this instance's default preset",
+    "clearDefaultSuccess": "Cleared this instance's default preset",
+    "setDefaultFailed": "Failed to update this instance's default preset",
+    "readOnlyGlobal": "Globally shared presets are read-only in instance scope"
+  },
+  "plugins": {
+    "effectiveEnabled": "Enabled",
+    "effectiveDisabled": "Disabled",
+    "scopeToggleTooltip": "Writes an instance-level enable/disable override"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "title": "确认运维操作",
+  "subtitle": "这条链接由运维 Bot 在聊天频道里签发。请看清下面的内容再确认——确认后立即执行，且不可撤销。",
+  "loading": "正在校验确认链接…",
+  "invalidTitle": "无法确认",
+  "missingToken": "链接里没有确认令牌，请回到运维频道重新发起。",
+  "notOwnerHint": "只有平台方账号可以确认运维操作。请用平台方账号登录后重新打开链接。",
+  "fields": {
+    "action": "操作",
+    "summary": "将要发生什么",
+    "target": "操作目标",
+    "issuer": "发起人",
+    "channel": "发起频道",
+    "expiresAt": "链接有效至"
+  },
+  "expired": "链接已过期",
+  "confirm": "确认执行",
+  "cancel": "返回总后台",
+  "confirming": "执行中…",
+  "doneTitle": "已执行",
+  "oneTimeHint": "该链接一次性有效，确认后立即失效。"
+}

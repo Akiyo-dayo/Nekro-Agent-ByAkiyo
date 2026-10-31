@@ -1,0 +1,73 @@
+{
+  "title": "Usage & Cost",
+  "subtitle": "Token consumption and converted cost by instance, model group, model and scene. Failed and aborted requests are included — they cost real money too.",
+  "stats": {
+    "cost": "Converted cost",
+    "tokens": "Total tokens",
+    "records": "Requests",
+    "wasted": "Wasted / success rate"
+  },
+  "filters": {
+    "window": "Time window",
+    "lastDays": "Last {{count}} days",
+    "instance": "Instance",
+    "instancePlaceholder": "Empty = all visible instances",
+    "scene": "Scene",
+    "status": "Outcome",
+    "all": "All"
+  },
+  "actions": {
+    "refresh": "Refresh"
+  },
+  "breakdown": {
+    "byInstance": "By instance",
+    "byModelGroup": "By model group",
+    "byModel": "By model",
+    "byScene": "By scene",
+    "byTenant": "By Tenant"
+  },
+  "columns": {
+    "time": "Time",
+    "instance": "Instance",
+    "modelGroup": "Model group",
+    "model": "Model",
+    "scene": "Scene",
+    "status": "Outcome",
+    "records": "Requests",
+    "tokens": "Tokens",
+    "input": "Input",
+    "output": "Output",
+    "cost": "Cost",
+    "tenant": "Tenant"
+  },
+  "records": {
+    "title": "Usage ledger"
+  },
+  "scene": {
+    "chat": "Chat",
+    "embedding": "Embedding",
+    "history_plan": "Context planning",
+    "affection_eval": "Affection evaluation",
+    "memory_consolidate": "Memory consolidation",
+    "vision_describe": "Image description",
+    "plugin": "Plugin call",
+    "plugin_generate": "Plugin code generation",
+    "model_test": "Connectivity test",
+    "command": "Chat command",
+    "unattributed": "Unattributed"
+  },
+  "status": {
+    "success": "Success",
+    "failed": "Failed",
+    "aborted": "Aborted"
+  },
+  "value": {
+    "empty": "No records in this time window",
+    "unattributed": "(unattributed)",
+    "fallback": "fallback",
+    "attempt": "attempt {{index}}/{{total}}"
+  },
+  "hint": {
+    "noBilling": "This page is a ledger and a view only — no charging is applied. Cost is converted with the model group rates in effect at request time; those rates are stored on each row, so changing them later never rewrites historical bills."
+  }
+}

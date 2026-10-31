@@ -1,0 +1,95 @@
+name: 🚨 插件举报
+description: 举报违规插件或内容
+title: "[Plugin Report]: "
+labels: ["plugin-report", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢您帮助我们维护社区环境！请提供以下详细信息，以便我们能够及时处理您的举报。
+        所有举报信息将被严格保密处理。
+
+  - type: dropdown
+    id: report_type
+    attributes:
+      label: 举报类型
+      description: 请选择您举报的主要问题类型
+      options:
+        - 含有恶意代码/安全风险
+        - 违反法律法规
+        - 内容不适宜（低俗/暴力/歧视等）
+        - 侵犯知识产权
+        - 插件存在严重bug或可能造成数据损失
+        - 其他违规行为
+    validations:
+      required: true
+
+  - type: input
+    id: plugin_name
+    attributes:
+      label: 插件名称
+      description: 被举报插件的名称
+      placeholder: 例如：Image Generator
+    validations:
+      required: true
+
+  - type: input
+    id: module_name
+    attributes:
+      label: 插件模块名
+      description: 插件的模块名（如有）
+      placeholder: 例如：image_generator
+
+  - type: input
+    id: repo_url
+    attributes:
+      label: 仓库地址
+      description: 插件的GitHub仓库或其他代码仓库地址
+      placeholder: 例如：https://github.com/username/repo
+
+  - type: textarea
+    id: report_details
+    attributes:
+      label: 举报详情
+      description: 请详细描述您发现的问题，越详细越有助于我们处理
+      placeholder: |
+        请尽可能详细地描述问题：
+        1. 您发现了什么具体问题？
+        2. 如何重现这个问题（如适用）？
+        3. 这个问题产生了什么危害或可能的风险？
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 证据材料
+      description: 请提供相关的代码片段、截图或其他证据（如有）
+      placeholder: |
+        请粘贴相关代码、截图链接或其他能够证明问题存在的材料。
+        注意隐去任何个人敏感信息。
+
+  - type: dropdown
+    id: contact_permission
+    attributes:
+      label: 联系许可
+      description: 如果需要更多信息，我们是否可以通过您的GitHub账号联系您？
+      options:
+        - 是，可以联系我获取更多信息
+        - 否，我希望保持匿名
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: 确认声明
+      description: 请确认以下声明
+      options:
+        - label: 我确认所提供的信息真实准确，此举报是出于维护社区环境的善意行为，而非恶意举报
+
+  - type: markdown
+    attributes:
+      value: |
+        **感谢您的举报**。根据《NekroAI社区资源共享规范》，我们将认真审核并在必要时采取适当措施。
+        您可以在 [社区资源使用与共享规范](https://cloud.nekro.ai/terms) 了解更多关于我们的政策。 

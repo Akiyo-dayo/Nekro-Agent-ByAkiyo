@@ -1,0 +1,44 @@
+{
+  "title": "隔离规则",
+  "subtitle": "盘点宿主 iptables 链上的沙盒 / CC 工作区隔离规则，并安全地清理已经没有主的那几组。",
+  "scopeLine": "本部署当前作用域：{{scope}}（{{source}}）。只有不属于本作用域、且判定通过的标记才可清理。",
+  "empty": "链上没有本项目的隔离规则标记。",
+  "ruleCount": "{{count}} 条规则",
+  "chains": "涉及链",
+  "rulesTitle": "规则原文（{{count}} 条）",
+  "verdict": {
+    "orphan": "可清理",
+    "blocked": "已拦住",
+    "self": "本部署自用"
+  },
+  "section": {
+    "orphan": {
+      "title": "可清理（{{count}}）",
+      "hint": "全部判据通过：不属于本部署、旧网桥上没有容器、没有容器认领这个作用域、放行端点上也没有进程在监听。"
+    },
+    "blocked": {
+      "title": "已拦住（{{count}}）",
+      "hint": "有证据说明它还在被使用，或者本进程判不准。判不准就不给删——宁可少删。"
+    },
+    "self": {
+      "title": "本部署自用（{{count}}）",
+      "hint": "本部署当前正在使用的标记，永远不会出现在可清理清单里。"
+    }
+  },
+  "network": {
+    "none": "（无对应网络）",
+    "empty": "旧网络 {{network}}（网桥 {{bridge}}）上没有容器。",
+    "occupied": "旧网络 {{network}}（网桥 {{bridge}}）上还有 {{count}} 个容器：{{containers}}。CC 工作区容器是长命的、重启不换网，删掉这组规则里的兜底 DROP 之后它们可以直接访问宿主内网，不报错也不留日志。"
+  },
+  "actions": {
+    "cleanup": "清理这组规则"
+  },
+  "confirmDialog": {
+    "title": "清理孤儿隔离规则",
+    "warning": "即将从宿主的 iptables 链上删除标记 {{marker}} 的全部 {{count}} 条规则。该操作不可撤销。",
+    "recheck": "执行前后端会重新判定一次：如果这期间有容器挂回了旧网桥、或者旧部署又起来了，本次请求会被拒绝而不是照删。",
+    "label": "回填规则标记以确认",
+    "helper": "请输入 {{marker}}",
+    "mismatch": "与要清理的标记不一致"
+  }
+}

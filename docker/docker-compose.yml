@@ -1,0 +1,118 @@
+# 请先运行 `export NEKRO_DATA_DIR=${HOME}/srv/nekro_agent` 设定数据目录
+# 然后运行 `sudo -E docker-compose up -d` 启动服务
+
+version: "3"
+
+services:
+  # PostgreSQL 服务
+  nekro_postgres:
+    image: postgres:14
+    container_name: ${INSTANCE_NAME}nekro_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    volumes:
+      - nekro_postgres_data:/var/lib/postgresql/data
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # Qdrant 服务
+  nekro_qdrant:
+    image: qdrant/qdrant:v1.17.1
+    container_name: ${INSTANCE_NAME:-}nekro_qdrant
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - nekro_qdrant_data:/qdrant/storage:z
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # 主服务
+  nekro_agent:
+    image: ghcr.io/akiyo-dayo/nekro-agent-byakiyo:latest
+    container_name: ${INSTANCE_NAME}nekro_agent
+    environment:
+      # compose 里的 ${INSTANCE_NAME} 只前缀容器名/网络名/卷名，应用层看不到它。
+      # 而沙盒与 CC 工作区的防火墙规则标记（`nekro-sandbox:{作用域}`）、专用网络名、网桥名、
+      # 沙盒容器归属标签都是**宿主全局**的，规则的安装语义又是「先按标记全删、再装自己那套」。
+      # 把它传进来，应用层的这批名字就跟着运维给的实例名走，一眼能对上是哪套部署。
+      #
+      # 留空**不再**回落到全宿主共用的 `default`：应用会从 NEKRO_DATA_DIR 派生一个稳定后缀
+      # （形如 `myfork-3f2a91c4-`，见 nekro_agent/core/os_env.py:deployment_scope）。
+      # 两套部署不可能共用数据目录，所以撞车在结构上不可能发生，不再依赖「运维记得设变量」。
+      # ⚠️ 同宿主多套部署必须给每套一个**不同的** NEKRO_DATA_DIR —— 那是派生的唯一依据，
+      #    也是两套部署的沙盒共享目录/pip 缓存/插件目录/工作区各自的家。
+      # ⚠️ 从旧版本升级时标记会变一次，旧的 `nekro-sandbox:default` 规则成为孤儿（不影响流量）；
+      #    启动日志会报出条数与清理命令，处置见 docs/multi-deploy-same-host.md。
+      #
+      - NEKRO_INSTANCE_NAME=${INSTANCE_NAME:-}
+      # NA 自己的 DNS 主机名（#47）：内置 NapCat 反连 NA 用
+      # `ws://{主机名}:{端口}/onebot/v11/ws`，应用层按 NEKRO_SELF_HOSTNAME → NEKRO_INSTANCE_NAME
+      # → `nekro_agent` 三级回落取它（nekro_agent/core/os_env.py:resolve_self_hostname）。
+      # 本文件里 NA 的容器名是 `${INSTANCE_NAME}nekro_agent`（设了 INSTANCE_NAME=foo 就是
+      # `foonekro_agent` 而不是 `foo`），所以默认值取**逐字等于容器名**的那个形态：
+      # 运维零配置，前缀（NEKRO_INSTANCE_NAME 那一行）与反连解析同时成立，不再二选一。
+      # 想显式覆盖就在 docker/.env 里写 NEKRO_SELF_HOSTNAME=...（`:-` 把空值也当未设置）。
+      # ⚠️ compose 的 environment 是**显式白名单**、本服务也没有 env_file：不写这一行时，
+      #    运维写进 .env 的值进不了容器（与 NEKRO_CREDENTIAL_SECRET_KEY 同一个坑）。
+      # ⚠️ 不要把它加进 .env.prod：那份文件被打进镜像，run_bot.py 会把其中 NEKRO_ 前缀的键
+      #    无条件覆盖进 os.environ，会抹掉这里传进来的值。
+      #    钉住它的用例：tests/test_compose_self_hostname.py。
+      - NEKRO_SELF_HOSTNAME=${NEKRO_SELF_HOSTNAME:-${INSTANCE_NAME:-}nekro_agent}
+      - NEKRO_DATA_DIR=${NEKRO_DATA_DIR}
+      - NEKRO_EXPOSE_PORT=${NEKRO_EXPOSE_PORT:-8021}
+      - NEKRO_POSTGRES_HOST=${POSTGRES_HOST:-nekro_postgres}
+      - NEKRO_POSTGRES_PORT=5432
+      - NEKRO_POSTGRES_USER=${POSTGRES_USER:-nekro_agent}
+      - NEKRO_POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-nekro_agent}
+      - NEKRO_POSTGRES_DATABASE=${POSTGRES_DATABASE:-nekro_agent}
+      - NEKRO_RUN_IN_DOCKER=true
+      - NEKRO_ADMIN_PASSWORD=${NEKRO_ADMIN_PASSWORD:-}
+      # JWT 两把签名密钥（#40；安装脚本会往 docker/.env 里填随机值，已有值不覆盖）。
+      # 拿到它的人可以自签 admin 的令牌，所以不能让它留在「每次重启随机」之外的任何可猜值上。
+      # 这里必须显式透传：environment 是白名单，不写则 docker/.env 里的值进不了容器、
+      # 安装脚本的随机化就是白做。留空 / 没配时应用回落每进程随机（`os_env.resolve_signing_secret`，
+      # 空串**不会**变成空密钥）；启动审计会对示例值 / 过短 / 两把相同点名告警。
+      # ⚠️ 不要加进 .env.prod：run_bot.py 会把其中 NEKRO_ 前缀的键无条件覆盖进 os.environ。
+      - NEKRO_JWT_SECRET_KEY=${NEKRO_JWT_SECRET_KEY:-}
+      - NEKRO_JWT_REFRESH_SECRET_KEY=${NEKRO_JWT_REFRESH_SECRET_KEY:-}
+      # 模型组 api_key 的静态加密主密钥。**留空不等于不加密**：留空时应用在数据目录里
+      # 自动生成一把 0600 的密钥文件（数据目录是 bind 挂进来的，重建容器不会丢）。
+      # 配了它则密钥完全不落在数据目录里，是推荐形态 —— 而这一行就是让「配了它」在
+      # Docker 下真的生效的那份清单：compose 的 environment 是**显式白名单**，
+      # 少这一行时运维在 docker/.env 里填了也进不了容器，应用照旧走文件密钥那一档，
+      # 并在启动日志里说「未配置 NEKRO_CREDENTIAL_SECRET_KEY」——与运维刚做的事矛盾。
+      # ⚠️ 不要改成从 .env.prod 里读：那份文件被打进镜像，而 run_bot.py 会把其中
+      #    `NEKRO_` 前缀的键**无条件覆盖**进 os.environ，会把这里传进来的值抹成空串。
+      - NEKRO_CREDENTIAL_SECRET_KEY=${NEKRO_CREDENTIAL_SECRET_KEY:-}
+      - ONEBOT_ACCESS_TOKEN=${ONEBOT_ACCESS_TOKEN:-}
+      - NEKRO_QDRANT_URL=${QDRANT_URL:-http://nekro_qdrant:6333}
+      - NEKRO_QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      # ⚠ 直挂 docker.sock = 给 NA 进程宿主 root（可起特权容器/挂载宿主 /，实测能读宿主
+      #   /etc/shadow）。这是有意的默认（部署最简），真实边界见 docs/docker-guard.md。
+      #   要收紧的部署改用 docker/docker-compose-x-hardened.yml（docker-guard 边车按动作放行）。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${NEKRO_DATA_DIR}:${NEKRO_DATA_DIR}:rw
+    depends_on:
+      - nekro_postgres
+      - nekro_qdrant
+    ports:
+      - "${NEKRO_EXPOSE_PORT:-8021}:8021"
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+volumes:
+  nekro_postgres_data:
+    name: ${INSTANCE_NAME}nekro_postgres_data
+  nekro_qdrant_data:
+    name: ${INSTANCE_NAME}nekro_qdrant_data
+
+networks:
+  nekro_network:
+    name: ${INSTANCE_NAME}nekro_network
+    driver: bridge

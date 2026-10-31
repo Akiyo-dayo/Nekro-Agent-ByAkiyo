@@ -1,0 +1,251 @@
+{
+  "title": "总后台",
+  "subtitle": "统一管理机器人实例、协议端与运行状态",
+  "placeholder": {
+    "underConstruction": "施工中"
+  },
+  "overview": {
+    "instanceTotal": "实例总数",
+    "instanceOnline": "在线",
+    "instanceOffline": "离线",
+    "instanceUnbound": "未绑定账号",
+    "instanceUnclaimed": "待认领",
+    "unboundBanner_one": "有 {{count}} 个实例还没有绑定账号，它们不会收到任何消息——去实例详情认领一个已连入的协议端，或手工填上账号。",
+    "unboundBanner_other": "有 {{count}} 个实例还没有绑定账号，它们不会收到任何消息——去实例详情认领一个已连入的协议端，或手工填上账号。",
+    "channelTotal": "会话总数",
+    "messageToday": "今日消息",
+    "dockerAvailable": "Docker 可用",
+    "dockerUnavailable": "Docker 不可用",
+    "dockerAvailableHint": "可在本机托管内置 NapCat 容器",
+    "dockerUnavailableHint": "无法托管内置容器，只能接入外部协议端",
+    "instancesTitle": "实例",
+    "instanceTitleSingle": "当前实例",
+    "empty": "还没有实例",
+    "emptyHint": "创建第一个实例，把机器人账号接进来。",
+    "unclaimedBanner_one": "有 {{count}} 个协议端已连入但尚未认领，认领后才会纳入管理。",
+    "unclaimedBanner_other": "有 {{count}} 个协议端已连入但尚未认领，认领后才会纳入管理。"
+  },
+  "list": {
+    "title": "实例列表",
+    "searchPlaceholder": "搜索实例标识、名称或账号",
+    "clearSearch": "清空搜索",
+    "statusFilter": "状态",
+    "statusAll": "全部状态",
+    "empty": "没有符合条件的实例",
+    "emptyHint": "调整搜索词或状态筛选后再试。",
+    "unboundAction": "去认领或绑定账号",
+    "columns": {
+      "instance": "实例",
+      "status": "状态",
+      "provider": "协议端",
+      "account": "账号",
+      "channels": "会话",
+      "messagesToday": "今日消息",
+      "lastActive": "最近活跃",
+      "actions": "操作"
+    }
+  },
+  "detail": {
+    "notFound": "实例不存在或已被删除",
+    "backToList": "返回实例列表",
+    "tabs": {
+      "overview": "概览",
+      "protocol": "协议端",
+      "events": "状态记录"
+    },
+    "baseInfo": "基本信息",
+    "runtime": "运行统计",
+    "container": "容器",
+    "containerNone": "该实例没有托管容器",
+    "unboundTitle": "尚未绑定账号",
+    "unboundHint": "本实例没有绑定任何 Bot 账号，因此不会建立连接、也不会收到任何消息——它不是掉线了。协议端连上来时会先自行登记成一个待认领实例，在下方把它认领过来即可；协议端还没连上来时，用下面的「绑定账号」直接填上要绑定的账号。",
+    "migration": "历史归属",
+    "migrationHint": "协议端在建实例之前先连上时会自行登记一个待认领实例并认领历史会话。可以把那个实例名下的会话、消息与记忆显式迁到本实例。",
+    "fields": {
+      "instanceKey": "实例标识",
+      "displayName": "显示名称",
+      "adapterKey": "适配器",
+      "provider": "协议端形态",
+      "account": "绑定账号",
+      "status": "状态",
+      "enabled": "启用状态",
+      "isDefault": "默认实例",
+      "lastError": "最近错误",
+      "offlineSince": "掉线起始",
+      "containerName": "容器名",
+      "containerState": "容器状态",
+      "containerImage": "镜像",
+      "webuiPort": "WebUI 端口",
+      "startedAt": "启动时间"
+    },
+    "events": {
+      "empty": "暂无状态变更记录",
+      "loadFailed": "状态记录加载失败",
+      "columns": {
+        "time": "时间",
+        "type": "事件",
+        "change": "状态变更",
+        "message": "说明"
+      }
+    }
+  },
+  "status": {
+    "online": "在线",
+    "connecting": "连接中",
+    "offline": "离线",
+    "unbound": "未绑定账号",
+    "login_required": "待扫码登录",
+    "error": "异常",
+    "unclaimed": "待认领",
+    "disabled": "已停用",
+    "archived": "已归档",
+    "offlineForMinutes": "已掉线 {{count}} 分钟",
+    "offlineForHours": "已掉线 {{count}} 小时"
+  },
+  "statusHint": {
+    "online": "协议端已连接，可正常收发消息",
+    "connecting": "正在建立协议端连接",
+    "offline": "协议端已断开，消息无法收发",
+    "unbound": "从未绑定账号，因此从来没有连接过——不是掉线。去认领一个已连入的协议端，或手工填上账号",
+    "login_required": "容器已运行但账号未登录，需要扫码",
+    "error": "运行出现异常，请查看最近错误",
+    "unclaimed": "协议端自行连入但尚未在后台登记，认领后才纳入管理",
+    "disabled": "已被手动停用，不会建立连接",
+    "archived": "已归档，数据只读保留"
+  },
+  "container": {
+    "running": "运行中",
+    "exited": "已退出",
+    "created": "已创建",
+    "restarting": "重启中",
+    "paused": "已暂停",
+    "absent": "不存在"
+  },
+  "provider": {
+    "builtin_napcat": "内置 NapCat",
+    "remote_onebot": "外部 OneBot",
+    "native": "原生适配器"
+  },
+  "card": {
+    "accountUnbound": "未绑定账号",
+    "channelCount": "{{count}} 个会话",
+    "messageToday": "今日 {{count}} 条消息",
+    "lastActive": "最近活跃 {{time}}",
+    "never": "从未",
+    "actionHint": {
+      "unclaimed": "协议端已连入，认领后纳入管理",
+      "unbound": "尚未绑定账号，不会收到任何消息",
+      "login_required": "容器在跑但账号未登录，需要扫码"
+    }
+  },
+  "actions": {
+    "create": "新建实例",
+    "claim": "认领",
+    "enable": "启用",
+    "disable": "停用",
+    "detail": "详情",
+    "delete": "删除",
+    "migrate": "迁移历史归属",
+    "viewAll": "查看全部实例",
+    "refresh": "刷新",
+    "bindAccount": "绑定账号",
+    "rebindAccount": "改绑"
+  },
+  "migrationDialog": {
+    "title": "迁移历史归属",
+    "description": "把源实例名下的会话、消息、执行记录与记忆改判给 {{instanceKey}}。操作不可逆，请先核对下方预览。",
+    "sourceLabel": "源实例",
+    "noCandidates": "同一适配器下没有其他实例可作为迁移来源",
+    "summary": "将迁移 {{channels}} 个会话，其中 {{conflicts}} 个会与本实例已有会话合并（合并时本实例已有的人设/工作区绑定优先保留，源实例那一行会被归档进会话数据里）。",
+    "countsTitle": "将要改写的数据",
+    "channelsTitle": "会话明细",
+    "residuesTitle": "不会被迁移的数据",
+    "columns": {
+      "channel": "会话",
+      "messages": "历史消息",
+      "action": "处理方式"
+    },
+    "actionMove": "整体搬迁",
+    "actionMerge": "合并",
+    "confirmLabel": "输入源实例标识以确认",
+    "confirmHelper": "请手工输入 {{instanceKey}}",
+    "confirmMismatch": "输入的实例标识不匹配",
+    "submit": "执行迁移",
+    "resource": {
+      "chat_channel": "会话",
+      "chat_message": "消息",
+      "exec_code": "执行记录",
+      "plugin_data": "插件数据",
+      "recurring_timer_job": "循环定时任务",
+      "workspace_comm_log": "工作区通信记录",
+      "mem_paragraph": "记忆段落",
+      "mem_episode": "记忆情节",
+      "mem_entity": "记忆实体",
+      "mem_relation": "记忆关系",
+      "preset": "人设",
+      "one_shot_timer": "一次性定时器",
+      "qdrant_paragraph_payload": "记忆向量",
+      "affection": "好感度",
+      "affection_event": "好感度变化流水",
+      "announcement_delivery": "公告投递流水"
+    }
+  },
+  "unclaimedPanel": {
+    "title_one": "有 {{count}} 个协议端已连接，但还没有人认领",
+    "title_other": "有 {{count}} 个协议端已连接，但还没有人认领",
+    "description": "协议端连上时会先把自己登记成一个待认领实例。在认领之前，它不属于你建的任何实例——你建的那个不会收到消息。",
+    "descriptionWithChannels_one": "协议端连上时会先把自己登记成一个待认领实例，消息与会话都归它。目前已有 {{count}} 个会话挂在这些待认领实例名下——如果频道管理里找不到你的群，多半就在这里。",
+    "descriptionWithChannels_other": "协议端连上时会先把自己登记成一个待认领实例，消息与会话都归它。目前已有 {{count}} 个会话挂在这些待认领实例名下——如果频道管理里找不到你的群，多半就在这里。",
+    "accountLabel": "账号 {{account}}",
+    "firstSeen": "首次连入"
+  },
+  "claimDialog": {
+    "title": "认领协议端",
+    "summary": "账号 {{account}} 目前登记在自动生成的实例 {{instanceKey}} 下，名下有 {{count}} 个会话。",
+    "modeNew": "认领为新实例",
+    "modeAdopt": "并入已有实例",
+    "modeNewHint": "用你自己的标识接管这个协议端。填了新标识就会新建一个实例并把会话、消息与记忆整体迁过去；留空则沿用自动生成的标识。",
+    "modeAdoptHint": "把账号绑到一个已有实例上，并把这个协议端名下的历史会话迁过去。适用于「我先建了实例、协议端却自己登记了一行」的情况。",
+    "displayName": "显示名称",
+    "displayNameHelper": "留空则沿用协议端登记时的名称",
+    "newInstanceKey": "新的实例标识",
+    "newInstanceKeyHelper": "留空则沿用自动生成的标识；仅小写字母、数字与下划线，最长 32",
+    "instanceKeyInvalid": "实例标识仅允许小写字母、数字与下划线，且长度不超过 32",
+    "adoptTargetLabel": "并入到哪个实例",
+    "noAdoptTargets": "同一适配器下没有可用的目标实例：目标实例必须还没有绑定自己的账号（一个实例只能绑一个账号）。",
+    "confirmLabel": "输入待认领实例标识以确认",
+    "confirmHelper": "请手工输入 {{instanceKey}}",
+    "confirmMismatch": "输入的实例标识不匹配",
+    "running": "正在迁移会话与记忆，请勿关闭…",
+    "submitNew": "认领",
+    "submitAdopt": "并入并迁移历史"
+  },
+  "deleteDialog": {
+    "title": "删除实例",
+    "modeLabel": "删除方式",
+    "modeArchive": "归档",
+    "modePurge": "彻底删除",
+    "archiveDescription": "归档后实例停止工作，会话、消息与记忆等数据只读保留，后续可再处理。",
+    "purgeDescription": "彻底删除会级联清除该实例的全部会话、消息与记忆数据，且无法恢复。",
+    "confirmLabel": "输入实例标识以确认",
+    "confirmHelper": "请手工输入 {{instanceKey}}",
+    "confirmMismatch": "输入的实例标识不匹配",
+    "submitArchive": "确认归档",
+    "submitPurge": "彻底删除"
+  },
+  "messages": {
+    "loadFailed": "加载实例信息失败",
+    "claimSuccess": "已认领实例",
+    "enableSuccess": "已启用实例",
+    "disableSuccess": "已停用实例",
+    "archiveSuccess": "已归档实例",
+    "purgeSuccess": "已彻底删除实例",
+    "accountBound": "账号已绑定，等待协议端连接",
+    "accountUnbound": "账号已解绑，该实例不会再收发消息"
+  },
+  "accountDialog": {
+    "title": "绑定 Bot 账号",
+    "description": "入站消息按账号定位实例：填上协议端登录的那个账号（如 QQ 号），这个实例才会收到它的消息。留空表示解绑。",
+    "helper": "一个账号只能绑一个实例；已被别的实例占用时会提示去认领或解绑"
+  }
+}

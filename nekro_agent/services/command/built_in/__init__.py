@@ -1,0 +1,87 @@
+"""内置命令自动注册"""
+
+from nekro_agent.services.command.registry import command_registry
+
+from .chat import InspectCommand, ResetCommand, StopCommand
+from .config_cmd import ConfReloadCommand, ConfSaveCommand, ConfSetCommand, ConfShowCommand
+from .debug import CodeLogCommand, DebugOffCommand, DebugOnCommand, ExecCommand, LogChatTestCommand, SystemCommand
+from .identity_cmd import MergeRequestCommand
+from .info import NaHelpCommand, NaInfoCommand
+from .model import ModelTestCommand
+from .ops import (
+    ClearSandboxCacheCommand,
+    DockerLogsCommand,
+    DockerRestartCommand,
+    GithubStarsCheckCommand,
+    InstanceIdCommand,
+    LogErrListCommand,
+    MemoryPruneCommand,
+    MemoryRebuildCommand,
+    MemoryReindexCommand,
+    ShCommand,
+)
+from .ops_bot_cmd import OpsBotCommand
+from .plugin_cmd import NaPluginsCommand, PluginCtlCommand, PluginInfoCommand, ResetPluginCommand
+from .quota_cmd import QuotaBoostCommand, QuotaCommand, QuotaResetCommand, QuotaSetCommand, QuotaWhitelistCommand
+from .switch import NaObserveCommand, NaOffCommand, NaOnCommand
+from .user import SetUsernameCommand
+
+
+def register_built_in_commands() -> None:
+    """注册所有内置命令"""
+    commands = [
+        # 会话类
+        ResetCommand(),
+        StopCommand(),
+        InspectCommand(),
+        # 信息类
+        NaInfoCommand(),
+        NaHelpCommand(),
+        # 开关类
+        NaOnCommand(),
+        NaOffCommand(),
+        NaObserveCommand(),
+        # 配置类
+        ConfShowCommand(),
+        ConfSetCommand(),
+        ConfReloadCommand(),
+        ConfSaveCommand(),
+        # 调试类
+        ExecCommand(),
+        CodeLogCommand(),
+        SystemCommand(),
+        DebugOnCommand(),
+        DebugOffCommand(),
+        LogChatTestCommand(),
+        # 插件类
+        NaPluginsCommand(),
+        PluginInfoCommand(),
+        ResetPluginCommand(),
+        PluginCtlCommand(),
+        # 运维类
+        ClearSandboxCacheCommand(),
+        DockerRestartCommand(),
+        DockerLogsCommand(),
+        ShCommand(),
+        InstanceIdCommand(),
+        GithubStarsCheckCommand(),
+        LogErrListCommand(),
+        MemoryPruneCommand(),
+        MemoryRebuildCommand(),
+        MemoryReindexCommand(),
+        # 运维 Bot（默认关闭；鉴权见 services/ops_bot/policy.py，不走通用命令权限层）
+        OpsBotCommand(),
+        # 配额类
+        QuotaCommand(),
+        QuotaBoostCommand(),
+        QuotaResetCommand(),
+        QuotaSetCommand(),
+        QuotaWhitelistCommand(),
+        # 模型类
+        ModelTestCommand(),
+        # 用户类
+        SetUsernameCommand(),
+        MergeRequestCommand(),
+    ]
+    for cmd in commands:
+        command_registry.register(cmd)

@@ -1,0 +1,152 @@
+{
+  "title": "身份与域",
+  "subtitle": "好感与记忆按（记忆域, 人, 人设）隔离。这里管前两维：哪些实例互通、哪两个账号是同一个人。",
+  "readOnlyHint": "你是只读成员：这一页的所有写操作对你不开放，因此不渲染那些按钮（点了也会被服务端拒绝）。",
+  "tabs": {
+    "domains": "记忆域",
+    "merge": "账号合并",
+    "orphans": "人设孤儿数据"
+  },
+  "scopePicker": "按实例定位域",
+  "needScope": "请先选择一个实例作用域，账号合并与孤儿数据都按域进行。",
+  "actions": {
+    "refresh": "刷新",
+    "create": "新建域",
+    "delete": "删除",
+    "cancel": "取消",
+    "confirm": "确定",
+    "preview": "预览",
+    "merge": "确认合并",
+    "revoke": "撤销",
+    "cleanup": "清理"
+  },
+  "domain": {
+    "intro": "默认每个实例自成一域：不配置时的行为与今天逐字相同。把几个实例放进同一个域，它们之间的记忆与好感才互通。好感域跟随记忆域，不单独配置。",
+    "listTitle": "域（实例组）",
+    "listHint": "组名只用于展示，不要求唯一；组的身份是它的 ID",
+    "empty": "还没有配置任何域，所有实例各自成一域（= 互相隔离）。",
+    "columns": {
+      "domain": "域",
+      "members": "成员实例",
+      "note": "备注",
+      "actions": "操作"
+    },
+    "ownerPlatform": "平台方",
+    "ownerTenant": "租户 #{{id}}",
+    "emptyGroup": "（空组）",
+    "bindTitle": "实例的域归属",
+    "bindHint": "每个实例属于且仅属于一个域；选「自成一域」等于不配置（库里不留任何行）",
+    "bindColumns": {
+      "instance": "实例",
+      "domainId": "域标识",
+      "domain": "所属域"
+    },
+    "selfDomain": "自成一域（默认）",
+    "optionLabel": "{{name}}（g:{{id}}）",
+    "createTitle": "新建域",
+    "createHint": "域的归属创建之后不可更改，只有归属一致的实例才能加进来 —— 这是「不把别的租户的实例拉进自己的域」的第一道闸。租户身份下归属恒为你自己的租户。",
+    "ownerLabel": "归属租户",
+    "ownerHint": "只有归属与本组一致的实例才能加进来。要给某个客户配域，这里就得选他的租户，否则建出来的组一个客户实例都装不进去。",
+    "nameLabel": "域名称",
+    "noteLabel": "备注",
+    "created": "已新建域「{{name}}」",
+    "joined": "{{instance}} 已加入域「{{domain}}」",
+    "joinedMigrated": "{{instance}} 已加入域「{{domain}}」：并入 {{rows}} 条好感（折叠 {{folded}} 条）、合并关系 {{aliases}} 条",
+    "left": "{{instance}} 已回到自成一域",
+    "joinTitle": "加入域",
+    "joinLine": "「{{instance}}」将加入域「{{domain}}」。",
+    "joinConfirm": "确认加入",
+    "migrateLabel": "并入该实例自成一域时期的存量好感、事件流水与合并关系",
+    "deleteTitle": "删除域",
+    "deleteWarning": "删除域「{{name}}」后，其中 {{count}} 个实例回到自成一域（互相不再互通）。已有的好感与记忆不会被删除，但它们此前落在组域上，回到自成一域后需要重新配回同一个组才能再看到。",
+    "deleted": "已删除域"
+  },
+  "requests": {
+    "title": "待审批的自助申报",
+    "hint": "用户在 Bot 里用 merge_request 申报「那个账号也是我」；批准即并入（与手动合并同一条路径），拒绝只留痕",
+    "empty": "没有待审批的申报",
+    "columns": {
+      "reporter": "申报人",
+      "claimed": "申报并入的账号",
+      "time": "申报时间",
+      "actions": "操作"
+    },
+    "approve": "批准",
+    "reject": "拒绝",
+    "approveTitle": "批准账号合并申报",
+    "rejectTitle": "拒绝账号合并申报",
+    "approveLine": "批准后将把 {{alias}} 并入申报人 {{reporter}} 名下（好感按「取高」补偿，事后可撤销合并）。",
+    "rejectLine": "拒绝 {{reporter}} 并入 {{alias}} 的申报：不合并任何数据，只在申报单上留痕。",
+    "reviewNoteLabel": "审批备注（拒绝时会回给申报人）",
+    "approved": "已批准：{{alias}} 已并入",
+    "rejected": "已拒绝申报 #{{id}}"
+  },
+  "merge": {
+    "intro": "合并只写一行别名，一个数据行都不动：副账号自己的好感与流水原样保留，撤销即回到合并前。合并的范围是当前实例所在的域{{domain}}。",
+    "formTitle": "合并两个账号",
+    "formHint": "先预览（看清两边各自有什么、将采用哪个值），再执行",
+    "aliasLabel": "副账号（换号前的旧号）",
+    "personLabel": "主账号（这个人的标识）",
+    "noteLabel": "备注",
+    "previewTitle": "合并预览 · 域 {{domain}}",
+    "columns": {
+      "account": "账号",
+      "bestScore": "最高好感",
+      "affectionRows": "好感记录",
+      "eventRows": "事件流水",
+      "interactions": "累计互动"
+    },
+    "sideAlias": "副账号",
+    "sidePerson": "主账号",
+    "memoryLine": "本域记忆条数：{{count}} · {{note}}",
+    "transferTitle": "将采用哪个值（逐人设，取两边的较高者）",
+    "transferColumns": {
+      "preset": "人设",
+      "alias": "副账号",
+      "person": "主账号",
+      "delta": "补入",
+      "after": "合并后"
+    },
+    "presetDeleted": "已删除",
+    "done": "已合并：{{alias}} → {{person}}，补入 {{delta}} 点好感",
+    "aliasesTitle": "已生效的合并",
+    "aliasesHint": "删掉一行即撤销：副账号立刻回到自己那份数据",
+    "aliasesEmpty": "这个域里还没有任何账号合并。",
+    "aliasColumns": {
+      "alias": "副账号",
+      "person": "指向的人",
+      "source": "来源",
+      "operator": "操作者",
+      "actions": "操作"
+    },
+    "sourceManual": "后台手动",
+    "sourceSelfReport": "用户申报",
+    "revokeTitle": "撤销账号合并",
+    "revokeWarning": "撤销后 {{alias}} 立刻回到自己那份好感与流水（它们从来没被改过），当初按「取高的」补给 {{person}} 的那一份会被原样扣回。合并期间新挣到的分数留在 {{person}} 名下。",
+    "revoked": "已撤销：{{alias}} 回到自己那份数据（扣回 {{delta}} 点）"
+  },
+  "orphan": {
+    "empty": "没有孤儿数据：所有好感记录都挂在仍然存在的人设下。",
+    "columns": {
+      "preset": "已删除的人设",
+      "domain": "域",
+      "affectionRows": "好感记录",
+      "people": "涉及人数",
+      "eventRows": "事件流水",
+      "actions": "操作"
+    },
+    "cleanupTitle": "清理孤儿数据",
+    "cleanupWarning": "将永久删除人设 #{{preset}} 名下 {{rows}} 条好感记录（涉及 {{people}} 人）与 {{events}} 条事件流水。这一步不可撤销；如果那个人设只是误删，请先把它建回来。",
+    "cleaned": "已清理 {{rows}} 条好感、{{events}} 条流水"
+  },
+  "presetSwitch": {
+    "title": "确认更换人设",
+    "confirm": "确认更换",
+    "cancel": "取消",
+    "line": "{{scope}} 的人设将从「{{from}}」换成「{{to}}」。",
+    "impact": "本次将影响 {{people}} 人的好感与记忆。换过去之后，这些人在这里看起来会是陌生人。",
+    "impactChannels": "本次将影响 {{people}} 人的好感与记忆（涉及 {{channels}} 个频道）。换过去之后，这些人在这里看起来会是陌生人。",
+    "returning": "目标人设「{{to}}」下已经有 {{people}} 人的旧记录，换过去之后那一份会回来。",
+    "domainLine": "域：{{domain}} · 本域记忆条数：{{memories}}"
+  }
+}

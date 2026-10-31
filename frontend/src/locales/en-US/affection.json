@@ -1,0 +1,71 @@
+{
+  "title": "Affection",
+  "subtitle": "How the bot feels about each person, isolated per instance",
+  "scopeBanner": "Only affection under this instance is listed and editable; other instances stay invisible",
+  "filters": {
+    "searchPlaceholder": "Search nickname or user id",
+    "clearSearch": "Clear search",
+    "stage": "Closeness",
+    "allStages": "All",
+    "sort": "Sort"
+  },
+  "sort": {
+    "score_desc": "Closest first",
+    "score_asc": "Most distant first",
+    "recent": "Recently changed",
+    "interaction": "Most talked to"
+  },
+  "columns": {
+    "person": "Who",
+    "relation": "Closeness",
+    "feeling": "In the bot's eyes",
+    "feelingEmpty": "No impression yet",
+    "interactions": "Chats",
+    "actions": "Actions",
+    "mergedInto": "Merged into {{person}}; this row is dormant, editing it has no effect"
+  },
+  "empty": {
+    "title": "Nobody remembered yet",
+    "hint": "Affection builds up as conversations happen. If nothing shows up, enable the affection system in system settings first."
+  },
+  "actions": {
+    "detail": "See what happened",
+    "adjust": "Adjust",
+    "reset": "Reset"
+  },
+  "detail": {
+    "title": "This relationship",
+    "timeline": "What happened",
+    "timelineEmpty": "Nothing recorded yet",
+    "source": {
+      "llm": "Natural change",
+      "manual": "Manual adjustment",
+      "reset": "Reset",
+      "merge": "Merged in",
+      "unmerge": "Merge revoked",
+      "domain_merge": "Domain join migration"
+    },
+    "sourceAccount": "from account {{account}}",
+    "scopeLine": "This affection belongs to: domain {{domain}} / preset {{preset}}",
+    "presetDeleted": "That preset was deleted; this data is kept as an orphan (never cascade-deleted, clean it up manually under Console → Identity & Domains)",
+    "mergedAccounts": "Accounts merged into this person: {{accounts}}"
+  },
+  "adjustDialog": {
+    "title": "Adjust affection",
+    "description": "Set the affection score directly. The written impression comes from the bot itself and cannot be edited here — use reset to clear anything inappropriate.",
+    "score": "Affection score",
+    "scoreHelper": "Ranges from -100 to 200; values outside are clamped",
+    "scoreInvalid": "Please enter an integer",
+    "reason": "Note",
+    "reasonHelper": "Recorded in the change history for later reference"
+  },
+  "resetDialog": {
+    "title": "Reset affection",
+    "description": "This clears the score for \"{{name}}\" and wipes the impression the bot wrote. It will build up again from the next conversation.",
+    "submit": "Reset"
+  },
+  "messages": {
+    "loadFailed": "Failed to load the affection list",
+    "resetDone": "Reset done"
+  }
+}

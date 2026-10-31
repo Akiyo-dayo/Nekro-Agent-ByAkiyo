@@ -1,0 +1,195 @@
+{
+  "common": {
+    "close": "Close",
+    "cancel": "Cancel",
+    "back": "Back",
+    "next": "Next",
+    "save": "Save",
+    "reset": "Reset",
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Copy failed"
+  },
+  "wizard": {
+    "title": "New Instance",
+    "subtitle": "Pick a protocol backend, create the instance, and finish the connection",
+    "steps": {
+      "provider": "Backend",
+      "basic": "Instance Info",
+      "setup": "Connection",
+      "done": "Done"
+    },
+    "createInstance": "Create Instance",
+    "instanceCreated": "Instance {{name}} created",
+    "exit": "Exit Wizard",
+    "backToList": "Back to instances"
+  },
+  "provider": {
+    "intro": "The backend decides whether NA has to host a protocol container locally. Choose based on your resources and existing setup.",
+    "recommended": "Recommended",
+    "builtin_napcat": {
+      "description": "NA creates and hosts a NapCat container in local Docker. Just scan the QR code to sign in — no protocol backend to set up yourself.",
+      "cost": "Uses one container, roughly 300-500MB RAM"
+    },
+    "remote_onebot": {
+      "description": "Connect an existing NapCat / LLOneBot / Lagrange OneBot backend. NA only accepts the reverse WebSocket connection.",
+      "cost": "No container, zero extra resource cost"
+    },
+    "native": {
+      "description": "Use a native adapter such as qqbot_openclaw, email, or minecraft to talk to the platform directly, bypassing OneBot.",
+      "cost": "No container, zero extra resource cost"
+    }
+  },
+  "basic": {
+    "displayName": "Display name",
+    "displayNamePlaceholder": "e.g. Main account, Test account",
+    "instanceKey": "Instance key",
+    "instanceKeyPlaceholder": "Leave empty to generate automatically",
+    "instanceKeyHint": "Lowercase letters, digits and underscores only, up to 32 characters",
+    "instanceKeyInvalid": "Only lowercase letters, digits and underscores, 1-32 characters",
+    "immutableNotice": "The instance key is encoded into every chat key and cannot be changed after creation.",
+    "adapter": "Native adapter",
+    "adapterHint": "Pick the native adapter this instance will use",
+    "noNativeAdapter": "No native adapter is available. Enable one in adapter management first."
+  },
+  "builtin": {
+    "intro": "NA creates and hosts a NapCat container in local Docker. Once it is running, scan the QR code to bring the account online.",
+    "phase": {
+      "create": {
+        "title": "Create container",
+        "hint": "The first run pulls the image and may take several minutes"
+      },
+      "start": {
+        "title": "Start container",
+        "hint": "The QR code becomes available once the container is running"
+      },
+      "login": {
+        "title": "Scan to sign in",
+        "hint": "Scan the QR code with your mobile client to sign in"
+      }
+    },
+    "creatingHint": "Working on it — container status refreshes automatically.",
+    "beforeCreate": "The container uses roughly 300-500MB RAM on this machine. Make sure Docker is available.",
+    "runningHint": "The container is running. You can scan the QR code to sign in now.",
+    "loginDone": "Signed in. The instance is connected."
+  },
+  "remote": {
+    "noContainerNotice": "This backend creates no container. Just put the connection details below into your existing protocol backend.",
+    "wsUrl": "Reverse WebSocket URL",
+    "accessToken": "Access token",
+    "guideTitle": "Configure your protocol backend",
+    "guide": {
+      "open": "Open the OneBot configuration page of NapCat / LLOneBot / Lagrange",
+      "addWs": "Add a reverse WebSocket client and paste the WS URL above",
+      "fillToken": "Paste the access token above into the auth token field",
+      "enable": "Save and enable the connection — the backend will connect back to NA"
+    },
+    "claimHint": "Once connected, if the instance shows as unclaimed, claim it from the instance list to bring it under management."
+  },
+  "native": {
+    "intro": "The instance is created. Account and credentials for the native adapter are configured on the adapter page.",
+    "openConfig": "Open adapter config",
+    "returnHint": "Return to the instance list afterwards to check the connection status."
+  },
+  "done": {
+    "title": "Instance ready",
+    "subtitle": "Open the instance to check its status and configure channels.",
+    "field": {
+      "displayName": "Display name",
+      "instanceKey": "Instance key",
+      "provider": "Backend",
+      "adapter": "Adapter",
+      "container": "Container",
+      "status": "Status"
+    },
+    "noContainer": "No hosted container",
+    "enterInstance": "Open instance"
+  },
+  "panel": {
+    "unnamedContainer": "Unnamed container",
+    "start": "Start",
+    "stop": "Stop",
+    "restart": "Restart",
+    "delete": "Delete container",
+    "scanLogin": "Scan to sign in",
+    "openWebui": "Open WebUI",
+    "createContainer": "Create container",
+    "createStarted": "Container creation started",
+    "started": "Container started",
+    "stopped": "Container stopped",
+    "restarted": "Container restarted",
+    "deleted": "Container deleted",
+    "notRunningHint": "The container is not running, so the protocol backend cannot connect. Start it first.",
+    "emptyTitle": "No protocol container yet",
+    "emptyDescription": "NA will host NapCat in local Docker, using roughly 300-500MB RAM.",
+    "emptyNoPermission": "No container has been created for this instance yet. Container creation allocates host resources, so ask your service provider to set it up.",
+    "remoteNotice": "This instance connects to an external protocol backend — NA hosts no container. Put the connection details below into your backend.",
+    "nativeNotice": "This instance uses the native adapter {{adapter}}. It bypasses OneBot and needs no container; manage its credentials on the adapter config page.",
+    "deleteConfirmTitle": "Delete container",
+    "deleteConfirmBody": "Container {{name}} will be removed along with its stored login state, so you will need to scan the QR code again. This cannot be undone.",
+    "network": {
+      "title": "Network configuration",
+      "subtitle": "A protocol backend can run several connections of different types at once. NekroAgent manages exactly one of them; the rest are yours.",
+      "addEntry": "Add connection",
+      "empty": "No network connection configured yet.",
+      "saved": "Network configuration saved",
+      "restartRequired": "Network changes take effect after the container restarts.",
+      "remoteSyncRequired": "After changing the network configuration, update your protocol backend and reconnect.",
+      "type": {
+        "websocketClients": "Reverse WebSocket (backend dials out)",
+        "websocketClientsHint": "The backend connects out to the given address; this is what NekroAgent uses",
+        "websocketServers": "Forward WebSocket (backend listens)",
+        "websocketServersHint": "The backend listens on a port and your tools connect in",
+        "httpServers": "HTTP server",
+        "httpServersHint": "The backend listens on a port and serves the OneBot HTTP API",
+        "httpSseServers": "HTTP + SSE server",
+        "httpSseServersHint": "Same as the HTTP server, but pushes events over SSE",
+        "httpClients": "HTTP report (POST events out)",
+        "httpClientsHint": "The backend POSTs events to the given address, which must be a public http/https URL"
+      },
+      "entry": {
+        "unnamed": "Unnamed connection",
+        "managedBadge": "Managed by NekroAgent",
+        "managedHint": "This connection is managed by NekroAgent: its address and token are generated automatically, and it cannot be edited or removed. Only heartbeat, reconnect and debug are adjustable.",
+        "type": "Connection type",
+        "name": "Connection name",
+        "nameHint": "Unique per type; letters, digits, underscore, dot and hyphen only",
+        "enable": "Enabled",
+        "remove": "Remove this connection",
+        "url": "Target address",
+        "urlHint": "Must be a full {{schemes}} URL",
+        "host": "Listen address",
+        "hostHint": "Listen address inside the protocol container, usually 0.0.0.0",
+        "port": "Listen port",
+        "portHint": "Between {{min}} and {{max}}, and must not clash with another connection",
+        "token": "Access token",
+        "tokenHint": "Leave empty to disable auth",
+        "messagePostFormat": "Message post format",
+        "reportSelfMessage": "Report self messages",
+        "forcePushEvent": "Force push events",
+        "debug": "Debug mode",
+        "heartInterval": "Heartbeat interval (ms)",
+        "reconnectInterval": "Reconnect interval (ms)"
+      },
+      "errors": {
+        "nameRequired": "Every connection needs a name",
+        "duplicateName": "Duplicate connection name within the same type: {{name}}",
+        "invalidPort": "Connection \"{{name}}\" needs a listen port between {{min}} and {{max}}",
+        "invalidUrl": "Connection \"{{name}}\" must start with {{schemes}}"
+      }
+    }
+  },
+  "login": {
+    "title": "Scan to sign in",
+    "quickLogin": "Quick login",
+    "quickLoginRequested": "Quick login requested",
+    "refresh": "Refresh QR code",
+    "success": "Signed in",
+    "successHint": "The account is signed in. You can close this dialog.",
+    "boundHint": "Account {{account}} is signed in and has been bound to this instance automatically. You can close this dialog.",
+    "qrAlt": "Login QR code",
+    "waiting": "Fetching QR code...",
+    "scanHint": "Scan the QR code with your mobile client. It refreshes automatically.",
+    "pollingStopped": "Auto refresh stopped. Click \"Refresh QR code\" to continue."
+  }
+}

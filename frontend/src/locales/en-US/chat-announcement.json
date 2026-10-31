@@ -1,0 +1,101 @@
+{
+  "title": "Bot Announcement",
+  "subtitle": "Send the same message to multiple channels without writing it into AI context or WebUI conversation history. The task runs on the server, so closing this page will not interrupt it.",
+  "search": {
+    "placeholder": "Search by channel name or chat_key"
+  },
+  "filters": {
+    "type": "Type",
+    "status": "Status",
+    "all": "All",
+    "group": "Group",
+    "private": "Private",
+    "observe": "Observe",
+    "active": "Active",
+    "inactive": "Disabled"
+  },
+  "scope": {
+    "title": "Target Scope",
+    "all": "All",
+    "instances": "By Instance",
+    "channels": "By Channel",
+    "allHint": "Will be sent to {{channels}} active channels across {{instances}} instances",
+    "instancesEmpty": "No adapter instance available",
+    "instanceChannels": "{{count}} active channels"
+  },
+  "selector": {
+    "title": "Channel Selector",
+    "selectVisible": "Select Current Page",
+    "clearSelection": "Clear Selection",
+    "visibleCount": "{{count}} channels on this page",
+    "selectedCount": "{{count}} channels selected",
+    "empty": "No channels match the current filters",
+    "messageCount": "{{count}} messages",
+    "noActivity": "No recent activity",
+    "chatKey": "Channel Key"
+  },
+  "summary": {
+    "title": "Selected Channels",
+    "empty": "No channels selected yet",
+    "clear": "Clear",
+    "count": "{{count}} channels"
+  },
+  "composer": {
+    "title": "Announcement Content",
+    "help": "Announcement details",
+    "messageLabel": "Announcement Message",
+    "messagePlaceholder": "Type the announcement to send...",
+    "helper": "Announcements are dispatched per adapter instance in parallel, with randomized delays inside each instance to avoid rate limits.",
+    "length": "{{count}} chars",
+    "selectionSummary": "{{selected}} channels selected, {{filtered}} channels in the current filter.",
+    "actionTitle": "Ready to send",
+    "actionHint": {
+      "all": "Will target every active channel of every enabled instance. You will be asked to confirm.",
+      "instances": "Will target every active channel of the selected instances. You will be asked to confirm.",
+      "channels": "Will target the selected channels. You will be asked to confirm."
+    },
+    "send": "Submit Announcement",
+    "sending": "Task running...",
+    "submitted": "Announcement task submitted for {{count}} channels",
+    "messageRequired": "Please enter a message to send",
+    "selectionRequired": "Please select at least one channel",
+    "instanceRequired": "Please select at least one instance"
+  },
+  "confirm": {
+    "title": "Confirm Announcement",
+    "loading": "Calculating impact...",
+    "impact": "Will be sent to {{channels}} channels across {{instances}} instances",
+    "exceedsLimit": "This scope exceeds the per-task limit of {{max}} channels, please narrow it down",
+    "messagePreview": "Message preview",
+    "irreversible": "Mass sending is a high-risk operation for the account, and sent messages cannot be recalled.",
+    "cancel": "Not now",
+    "submit": "Send"
+  },
+  "status": {
+    "pending": "Pending",
+    "running": "Running",
+    "completed": "Completed",
+    "failed": "Failed",
+    "cancelled": "Cancelled"
+  },
+  "progress": {
+    "title": "Announcement Progress",
+    "count": "{{completed}} / {{total}} completed",
+    "summary": "{{success}} succeeded · {{failure}} failed",
+    "cancel": "Cancel Task",
+    "dismiss": "Dismiss",
+    "reconnecting": "Connection lost, reconnecting",
+    "backgroundHint": "The task runs on the server; closing this page will not stop it.",
+    "failedList": "Failed channels"
+  },
+  "history": {
+    "title": "Announcement History",
+    "empty": "No announcement records yet",
+    "meta": "{{time}} · {{scope}} · {{success}} succeeded / {{failure}} failed / {{total}} total",
+    "noDeliveries": "This task produced no delivery records"
+  },
+  "result": {
+    "ok": "Sent",
+    "failed": "Failed"
+  }
+}

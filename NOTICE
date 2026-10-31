@@ -1,0 +1,59 @@
+NekroAgent derivative edition
+=============================
+
+This distribution is a derivative work of NekroAgent.
+
+  Upstream project : NekroAgent  <https://github.com/KroMiose/nekro-agent>
+  Upstream authors : KroMiose and the NekroAgent contributors
+  Based on version : 2.3.3 (the "version" field of pyproject.toml, kept as upstream's)
+  This edition     : 0.2.0 (FORK_VERSION in nekro_agent/tools/common_util.py)
+  This repository  : <https://github.com/Akiyo-dayo/Nekro-Agent-ByAkiyo>
+
+This edition is NOT an official release of NekroAgent and is not affiliated with
+or endorsed by the NekroAgent maintainers.
+
+License
+-------
+The file LICENSE in this distribution is a complete, unmodified copy of the upstream
+"Nekro Agent Open Source License V1.1" (modified from Apache License 2.0). It applies to
+this whole distribution, including the modifications described below. Where the license
+asks for it, this distribution states that it is built on the NekroAgent project and
+links to the original project (above, and in README.md).
+
+Statement of changes
+--------------------
+The upstream source has been modified. The principal modifications are listed in
+README.md ("与上游的主要差异" / "Main differences from upstream") and CHANGELOG.md;
+in short: multi-instance operation, a platform console with multi-tenant permissions,
+identity / favourability / memory isolation by memory domain, an LLM usage ledger,
+credential encryption and startup audits, installer and compose changes, container
+images published under a different namespace, and the tests and CI workflows that cover
+them. Files that were modified, added or removed relative to upstream 2.3.3 can be
+identified by comparing this tree with the upstream release.
+
+Attribution that must stay
+--------------------------
+* Keep LICENSE and this NOTICE with every redistribution.
+* Keep the upstream attribution and links in the user interface and documents, and state
+  that the work is built on NekroAgent.
+* See LICENSE for the conditions that apply to large-scale commercial use, to public-facing
+  commercial services ("Powered by NekroAgent"), and to technical support services.
+
+Telemetry (on by default, unchanged from upstream)
+--------------------------------------------------
+The setting ENABLE_NEKRO_CLOUD ("Enable NekroAI cloud service") defaults to true. While it is
+on, the application sends an hourly usage report (instance ID derived from environment
+information, upstream version, Docker flag, basic system information including the hostname,
+and aggregate counts of users, channels, messages and sandbox executions; no chat or code
+content) to https://cloud.nekro.ai, a service operated by the upstream project. This edition does not change
+that behaviour.
+
+To turn it off: set ENABLE_NEKRO_CLOUD to false (web UI: Settings > Basic settings; the setup
+wizard; or <data directory>/configs/nekro-agent.yaml). Known limitation: when no NekroAI cloud
+API key is configured, the telemetry report does not check that switch. To stop the reports for
+certain, also set the environment variable NEKRO_NEKRO_CLOUD_API_BASE_URL (two NEKRO_ prefixes)
+to an unreachable address such as http://127.0.0.1:9, or block cloud.nekro.ai at your egress
+firewall; this also disables the cloud features. Details: README.md / README_en.md.
+
+Third-party components keep their own licenses (see pyproject.toml, uv.lock and
+frontend/package.json for the dependency lists).

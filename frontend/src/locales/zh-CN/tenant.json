@@ -1,0 +1,267 @@
+{
+  "role": {
+    "platform_owner": "平台方",
+    "tenant_admin": "租户管理员",
+    "tenant_user": "租户成员"
+  },
+  "status": {
+    "active": "正常",
+    "suspended": "已停用",
+    "archived": "已归档",
+    "all": "全部状态"
+  },
+  "identity": {
+    "platformLabel": "平台方",
+    "platformTooltip": "平台方视角，可见并可管理全部租户与实例",
+    "tenantTooltip": "当前处于租户「{{tenant}}」的作用域，页面只显示该租户名下的数据",
+    "readOnlyTooltip": "当前身份为租户成员，仅可查看，不能修改",
+    "ariaLabel": "当前身份"
+  },
+  "guard": {
+    "title": "无权访问",
+    "description": "该功能仅平台方可用。如需调整，请联系平台方。",
+    "readOnlyDescription": "你的账号是租户成员（只读），这一页需要租户管理员权限。这不代表这里没有数据，只代表它不对你开放；如需查看请联系你的租户管理员。",
+    "back": "返回总后台",
+    "backToDashboard": "返回仪表盘"
+  },
+  "unavailable": {
+    "title": "该功能后端尚未就绪",
+    "tenants": "租户管理接口尚未上线，暂时无法查看或维护租户。",
+    "tenantDetail": "租户详情接口尚未上线，暂时无法查看该租户。",
+    "members": "租户成员接口尚未上线，暂时无法维护成员账号。",
+    "instances": "实例划归接口尚未上线，暂时无法调整实例归属。",
+    "modelGroups": "按归属划分的模型组接口尚未上线，暂时无法在此维护模型组。",
+    "retry": "重试"
+  },
+  "list": {
+    "title": "租户管理",
+    "subtitle": "为定制版客户划分独立的实例与资源作用域",
+    "searchPlaceholder": "搜索租户标识、名称或联系方式",
+    "clearSearch": "清空搜索",
+    "statusFilter": "状态",
+    "empty": "还没有租户",
+    "emptyHint": "创建第一个租户，把定制版客户接进来。",
+    "noResults": "没有符合条件的租户",
+    "noResultsHint": "调整搜索词或状态筛选后再试。",
+    "loadFailed": "租户列表加载失败",
+    "columns": {
+      "tenant": "租户",
+      "status": "状态",
+      "instances": "实例",
+      "members": "成员",
+      "contact": "联系方式",
+      "createTime": "创建时间",
+      "actions": "操作"
+    }
+  },
+  "actions": {
+    "create": "新建租户",
+    "refresh": "刷新",
+    "detail": "详情",
+    "suspend": "停用",
+    "resume": "恢复",
+    "archive": "归档",
+    "save": "保存",
+    "addMember": "添加成员",
+    "removeMember": "移除成员",
+    "bindInstances": "保存归属",
+    "resetSelection": "撤销改动",
+    "test": "测试",
+    "edit": "编辑",
+    "delete": "删除",
+    "createModelGroup": "新建模型组"
+  },
+  "createDialog": {
+    "title": "新建租户",
+    "description": "租户标识创建后不可修改，它是该客户全部资源的作用域标记。",
+    "name": "租户标识",
+    "nameHelper": "仅小写字母、数字和下划线，最长 32 位",
+    "nameInvalid": "只能使用小写字母、数字和下划线，最长 32 位",
+    "nameDuplicated": "该租户标识已被占用",
+    "displayName": "显示名称",
+    "displayNameHelper": "展示给运营人员看的名字，可随时修改",
+    "contact": "联系方式",
+    "note": "备注",
+    "submit": "创建"
+  },
+  "suspendDialog": {
+    "title": "停用租户",
+    "description": "停用「{{tenant}}」后会立即发生：",
+    "consequenceLogin": "该租户下的全部成员无法登录后台",
+    "consequenceInstance": "名下 {{instanceCount}} 个实例停止收发消息",
+    "consequenceReversible": "停用可随时恢复，数据不会被删除",
+    "confirmLabel": "输入租户标识以确认",
+    "confirmHelper": "请输入 {{name}}",
+    "confirmMismatch": "与租户标识不一致",
+    "submit": "确认停用"
+  },
+  "resumeDialog": {
+    "title": "恢复租户",
+    "description": "恢复后「{{tenant}}」的成员可重新登录，名下实例恢复收发消息。",
+    "submit": "确认恢复"
+  },
+  "archiveDialog": {
+    "title": "归档租户",
+    "description": "归档「{{tenant}}」后该租户不再出现在列表中，数据只读保留。请先确认名下实例已妥善处理。",
+    "submit": "确认归档"
+  },
+  "detail": {
+    "notFound": "租户不存在或已被归档",
+    "backToList": "返回租户列表",
+    "baseInfo": "客户资料",
+    "fields": {
+      "name": "租户标识",
+      "displayName": "显示名称",
+      "contact": "联系方式",
+      "note": "备注",
+      "status": "状态",
+      "instanceCount": "名下实例",
+      "memberCount": "成员",
+      "createTime": "创建时间"
+    },
+    "saveSuccess": "租户信息已更新",
+    "nameImmutable": "租户标识 {{name}} 创建后不可修改",
+    "suspendedBanner": "该租户已停用：成员无法登录，名下实例已停止收发消息。"
+  },
+  "members": {
+    "title": "成员",
+    "description": "为该租户创建后台账号。租户管理员可管理自己名下的实例与资源，租户成员只读。",
+    "empty": "该租户还没有成员",
+    "emptyHint": "创建一个租户管理员账号，客户即可登录自己的后台。",
+    "loadFailed": "成员列表加载失败",
+    "columns": {
+      "username": "登录名",
+      "role": "角色",
+      "state": "状态",
+      "actions": "操作"
+    },
+    "state": {
+      "active": "正常",
+      "inactive": "已禁用"
+    },
+    "createDialog": {
+      "title": "添加成员",
+      "description": "账号创建后请通过安全渠道把初始密码交给客户，并提示其首次登录后修改。",
+      "username": "登录名",
+      "password": "初始密码",
+      "passwordHelper": "至少 8 位；创建后不会再次展示",
+      "passwordTooShort": "初始密码至少 8 位",
+      "role": "角色",
+      "roleAdminHint": "租户管理员：可管理该租户名下的实例与资源",
+      "roleUserHint": "租户成员：只能查看，不能修改",
+      "submit": "创建账号"
+    },
+    "removeDialog": {
+      "title": "移除成员",
+      "description": "移除「{{username}}」后该账号将无法再登录该租户的后台。",
+      "submit": "确认移除"
+    },
+    "createSuccess": "成员账号已创建",
+    "removeSuccess": "成员已移除",
+    "count": "{{count}} 名成员",
+    "cannotRemoveSelf": "不能移除自己"
+  },
+  "team": {
+    "title": "我的团队",
+    "subtitle": "为团队成员开后台账号。管理员可管理名下实例与资源，成员只读；账号一旦创建，初始密码不会再次展示。",
+    "readOnlyBanner": "当前身份为租户成员，只能查看成员列表，不能增删账号。",
+    "noTenant": "当前账号没有租户归属，暂时无法管理团队成员，请联系服务提供方。",
+    "platformTitle": "这是租户自助页",
+    "platformHint": "平台方管理某个客户的成员请从「租户管理」进入对应租户，那里还能编辑客户资料、停用租户与划归实例。",
+    "platformAction": "前往租户管理"
+  },
+  "instances": {
+    "title": "实例归属",
+    "empty": "还没有可划归的实例",
+    "emptyHint": "先在实例管理里创建实例，再回来划分归属。",
+    "loadFailed": "实例列表加载失败",
+    "ownedByOtherHint": "该实例已划归其他租户，需先在对应租户下解绑",
+    "unassigned": "未归属",
+    "saveSuccess": "实例归属已更新",
+    "searchPlaceholder": "搜索实例名、标识或账号",
+    "clearSearch": "清空搜索",
+    "boundCount": "名下 {{count}} 个实例",
+    "selectAllHint": "全选/取消当前筛选出的实例",
+    "noResults": "没有符合条件的实例",
+    "noResultsHint": "调整搜索词或归属筛选后再试。",
+    "ownedByThis": "本租户",
+    "ownedByNamed": "归属 {{tenant}}",
+    "pendingAdded": "将新增 {{count}} 个归属：{{keys}}",
+    "pendingRemoved": "将解除 {{count}} 个归属：{{keys}}（保存后这些实例变为未归属）",
+    "filter": {
+      "all": "全部",
+      "mine": "本租户",
+      "unassigned": "未归属",
+      "others": "其他租户"
+    }
+  },
+  "modelGroups": {
+    "title": "模型组",
+    "subtitle": "平台提供的模型组可直接使用，也可以接入自己的 API",
+    "searchPlaceholder": "搜索模型组名或模型",
+    "clearSearch": "清空搜索",
+    "ownershipFilter": "归属",
+    "ownershipAll": "全部归属",
+    "ownership": {
+      "platform": "平台提供",
+      "tenant": "自建"
+    },
+    "ownershipPlatformHint": "由平台方维护，可直接使用，凭据不对外展示",
+    "ownershipTenantHint": "接入的是你自己的 API，凭据由你自己维护",
+    "empty": "还没有模型组",
+    "emptyHint": "新建一个模型组，接入你自己的 API。",
+    "noResults": "没有符合条件的模型组",
+    "noResultsHint": "调整搜索词或归属筛选后再试。",
+    "loadFailed": "模型组加载失败",
+    "readOnlyTooltip": "平台提供的模型组只读，如需调整请联系平台方",
+    "readOnlyRoleTooltip": "当前身份为只读，无法修改模型组",
+    "columns": {
+      "name": "模型组",
+      "ownership": "归属",
+      "model": "模型",
+      "type": "类型",
+      "baseUrl": "接口地址",
+      "credential": "凭据",
+      "actions": "操作"
+    },
+    "credentialHidden": "凭据已隐藏",
+    "credentialHiddenTooltip": "这里显示的是掩码，不是真实密钥。平台提供的模型组凭据不会下发给租户。",
+    "credentialVisible": "可见",
+    "testSuccess": "连通性测试通过",
+    "testFailed": "连通性测试失败",
+    "createSuccess": "模型组已创建",
+    "updateSuccess": "模型组已更新",
+    "deleteSuccess": "模型组已删除",
+    "editDialog": {
+      "createTitle": "新建模型组",
+      "editTitle": "编辑模型组",
+      "name": "模型组名",
+      "nameHelper": "创建后不可修改",
+      "nameRequired": "请填写模型组名",
+      "baseUrl": "接口地址",
+      "baseUrlRequired": "请填写接口地址",
+      "chatModel": "模型名",
+      "modelType": "类型",
+      "apiKey": "API Key",
+      "apiKeyHiddenLabel": "API Key（已隐藏）",
+      "apiKeyHiddenHelper": "这里显示的是掩码，不是真实密钥；保存时会原样保留原有凭据。",
+      "apiKeyKeepHelper": "留空不动即保持现有凭据不变；填入新值才会覆盖。",
+      "apiKeyMaskLike": "输入的是一串掩码符号，不是有效凭据。保持原样即可维持现有凭据不变。",
+      "apiKeyRequired": "请填写 API Key",
+      "credentialUnchanged": "凭据保持不变",
+      "credentialWillReplace": "保存后将覆盖现有凭据",
+      "submitCreate": "创建",
+      "submitSave": "保存"
+    },
+    "deleteDialog": {
+      "title": "删除模型组",
+      "description": "删除「{{name}}」后，正在使用它的配置会失去模型来源。此操作不可撤销。",
+      "submit": "确认删除"
+    },
+    "modelType": {
+      "chat": "聊天",
+      "embedding": "嵌入",
+      "draw": "绘图"
+    }
+  }
+}

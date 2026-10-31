@@ -1,0 +1,20 @@
+{
+  "networkError": "Network connection failed, please check your network settings",
+  "unauthorized": "Unauthorized access",
+  "sessionExpired": "Session expired, please log in again",
+  "forbidden": "Permission denied",
+  "accessDenied": {
+    "title": "You cannot view this",
+    "hint": "This account is not allowed to view this page. It does not mean there is no data here — only that it is not open to you. Contact your tenant admin or the platform owner if you need access."
+  },
+  "loadFailed": {
+    "title": "Failed to load",
+    "retry": "Retry"
+  },
+  "notFound": "Resource not found",
+  "serverError": "Internal server error",
+  "timeout": "Request timeout, please try again later",
+  "validationError": "Invalid request parameters",
+  "conflict": "Resource conflict",
+  "tooManyRequests": "Too many requests, please try again later"
+}

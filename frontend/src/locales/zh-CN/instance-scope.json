@@ -1,0 +1,80 @@
+{
+  "scope": {
+    "global": "全局视图",
+    "globalHint": "平台方视角，管理全部实例数据"
+  },
+  "switcher": {
+    "title": "切换管理作用域",
+    "ariaLabel": "切换实例作用域",
+    "searchPlaceholder": "搜索实例标识 / 名称 / QQ 号",
+    "clearSearch": "清除搜索",
+    "listAriaLabel": "可切换的实例",
+    "recentBadge": "常用",
+    "attentionFilter": "仅看需处理 {{attention}}",
+    "unboundAccount": "未绑定账号",
+    "noResults": "没有匹配的实例",
+    "noResultsHint": "可按实例标识、显示名或 QQ 号搜索",
+    "summary": "共 {{total}} 个实例，当前显示 {{shown}} 个"
+  },
+  "banner": {
+    "default": "当前处于该实例的作用域，页面数据与操作仅作用于本实例",
+    "channels": "只显示属于本实例的会话",
+    "plugins": "插件启停写入本实例覆盖，不影响其他实例",
+    "presets": "只显示全局共享人设与本实例私有人设，新建的人设归本实例所有",
+    "settings": "编辑的是本实例的配置覆盖，未覆盖的字段继承全局配置",
+    "logs": "日志按本实例作用域请求",
+    "sandbox": "只统计本实例的沙盒执行记录"
+  },
+  "layer": {
+    "global": "全局",
+    "system": "全局",
+    "adapter": "适配器",
+    "instance": "实例",
+    "session": "会话",
+    "channel": "会话"
+  },
+  "override": {
+    "effective": "生效值",
+    "inheritedBadge": "继承自{{layer}}",
+    "overriddenBadge": "{{layer}}覆盖",
+    "tooltipInherited": "当前值继承自「{{layer}}」层，本层未设置覆盖",
+    "tooltipOverridden": "当前值来自「{{layer}}」层的覆盖，已遮蔽上层设置",
+    "restoreInherit": "恢复继承",
+    "restoreSuccess": "已恢复继承上层设置",
+    "overrideSuccess": "已写入本实例覆盖"
+  },
+  "unavailable": {
+    "title": "该功能后端尚未就绪",
+    "plugins": "实例级插件启停接口尚未上线，当前无法在实例作用域下修改插件状态。可切回全局视图管理全局启停。",
+    "settings": "实例级配置覆盖接口尚未上线，暂时无法在实例作用域下编辑配置。",
+    "backToGlobal": "切回全局视图",
+    "retry": "重试"
+  },
+  "tenantScope": {
+    "noInstanceTitle": "当前没有可管理的实例",
+    "noInstanceHint": "这一页编辑的是某个实例的配置覆盖，全局配置由平台方维护、不对外开放。名下暂时没有实例，请联系服务提供方。",
+    "readOnlyTitle": "需要租户管理员权限",
+    "readOnlyHint": "实例配置的读取与修改都需要租户管理员权限，当前账号是只读成员。请让本团队的管理员操作，或联系服务提供方调整权限。",
+    "listFailedTitle": "实例列表没有取到",
+    "listFailedHint": "名下确实有实例，但这次没有把实例列表取回来。请重试；持续失败请联系服务提供方。"
+  },
+  "warning": {
+    "serverFilterPending": "后端按实例过滤尚未就绪，列表中仍包含其他实例的数据"
+  },
+  "presets": {
+    "ownerGlobal": "全局共享",
+    "ownerInstance": "本实例私有",
+    "instanceDefault": "本实例默认",
+    "setInstanceDefault": "设为本实例默认人设",
+    "clearInstanceDefault": "取消本实例默认人设",
+    "setDefaultSuccess": "已设为本实例默认人设",
+    "clearDefaultSuccess": "已取消本实例默认人设",
+    "setDefaultFailed": "设置本实例默认人设失败",
+    "readOnlyGlobal": "全局共享人设在实例作用域下只读"
+  },
+  "plugins": {
+    "effectiveEnabled": "已启用",
+    "effectiveDisabled": "已禁用",
+    "scopeToggleTooltip": "写入本实例的启停覆盖"
+  }
+}

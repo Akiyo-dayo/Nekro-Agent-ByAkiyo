@@ -1,0 +1,267 @@
+{
+  "role": {
+    "platform_owner": "Platform",
+    "tenant_admin": "Tenant Admin",
+    "tenant_user": "Tenant Member"
+  },
+  "status": {
+    "active": "Active",
+    "suspended": "Suspended",
+    "archived": "Archived",
+    "all": "All statuses"
+  },
+  "identity": {
+    "platformLabel": "Platform",
+    "platformTooltip": "Platform view: every tenant and instance is visible and manageable",
+    "tenantTooltip": "You are inside tenant \"{{tenant}}\"; only this tenant's data is shown",
+    "readOnlyTooltip": "You are a tenant member: read-only access",
+    "ariaLabel": "Current identity"
+  },
+  "guard": {
+    "title": "No access",
+    "description": "This feature is available to the platform owner only. Contact the platform owner if you need a change.",
+    "readOnlyDescription": "Your account is a read-only tenant member; this page needs tenant admin permission. It does not mean there is no data here — only that it is not open to you. Ask your tenant admin if you need access.",
+    "back": "Back to console",
+    "backToDashboard": "Back to dashboard"
+  },
+  "unavailable": {
+    "title": "This backend endpoint is not ready yet",
+    "tenants": "The tenant management endpoint is not available yet, so tenants cannot be listed or maintained.",
+    "tenantDetail": "The tenant detail endpoint is not available yet, so this tenant cannot be opened.",
+    "members": "The tenant member endpoint is not available yet, so member accounts cannot be maintained.",
+    "instances": "The instance assignment endpoint is not available yet, so ownership cannot be changed.",
+    "modelGroups": "The ownership-aware model group endpoint is not available yet, so model groups cannot be maintained here.",
+    "retry": "Retry"
+  },
+  "list": {
+    "title": "Tenants",
+    "subtitle": "Give each dedicated customer its own instance and resource scope",
+    "searchPlaceholder": "Search by tenant key, name or contact",
+    "clearSearch": "Clear search",
+    "statusFilter": "Status",
+    "empty": "No tenants yet",
+    "emptyHint": "Create the first tenant to onboard a dedicated customer.",
+    "noResults": "No matching tenants",
+    "noResultsHint": "Adjust the search term or status filter and try again.",
+    "loadFailed": "Failed to load tenants",
+    "columns": {
+      "tenant": "Tenant",
+      "status": "Status",
+      "instances": "Instances",
+      "members": "Members",
+      "contact": "Contact",
+      "createTime": "Created",
+      "actions": "Actions"
+    }
+  },
+  "actions": {
+    "create": "New tenant",
+    "refresh": "Refresh",
+    "detail": "Details",
+    "suspend": "Suspend",
+    "resume": "Resume",
+    "archive": "Archive",
+    "save": "Save",
+    "addMember": "Add member",
+    "removeMember": "Remove member",
+    "bindInstances": "Save assignment",
+    "resetSelection": "Discard changes",
+    "test": "Test",
+    "edit": "Edit",
+    "delete": "Delete",
+    "createModelGroup": "New model group"
+  },
+  "createDialog": {
+    "title": "New tenant",
+    "description": "The tenant key cannot be changed later; it scopes every resource of this customer.",
+    "name": "Tenant key",
+    "nameHelper": "Lowercase letters, digits and underscores, up to 32 characters",
+    "nameInvalid": "Only lowercase letters, digits and underscores, up to 32 characters",
+    "nameDuplicated": "This tenant key is already taken",
+    "displayName": "Display name",
+    "displayNameHelper": "Shown to operators; can be changed at any time",
+    "contact": "Contact",
+    "note": "Note",
+    "submit": "Create"
+  },
+  "suspendDialog": {
+    "title": "Suspend tenant",
+    "description": "Suspending \"{{tenant}}\" takes effect immediately:",
+    "consequenceLogin": "All members of this tenant can no longer sign in",
+    "consequenceInstance": "Its {{instanceCount}} instance(s) stop sending and receiving messages",
+    "consequenceReversible": "Suspension is reversible; no data is deleted",
+    "confirmLabel": "Type the tenant key to confirm",
+    "confirmHelper": "Type {{name}}",
+    "confirmMismatch": "Does not match the tenant key",
+    "submit": "Suspend"
+  },
+  "resumeDialog": {
+    "title": "Resume tenant",
+    "description": "Members of \"{{tenant}}\" can sign in again and its instances resume messaging.",
+    "submit": "Resume"
+  },
+  "archiveDialog": {
+    "title": "Archive tenant",
+    "description": "After archiving \"{{tenant}}\" it disappears from the list and its data becomes read-only. Make sure its instances have been handled first.",
+    "submit": "Archive"
+  },
+  "detail": {
+    "notFound": "Tenant not found or already archived",
+    "backToList": "Back to tenants",
+    "baseInfo": "Customer details",
+    "fields": {
+      "name": "Tenant key",
+      "displayName": "Display name",
+      "contact": "Contact",
+      "note": "Note",
+      "status": "Status",
+      "instanceCount": "Instances",
+      "memberCount": "Members",
+      "createTime": "Created"
+    },
+    "saveSuccess": "Tenant updated",
+    "nameImmutable": "Tenant key {{name}} cannot be changed after creation",
+    "suspendedBanner": "This tenant is suspended: members cannot sign in and its instances have stopped sending and receiving."
+  },
+  "members": {
+    "title": "Members",
+    "description": "Create backend accounts for this tenant. A tenant admin manages the tenant's own instances and resources; a tenant member is read-only.",
+    "empty": "This tenant has no members yet",
+    "emptyHint": "Create a tenant admin account so the customer can sign in to their own console.",
+    "loadFailed": "Failed to load members",
+    "columns": {
+      "username": "Username",
+      "role": "Role",
+      "state": "State",
+      "actions": "Actions"
+    },
+    "state": {
+      "active": "Active",
+      "inactive": "Disabled"
+    },
+    "createDialog": {
+      "title": "Add member",
+      "description": "Hand the initial password to the customer over a secure channel and ask them to change it after the first sign-in.",
+      "username": "Username",
+      "password": "Initial password",
+      "passwordHelper": "At least 8 characters; it will not be shown again",
+      "passwordTooShort": "The initial password needs at least 8 characters",
+      "role": "Role",
+      "roleAdminHint": "Tenant admin: manages this tenant's instances and resources",
+      "roleUserHint": "Tenant member: read-only access",
+      "submit": "Create account"
+    },
+    "removeDialog": {
+      "title": "Remove member",
+      "description": "\"{{username}}\" will no longer be able to sign in to this tenant's console.",
+      "submit": "Remove"
+    },
+    "createSuccess": "Member account created",
+    "removeSuccess": "Member removed",
+    "count": "{{count}} member(s)",
+    "cannotRemoveSelf": "You cannot remove yourself"
+  },
+  "team": {
+    "title": "My Team",
+    "subtitle": "Create console accounts for your team. Admins can manage the instances and resources under your tenant; members are read-only. The initial password is shown only once.",
+    "readOnlyBanner": "You are signed in as a tenant member: the member list is read-only for you.",
+    "noTenant": "This account is not bound to any tenant, so team members cannot be managed. Please contact your service provider.",
+    "platformTitle": "This is the tenant self-service page",
+    "platformHint": "To manage a customer's members, open that tenant from Tenants — there you can also edit customer details, suspend the tenant and assign instances.",
+    "platformAction": "Go to Tenants"
+  },
+  "instances": {
+    "title": "Instance assignment",
+    "empty": "No instances available",
+    "emptyHint": "Create an instance first, then come back to assign ownership.",
+    "loadFailed": "Failed to load instances",
+    "ownedByOtherHint": "Assigned to another tenant; unbind it there first",
+    "unassigned": "Unassigned",
+    "saveSuccess": "Instance assignment updated",
+    "searchPlaceholder": "Search by name, key or account",
+    "clearSearch": "Clear search",
+    "boundCount": "{{count}} instance(s) assigned",
+    "selectAllHint": "Select/clear all instances in the current filter",
+    "noResults": "No matching instances",
+    "noResultsHint": "Adjust the search term or ownership filter and try again.",
+    "ownedByThis": "This tenant",
+    "ownedByNamed": "Owned by {{tenant}}",
+    "pendingAdded": "Will assign {{count}} instance(s): {{keys}}",
+    "pendingRemoved": "Will release {{count}} instance(s): {{keys}} (they become unassigned)",
+    "filter": {
+      "all": "All",
+      "mine": "This tenant",
+      "unassigned": "Unassigned",
+      "others": "Other tenants"
+    }
+  },
+  "modelGroups": {
+    "title": "Model groups",
+    "subtitle": "Use the model groups provided by the platform, or bring your own API",
+    "searchPlaceholder": "Search by group or model name",
+    "clearSearch": "Clear search",
+    "ownershipFilter": "Ownership",
+    "ownershipAll": "All ownerships",
+    "ownership": {
+      "platform": "Platform",
+      "tenant": "Own"
+    },
+    "ownershipPlatformHint": "Maintained by the platform; ready to use, credentials are never exposed",
+    "ownershipTenantHint": "Your own API; you maintain these credentials yourself",
+    "empty": "No model groups yet",
+    "emptyHint": "Create a model group to connect your own API.",
+    "noResults": "No matching model groups",
+    "noResultsHint": "Adjust the search term or ownership filter and try again.",
+    "loadFailed": "Failed to load model groups",
+    "readOnlyTooltip": "Platform model groups are read-only; contact the platform owner for changes",
+    "readOnlyRoleTooltip": "Your role is read-only and cannot modify model groups",
+    "columns": {
+      "name": "Model group",
+      "ownership": "Ownership",
+      "model": "Model",
+      "type": "Type",
+      "baseUrl": "Base URL",
+      "credential": "Credential",
+      "actions": "Actions"
+    },
+    "credentialHidden": "Hidden",
+    "credentialHiddenTooltip": "This is a mask, not the real key. Platform credentials are never handed to tenants.",
+    "credentialVisible": "Visible",
+    "testSuccess": "Connectivity test passed",
+    "testFailed": "Connectivity test failed",
+    "createSuccess": "Model group created",
+    "updateSuccess": "Model group updated",
+    "deleteSuccess": "Model group deleted",
+    "editDialog": {
+      "createTitle": "New model group",
+      "editTitle": "Edit model group",
+      "name": "Group name",
+      "nameHelper": "Cannot be changed after creation",
+      "nameRequired": "Group name is required",
+      "baseUrl": "Base URL",
+      "baseUrlRequired": "Base URL is required",
+      "chatModel": "Model name",
+      "modelType": "Type",
+      "apiKey": "API key",
+      "apiKeyHiddenLabel": "API key (hidden)",
+      "apiKeyHiddenHelper": "This is a mask, not the real key; saving keeps the existing credential untouched.",
+      "apiKeyKeepHelper": "Leave it untouched to keep the current credential; type a new value to replace it.",
+      "apiKeyMaskLike": "That is a row of mask characters, not a valid credential. Leave the field untouched to keep the current one.",
+      "apiKeyRequired": "API key is required",
+      "credentialUnchanged": "Credential unchanged",
+      "credentialWillReplace": "Saving replaces the current credential",
+      "submitCreate": "Create",
+      "submitSave": "Save"
+    },
+    "deleteDialog": {
+      "title": "Delete model group",
+      "description": "After deleting \"{{name}}\", configurations using it lose their model source. This cannot be undone.",
+      "submit": "Delete"
+    },
+    "modelType": {
+      "chat": "Chat",
+      "embedding": "Embedding",
+      "draw": "Image"
+    }
+  }
+}

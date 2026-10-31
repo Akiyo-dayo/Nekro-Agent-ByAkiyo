@@ -1,0 +1,108 @@
+# 运行 `export NEKRO_DATA_DIR=${HOME}/srv/nekro_agent` 设定数据目录
+# 然后运行 `sudo -E docker-compose up -d` 启动服务
+
+version: "3"
+
+services:
+  # PostgreSQL 服务
+  nekro_postgres:
+    image: postgres:14
+    container_name: ${INSTANCE_NAME:-}nekro_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    volumes:
+      - nekro_postgres_data:/var/lib/postgresql/data
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # Qdrant 服务
+  nekro_qdrant:
+    image: qdrant/qdrant:v1.17.1
+    container_name: ${INSTANCE_NAME:-}nekro_qdrant
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - nekro_qdrant_data:/qdrant/storage:z
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # 主服务
+  nekro_agent:
+    image: ghcr.io/akiyo-dayo/nekro-agent-byakiyo:latest
+    container_name: ${INSTANCE_NAME:-}nekro_agent
+    environment:
+      # ⚠️ 这里的取值与 docker-compose.yml / -x-hardened.yml **有意不同**：本文件里的 NapCat
+      # 是一个 compose 服务，它按 `ws://{NEKRO_INSTANCE_NAME}:{端口}/onebot/v11/ws` 反连 NA
+      # （见 adapters/onebot_v11/routers.py:ADAPTER_TEMPLATE 与
+      #  services/console/container_manager.py:build_managed_entry），
+      # 所以这个值必须**逐字等于 NA 的容器名**，否则 Docker 内嵌 DNS 解析不到、协议端连不上。
+      # 它同时充当应用层的宿主全局作用域（iptables 标记 / 专用网络 / 网桥 / 沙盒容器标签），
+      # 而容器名在同一台宿主上本来就唯一，所以多套部署天然分得开。
+      - NEKRO_INSTANCE_NAME=${INSTANCE_NAME:-}nekro_agent
+      # 反连主机名（#47）：本文件里 NEKRO_INSTANCE_NAME 本来就**逐字等于容器名**，所以不显式
+      # 传也解析得到；这里仍然传，是为了「每份定义 NA 服务的 compose 都带这一行」这条清单
+      # 对得齐（tests/test_compose_self_hostname.py），且运维在 docker/.env 里写的
+      # NEKRO_SELF_HOSTNAME 在这份文件里同样进得了容器。默认值与 container_name 一致。
+      # ⚠️ 不要加进 .env.prod（run_bot.py 会无条件覆盖 NEKRO_ 前缀的键）。
+      - NEKRO_SELF_HOSTNAME=${NEKRO_SELF_HOSTNAME:-${INSTANCE_NAME:-}nekro_agent}
+      - NEKRO_DATA_DIR=${NEKRO_DATA_DIR}
+      - NEKRO_EXPOSE_PORT=${NEKRO_EXPOSE_PORT:-8021}
+      - NEKRO_POSTGRES_HOST=${POSTGRES_HOST:-nekro_postgres}
+      - NEKRO_POSTGRES_PORT=5432
+      - NEKRO_POSTGRES_USER=${POSTGRES_USER:-nekro_agent}
+      - NEKRO_POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-nekro_agent}
+      - NEKRO_POSTGRES_DATABASE=${POSTGRES_DATABASE:-nekro_agent}
+      - NEKRO_RUN_IN_DOCKER=true
+      - NEKRO_ADMIN_PASSWORD=${NEKRO_ADMIN_PASSWORD:-}
+      # JWT 两把签名密钥；与 docker-compose.yml 那两行同源同理由（白名单透传、留空回落随机）
+      - NEKRO_JWT_SECRET_KEY=${NEKRO_JWT_SECRET_KEY:-}
+      - NEKRO_JWT_REFRESH_SECRET_KEY=${NEKRO_JWT_REFRESH_SECRET_KEY:-}
+      # 模型组 api_key 的静态加密主密钥；与 docker-compose.yml 那一行同源同理由
+      # （留空 = 走数据目录里自动生成的密钥文件那一档，不是「不加密」）
+      - NEKRO_CREDENTIAL_SECRET_KEY=${NEKRO_CREDENTIAL_SECRET_KEY:-}
+      - ONEBOT_ACCESS_TOKEN=${ONEBOT_ACCESS_TOKEN:-}
+      - NEKRO_QDRANT_URL=${QDRANT_URL:-http://nekro_qdrant:6333}
+      - NEKRO_QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      # ⚠ 直挂 docker.sock = 给 NA 进程宿主 root（可起特权容器/挂载宿主 /，实测能读宿主
+      #   /etc/shadow）。这是有意的默认（部署最简），真实边界见 docs/docker-guard.md。
+      #   要收紧的部署改用 docker/docker-compose-x-hardened.yml（docker-guard 边车按动作放行）。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${NEKRO_DATA_DIR}:${NEKRO_DATA_DIR}:rw
+    depends_on:
+      - nekro_postgres
+      - nekro_qdrant
+    ports:
+      - "${NEKRO_EXPOSE_PORT:-8021}:8021"
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+  # Napcat 服务
+  nekro_napcat:
+    image: mlikiowa/napcat-docker
+    container_name: ${INSTANCE_NAME:-}nekro_napcat
+    ports:
+      - "${NAPCAT_EXPOSE_PORT:-6099}:6099"
+    volumes:
+      - ${NEKRO_DATA_DIR}:/app/nekro_agent_data
+      - ${NEKRO_DATA_DIR}/napcat_data/QQ:/app/.config/QQ
+      - ${NEKRO_DATA_DIR}/napcat_data/napcat:/app/napcat/config
+    networks:
+      - nekro_network
+    restart: unless-stopped
+
+volumes:
+  nekro_postgres_data:
+    name: ${INSTANCE_NAME:-}nekro_postgres_data
+  nekro_qdrant_data:
+    name: ${INSTANCE_NAME}nekro_qdrant_data
+
+networks:
+  nekro_network:
+    name: ${INSTANCE_NAME:-}nekro_network
+    driver: bridge

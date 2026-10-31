@@ -1,0 +1,251 @@
+{
+  "title": "Console",
+  "subtitle": "Manage bot instances, protocol endpoints and runtime status in one place",
+  "placeholder": {
+    "underConstruction": "Under construction"
+  },
+  "overview": {
+    "instanceTotal": "Instances",
+    "instanceOnline": "Online",
+    "instanceOffline": "Offline",
+    "instanceUnbound": "No account",
+    "instanceUnclaimed": "Unclaimed",
+    "unboundBanner_one": "{{count}} instance has no account bound yet and will never receive a message — claim a connected protocol endpoint, or fill in the account by hand.",
+    "unboundBanner_other": "{{count}} instances have no account bound yet and will never receive a message — claim a connected protocol endpoint, or fill in the accounts by hand.",
+    "channelTotal": "Channels",
+    "messageToday": "Messages today",
+    "dockerAvailable": "Docker available",
+    "dockerUnavailable": "Docker unavailable",
+    "dockerAvailableHint": "Built-in NapCat containers can be hosted locally",
+    "dockerUnavailableHint": "Cannot host built-in containers; only external protocol endpoints",
+    "instancesTitle": "Instances",
+    "instanceTitleSingle": "Current instance",
+    "empty": "No instances yet",
+    "emptyHint": "Create the first instance to connect a bot account.",
+    "unclaimedBanner_one": "{{count}} protocol endpoint connected but not claimed yet. Claim it to bring it under management.",
+    "unclaimedBanner_other": "{{count}} protocol endpoints connected but not claimed yet. Claim them to bring them under management."
+  },
+  "list": {
+    "title": "Instances",
+    "searchPlaceholder": "Search instance key, name or account",
+    "clearSearch": "Clear search",
+    "statusFilter": "Status",
+    "statusAll": "All statuses",
+    "empty": "No instances match the current filters",
+    "emptyHint": "Try a different keyword or status filter.",
+    "unboundAction": "Claim or bind an account",
+    "columns": {
+      "instance": "Instance",
+      "status": "Status",
+      "provider": "Provider",
+      "account": "Account",
+      "channels": "Channels",
+      "messagesToday": "Messages today",
+      "lastActive": "Last active",
+      "actions": "Actions"
+    }
+  },
+  "detail": {
+    "notFound": "Instance not found or already deleted",
+    "backToList": "Back to instances",
+    "tabs": {
+      "overview": "Overview",
+      "protocol": "Protocol",
+      "events": "Status log"
+    },
+    "baseInfo": "Basic information",
+    "runtime": "Runtime stats",
+    "container": "Container",
+    "containerNone": "This instance has no hosted container",
+    "unboundTitle": "No account bound yet",
+    "unboundHint": "This instance has no bot account bound, so it never establishes a connection and never receives a message — it is not offline. A protocol endpoint that connects first registers itself as an unclaimed instance; claim it below. If nothing has connected yet, use \"Bind account\" below to type the account in directly.",
+    "migration": "History ownership",
+    "migrationHint": "When a protocol endpoint connects before its instance exists, it registers itself as an unclaimed instance and claims the historical channels. You can explicitly move that instance's channels, messages and memories into this one.",
+    "fields": {
+      "instanceKey": "Instance key",
+      "displayName": "Display name",
+      "adapterKey": "Adapter",
+      "provider": "Provider",
+      "account": "Bound account",
+      "status": "Status",
+      "enabled": "Enabled",
+      "isDefault": "Default instance",
+      "lastError": "Last error",
+      "offlineSince": "Offline since",
+      "containerName": "Container name",
+      "containerState": "Container state",
+      "containerImage": "Image",
+      "webuiPort": "WebUI port",
+      "startedAt": "Started at"
+    },
+    "events": {
+      "empty": "No status changes recorded",
+      "loadFailed": "Failed to load status log",
+      "columns": {
+        "time": "Time",
+        "type": "Event",
+        "change": "Transition",
+        "message": "Message"
+      }
+    }
+  },
+  "status": {
+    "online": "Online",
+    "connecting": "Connecting",
+    "offline": "Offline",
+    "unbound": "No account",
+    "login_required": "Login required",
+    "error": "Error",
+    "unclaimed": "Unclaimed",
+    "disabled": "Disabled",
+    "archived": "Archived",
+    "offlineForMinutes": "Offline for {{count}} min",
+    "offlineForHours": "Offline for {{count}} h"
+  },
+  "statusHint": {
+    "online": "Protocol endpoint connected, messages flowing normally",
+    "connecting": "Establishing the protocol endpoint connection",
+    "offline": "Protocol endpoint disconnected, messages cannot be delivered",
+    "unbound": "Never had an account bound, so it was never online — this is not a disconnect. Claim a connected protocol endpoint, or fill in the account by hand",
+    "login_required": "Container is running but the account is not logged in; scan the QR code",
+    "error": "Runtime error occurred, check the last error",
+    "unclaimed": "Protocol endpoint connected on its own but not registered yet; claim it to manage it",
+    "disabled": "Manually disabled, no connection will be established",
+    "archived": "Archived, data kept read-only"
+  },
+  "container": {
+    "running": "Running",
+    "exited": "Exited",
+    "created": "Created",
+    "restarting": "Restarting",
+    "paused": "Paused",
+    "absent": "Absent"
+  },
+  "provider": {
+    "builtin_napcat": "Built-in NapCat",
+    "remote_onebot": "External OneBot",
+    "native": "Native adapter"
+  },
+  "card": {
+    "accountUnbound": "No account bound",
+    "channelCount": "{{count}} channels",
+    "messageToday": "{{count}} messages today",
+    "lastActive": "Last active {{time}}",
+    "never": "never",
+    "actionHint": {
+      "unclaimed": "Protocol endpoint connected, claim it to manage",
+      "unbound": "No account bound yet; it will not receive any message",
+      "login_required": "Container is running but the account is not logged in; scan the QR code"
+    }
+  },
+  "actions": {
+    "create": "New instance",
+    "claim": "Claim",
+    "enable": "Enable",
+    "disable": "Disable",
+    "detail": "Details",
+    "delete": "Delete",
+    "migrate": "Migrate history",
+    "viewAll": "View all instances",
+    "refresh": "Refresh",
+    "bindAccount": "Bind account",
+    "rebindAccount": "Rebind"
+  },
+  "migrationDialog": {
+    "title": "Migrate history ownership",
+    "description": "Reassign the source instance's channels, messages, execution records and memories to {{instanceKey}}. This cannot be undone — review the preview below first.",
+    "sourceLabel": "Source instance",
+    "noCandidates": "No other instance under the same adapter can act as a migration source",
+    "summary": "{{channels}} channels will be migrated, {{conflicts}} of which merge into channels this instance already has (on merge, this instance's existing preset/workspace bindings win and the source row is archived into the channel data).",
+    "countsTitle": "Data to be rewritten",
+    "channelsTitle": "Channel details",
+    "residuesTitle": "Data that will not be migrated",
+    "columns": {
+      "channel": "Channel",
+      "messages": "Messages",
+      "action": "Action"
+    },
+    "actionMove": "Move",
+    "actionMerge": "Merge",
+    "confirmLabel": "Type the source instance key to confirm",
+    "confirmHelper": "Type {{instanceKey}} manually",
+    "confirmMismatch": "Instance key does not match",
+    "submit": "Run migration",
+    "resource": {
+      "chat_channel": "Channels",
+      "chat_message": "Messages",
+      "exec_code": "Execution records",
+      "plugin_data": "Plugin data",
+      "recurring_timer_job": "Recurring timers",
+      "workspace_comm_log": "Workspace comm logs",
+      "mem_paragraph": "Memory paragraphs",
+      "mem_episode": "Memory episodes",
+      "mem_entity": "Memory entities",
+      "mem_relation": "Memory relations",
+      "preset": "Presets",
+      "one_shot_timer": "One-shot timers",
+      "qdrant_paragraph_payload": "Memory vectors",
+      "affection": "Affection",
+      "affection_event": "Affection events",
+      "announcement_delivery": "Announcement deliveries"
+    }
+  },
+  "unclaimedPanel": {
+    "title_one": "{{count}} protocol endpoint is connected but nobody has claimed it",
+    "title_other": "{{count}} protocol endpoints are connected but nobody has claimed them",
+    "description": "A protocol endpoint registers itself as an unclaimed instance when it connects. Until it is claimed it belongs to none of the instances you created — the one you created receives nothing.",
+    "descriptionWithChannels_one": "A protocol endpoint registers itself as an unclaimed instance when it connects, and messages and channels go to it. {{count}} channel currently sits under these unclaimed instances — if you cannot find your group in channel management, this is where it is.",
+    "descriptionWithChannels_other": "A protocol endpoint registers itself as an unclaimed instance when it connects, and messages and channels go to it. {{count}} channels currently sit under these unclaimed instances — if you cannot find your group in channel management, this is where they are.",
+    "accountLabel": "Account {{account}}",
+    "firstSeen": "first seen"
+  },
+  "claimDialog": {
+    "title": "Claim protocol endpoint",
+    "summary": "Account {{account}} is currently registered under the auto-generated instance {{instanceKey}}, which owns {{count}} channels.",
+    "modeNew": "Claim as a new instance",
+    "modeAdopt": "Merge into an existing instance",
+    "modeNewHint": "Take over this protocol endpoint under a key of your choosing. Providing a new key creates an instance and moves the channels, messages and memories over; leaving it empty keeps the auto-generated key.",
+    "modeAdoptHint": "Bind the account to an existing instance and move this endpoint's historical channels there. Use this when you created the instance first and the protocol endpoint registered a row of its own.",
+    "displayName": "Display name",
+    "displayNameHelper": "Leave empty to keep the name from registration",
+    "newInstanceKey": "New instance key",
+    "newInstanceKeyHelper": "Leave empty to keep the auto-generated key; lowercase letters, digits and underscores only, max 32",
+    "instanceKeyInvalid": "Instance keys allow lowercase letters, digits and underscores only, max 32 characters",
+    "adoptTargetLabel": "Merge into",
+    "noAdoptTargets": "No eligible target under the same adapter: the target must not have an account of its own yet (one instance, one account).",
+    "confirmLabel": "Type the unclaimed instance key to confirm",
+    "confirmHelper": "Type {{instanceKey}} manually",
+    "confirmMismatch": "The instance key does not match",
+    "running": "Moving channels and memories, do not close…",
+    "submitNew": "Claim",
+    "submitAdopt": "Merge and move history"
+  },
+  "deleteDialog": {
+    "title": "Delete instance",
+    "modeLabel": "Delete mode",
+    "modeArchive": "Archive",
+    "modePurge": "Purge",
+    "archiveDescription": "Archiving stops the instance but keeps channels, messages and memories read-only for later handling.",
+    "purgeDescription": "Purging cascades to every channel, message and memory of this instance and cannot be undone.",
+    "confirmLabel": "Type the instance key to confirm",
+    "confirmHelper": "Type {{instanceKey}} manually",
+    "confirmMismatch": "The instance key does not match",
+    "submitArchive": "Archive",
+    "submitPurge": "Purge permanently"
+  },
+  "messages": {
+    "loadFailed": "Failed to load instance information",
+    "claimSuccess": "Instance claimed",
+    "enableSuccess": "Instance enabled",
+    "disableSuccess": "Instance disabled",
+    "archiveSuccess": "Instance archived",
+    "purgeSuccess": "Instance permanently deleted",
+    "accountBound": "Account bound, waiting for the protocol endpoint to connect",
+    "accountUnbound": "Account unbound; this instance will no longer send or receive messages"
+  },
+  "accountDialog": {
+    "title": "Bind a bot account",
+    "description": "Inbound messages are routed to an instance by account. Enter the account the protocol endpoint logs in with (e.g. the QQ number) so this instance receives its messages. Leave it empty to unbind.",
+    "helper": "One account can only be bound to one instance; if another instance already holds it you will be told to claim or unbind that one"
+  }
+}

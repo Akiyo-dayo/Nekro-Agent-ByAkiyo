@@ -1,0 +1,147 @@
+"""运行日志路由 —— 整组平台方专属
+
+日志是**未脱敏的进程输出**：上游报错原文、协议端令牌、配置加载信息全在里面，
+而且是整个进程一份、跨租户混写的，没有可用的过滤维度。
+`/logs/download` 更是直接把日志文件交出去。
+
+这与 PROJECT_STATE §3 #16 把 NapCat `/logs` 提到 `Role.Super` 是同一条判据：
+**日志里就带着令牌**（前端当时正是从日志里抠 WebUI 令牌）。
+改前 4 个端点都是 `Role.Admin`，而租户管理员就是 `Role.Admin`。
+"""
+
+import asyncio
+from asyncio import Queue
+from datetime import datetime
+from typing import AsyncGenerator, List, Optional
+
+from fastapi import APIRouter, Depends, Request, Response
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+
+from nekro_agent.core.logger import (
+    get_log_records,
+    get_log_sources,
+    subscribers,
+)
+from nekro_agent.models.db_user import DBUser
+from nekro_agent.services.user.deps import get_current_active_user
+from nekro_agent.services.user.perm import Role, require_role
+
+router = APIRouter(prefix="/logs", tags=["Logs"])
+
+# 基础日志来源
+DEFAULT_LOG_SOURCES = ["nonebot", "nekro_agent", "uvicorn"]
+
+
+class LogEntry(BaseModel):
+    timestamp: str
+    level: str
+    message: str
+    source: str
+    function: str
+    line: int
+    subsystem: Optional[str] = None
+    plugin_key: Optional[str] = None
+    exception_type: Optional[str] = None
+    exception_message: Optional[str] = None
+    traceback: Optional[str] = None
+
+
+class LogsResponse(BaseModel):
+    logs: List[LogEntry]
+    total: int
+
+
+@router.get("", summary="获取历史日志", response_model=LogsResponse)
+@require_role(Role.Super)
+async def get_logs(
+    page: int = 1,
+    page_size: int = 500,
+    source: Optional[str] = None,
+    subsystem: Optional[str] = None,
+    plugin_key: Optional[str] = None,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> LogsResponse:
+    """获取历史日志记录"""
+    logs = await get_log_records(page, page_size, source, count_only=False, subsystem=subsystem, plugin_key=plugin_key)
+    total = await get_log_records(1, 0, source, count_only=True, subsystem=subsystem, plugin_key=plugin_key)
+
+    assert isinstance(logs, list)
+    assert isinstance(total, int)
+
+    return LogsResponse(logs=[LogEntry(**log) for log in logs], total=total)
+
+
+@router.get("/sources", summary="获取日志来源列表", response_model=List[str])
+@require_role(Role.Super)
+async def get_sources(_current_user: DBUser = Depends(get_current_active_user)) -> List[str]:
+    """获取所有日志来源"""
+    sources = await get_log_sources()
+    return sorted(set(DEFAULT_LOG_SOURCES) | set(sources))
+
+
+@router.get("/stream", summary="实时日志流")
+@require_role(Role.Super)
+async def stream_logs(
+    request: Request,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> EventSourceResponse:
+    """获取实时日志流"""
+    from nekro_agent.services.runtime_state import is_shutting_down
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        queue: Queue = Queue()
+        subscribers.append(queue)
+        try:
+            while not is_shutting_down():
+                if await request.is_disconnected():
+                    return
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    yield {"comment": "ping"}
+                    continue
+                yield message
+        finally:
+            subscribers.remove(queue)
+
+    return EventSourceResponse(event_generator())
+
+
+@router.get("/download", summary="下载最近日志")
+@require_role(Role.Super)
+async def download_logs(
+    lines: int = 1000,
+    source: Optional[str] = None,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> Response:
+    """下载最近的日志文件
+
+    Args:
+        lines: 要下载的日志行数
+        source: 日志来源过滤
+
+    Returns:
+        日志文件下载响应
+    """
+    max_lines = min(lines, 10000)
+
+    logs = await get_log_records(page=1, page_size=max_lines, source=source, count_only=False)
+    if not isinstance(logs, list):
+        logs = []
+
+    log_text = ""
+    for log in logs:
+        log_text += (
+            f"[{log['timestamp']}] [{log['level']}] {log['source']} | {log['function']}:{log['line']} | {log['message']}\n"
+        )
+        if log.get("traceback"):
+            log_text += f"{log['traceback']}\n"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    source_part = f"_{source}" if source else ""
+    filename = f"nekro_agent_logs{source_part}_{timestamp}.txt"
+
+    response = Response(content=log_text, media_type="text/plain")
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return response
