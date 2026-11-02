@@ -6,7 +6,7 @@ This distribution is a derivative work of NekroAgent.
   Upstream project : NekroAgent  <https://github.com/KroMiose/nekro-agent>
   Upstream authors : KroMiose and the NekroAgent contributors
   Based on version : 2.3.3 (the "version" field of pyproject.toml, kept as upstream's)
-  This edition     : 0.2.0 (FORK_VERSION in nekro_agent/tools/common_util.py)
+  This edition     : 0.3.0 (FORK_VERSION in nekro_agent/tools/common_util.py)
   This repository  : <https://github.com/Akiyo-dayo/Nekro-Agent-ByAkiyo>
 
 This edition is NOT an official release of NekroAgent and is not affiliated with

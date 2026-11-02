@@ -99,7 +99,7 @@ store = plugin.store
 # region: 漫游消息处理方法
 def parse_history_travel_message(db_chat_message: DBChatMessage, config: core.CoreConfig) -> str:
     """解析漫游消息"""
-    return db_chat_message.parse_chat_history_prompt("", config, ref_mode=True)
+    return db_chat_message.parse_chat_history_prompt("", config, ref_mode=True, travel_mode=True)
 
 
 # endregion: 漫游消息处理方法

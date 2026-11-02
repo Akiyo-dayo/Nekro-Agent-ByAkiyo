@@ -26,8 +26,12 @@
 
 from typing import Dict, Optional
 
+from nekro_agent.tools.untrusted_content import UntrustedToolResult, render_untrusted_result
+
 # container_key -> one_time_code。同一频道的容器键是稳定的，新一轮运行会直接覆盖旧值
 _session_tokens: Dict[str, str] = {}
+# container_key -> 等着拼进本轮模型上下文的不可信结果。沙盒只拿到占位，正文留在这里
+_held_results: Dict[str, UntrustedToolResult] = {}
 
 
 def register_session_token(container_key: str, one_time_code: str) -> None:
@@ -39,6 +43,8 @@ def register_session_token(container_key: str, one_time_code: str) -> None:
     """
     if container_key and one_time_code:
         _session_tokens[container_key] = one_time_code
+        # 上一轮沙盒死在半路时结果没人取走，不能带到这一轮
+        _held_results.pop(container_key, None)
 
 
 def get_session_token(container_key: str) -> Optional[str]:
@@ -56,3 +62,19 @@ def get_session_token(container_key: str) -> Optional[str]:
 def clear_session_token(container_key: str) -> None:
     """清除登记，避免映射随频道数单向增长"""
     _session_tokens.pop(container_key, None)
+
+
+def hold_untrusted_result(container_key: str, result: UntrustedToolResult) -> None:
+    """暂存沙盒方法的不可信结果，等 Agent 循环取走"""
+    _held_results[container_key] = result
+
+
+def attach_untrusted_result(sandbox_output: str, container_key: str, one_time_code: str) -> str:
+    """把暂存的结果用本轮令牌包好，接在沙盒输出后面
+
+    历史渲染有单条长度上限，这一轮要看完整内容只能走这里。只交付一次。
+    """
+    result = _held_results.pop(container_key, None)
+    if result is None:
+        return sandbox_output
+    return f"{sandbox_output}\n{render_untrusted_result(one_time_code, result)}"

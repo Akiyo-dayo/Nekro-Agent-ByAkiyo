@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import re
@@ -12,6 +13,7 @@ from typing import (
     Any,
     AsyncGenerator,
     Dict,
+    FrozenSet,
     List,
     Mapping,
     NamedTuple,
@@ -230,31 +232,59 @@ def build_log_handlers(diagnose: bool) -> List[Dict[str, Any]]:
 # ② `logging.config.dictConfig()`（uvicorn 启动时会跑一次）**只清 handlers、不清 filters**，
 #    所以这里在 import 期装上的过滤器活得过 uvicorn 的配置动作（有用例钉住这一条）。
 
-# 判据：query 参数名里出现这些子串就把**取值**换成掩码。
+# 判据：query 参数名**按整词**匹配，命中就把**取值**换成掩码。
+# 旧写法是子串（`auth` 命中 author / authority，`sig` 命中 design / assign / signal，
+# `token` 命中 max_tokens），于是访问日志里这些无辜参数的取值被白白遮掉，排障价值丢了；
+# 整词匹配把参数名切成词（按 `_` `-` 等分隔符和 camelCase 的大小写边界）再逐词比对，
+# 另有一份“连写”名单收 `accesstoken` / `apikey` 这类没有分隔符的常见写法。
 # **与 `tools/redaction.py:HIDDEN_KEY_PARTS` 是同一份判据的镜像**——那边管「字典/文本对外
 # 输出前脱敏」，这边管「访问日志」，判据分叉就等于其中一处悄悄失效。
 # 不 import 那个模块是因为 `core/logger.py` 是全项目最早被导入的模块之一，
 # 而 `tools.redaction` → `schemas.tenant` → `core.config` 这条链会把 import 顺序钉死；
 # 由 `tests/test_log_diagnose_hygiene.py` 断言这边覆盖得住那边的每一项。
 #
-# 判据有意**偏向多遮**（与 `nekro_log_hygiene.build_env_secret_shield` 同一条理由）：
+# 判据仍然**偏向多遮**（与 `nekro_log_hygiene.build_env_secret_shield` 同一条理由）：
 # 多遮一个非凭据，代价是访问日志里少看见一个取值（键名与整条请求行都还在）；
 # 漏遮一个凭据，代价是它进了每一份被打包、被 scp、被贴进工单的日志。
-# 但**不收 `key` 这个裸子串**：`chat_key` / `instance_key` / `container_key` 是访问日志里
+# 但**不收 `key` 这个裸词**：`chat_key` / `instance_key` / `container_key` 是访问日志里
 # 用来对上号的主要维度，遮掉它们等于把这行日志的价值清零，而它们本身不是凭据。
-SENSITIVE_QUERY_KEY_PARTS: Tuple[str, ...] = (
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "api_key",
-    "apikey",
-    "authorization",
-    "auth",
-    "credential",
-    "signature",
-    "sig",
+SENSITIVE_QUERY_KEY_WORDS: FrozenSet[str] = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "authorization",
+        "auth",
+        "credential",
+        "credentials",
+        "signature",
+        "sig",
+        "rkey",  # QQ 多媒体链接的取件凭据，NoneBot 的事件日志会带出原始链接
+        "apikey",
+    },
 )
+# 相邻若干个词连写后的名字（`api_key` -> `apikey`），以及没有分隔符的常见连写
+SENSITIVE_QUERY_KEY_COMPOUNDS: FrozenSet[str] = frozenset(
+    {
+        "apikey",
+        "accesskey",
+        "secretkey",
+        "privatekey",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "authtoken",
+        "apitoken",
+        "sessiontoken",
+        "clientsecret",
+        "tenantaccesstoken",
+    },
+)
+_KEY_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_KEY_WORD_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_KEY_MAX_COMPOUND_WORDS = 3
 
 # 与 `tools/redaction.py:REDACTED_CREDENTIAL` 逐字相同（同上，由测试钉住）
 REDACTED_QUERY_VALUE = "[redacted_credential]"
@@ -271,10 +301,21 @@ _QUERY_PARAM_RE = re.compile(r"(?P<sep>[?&])(?P<key>[^?&=\s\"']+)=(?P<value>[^&\
 ACCESS_LOG_LOGGER_NAMES: Tuple[str, ...] = ("uvicorn.access", "uvicorn.error")
 
 
+def _key_words(key: str) -> List[str]:
+    spaced = _KEY_CAMEL_BOUNDARY.sub("_", key).lower()
+    return [word for word in _KEY_WORD_SEPARATOR.split(spaced) if word]
+
+
 def is_sensitive_query_key(key: str) -> bool:
-    """query 参数名是否应视为凭据（大小写不敏感的子串匹配）"""
-    lowered = key.lower()
-    return any(part in lowered for part in SENSITIVE_QUERY_KEY_PARTS)
+    """query 参数名是否应视为凭据（大小写不敏感，按整词匹配，见上方说明）"""
+    words = _key_words(key)
+    if any(word in SENSITIVE_QUERY_KEY_WORDS for word in words):
+        return True
+    for start in range(len(words)):
+        for stop in range(start + 1, min(len(words), start + _KEY_MAX_COMPOUND_WORDS) + 1):
+            if "".join(words[start:stop]) in SENSITIVE_QUERY_KEY_COMPOUNDS:
+                return True
+    return False
 
 
 def redact_sensitive_query_params(text: str) -> str:
@@ -320,6 +361,94 @@ class SensitiveQueryParamFilter(logging.Filter):
         elif isinstance(record.msg, str):
             record.msg = redact_sensitive_query_params(record.msg)
         return True
+
+
+def _text_of(exc: BaseException) -> str:
+    try:
+        return str(exc)
+    except Exception:  # noqa: BLE001 - 日志路径上，坏掉的 __str__ 不能再炸一次
+        return "<unprintable exception>"
+
+
+def _clone_with_message(exc: BaseException, message: str) -> BaseException:
+    """造一个“文本已脱敏”的异常副本；原异常不动
+
+    先试 `copy.copy` + 改 `args`（保留原类型与属性）；构造参数和 `args` 对不上的异常复制不了，
+    或者复制出来文本仍不对（自定义了 `__str__`），就退到一个同名同模块的占位类，保证日志里的类型名不变。
+    """
+    try:
+        clone = copy.copy(exc)
+        clone.args = tuple(redact_sensitive_query_params(arg) if isinstance(arg, str) else arg for arg in exc.args)
+        if _text_of(clone) == message:
+            return clone
+    except Exception:  # noqa: BLE001, S110 - 复制失败走下面的兜底
+        pass
+    stand_in = type(type(exc).__name__, (Exception,), {"__module__": type(exc).__module__, "__qualname__": type(exc).__qualname__})
+    return stand_in(message)
+
+
+def redact_exception_for_log(exc: BaseException, _seen: Optional[Dict[int, BaseException]] = None) -> BaseException:
+    """返回一个可以安全交给日志格式化的异常：文本里的 URL 凭据已遮，`__cause__` / `__context__` 链同样处理
+
+    `traceback.format_exception` 会把异常消息和整条链上每个异常的消息原样打出来，而 httpx 一类的异常
+    消息里就是完整链接（含 `rkey`）。没有任何需要遮的内容时原样返回同一个对象，有才造副本；
+    **绝不就地改原异常**——调用方捕获后重新抛出、处理时拿到的必须还是原样。
+    """
+    seen = {} if _seen is None else _seen
+    if id(exc) in seen:
+        return seen[id(exc)]
+    seen[id(exc)] = exc  # 先占位，防止 __context__ 成环
+
+    text = _text_of(exc)
+    redacted = redact_sensitive_query_params(text)
+    cause = exc.__cause__
+    context = exc.__context__
+    new_cause = redact_exception_for_log(cause, seen) if cause is not None else None
+    new_context = redact_exception_for_log(context, seen) if context is not None else None
+    members = list(exc.exceptions) if isinstance(exc, BaseExceptionGroup) else []
+    new_members = [redact_exception_for_log(member, seen) for member in members]
+
+    unchanged = (
+        redacted == text
+        and new_cause is cause
+        and new_context is context
+        and all(new is old for new, old in zip(new_members, members))
+    )
+    if unchanged:
+        return exc
+
+    twin: BaseException
+    if isinstance(exc, BaseExceptionGroup):
+        try:
+            twin = type(exc)(redact_sensitive_query_params(exc.message), new_members)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - 自定义了构造参数的异常组，退到 derive（消息原样）
+            twin = exc.derive(new_members)  # type: ignore[arg-type]
+    else:
+        twin = _clone_with_message(exc, redacted)
+    twin.__cause__ = new_cause
+    twin.__context__ = new_context
+    twin.__suppress_context__ = exc.__suppress_context__
+    twin.__traceback__ = exc.__traceback__
+    seen[id(exc)] = twin
+    return twin
+
+
+def scrub_sensitive_query_params(record: Any) -> None:
+    """loguru 的 patcher：第三方经 loguru 打的日志也要遮
+
+    上面的过滤器只管 stdlib 那条路。NoneBot 的事件日志走 loguru，内容是原始消息，
+    QQ 的多媒体链接连同 `rkey` 都在里面。
+
+    异常也要处理：sink 把 traceback 格式化出来的时候会带上异常消息与整条异常链，
+    而 httpx 一类的异常消息里就是完整链接。这里把 `record["exception"]` 换成已脱敏的副本，
+    三个 sink（内存/SSE、stdout、`app.log`）拿到的都是它。
+    """
+    record["message"] = redact_sensitive_query_params(record["message"])
+    exception = record.get("exception")
+    if exception is not None and exception.value is not None:
+        value = redact_exception_for_log(exception.value)
+        if value is not exception.value:
+            record["exception"] = type(exception)(type(value), value, exception.traceback)
 
 
 def install_sensitive_query_param_filter(logger_names: Tuple[str, ...] = ACCESS_LOG_LOGGER_NAMES) -> List[str]:
@@ -484,7 +613,7 @@ Path(APP_LOG_DIR).mkdir(parents=True, exist_ok=True)
 LOG_DIAGNOSE_ENABLED, LOG_DIAGNOSE_REASON = resolve_log_diagnose()
 log_handlers = build_log_handlers(LOG_DIAGNOSE_ENABLED)
 
-logger.configure(handlers=log_handlers)  # type: ignore
+logger.configure(handlers=log_handlers, patcher=scrub_sensitive_query_params)  # type: ignore
 
 # 访问日志的 URL 凭据遮蔽：必须在 `nonebot.run()`（uvicorn 起服务、跑 dictConfig）之前装上。
 # 本模块由插件加载阶段导入，早于 run，满足这个顺序。

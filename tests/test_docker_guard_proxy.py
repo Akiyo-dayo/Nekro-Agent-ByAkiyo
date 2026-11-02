@@ -23,13 +23,17 @@ from yarl import URL
 
 from nekro_agent.services.docker_guard.policy import PolicyContext
 from nekro_agent.services.docker_guard.proxy import _MAX_OWNED_IDS, DockerGuardProxy
+from tests.docker_guard_fakefs import data_dir_fs
 
 DATA_DIR = "/srv/nekro_agent"
 FULL_ID = "a" * 64  # docker create 返回的完整 64 位容器 ID
 
 
 def _make_proxy() -> DockerGuardProxy:
-    return DockerGuardProxy("/nonexistent.sock", PolicyContext(allowed_bind_roots=(DATA_DIR,)))
+    return DockerGuardProxy(
+        "/nonexistent.sock",
+        PolicyContext(allowed_bind_roots=(DATA_DIR,), fs=data_dir_fs(DATA_DIR)),
+    )
 
 
 def _request(method: str, path: str, body: bytes = b"") -> web.Request:

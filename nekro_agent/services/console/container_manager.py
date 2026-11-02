@@ -67,8 +67,11 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import random
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
@@ -78,6 +81,7 @@ import httpx
 from aiodocker.containers import DockerContainer
 from aiodocker.exceptions import DockerError
 from pydantic import BaseModel, ConfigDict, Field
+from tortoise.transactions import in_transaction
 
 from nekro_agent.adapters.onebot_v11.core.instance import clear_instance_cache
 from nekro_agent.core.logger import get_sub_logger
@@ -180,6 +184,65 @@ _DOCKER_STATE_MAP: Dict[str, ContainerState] = {
     "dead": ContainerState.EXITED,
     "removing": ContainerState.EXITED,
 }
+
+# ---------------------------------------------------------------------------
+# 走不走 docker-guard：决定 NapCat 容器的保活方式
+# ---------------------------------------------------------------------------
+
+DOCKER_GUARD_ACTIVE_ENV = "NEKRO_DOCKER_GUARD_ACTIVE"
+"""显式声明「NA 的 Docker 调用经过 docker-guard」：`1/true/yes/on` 是，`0/false/no/off` 否。
+
+不设时按 `DOCKER_HOST` 推断（见 `docker_guard_in_path`）。硬化 compose 两样都给了。
+"""
+
+DESIRED_RUNNING = "running"
+DESIRED_STOPPED = "stopped"
+"""实例元数据 `desired_state` 的取值：运维（或 NA）希望这个容器处于什么状态。只在走 guard 时才记录。"""
+
+RECONCILE_MIN_DELAY_SECONDS = 30.0
+RECONCILE_MAX_DELAY_SECONDS = 600.0
+RECONCILE_STABLE_SECONDS = 120.0
+RECONCILE_INSTANCE_TIMEOUT_SECONDS = 30.0
+"""拉起退避区间（每次拉起无论成败都翻倍）；拉起后跑满 `RECONCILE_STABLE_SECONDS` 才清零；单个实例一轮的时限。"""
+
+
+@dataclass
+class _ReconcileState:
+    next_try: float  # 下次允许拉起的 monotonic 时刻
+    delay: float  # 当前退避秒数
+    started_at: Optional[float]  # 最近一次成功拉起的时刻（None = 最近一次是失败 / 超时）
+
+
+_reconcile_state: Dict[str, _ReconcileState] = {}
+"""实例标识 -> 保活状态。进程内状态，重启即清零。"""
+
+
+def docker_guard_in_path() -> bool:
+    """NA 的 Docker 调用是否经过 docker-guard（`docs/docker-guard.md`）。
+
+    先看显式的 `NEKRO_DOCKER_GUARD_ACTIVE`；没设再看 `DOCKER_HOST`：硬化 compose 把它指向
+    `unix:///run/nekro-guard/guard.sock`，路径里含 `nekro-guard` 或以 `guard.sock` 结尾就算走 guard。
+    标准部署（直挂 docker.sock、不设 `DOCKER_HOST`）恒为 False，下面所有因它分支的行为都等于没有。
+    """
+    explicit = os.environ.get(DOCKER_GUARD_ACTIVE_ENV, "").strip().lower()
+    if explicit in {"1", "true", "yes", "on"}:
+        return True
+    if explicit in {"0", "false", "no", "off"}:
+        return False
+    host = os.environ.get("DOCKER_HOST", "").strip().lower()
+    return "nekro-guard" in host or host.endswith("guard.sock")
+
+
+def napcat_restart_policy() -> str:
+    """新建 NapCat 容器的 `RestartPolicy.Name`。
+
+    标准部署（不走 guard）逐字保持 `unless-stopped`。走 guard 时必须是 `no`：带 Binds 的容器若交给 Docker
+    守护进程自动重启，重启时的挂载源解析不经过 guard（容器退出期间把挂载源换成链接即可逃出数据目录，
+    见 `docker_guard.policy._check_restart_policy`），guard 会拒绝这种 create。保活改由 NA 经 guard 重新拉起，
+    见 `reconcile_container_liveness`。
+    """
+    return "no" if docker_guard_in_path() else "unless-stopped"
+
 
 IMAGE_PULL_TIMEOUT_SECONDS = 900
 NAPCAT_HTTP_TIMEOUT_SECONDS = 5.0
@@ -386,6 +449,7 @@ class ContainerMetadata(BaseModel):
     webui_port: Optional[int] = Field(default=None)
     image: str = Field(default="")
     access_token: str = Field(default="")
+    desired_state: str = Field(default="", description="走 docker-guard 时记录的期望状态（running / stopped），空 = 没记录")
 
 
 def _load_metadata(instance: DBAdapterInstance) -> Dict[str, Any]:
@@ -406,11 +470,31 @@ def read_container_metadata(instance: DBAdapterInstance) -> ContainerMetadata:
 
 
 async def _write_container_metadata(instance: DBAdapterInstance, patch: Dict[str, Any]) -> None:
-    """合并写回容器相关元数据，保留其他子模块写入的键"""
-    metadata = _load_metadata(instance)
-    metadata.update(patch)
-    instance.metadata_json = json.dumps(metadata, ensure_ascii=False)
-    await instance.save(update_fields=["metadata_json", "update_time"])
+    """合并写回容器相关元数据，保留其他子模块写入的键
+
+    **在行锁下读改写，且基于数据库里的当前值，而不是调用方手里那份快照**：`instance` 可能是几十秒前读出来的
+    （例如 reconcile 一轮里先读了一批行，再逐个处理），用快照整份覆盖 `metadata_json` 会把期间别处写入的
+    `webui_port` / `access_token` / `desired_state` 抹掉。写完把调用方那份的 `metadata_json` 刷新成最新值。
+    """
+    async with in_transaction() as connection:
+        row = await DBAdapterInstance.filter(id=instance.id).using_db(connection).select_for_update().first()
+        if row is None:
+            return
+        metadata = _load_metadata(row)
+        metadata.update(patch)
+        row.metadata_json = json.dumps(metadata, ensure_ascii=False)
+        await row.save(update_fields=["metadata_json", "update_time"], using_db=connection)
+    instance.metadata_json = row.metadata_json
+
+
+async def _record_desired_state(instance: DBAdapterInstance, state: str) -> None:
+    """走 docker-guard 时记下「这个容器该不该在跑」，供 `reconcile_container_liveness` 区分崩溃与主动停止。
+
+    不走 guard 时什么都不写：标准部署由 Docker 的 `unless-stopped` 自己保活，元数据保持逐字不变。
+    """
+    if not docker_guard_in_path():
+        return
+    await _write_container_metadata(instance, {"desired_state": state})
 
 
 def resolve_access_token(instance: DBAdapterInstance) -> str:
@@ -915,7 +999,8 @@ async def create_container(
                 "PortBindings": {
                     f"{NAPCAT_WEBUI_PORT}/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(webui_port)}],
                 },
-                "RestartPolicy": {"Name": "unless-stopped"},
+                # 标准部署 unless-stopped（逐字不变）；走 docker-guard 时是 no，保活由 NA 经 guard 拉起
+                "RestartPolicy": {"Name": napcat_restart_policy()},
             },
         }
 
@@ -928,10 +1013,10 @@ async def create_container(
         except DockerError as e:
             raise OperationFailedError(operation=f"创建容器 '{container_name}'", detail=str(e)) from e
 
-    await _write_container_metadata(
-        instance,
-        {"container_name": container_name, "webui_port": webui_port, "image": image},
-    )
+    metadata_patch: Dict[str, Any] = {"container_name": container_name, "webui_port": webui_port, "image": image}
+    if docker_guard_in_path():
+        metadata_patch["desired_state"] = DESIRED_RUNNING
+    await _write_container_metadata(instance, metadata_patch)
     logger.info(f"已创建 NapCat 容器: {container_name} (image={image}, webui_port={webui_port})")
 
     info = await get_container_info(instance)
@@ -949,8 +1034,11 @@ def _actual_name(info: Dict[str, Any]) -> str:
     return str(info.get("Name", "")).lstrip("/")
 
 
-async def start_container(instance: DBAdapterInstance) -> None:
-    """启动实例容器"""
+async def start_container(instance: DBAdapterInstance, *, record_intent: bool = True) -> None:
+    """启动实例容器
+
+    `record_intent=False` 只给保活（reconcile）用：它启动的前提就是期望状态已是 running，不需要再写一遍。
+    """
     _require_builtin_napcat(instance)
     async with _owned_container(instance.instance_key) as (container, info):
         try:
@@ -958,6 +1046,8 @@ async def start_container(instance: DBAdapterInstance) -> None:
         except DockerError as e:
             if e.status != 304:  # 已在运行
                 raise OperationFailedError(operation="启动容器", detail=str(e)) from e
+    if record_intent:
+        await _record_desired_state(instance, DESIRED_RUNNING)
     logger.info(f"已启动 NapCat 容器: {_actual_name(info)}")
 
 
@@ -967,10 +1057,14 @@ async def stop_container(instance: DBAdapterInstance, timeout: int = 15) -> None
     **有意不做 `_require_builtin_napcat` 校验**，理由见该函数的 docstring「回收方向的两个豁免」。
     """
     async with _owned_container(instance.instance_key) as (container, info):
+        # 主动停止要**先**记下来再停：走 guard 的保活（reconcile）靠它区分「崩溃」与「被停掉」，
+        # 先停后记的话，两步之间恰好撞上一轮探活就会把刚停掉的容器又拉起来
+        await _record_desired_state(instance, DESIRED_STOPPED)
         try:
             await container.stop(t=timeout)
         except DockerError as e:
             if e.status != 304:  # 已停止
+                await _record_desired_state(instance, DESIRED_RUNNING)  # 没停成：容器还在跑，还原期望
                 raise OperationFailedError(operation="停止容器", detail=str(e)) from e
     logger.info(f"已停止 NapCat 容器: {_actual_name(info)}")
 
@@ -985,6 +1079,7 @@ async def restart_container(instance: DBAdapterInstance, timeout: int = 15) -> N
             await container.restart(t=timeout)
         except DockerError as e:
             raise OperationFailedError(operation="重启容器", detail=str(e)) from e
+    await _record_desired_state(instance, DESIRED_RUNNING)
     logger.info(f"已重启 NapCat 容器: {_actual_name(info)}")
 
 
@@ -1003,8 +1098,208 @@ async def delete_container(instance: DBAdapterInstance) -> None:
         except DockerError as e:
             raise OperationFailedError(operation="删除容器", detail=str(e)) from e
 
-    await _write_container_metadata(instance, {"container_name": ""})
+    delete_patch: Dict[str, Any] = {"container_name": ""}
+    if docker_guard_in_path():
+        delete_patch["desired_state"] = DESIRED_STOPPED
+    await _write_container_metadata(instance, delete_patch)
     logger.info(f"已删除 NapCat 容器: {_actual_name(info)}（数据目录保留）")
+
+
+async def _reconcile_one(instance_id: int, current: float) -> Optional[str]:
+    """处理一个实例：该拉起就拉起，返回被拉起的实例标识（没拉起返回 None）。
+
+    **一律重读该行再判**：调用方手里的行是一轮开始时的快照，一轮里控制台可能点了「停止」；
+    按快照判断会把刚停掉的容器又拉起来，再用快照里的元数据整份覆盖回 running。
+    """
+    instance = await DBAdapterInstance.get_or_none(id=instance_id)
+    if instance is None or not _is_bindable(instance) or not _is_builtin_napcat(instance):
+        return None
+    key = instance.instance_key
+    state = _reconcile_state.get(key)
+    if read_container_metadata(instance).desired_state != DESIRED_RUNNING:
+        _reconcile_state.pop(key, None)
+        return None
+    try:
+        info = await get_container_info(instance)
+    except Exception as e:  # noqa: BLE001 - 单个实例的探测失败不能中断整轮
+        logger.warning(f"[保活] 读取实例 {key} 的容器状态失败，本轮跳过: {e}")
+        return None
+    if info is None or info.state == ContainerState.ABSENT:
+        _reconcile_state.pop(key, None)
+        return None
+    if info.state == ContainerState.RUNNING:
+        # 退避只在「跑满一段时间」之后才清零：刚拉起就又崩的容器（崩溃循环）要接着退避，
+        # 否则每个探活周期都拉起一次，等于把 Docker 的 restart 风暴搬到了 NA 里
+        if state is not None and state.started_at is not None and current - state.started_at >= RECONCILE_STABLE_SECONDS:
+            _reconcile_state.pop(key, None)
+        return None
+    if info.state in (ContainerState.RESTARTING, ContainerState.PAUSED):
+        return None
+    if state is not None and current < state.next_try:
+        return None
+
+    previous_delay = state.delay if state is not None else 0.0
+    delay = min(RECONCILE_MAX_DELAY_SECONDS, previous_delay * 2 if previous_delay else RECONCILE_MIN_DELAY_SECONDS)
+    try:
+        # record_intent=False：期望状态本来就是 running，不用再写一遍（写会基于旧快照，见 `_write_container_metadata`）
+        await start_container(instance, record_intent=False)
+    except Exception as e:  # noqa: BLE001 - 拉起失败只影响这一个实例，记下并退避
+        _reconcile_state[key] = _ReconcileState(current + delay, delay, None)
+        logger.warning(f"[保活] 经 docker-guard 拉起实例 {key} 的 NapCat 容器失败（{delay:.0f}s 后重试）: {e}")
+        return None
+    # 成功也要退避：下一次崩溃必须等过这段时间才会再拉起；跑满 RECONCILE_STABLE_SECONDS 才清零
+    _reconcile_state[key] = _ReconcileState(current + delay, delay, current)
+    logger.warning(f"[保活] 实例 {key} 的 NapCat 容器已退出，已经 docker-guard 重新拉起")
+
+    # 拉起期间控制台可能点了「停止」：再读一次期望，已经是 stopped 就把刚拉起的容器停回去
+    latest = await DBAdapterInstance.get_or_none(id=instance_id)
+    if latest is not None and read_container_metadata(latest).desired_state == DESIRED_STOPPED:
+        logger.info(f"[保活] 实例 {key} 在拉起期间被要求停止，停回去")
+        try:
+            await stop_container(latest)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[保活] 停回实例 {key} 的容器失败: {e}")
+        _reconcile_state.pop(key, None)
+        return None
+    return key
+
+
+async def reconcile_container_liveness(now: Optional[float] = None) -> List[str]:
+    """走 docker-guard 的部署：把「应当在跑却已退出」的内置 NapCat 容器经 guard 重新拉起。
+
+    ## 为什么需要它
+
+    带 Binds 的容器在 guard 下只能是 `RestartPolicy=no`（见 `napcat_restart_policy`）——守护进程自己触发的
+    重启不经过 guard 的挂载源复核。可 NapCat 是长命的协议端，崩溃 / 被 OOM 杀 / 宿主重启后需要回来。
+    这个函数把「回来」这个动作收回到 NA 手里：每一次拉起都是一个普通的 `POST /containers/{id}/start`，
+    要过 guard 的归属门与挂载源复核。
+
+    ## 复用而不新造
+
+    - 周期：挂在实例健康监测的探活循环里（`instance_health`，同一个周期；但在**独立任务**里跑，不挡探活）；
+    - 拉起：`start_container()`，与控制台「启动」按钮是同一条路径（含归属校验）；
+    - 状态：`get_container_info()`，与控制台展示是同一份判据。
+
+    ## 判据（保守：宁可不拉起，也不要把运维主动停掉的容器拉回来）
+
+    只处理同时满足下列条件的实例：启用且不在 `NON_DISPATCHABLE_STATUSES`、是内置 NapCat、
+    元数据 `desired_state == running`（走 guard 时 create / start / restart 记下，stop / delete 记 stopped；
+    **没记录的存量容器不碰**）、容器存在且不在运行。每个实例并发处理、各有 `RECONCILE_INSTANCE_TIMEOUT_SECONDS`
+    的时限（一个实例的 Docker 调用挂住，只让它自己超时退避，不影响别的实例）。
+    退避：每次拉起（无论成败）都把「下次允许拉起」推后（30s 起翻倍、封顶 10 分钟），**跑满
+    `RECONCILE_STABLE_SECONDS` 才清零**，崩溃循环因此持续退避。标准部署（不走 guard）直接返回空列表。
+
+    Returns:
+        本轮成功拉起的实例标识
+    """
+    if not docker_guard_in_path():
+        return []
+
+    current = time.monotonic() if now is None else now
+    rows = await DBAdapterInstance.filter(enabled=True).exclude(status__in=list(NON_DISPATCHABLE_STATUSES))
+    candidates = [(row.id, row.instance_key) for row in rows if _is_builtin_napcat(row)]
+
+    async def bounded(instance_id: int, key: str) -> Optional[str]:
+        try:
+            return await asyncio.wait_for(_reconcile_one(instance_id, current), timeout=RECONCILE_INSTANCE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            state = _reconcile_state.get(key)
+            delay = min(RECONCILE_MAX_DELAY_SECONDS, state.delay * 2 if state and state.delay else RECONCILE_MIN_DELAY_SECONDS)
+            _reconcile_state[key] = _ReconcileState(current + delay, delay, None)
+            logger.warning(
+                f"[保活] 实例 {key} 的容器检查 / 拉起超过 {RECONCILE_INSTANCE_TIMEOUT_SECONDS:.0f}s 未返回，放弃本轮（{delay:.0f}s 后重试）",
+            )
+            return None
+        except Exception as e:  # noqa: BLE001 - 单个实例的意外不能带倒整轮
+            logger.warning(f"[保活] 处理实例 {key} 时出错，本轮跳过: {e}")
+            return None
+
+    results = await asyncio.gather(*(bounded(instance_id, key) for instance_id, key in candidates))
+    return [key for key in results if key is not None]
+
+
+# ---------------------------------------------------------------------------
+# 启动阶段：存量 NapCat 容器的 RestartPolicy 迁移 / 回滚告警
+# ---------------------------------------------------------------------------
+
+
+async def audit_napcat_restart_policies() -> None:
+    """NA 启动时扫一遍本部署的内置 NapCat 容器，处理「RestartPolicy 与当前部署形态不匹配」的存量。
+
+    **走 guard**：升级前（标准部署）建的 NapCat 是 `unless-stopped` 且带 Binds，守护进程会自己重启它，
+    重启时的挂载源解析不经过 guard（见 `docker_guard.policy._check_restart_policy`）。这里用 `update`
+    把它改成 `no`（guard 只放行这一种 update：`{"RestartPolicy":{"Name":"no"}}`），并补记 `desired_state`
+    （正在跑 = running，已退出 = stopped；已有记录的不覆盖），之后由 reconcile 保活。**失败打 ERROR 并点名容器**，
+    运维按日志去控制台删除重建。只动归属校验通过的 NapCat 容器（NA 自己的容器带 `nekro.owner.*` 标签但不是 NapCat，不在扫描范围）。
+
+    **不走 guard**（含从硬化部署回滚到标准 compose）：不改任何东西；若发现 `RestartPolicy=no` 的带挂载 NapCat，
+    打 WARNING——回滚后没有 reconcile 保活，这些容器崩溃后不会回来，需要在控制台删除重建（建成 `unless-stopped`）。
+
+    整个函数不抛异常：它是启动期的辅助动作，不能拖垮启动。
+    """
+    guarded = docker_guard_in_path()
+    try:
+        async with _docker_client() as docker:
+            listed = await docker.containers.list(all=True, filters=json.dumps({"label": [LABEL_INSTANCE]}))
+            for item in listed:
+                try:
+                    await _audit_one_container(docker, item, guarded)
+                except Exception as e:  # noqa: BLE001 - 单个容器的失败不影响其余
+                    logger.error(f"[RestartPolicy] 检查 NapCat 容器时出错: {e}")
+    except Exception as e:  # noqa: BLE001
+        # 没有 Docker（开发机 / 未挂 socket）是正常情况，不是错误
+        logger.debug(f"[RestartPolicy] 无法列出容器，跳过扫描: {e}")
+
+
+async def _audit_one_container(docker: aiodocker.Docker, item: DockerContainer, guarded: bool) -> None:
+    info = await item.show()
+    labels = (info.get("Config") or {}).get("Labels") or {}
+    instance_key = str(labels.get(LABEL_INSTANCE) or "")
+    if not INSTANCE_KEY_PATTERN.match(instance_key):
+        return
+    name = str(info.get("Name", "")).lstrip("/")
+    try:
+        _assert_owned(info, instance_key, build_container_name(instance_key))
+    except PermissionDeniedError:
+        return  # 邻居部署的容器，不归我们管
+    host_config = info.get("HostConfig") or {}
+    policy_name = str((host_config.get("RestartPolicy") or {}).get("Name") or "")
+    has_binds = bool(host_config.get("Binds")) or any(
+        isinstance(m, dict) and m.get("Type") == "bind" for m in (info.get("Mounts") or [])
+    )
+    if not has_binds:
+        return
+
+    if not guarded:
+        if policy_name in ("", "no"):
+            logger.warning(
+                f"[RestartPolicy] NapCat 容器 {name!r} 的 RestartPolicy 是 {policy_name or '空'}：它是在 docker-guard 下建的，"
+                "当前部署不走 guard（回滚到标准 compose？），不会有人保活——崩溃或宿主重启后不会自己回来。"
+                "请在控制台把该实例的容器「删除」再「创建」一次（数据目录保留），新容器会是 unless-stopped",
+            )
+        return
+
+    if policy_name in ("", "no"):
+        return
+    try:
+        await docker._query_json(
+            f"containers/{item.id}/update",
+            method="POST",
+            data={"RestartPolicy": {"Name": "no"}},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            f"[RestartPolicy] 无法把 NapCat 容器 {name!r}（实例 {instance_key}）的 RestartPolicy 从 {policy_name} 改成 no：{e}。"
+            "它仍会被 Docker 守护进程自动重启，重启时的挂载源解析不经过 docker-guard。"
+            "请在控制台把该实例的容器「删除」再「创建」一次（数据目录保留）",
+        )
+        return
+    logger.warning(f"[RestartPolicy] 已把 NapCat 容器 {name!r}（实例 {instance_key}）的 RestartPolicy 从 {policy_name} 改成 no，改由 NA 经 docker-guard 保活")
+
+    instance = await DBAdapterInstance.filter(instance_key=instance_key).exclude(status="deleted").first()
+    if instance is not None and not read_container_metadata(instance).desired_state:
+        running = str((info.get("State") or {}).get("Status", "")).lower() in ("running", "restarting")
+        await _write_container_metadata(instance, {"desired_state": DESIRED_RUNNING if running else DESIRED_STOPPED})
 
 
 # ---------------------------------------------------------------------------

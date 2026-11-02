@@ -134,7 +134,12 @@ async def collect_message(
         f"Message Collect: [{chat_message.chat_key}] {platform_user.platform_name} {chat_message.sender_nickname}: {chat_message.content_text}{ref_str}",
     )
 
-    await message_service.push_human_message(message=chat_message, user=user, db_chat_channel=db_chat_channel)
+    await message_service.push_human_message(
+        message=chat_message,
+        user=user,
+        db_chat_channel=db_chat_channel,
+        suppress_trigger=platform_message.suppress_trigger,
+    )
 
 
 async def _try_handle_command(

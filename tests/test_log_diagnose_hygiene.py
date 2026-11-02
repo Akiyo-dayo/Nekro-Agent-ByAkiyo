@@ -42,7 +42,8 @@ from nekro_agent.core.logger import (
     ACCESS_LOG_LOGGER_NAMES,
     FACTORY_DEFAULT_CREDENTIAL_CHECKS,
     REDACTED_QUERY_VALUE,
-    SENSITIVE_QUERY_KEY_PARTS,
+    SENSITIVE_QUERY_KEY_COMPOUNDS,
+    SENSITIVE_QUERY_KEY_WORDS,
     SensitiveQueryParamFilter,
     audit_factory_default_credentials,
     build_log_handlers,
@@ -51,6 +52,7 @@ from nekro_agent.core.logger import (
     is_sensitive_query_key,
     redact_sensitive_query_params,
     resolve_log_diagnose,
+    scrub_sensitive_query_params,
 )
 from nekro_agent.core.os_env import FACTORY_DEFAULT_POSTGRES_PASSWORD, OsEnv
 
@@ -294,6 +296,7 @@ class TestTheSwitchIsActuallyWiredIn:
         assert len(configure_calls) == 1
         assert [(kw.arg, ast.unparse(kw.value)) for kw in configure_calls[0].keywords] == [
             ("handlers", "log_handlers"),
+            ("patcher", "scrub_sensitive_query_params"),
         ]
 
 
@@ -612,7 +615,11 @@ def _isolated_uvicorn_loggers() -> Iterator[None]:
 
     这一节要跑 `dictConfig`、要临时摘掉过滤器（对照组），都是**进程全局**的改动。
     不还原的话后面的用例会在一个被改过的 logging 配置上跑。
+
+    loguru 的 patcher 是第二层遮蔽，这里摘掉：这一节要证明的是 stdlib 过滤器自己管用，
+    `--reload` 模式下 uvicorn 用自己的 stdout，根本不经过 loguru。
     """
+    logger.configure(patcher=lambda record: None)
     saved = [
         (
             name,
@@ -626,6 +633,7 @@ def _isolated_uvicorn_loggers() -> Iterator[None]:
     try:
         yield
     finally:
+        logger.configure(patcher=scrub_sensitive_query_params)
         for name, filters, handlers, level, propagate in saved:
             std_logger = logging.getLogger(name)
             std_logger.filters = filters
@@ -714,7 +722,7 @@ class TestSensitiveQueryParamRedaction:
         for part in HIDDEN_KEY_PARTS:
             assert is_sensitive_query_key(part), f"{part} 在 tools/redaction 里算凭据，这里却不算"
         # 反方向：这边额外收的几项是有意为之，不是笔误
-        assert set(HIDDEN_KEY_PARTS) <= {part for part in SENSITIVE_QUERY_KEY_PARTS} | {"api_key", "apikey"}
+        assert {part.replace("_", "") for part in HIDDEN_KEY_PARTS} <= SENSITIVE_QUERY_KEY_WORDS | SENSITIVE_QUERY_KEY_COMPOUNDS
         assert is_sensitive_query_key("sig") is True  # `tools/upload_access.py` 的取件签名
 
 
@@ -970,3 +978,137 @@ class TestLarkLogBridgeIsRedacted:
         """既有行为不许改：ping/pong 心跳仍然被丢掉"""
         assert self._drive("ping") == ""
         assert self._drive("PONG received") == ""
+
+
+# ============================================================
+# 复核后的小修：异常文本里的凭据、键名按整词匹配
+# ============================================================
+
+SENTINEL_RKEY = "S3ntinel-Rkey-do-not-leak-Zz"
+
+
+class TestSensitiveKeyIsMatchedByWholeWord:
+    """旧判据是子串：`auth` 命中 author / authority，`sig` 命中 design / assign / signal，访问日志里这些参数的取值被白白遮掉"""
+
+    @pytest.mark.parametrize(
+        "key",
+        ["author", "authority", "design", "designation", "assign", "signal", "signed_headers", "max_tokens", "keyword", "monkey", "chat_key"],
+    )
+    def test_ordinary_names_are_left_alone(self, key: str) -> None:
+        assert is_sensitive_query_key(key) is False
+        assert redact_sensitive_query_params(f"/x?{key}=plain") == f"/x?{key}=plain"
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "token", "Token", "userPassword", "csrfToken", "appSecret", "access_token", "accessToken", "refresh_token", "id_token", "auth_token", "authToken",
+            "secret", "client_secret", "clientSecret", "password", "passwd", "pwd", "api_key", "apiKey", "apikey", "x-api-key",
+            "authorization", "Authorization", "auth", "credential", "X-Amz-Credential", "X-Amz-Signature", "X-Amz-Security-Token",
+            "signature", "sig", "rkey", "RKey",
+        ],
+    )  # fmt: skip
+    def test_credential_names_are_still_masked(self, key: str) -> None:
+        assert is_sensitive_query_key(key) is True
+        assert redact_sensitive_query_params(f"/x?{key}=abc123") == f"/x?{key}={REDACTED_QUERY_VALUE}"
+
+    def test_the_mirror_of_tools_redaction_still_holds(self) -> None:
+        from nekro_agent.tools.redaction import HIDDEN_KEY_PARTS
+
+        known = SENSITIVE_QUERY_KEY_WORDS | SENSITIVE_QUERY_KEY_COMPOUNDS
+        for part in HIDDEN_KEY_PARTS:
+            assert is_sensitive_query_key(part), part
+            assert part.replace("_", "") in known, f"{part} 在 tools/redaction 里算凭据，这里的名单里没有"
+
+
+class _OddError(Exception):
+    """构造参数和 args 对不上：`copy.copy` 复制不了它"""
+
+    def __init__(self, first: str, second: str) -> None:
+        super().__init__(f"{first} {second}")
+
+
+def _emit_with_exception(raiser: Any) -> Tuple[str, List[Any]]:
+    """用产品的 sink 配置打一条带异常的日志，返回 (文本, 各 sink 收到的 record)"""
+    buffer = io.StringIO()
+    spec = build_log_handlers(False)[2]
+    kwargs = {key: value for key, value in spec.items() if key not in {"sink", "rotation", "retention", "compression"}}
+    kwargs["level"] = "INFO"
+    kwargs["colorize"] = False
+    records: List[Any] = []
+    text_id = logger.add(buffer, **kwargs)
+    record_id = logger.add(lambda message: records.append(message.record), level="INFO")
+    try:
+        try:
+            raiser()
+        except Exception:
+            logger.exception("request failed")
+    finally:
+        logger.remove(text_id)
+        logger.remove(record_id)
+    return buffer.getvalue(), records
+
+
+class TestExceptionTextIsScrubbed:
+    URL = f"https://multimedia.example.com/download?appid=1&rkey={SENTINEL_RKEY}"
+
+    def test_the_message_of_the_exception_is_redacted_in_the_traceback(self) -> None:
+        def raiser() -> None:
+            raise ValueError(f"GET {self.URL} returned 403")
+
+        text, _ = _emit_with_exception(raiser)
+        assert SENTINEL_RKEY not in text
+        # 反方向：异常类型、其余消息、调用栈逐字还在
+        assert "ValueError" in text and "returned 403" in text and "rkey=[redacted_credential]" in text
+        assert "Traceback" in text and "raiser" in text
+
+    def test_chained_exceptions_are_redacted_too(self) -> None:
+        def raiser() -> None:
+            try:
+                raise ConnectionError(f"connect to {self.URL} failed")
+            except ConnectionError as inner:
+                raise RuntimeError("download aborted") from inner
+
+        text, _ = _emit_with_exception(raiser)
+        assert SENTINEL_RKEY not in text
+        assert "ConnectionError" in text and "RuntimeError" in text and "download aborted" in text
+
+    def test_an_exception_that_cannot_be_copied_is_still_redacted(self) -> None:
+        def raiser() -> None:
+            raise _OddError("GET", self.URL)
+
+        text, _ = _emit_with_exception(raiser)
+        assert SENTINEL_RKEY not in text
+        assert "_OddError" in text
+
+    def test_the_in_memory_log_entry_is_redacted_too(self) -> None:
+        def raiser() -> None:
+            raise ValueError(f"GET {self.URL} returned 403")
+
+        _, records = _emit_with_exception(raiser)
+        entry = format_log_entry(records[0])
+        for field in ("exception_message", "traceback"):
+            assert SENTINEL_RKEY not in (entry[field] or ""), field
+        assert entry["exception_type"] == "ValueError"
+        assert "returned 403" in entry["exception_message"]
+
+    def test_the_original_exception_is_not_modified(self) -> None:
+        """脱敏只作用于日志；调用方捕获后重新抛出 / 处理时拿到的仍是原样的异常"""
+        error = ValueError(f"GET {self.URL} returned 403")
+
+        def raiser() -> None:
+            raise error
+
+        _emit_with_exception(raiser)
+        assert SENTINEL_RKEY in str(error)
+
+    def test_an_exception_without_credentials_is_passed_through_untouched(self) -> None:
+        error = ValueError("nothing to hide here")
+        assert logger_module.redact_exception_for_log(error) is error
+
+    def test_the_patcher_is_what_the_product_installs(self) -> None:
+        """零件对、接线断了测试照样全绿：生产配置用的就是这个 patcher"""
+        source = LOGGER_SOURCE.read_text(encoding="utf-8")
+        assert "patcher=scrub_sensitive_query_params" in source
+        record: Dict[str, Any] = {"message": f"x ?rkey={SENTINEL_RKEY}", "exception": None}
+        scrub_sensitive_query_params(record)
+        assert SENTINEL_RKEY not in record["message"]

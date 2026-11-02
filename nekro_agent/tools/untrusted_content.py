@@ -15,6 +15,8 @@
 """
 
 import re
+from dataclasses import dataclass, field
+from typing import Dict
 
 # 控制字符 + 零宽字符 + Unicode 行分隔符 + 双向文本覆盖符
 # 这些字符要么能破坏提示词的行结构，要么能在人工审阅时造成视觉欺骗
@@ -25,6 +27,9 @@ _ANY_WHITESPACE_PATTERN = re.compile(r"\s+")
 _EXCESSIVE_NEWLINE_PATTERN = re.compile(r"\n{3,}")
 
 TRUNCATION_MARK = "…"
+
+# 沙盒方法返回 `UntrustedToolResult` 时，回给沙盒的只有这句话。真正的内容由服务端交给模型
+UNTRUSTED_RESULT_PLACEHOLDER = "(the result is attached below by the host, not passed through the sandbox)"
 
 
 def sanitize_inline_text(text: str, max_length: int) -> str:
@@ -83,3 +88,35 @@ def wrap_untrusted_block(one_time_code: str, kind: str, body: str, **attrs: obje
     """
     attr_str = "".join(f" {key}:{value}" for key, value in attrs.items())
     return f"<{one_time_code} | {kind}{attr_str} trust:untrusted>\n{body}\n<{one_time_code} | /{kind}>"
+
+
+@dataclass(frozen=True)
+class UntrustedToolResult:
+    """沙盒方法交回来的不可信内容
+
+    `AGENT` 方法的普通返回值会落成 SYSTEM 消息并回传沙盒，而提示词要求模型信任 SYSTEM 消息，
+    所以外部内容（模型看过视频之后写的话、抓来的网页）不能走那条路：用本轮令牌包好也没用，
+    下一轮令牌换了，那段文字就只剩一条「SYSTEM 说的话」。返回这个类型时：
+
+    - 落库不用 SYSTEM 身份、不带令牌，渲染历史时用当时的令牌重新包裹；
+    - 回给沙盒的只有 :data:`UNTRUSTED_RESULT_PLACEHOLDER`，令牌与正文都不进容器；
+    - 本轮的完整内容由服务端直接拼进模型上下文（`session_token.attach_untrusted_result`）。
+
+    Attributes:
+        kind: 标签名，只能是字母，由插件写死
+        body: 已清洗的不可信正文
+        summary: 插件自己算出来的可信说明，不得含外部内容。它会进 `content_text`，
+            被记忆整理、好感评估读到，所以正文不放这里
+        attrs: 开标签上的数字属性
+    """
+
+    kind: str
+    body: str
+    summary: str = ""
+    attrs: Dict[str, int] = field(default_factory=dict)
+
+
+def render_untrusted_result(one_time_code: str, result: UntrustedToolResult) -> str:
+    """用给定令牌渲染结果：可信说明在标签外，正文在标签内"""
+    wrapped = wrap_untrusted_block(one_time_code, result.kind, result.body, **result.attrs)
+    return f"{result.summary}\n{wrapped}" if result.summary else wrapped

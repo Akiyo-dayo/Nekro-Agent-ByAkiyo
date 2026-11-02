@@ -82,6 +82,11 @@ services:
       # :ro 只是防止边车替换 socket 文件本身；连接/读写 socket 流不受影响（与 tecnativa 同）
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - nekro_guard_sock:/run/nekro-guard
+      # 数据目录以**同一路径、只读**挂进边车：guard 要在这份目录树上逐级解析 bind source 的符号链接，
+      # 确认挂载源没有经链接逃出数据目录，并把解析后的规范路径转发给 Docker。看不到这个目录时，
+      # guard 对挂在它之下的容器一律拒绝（fail-closed，不回落到字符串判断）；启动日志会报错提示。
+      # 边车只做 lstat / readlink，从不读文件内容；只读挂载保证它改不了任何东西。
+      - ${NEKRO_DATA_DIR}:${NEKRO_DATA_DIR}:ro
     restart: unless-stopped
 
   # 主服务
@@ -133,6 +138,10 @@ services:
       - NEKRO_QDRANT_API_KEY=${QDRANT_API_KEY:-}
       # 所有 Docker 调用（aiodocker 与 CLI）改走 guard，不再直连宿主 socket
       - DOCKER_HOST=unix:///run/nekro-guard/guard.sock
+      # 显式告诉 NA「我在 guard 后面」：带挂载的容器（NapCat）在 guard 下只能 RestartPolicy=no，
+      # 保活改由 NA 经 guard 拉起（container_manager.reconcile_container_liveness）。
+      # 不设时 NA 也会按上面的 DOCKER_HOST 推断；写出来是为了不依赖推断。
+      - NEKRO_DOCKER_GUARD_ACTIVE=true
     volumes:
       # 注意：这里**没有** /var/run/docker.sock 直挂 —— 这正是硬化的关键
       - nekro_guard_sock:/run/nekro-guard

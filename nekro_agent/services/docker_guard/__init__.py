@@ -9,6 +9,8 @@
 from nekro_agent.services.docker_guard.policy import (
     Decision,
     PolicyContext,
+    api_version_of,
+    body_forbidden,
     body_guard_rule,
     container_ownership_target,
     evaluate,
@@ -21,6 +23,8 @@ from nekro_agent.services.docker_guard.policy import (
 __all__ = [
     "Decision",
     "PolicyContext",
+    "api_version_of",
+    "body_forbidden",
     "body_guard_rule",
     "container_ownership_target",
     "evaluate",

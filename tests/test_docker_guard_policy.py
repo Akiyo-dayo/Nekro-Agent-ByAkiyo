@@ -30,9 +30,12 @@ from nekro_agent.services.docker_guard.policy import (
     network_connect_target,
     normalize_path,
 )
+from tests.docker_guard_fakefs import data_dir_fs
 
 DATA_DIR = "/srv/nekro_agent"
-CTX = PolicyContext(allowed_bind_roots=(DATA_DIR,))
+# 空数据目录的内存文件系统：bind source 的符号链接解析是 fail-closed 的（看不到允许根就一律拒绝），
+# 所以旧的「合法形状必须放行」用例也得给它一个文件系统；链接逃逸的用例在 test_docker_guard_bind_symlink.py
+CTX = PolicyContext(allowed_bind_roots=(DATA_DIR,), fs=data_dir_fs(DATA_DIR))
 
 NA_IMAGE = "kromiose/nekro-agent:latest"
 SANDBOX_IMAGE = "kromiose/nekro-agent-sandbox:latest"
@@ -56,7 +59,7 @@ def _sandbox_create() -> Dict[str, Any]:
                 f"{DATA_DIR}/uploads/ob1:/app/uploads:ro",
             ],
             "Memory": 512 * 1024 * 1024,
-            "NanoCPUs": 1_000_000_000,
+            "NanoCpus": 1_000_000_000,
             "SecurityOpt": ["no-new-privileges"],
             "NetworkMode": "nekro_sandbox_net",
             "ExtraHosts": ["host.docker.internal:172.20.0.1"],
@@ -98,7 +101,9 @@ def _napcat_create() -> Dict[str, Any]:
                 f"{DATA_DIR}/napcat_data/ob1/config:/app/napcat/config",
             ],
             "PortBindings": {"6099/tcp": [{"HostIp": "127.0.0.1", "HostPort": "36551"}]},
-            "RestartPolicy": {"Name": "unless-stopped"},
+            # 硬化部署（走 guard）下 NapCat 建成 RestartPolicy=no，保活由 NA 经 guard 拉起；
+            # 带 Binds 的容器不许 always / unless-stopped / on-failure（见 test_restart_policy_with_binds_*）
+            "RestartPolicy": {"Name": "no"},
             "NetworkMode": "nekro_network",
         },
     }
@@ -144,7 +149,6 @@ ALLOWED_ENDPOINTS = [
     ("GET", "/images/alpine:latest/json"),
     ("POST", "/networks/create"),
     ("GET", "/networks/nekro_sandbox_net"),
-    ("POST", "/networks/nekro_workspace_t1/connect"),
 ]
 
 
@@ -154,9 +158,15 @@ def test_allowed_endpoints_pass(method: str, path: str):
     assert decision.allow, f"{method} {path} 应放行，实际 deny: {decision.reason}"
 
 
+def test_network_connect_with_a_well_formed_body_passes():
+    """connect 的请求体现在要过判据（大小写变体键 / 缺 Container 都拒），合法形状照常放行。"""
+    decision = evaluate("POST", "/networks/nekro_workspace_t1/connect", CTX, body={"Container": "abcd"})
+    assert decision.allow, decision.reason
+    assert decision.rewritten_body == {"Container": "abcd"}
+
+
 DENIED_ENDPOINTS = [
     # NA 从不调用、且危险的端点
-    ("POST", "/containers/abcd/update"),      # 改配额/cgroup
     ("POST", "/commit"),                        # 把运行中容器打成镜像
     ("GET", "/events"),                         # 事件流（信息泄露）
     ("POST", "/build"),                         # 构建镜像
@@ -787,3 +797,294 @@ def test_container_creating_modules_all_carry_an_ownership_label():
             by_module[key] = True
     missing = sorted(mod for mod, ok in by_module.items() if not ok)
     assert not missing, f"这些建容器的模块里没有任何一张带 nekro.* 前缀的标签表: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# 请求体键名白名单（复核发现：Docker 的 Go 解码大小写不敏感，判据只认精确键）
+#
+# 端到端（真实 HTTP + 桩上游，断言字节到没到上游）的绕过表在 test_docker_guard_bypass.py；
+# 这里钉的是白名单本身的几个性质，每一条都对应一个变异。
+# ---------------------------------------------------------------------------
+
+# 判据里任何一处 `.get("Xxx")` 读的键都必须在白名单里：否则那条判据读到的永远是「没有」，
+# 或者更糟——合法请求被当成未知键整体拒绝（沙盒起不来）。
+POLICY_READS_HOST_CONFIG_KEYS = {
+    "Binds", "Mounts", "VolumesFrom", "Privileged", "PidMode", "IpcMode", "UsernsMode", "CgroupnsMode", "UTSMode",
+    "NetworkMode", "CgroupParent", "Devices", "DeviceCgroupRules", "Sysctls", "Runtime", "SecurityOpt", "CapAdd",
+    "RestartPolicy",
+}  # fmt: skip
+
+
+def test_whitelists_cover_every_key_the_policy_reads():
+    from nekro_agent.services.docker_guard import policy
+
+    assert POLICY_READS_HOST_CONFIG_KEYS <= policy._HOST_CONFIG_FIELDS
+    assert {"Image", "Labels", "Entrypoint", "Cmd", "HostConfig"} <= policy._CREATE_TOP_FIELDS
+    assert {"Privileged"} <= policy._EXEC_CREATE_FIELDS
+    assert {"Detach"} <= policy._EXEC_START_FIELDS
+    assert {"Container"} <= policy._NETWORK_CONNECT_FIELDS
+    assert {"Name"} <= policy._RESTART_POLICY_FIELDS
+
+
+def test_config_and_hostconfig_field_sets_do_not_overlap():
+    """重叠的名字没法判断它在顶层到底是 Config 字段还是摊平的 HostConfig 字段。"""
+    from nekro_agent.services.docker_guard import policy
+
+    assert not (policy._CONTAINER_CONFIG_FIELDS & policy._HOST_CONFIG_FIELDS)
+
+
+# (变体键, 它是谁的变体)。含 Unicode 折叠：Go 的 encoding/json 把 U+017F 当 `s`、U+212A 当 `k`。
+CASE_VARIANTS = [
+    ("hostconfig", "HostConfig"),
+    ("HOSTCONFIG", "HostConfig"),
+    ("hostConfig", "HostConfig"),
+    ("Ho\u017ftConfig", "HostConfig"),  # ſ
+    ("image", "Image"),
+    ("\u212aernelMemory", "KernelMemory"),  # K (Kelvin sign)
+]
+
+
+@pytest.mark.parametrize(("variant", "canonical"), CASE_VARIANTS)
+def test_check_keys_rejects_case_and_unicode_fold_variants(variant: str, canonical: str):
+    from nekro_agent.services.docker_guard.policy import _check_keys
+
+    denial = _check_keys({variant: {}}, frozenset({canonical}), "测试层", "t")
+    assert denial is not None and denial.rule == "t.key_case_variant", denial
+    assert canonical in denial.reason
+
+
+def test_check_keys_accepts_exact_keys_and_rejects_unknown_ones():
+    from nekro_agent.services.docker_guard.policy import _check_keys
+
+    assert _check_keys({"Image": 1, "HostConfig": {}}, frozenset({"Image", "HostConfig"}), "x", "t") is None
+    unknown = _check_keys({"Whatever": 1}, frozenset({"Image"}), "x", "t")
+    assert unknown is not None and unknown.rule == "t.key_unknown"
+
+
+def test_check_keys_flags_host_config_names_on_the_wrong_level():
+    from nekro_agent.services.docker_guard.policy import _check_keys
+
+    flat = _check_keys({"Binds": []}, frozenset({"Image"}), "x", "t", flat_fields=frozenset({"Binds"}))
+    assert flat is not None and flat.rule == "t.hostconfig_flat"
+    flat_variant = _check_keys({"binds": []}, frozenset({"Image"}), "x", "t", flat_fields=frozenset({"Binds"}))
+    assert flat_variant is not None and flat_variant.rule == "t.hostconfig_flat"
+
+
+def test_labels_are_data_not_keys_of_the_checked_structure():
+    """map 类字段（Labels / Env 里的键）大小写敏感，是数据：校验只看结构的字段名，不递归进去。"""
+    body = {"Image": "a", "Labels": {"Nekro.X": "1", "nekro.x": "2", "binds": "3"}}
+    decision = evaluate("POST", "/containers/create", CTX, body=body)
+    assert decision.allow, decision.reason
+    assert decision.rewritten_body == body
+
+
+API_VERSION_CASES = [
+    ("/containers/create", None),
+    ("/v1.24/containers/create", (1, 24)),
+    ("/v1.51/containers/abc/start", (1, 51)),
+    ("/v1.23/containers/abc/start", (1, 23)),
+    ("/v1.5/version?x=1", (1, 5)),
+    ("/v1.0024/version", (1, 24)),  # 前导零：Docker 按数值比较，这里也按数值
+    ("/%76%31.20/version", (1, 20)),  # 百分号编码：与 normalize_path 同一个解码口径
+    ("/v1/version", None),  # 无小数点：Docker 路由认，本判据的端点正则不认（落到 endpoint.denied）
+]
+
+
+@pytest.mark.parametrize(("raw", "expected"), API_VERSION_CASES)
+def test_api_version_of(raw: str, expected: Optional[tuple]):
+    from nekro_agent.services.docker_guard.policy import api_version_of
+
+    assert api_version_of(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "denied"),
+    [("/v1.23/version", True), ("/v1.24/version", False), ("/v1.51/version", False), ("/version", False)],
+)
+def test_old_api_versions_are_denied_for_every_endpoint(path: str, denied: bool):
+    decision = evaluate("GET", path, CTX)
+    assert decision.allow is (not denied)
+    if denied:
+        assert decision.rule == "endpoint.api_version_too_old"
+
+
+BODY_FORBIDDEN_CASES = [
+    ("POST", "/containers/abcd/start", True),
+    ("POST", "/v1.51/containers/abcd/restart?t=3", True),
+    ("POST", "/containers/abcd/stop", False),
+    ("POST", "/containers/abcd/kill", False),
+    ("POST", "/containers/create", False),
+    ("GET", "/containers/abcd/start", False),
+    ("POST", "/containers/x/../abcd/start", False),
+]
+
+
+@pytest.mark.parametrize(("method", "path", "expected"), BODY_FORBIDDEN_CASES)
+def test_body_forbidden(method: str, path: str, expected: bool):
+    from nekro_agent.services.docker_guard.policy import body_forbidden
+
+    assert body_forbidden(method, path) is expected
+
+
+# RestartPolicy：带 Binds 的容器只能 no / 空。直接喂 evaluate()，端到端见 test_docker_guard_bypass.py
+RESTART_POLICY_CASES = [
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"Name": "no"}}, True, ""),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"Name": ""}}, True, ""),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {}}, True, ""),
+    ({"Binds": [f"{DATA_DIR}/x:/m"]}, True, ""),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"Name": "always"}}, False, "create.restart_policy.with_binds"),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"Name": "unless-stopped"}}, False, "create.restart_policy.with_binds"),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"Name": "on-failure", "MaximumRetryCount": 3}}, False, "create.restart_policy.with_binds"),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"Name": None}}, False, "create.restart_policy.with_binds"),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": "always"}, False, "create.restart_policy.malformed"),
+    ({"Binds": [f"{DATA_DIR}/x:/m"], "RestartPolicy": {"name": "no"}}, False, "create.key_case_variant"),
+    ({"RestartPolicy": {"Name": "always"}}, True, ""),
+    ({"Binds": [], "RestartPolicy": {"Name": "always"}}, True, ""),
+]
+
+
+@pytest.mark.parametrize(("host_config", "allowed", "rule"), RESTART_POLICY_CASES)
+def test_restart_policy_with_binds_only_allows_no(host_config: Dict[str, Any], allowed: bool, rule: str):
+    decision = evaluate("POST", "/containers/create", CTX, body=_with_hostconfig(**host_config))
+    assert decision.allow is allowed, decision
+    if not allowed:
+        assert decision.rule == rule
+
+
+def test_too_many_binds_is_rejected():
+    from nekro_agent.services.docker_guard.policy import MAX_BINDS
+
+    ok = _with_hostconfig(Binds=[f"{DATA_DIR}/x:/m{i}" for i in range(MAX_BINDS)])
+    assert evaluate("POST", "/containers/create", CTX, body=ok).allow
+    too_many = _with_hostconfig(Binds=[f"{DATA_DIR}/x:/m{i}" for i in range(MAX_BINDS + 1)])
+    decision = evaluate("POST", "/containers/create", CTX, body=too_many)
+    assert (decision.allow, decision.rule) == (False, "create.binds.too_many")
+
+
+# ---------------------------------------------------------------------------
+# NA 自己建容器的四处字面量请求体必须过得了 guard 的键名白名单
+#
+# 这是「NA 自己的请求被自己的 guard 拒绝」的静态防线。本轮就抓到两处：沙盒配置里的
+# `NanoCPUs`（Docker 规范拼写是 `NanoCpus`，靠 Go 的大小写不敏感才一直能用）与顶层的 `AutoRemove`
+# （HostConfig 字段写在了顶层，Docker 从不读它）。字面量里写错了，在没有 guard 的部署里一切正常，
+# 到了硬化部署才整个起不来——本地与标准部署的任何用例都跑不出来。
+# ---------------------------------------------------------------------------
+
+
+def _create_config_literals() -> "list[tuple[str, int, ast.Dict]]":
+    found: "list[tuple[str, int, ast.Dict]]" = []
+    for rel in sorted(CONTAINER_CREATING_MODULES):
+        path = SERVICES_DIR / rel
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = [k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+            if "Image" in keys and ("HostConfig" in keys or "Labels" in keys):
+                found.append((rel, node.lineno, node))
+    return found
+
+
+def _literal_keys(node: ast.Dict) -> "list[str]":
+    return [k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+
+
+def test_every_container_config_literal_in_na_passes_the_key_whitelists():
+    from nekro_agent.services.docker_guard import policy
+
+    literals = _create_config_literals()
+    # 前提断言：四个建容器的模块各至少有一份字面量（NapCat / netguard / 沙盒 / CC 工作区）
+    assert {rel for rel, _l, _n in literals} == CONTAINER_CREATING_MODULES, [(r, ln) for r, ln, _ in literals]
+
+    for rel, lineno, node in literals:
+        where = f"{rel}:{lineno}"
+        for key in _literal_keys(node):
+            assert key in policy._CREATE_TOP_FIELDS, (
+                f"{where} 的顶层键 {key!r} 不在 docker-guard 的 create 白名单里（拼写必须与 Docker 的规范拼写逐字一致；"
+                "HostConfig 的字段要写进 HostConfig 里）。硬化部署下这个容器会被 guard 拒绝创建"
+            )
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and key.value == "HostConfig" and isinstance(value, ast.Dict)):
+                continue
+            for hc_key in _literal_keys(value):
+                assert hc_key in policy._HOST_CONFIG_FIELDS, f"{where} 的 HostConfig 键 {hc_key!r} 不在 guard 白名单里"
+            for hc_key, hc_value in zip(value.keys, value.values):
+                if (
+                    isinstance(hc_key, ast.Constant)
+                    and hc_key.value == "RestartPolicy"
+                    and isinstance(hc_value, ast.Dict)
+                ):
+                    for rp_key in _literal_keys(hc_value):
+                        assert rp_key in policy._RESTART_POLICY_FIELDS, f"{where} 的 RestartPolicy 键 {rp_key!r} 不对"
+
+# ---------------------------------------------------------------------------
+# update 端点只为「RestartPolicy 改成 no」开；复验追加的受限字段
+# ---------------------------------------------------------------------------
+
+
+def test_update_endpoint_is_body_gated_not_open():
+    """原先 `/containers/{id}/update` 整个不在白名单（改配额 / cgroup / 重启策略都不行）；现在只放行一个形状。"""
+    assert evaluate("POST", "/containers/abcd/update", CTX, body=None).rule == "update.body.missing"
+    assert evaluate("POST", "/containers/abcd/update", CTX, body={"Memory": 1}).rule == "update.key_unknown"
+    ok = evaluate("POST", "/containers/abcd/update", CTX, body={"RestartPolicy": {"Name": "no"}})
+    assert ok.allow and ok.rewritten_body == {"RestartPolicy": {"Name": "no"}}
+    assert body_guard_rule("POST", "/containers/abcd/update") == "update_restart_policy"
+    assert container_ownership_target("POST", "/containers/abcd/update") == "abcd"
+
+
+RESTRICTED_FIELD_CASES = [
+    ({"MaskedPaths": None}, True),
+    ({"ReadonlyPaths": None}, True),
+    ({"MaskedPaths": []}, False),
+    ({"ReadonlyPaths": []}, False),
+    ({"MaskedPaths": ["/proc/kcore"]}, False),
+    ({"DeviceRequests": []}, True),
+    ({"DeviceRequests": [{"Driver": "nvidia"}]}, False),
+    ({"Annotations": {}}, True),
+    ({"Annotations": {"a": "b"}}, False),
+    ({"Links": []}, True),
+    ({"Links": ["x:y"]}, False),
+    ({"GroupAdd": ["0"]}, False),
+    ({"OomScoreAdj": 0}, True),
+    ({"OomScoreAdj": -500}, False),
+    ({"Memory": 1, "NanoCpus": 1, "PidsLimit": 100, "ExtraHosts": ["a:172.20.0.1"], "Dns": ["172.20.0.1"]}, True),
+    ({"SecurityOpt": ["no-new-privileges"]}, True),
+    ({"SecurityOpt": ["label=disable"]}, False),
+    ({"SecurityOpt": ["label:disable"]}, False),
+    ({"SecurityOpt": ["label=type:svirt_lxc_net_t"]}, True),
+    ({"LogConfig": {"Type": "none"}}, True),
+    ({"LogConfig": {"Type": "fluentd", "Config": {"fluentd-address": "evil:24224"}}}, False),
+]
+
+
+@pytest.mark.parametrize(("host_config", "allowed"), RESTRICTED_FIELD_CASES)
+def test_restricted_host_config_fields(host_config: Dict[str, Any], allowed: bool):
+    decision = evaluate("POST", "/containers/create", CTX, body=_with_hostconfig(**host_config))
+    assert decision.allow is allowed, decision
+
+
+def test_every_host_config_field_is_either_judged_or_deliberately_left_open():
+    """HostConfig 白名单里的每个字段都要有明确归宿：有判据，或在这里登记为「只改资源 / 网络参数，不带逃逸能力」。
+
+    新增字段进白名单时必须在这里表态，不能只是「加进白名单让它别被拒」——那正是 MaskedPaths / ReadonlyPaths
+    在白名单里躺了一轮、没有任何判据的来路。
+    """
+    from nekro_agent.services.docker_guard import policy
+
+    judged = (
+        POLICY_READS_HOST_CONFIG_KEYS
+        | set(policy._MUST_BE_EMPTY_HOST_CONFIG_FIELDS)
+        | set(policy._MUST_BE_NULL_HOST_CONFIG_FIELDS)
+        | {"LogConfig"}
+    )
+    deliberately_open = {
+        "NetworkMode", "PortBindings", "AutoRemove", "ConsoleSize", "CapDrop", "Dns", "DnsOptions", "DnsSearch",
+        "ExtraHosts", "PublishAllPorts", "ReadonlyRootfs", "StorageOpt", "Tmpfs", "ShmSize", "Init",
+        "CpuShares", "Memory", "NanoCpus", "BlkioWeight", "BlkioWeightDevice", "BlkioDeviceReadBps",
+        "BlkioDeviceWriteBps", "BlkioDeviceReadIOps", "BlkioDeviceWriteIOps", "CpuPeriod", "CpuQuota",
+        "CpuRealtimePeriod", "CpuRealtimeRuntime", "CpusetCpus", "CpusetMems", "KernelMemory", "KernelMemoryTCP",
+        "MemoryReservation", "MemorySwap", "MemorySwappiness", "OomKillDisable", "PidsLimit", "Ulimits", "CpuCount",
+        "CpuPercent", "IOMaximumIOps", "IOMaximumBandwidth",
+    }  # fmt: skip
+    unaccounted = policy._HOST_CONFIG_FIELDS - judged - deliberately_open
+    assert not unaccounted, f"这些 HostConfig 字段既没有判据也没登记为有意放行: {sorted(unaccounted)}"

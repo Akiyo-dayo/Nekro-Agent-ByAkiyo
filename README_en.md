@@ -5,7 +5,7 @@
 > **This is an unofficial derivative edition.** It is modified from [KroMiose/nekro-agent](https://github.com/KroMiose/nekro-agent) (NekroAgent) and has no affiliation with, or endorsement from, the NekroAgent maintainers.
 > **Built on the NekroAgent project** — upstream project: <https://github.com/KroMiose/nekro-agent>.
 >
-> - Version: **0.2.0** (this edition's own version number; the upstream version it is based on is `2.3.3`)
+> - Version: **0.3.0** (this edition's own version number; the upstream version it is based on is `2.3.3`)
 > - License: the upstream [Nekro Agent Open Source License V1.1](./LICENSE) (modified from Apache License 2.0); see "License" below and [`NOTICE`](./NOTICE)
 > - Changes: [`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -24,6 +24,7 @@ This derivative edition adds capabilities for running several bots in one proces
 - **Isolation and identity**: affection and memory are isolated by "memory domain + person + persona" and can be shared across instances by configuration; identity aliases, merges and domain joins have an approval flow.
 - **Usage metering**: one ledger row per upstream LLM request, aggregated by instance / tenant / model group, viewable at `/console/usage`.
 - **Hardening**: model-group API keys encrypted at rest; startup audit of JWT keys and the admin password, with old tokens invalidated when the password changes; log and upstream-error redaction; sandbox and CC-workspace network isolation; optional `docker.sock` hardening ([`docs/docker-guard.md`](./docs/docker-guard.md)).
+- **Video reading and analysis** (built-in plugin, off by default): lets the AI read videos from the chat, sandbox files or links; see "Video Analysis plugin" below.
 - **Also**: a favourability soft reply gate, Chinese tokenization for memory and the knowledge base, NapCat container ownership and orphan reclaim, regression tests against a real PostgreSQL, and CI.
 
 ## Quick deployment (Docker)
@@ -60,7 +61,7 @@ Images are published to the GitHub Container Registry (GHCR), built and pushed b
 
 Tags:
 
-- **version number** (e.g. `0.2.0`) and `latest`: built when a `v*.*.*` tag is pushed, suitable for production;
+- **version number** (e.g. `0.3.0`) and `latest`: built when a `v*.*.*` tag is pushed, suitable for production;
 - `preview` / `preview-<short commit SHA>`: built on every `main` update, includes the latest changes, suitable for testing.
 
 ```bash
@@ -75,6 +76,18 @@ Sandbox containers are created by the application through the Docker API, and it
 - Several deployments on one host: [`docs/multi-deploy-same-host.md`](./docs/multi-deploy-same-host.md) (Chinese)
 - A stricter `docker.sock` boundary: [`docs/docker-guard.md`](./docs/docker-guard.md) (Chinese)
 - Bare-metal / development setup, plugin and adapter development: see [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`docs/`](./docs/) and the upstream [documentation center](https://doc.nekro.ai) (for image names and script addresses, this page wins over upstream documents)
+
+## Video Analysis plugin (off by default)
+
+The built-in plugin "Video Analysis" lets the AI watch videos: it samples frames with `ffmpeg`, sends them to a vision model group in batches and returns the answer to the question; optionally the audio track goes to an OpenAI-compatible transcription endpoint. In short:
+
+- **Off by default.** Enable it on the plugin page and pick a model group with vision (`VIDEO_MODEL_GROUP`; when empty, the channel's primary and then fallback group are tried).
+- **Needs `ffmpeg` / `ffprobe`.** The Docker image includes them; without Docker, install them yourself. Without them a call to the plugin fails; nothing else is affected.
+- **Audio transcription is off by default**: the audio leaves your host when it is on, and a tenant instance cannot turn it on while it is off globally.
+- **Conservative limits with hard ceilings**: 64 MB, 10 minutes, 16 frames, 768 px long edge, 8 frames per request, 100 seconds in total; 2 concurrent jobs process-wide and 1 per instance. An instance can tighten the limits but not loosen them (one exception: frames per request, because smaller batches mean more requests, so an instance can only raise it). The total time is capped at the sandbox timeout minus 10 seconds.
+- **Video content is untrusted**: link downloads go through the existing outbound protection (every redirect is checked, and the connected peer is checked again), `ffmpeg` reads only local plain video containers in an isolated working directory with memory limits, and text from the video or the models is sanitized and handed to the main model marked as untrusted, never as a system message.
+- **Video downloads do not use a proxy**: the HTTP client that downloads video links ignores `HTTP_PROXY` / `HTTPS_PROXY` and similar variables and always connects directly (through a proxy the connected peer is the proxy, which the outbound protection cannot check). If the host can only reach the internet through a proxy, video links in the chat will fail to download; put the video in the sandbox shared directory and analyze that instead.
+- With the plugin on, OneBot video messages are no longer dropped: the model sees `[Video: message:<id>]` and the link is fetched only when the video is analyzed; a recalled video cannot be analyzed. With the plugin off nothing changes: a lone video in a group is dropped, and a lone video in a private chat is still recorded but no longer triggers an empty reply.
 
 ## Telemetry and cloud services (on by default)
 

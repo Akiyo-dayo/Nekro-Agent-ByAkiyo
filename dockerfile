@@ -70,6 +70,8 @@ RUN apt install -y docker.io
 # 缺了它整条防线会静默退化成告警
 RUN apt install -y iptables
 RUN apt install -y git
+# 视频分析插件（plugins/builtin/video_analysis）抽帧与抽音轨用的 ffmpeg / ffprobe
+RUN apt install -y --no-install-recommends ffmpeg
 
 # 清理缓存
 RUN apt clean && rm -rf /var/lib/apt/lists/*

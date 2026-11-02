@@ -19,6 +19,11 @@ class ChatType(Enum):
     UNKNOWN = "unknown"
 
 
+# 工具结果行的身份。不是 "-1"（Bot，会占回复配额）也不是 SYSTEM（提示词要求模型信任它）
+TOOL_RESULT_SENDER_ID = "-2"
+TOOL_RESULT_SENDER_NAME = "UNTRUSTED_TOOL_RESULT"
+
+
 class ChatMessageSegmentType(Enum):
     TEXT = "text"
     IMAGE = "image"
@@ -30,6 +35,7 @@ class ChatMessageSegmentType(Enum):
     JSON_CARD = "json_card"
     FORWARD = "forward"
     POKE = "poke"
+    UNTRUSTED = "untrusted"
 
 
 class ChatMessageSegment(BaseModel):
@@ -237,6 +243,17 @@ class ChatMessageSegmentJsonCard(ChatMessageSegment):
         return ChatMessageSegmentType.JSON_CARD
 
 
+class ChatMessageSegmentUntrusted(ChatMessageSegment):
+    """沙盒方法交回来的不可信内容，`text` 是正文
+
+    存的是不带令牌的原文，渲染提示词时才用当时的令牌包裹，与合并转发同一个做法。
+    """
+
+    kind: str
+    summary: str = ""
+    attrs: Dict[str, int] = Field(default_factory=dict)
+
+
 class ChatMessageSegmentPoke(ChatMessageSegment):
     """戳一戳消息段"""
 
@@ -253,6 +270,9 @@ def segment_from_dict(data: Dict) -> ChatMessageSegment:
         return ChatMessageSegment.model_validate(data)
     if segment_type == ChatMessageSegmentType.IMAGE:
         return ChatMessageSegmentImage.model_validate(data)
+    # OneBot 的视频段只有占位文本，没有落盘文件
+    if segment_type == ChatMessageSegmentType.VIDEO and not data.get("file_name"):
+        return ChatMessageSegment.model_validate(data)
     if segment_type in {
         ChatMessageSegmentType.FILE,
         ChatMessageSegmentType.VOICE,
@@ -267,6 +287,8 @@ def segment_from_dict(data: Dict) -> ChatMessageSegment:
         return ChatMessageSegmentForward.model_validate(data)
     if segment_type == ChatMessageSegmentType.POKE:
         return ChatMessageSegmentPoke.model_validate(data)
+    if segment_type == ChatMessageSegmentType.UNTRUSTED:
+        return ChatMessageSegmentUntrusted.model_validate(data)
     raise ValueError(f"Unsupported segment type: {segment_type}")
 
 

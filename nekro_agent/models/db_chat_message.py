@@ -14,11 +14,17 @@ from nekro_agent.schemas.chat_message import (
     ChatMessageSegmentForward,
     ChatMessageSegmentImage,
     ChatMessageSegmentJsonCard,
+    ChatMessageSegmentUntrusted,
     segments_from_list,
 )
 from nekro_agent.tools.common_util import limited_text_output
 from nekro_agent.tools.path_convertor import convert_filename_to_sandbox_upload_path
-from nekro_agent.tools.untrusted_content import sanitize_block_text, wrap_untrusted_block
+from nekro_agent.tools.untrusted_content import (
+    UntrustedToolResult,
+    render_untrusted_result,
+    sanitize_block_text,
+    wrap_untrusted_block,
+)
 
 # 合并转发内容完全由发送方构造，渲染进提示词时的长度上限
 MAX_FORWARD_PROMPT_LENGTH = 2048
@@ -55,9 +61,23 @@ class DBChatMessage(Model):
     class Meta:  # type: ignore
         table = "chat_message"
 
-    def parse_chat_history_prompt(self, one_time_code: str, config: "CoreConfig", ref_mode: bool = False) -> str:
-        """解析聊天历史记录生成提示词"""
-        content = convert_raw_msg_data_json_to_msg_prompt(self.content_data, one_time_code, config, ref_mode)
+    def parse_chat_history_prompt(
+        self,
+        one_time_code: str,
+        config: "CoreConfig",
+        ref_mode: bool = False,
+        travel_mode: bool = False,
+    ) -> str:
+        """解析聊天历史记录生成提示词
+
+        Args:
+            ref_mode: 是否带消息编号 / 引用前缀（被引用的消息，或开了 `AI_ALWAYS_INCLUDE_MSG_ID`）。
+                只管前缀，**与令牌无关**：旧写法把它直接当 `travel_mode` 传下去，引用到的消息里的图片、
+                文件、@ 与工具结果都被渲染成没有令牌的裸文。
+            travel_mode: 漫游记录用的渲染（调用方没有本轮令牌，传空串），资源段不带令牌；
+                不可信内容的边界在任何模式下都保留。
+        """
+        content = convert_raw_msg_data_json_to_msg_prompt(self.content_data, one_time_code, config, travel_mode)
         content = limited_text_output(content, config.AI_CONTEXT_LENGTH_PER_MESSAGE, placeholder="(content too long, omitted)")
         time_str = datetime.datetime.fromtimestamp(self.send_timestamp).strftime("%m-%d %H:%M:%S")
 
@@ -153,6 +173,11 @@ def convert_raw_msg_data_json_to_msg_prompt(json_data: str, one_time_code: str, 
                     nodes=len(seg.forward_content),
                 )
             )
+        elif isinstance(seg, ChatMessageSegmentUntrusted):
+            result = UntrustedToolResult(kind=seg.kind, body=seg.text, summary=seg.summary, attrs=seg.attrs)
+            # 工具结果的正文来自外部（模型看过视频之后写的话、抓来的网页），任何渲染模式下都要有不可信边界；
+            # 漫游模式拿不到本轮令牌，边界里的令牌是空的，但 `trust:untrusted` 标注仍在
+            prompt_str += render_untrusted_result(one_time_code, result)
         elif isinstance(seg, ChatMessageSegment):
             prompt_str += seg.text
 

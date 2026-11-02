@@ -73,6 +73,7 @@ Webhook 与静默时段，不再只能等平台方发现。探活周期
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -201,6 +202,8 @@ class InstanceHealthService:
     def __init__(self) -> None:
         self._states: Dict[Tuple[str, str], _HealthState] = {}
         self._loop_task: Optional[asyncio.Task[None]] = None
+        self._reconcile_task: Optional[asyncio.Task[None]] = None
+        self._audit_task: Optional[asyncio.Task[None]] = None
         self._running: bool = False
 
     # ------------------------------------------------------------------
@@ -231,12 +234,20 @@ class InstanceHealthService:
             logger.warning(f"未绑定账号实例的状态改判失败（非致命，这些实例可能仍会误报掉线）: {e}")
 
         self._running = True
+        self._audit_task = asyncio.create_task(self._audit_restart_policies())
         self._loop_task = asyncio.create_task(self._run_loop())
         logger.info(f"实例健康监测已启动，探活周期 {self._check_interval_seconds()}s")
 
     async def stop(self) -> None:
         """停止后台探活循环，确保不留悬挂任务"""
         self._running = False
+        for background in (self._reconcile_task, self._audit_task):
+            if background is not None and not background.done():
+                background.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await background
+        self._reconcile_task = None
+        self._audit_task = None
         task = self._loop_task
         self._loop_task = None
         if task is not None and not task.done():
@@ -433,7 +444,46 @@ class InstanceHealthService:
                 # 单轮失败不能终结循环，否则一次偶发的数据库抖动就让监测永久失效
                 logger.exception(f"实例探活轮次异常: {e}")
 
+    async def _reconcile_containers(self) -> None:
+        """走 docker-guard 的部署：把「应当在跑却已退出」的内置 NapCat 容器经 guard 重新拉起。
+
+        带 Binds 的容器在 guard 下不能交给 Docker 守护进程自动重启（见 `container_manager.napcat_restart_policy`），
+        保活于是落到 NA 手里。不走 guard 时 `reconcile_container_liveness` 第一行就返回，标准部署不受影响。
+        任何失败都只记日志。**本方法在独立任务里跑**（见 `_spawn_reconcile`），不在探活的关键路径上。
+        """
+        try:
+            from nekro_agent.services.console.container_manager import reconcile_container_liveness
+
+            await reconcile_container_liveness()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"容器保活检查失败（不影响探活）: {e}")
+
+    def _spawn_reconcile(self) -> None:
+        """每个探活周期起一次保活任务；上一轮还没结束就不叠加。
+
+        **不能 await 在探活前面**：保活要对 Docker 发 `start`，守护进程挂起时这个调用会一直不返回，
+        串在前面的话全部实例的探活都停摆（本 PR 引入过的回归）。单个实例的时限由 reconcile 自己按实例施加。
+        """
+        task = self._reconcile_task
+        if task is not None and not task.done():
+            return
+        self._reconcile_task = asyncio.create_task(self._reconcile_containers())
+
+    async def _audit_restart_policies(self) -> None:
+        """启动阶段扫一次本部署的内置 NapCat 容器的 RestartPolicy（迁移 / 回滚告警），见 `audit_napcat_restart_policies`。"""
+        try:
+            from nekro_agent.services.console.container_manager import audit_napcat_restart_policies
+
+            await audit_napcat_restart_policies()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"NapCat 容器 RestartPolicy 扫描失败（不影响启动）: {e}")
+
     async def _probe_all(self) -> None:
+        self._spawn_reconcile()
         instances = await DBAdapterInstance.filter(enabled=True).exclude(status__in=list(UNMANAGED_STATUSES))
         if not instances:
             return

@@ -62,11 +62,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      # python-magic 在 Linux 上要系统库 libmagic（PROJECT_STATE §2.8）
-      - name: Install libmagic
+      # python-magic 在 Linux 上要系统库 libmagic（PROJECT_STATE §2.8）；
+      # ffmpeg 给视频分析插件的端到端用例用真实工具链（下面有一步断言这些用例没被跳过）
+      - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmagic1
+          sudo apt-get install -y libmagic1 ffmpeg
 
       - name: Install UV
         uses: astral-sh/setup-uv@v4
@@ -183,4 +184,30 @@ jobs:
               print("\n".join(skipped))
               sys.exit(1)
           print("真 PostgreSQL 用例均已执行")
+          PY
+
+      # 同一条理由：ffmpeg 没装上时视频分析的端到端用例会 skip，整体照样绿
+      - name: Assert ffmpeg tests were not skipped
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          executed = 0
+          skipped = []
+          for case in ET.parse("pytest-report.xml").getroot().iter("testcase"):
+              if "test_video_analysis_plugin" not in (case.get("classname") or ""):
+                  continue
+              executed += 1
+              for node in case.findall("skipped"):
+                  if "ffmpeg" in (node.get("message") or ""):
+                      skipped.append(f"{case.get('classname')}::{case.get('name')}")
+          if skipped:
+              print("以下依赖真实 ffmpeg 的用例被跳过:")
+              print("\n".join(skipped))
+              sys.exit(1)
+          if executed == 0:
+              print("报告里没有视频分析插件的用例，文件被改名或没被收集")
+              sys.exit(1)
+          print(f"视频分析插件用例 {executed} 条，依赖 ffmpeg 的均已执行")
           PY

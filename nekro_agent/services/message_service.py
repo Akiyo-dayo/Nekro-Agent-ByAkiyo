@@ -27,7 +27,14 @@ from nekro_agent.schemas.agent_message import (
     AgentMessageSegmentType,
     convert_agent_message_to_prompt,
 )
-from nekro_agent.schemas.chat_message import ChatMessage, ChatType
+from nekro_agent.schemas.chat_message import (
+    TOOL_RESULT_SENDER_ID,
+    TOOL_RESULT_SENDER_NAME,
+    ChatMessage,
+    ChatMessageSegmentType,
+    ChatMessageSegmentUntrusted,
+    ChatType,
+)
 from nekro_agent.schemas.errors import AdapterUnavailableError
 from nekro_agent.schemas.signal import MsgSignal
 from nekro_agent.services.channel_broadcaster import channel_broadcaster
@@ -42,6 +49,7 @@ from nekro_agent.tools.common_util import (
     copy_to_upload_dir,
     random_chat_check,
 )
+from nekro_agent.tools.untrusted_content import UntrustedToolResult
 
 logger = get_sub_logger("message_pipeline")
 
@@ -375,8 +383,13 @@ class MessageService:
         user: Optional[DBUser] = None,
         trigger_agent: bool = False,
         db_chat_channel: Optional[DBChatChannel] = None,
+        suppress_trigger: bool = False,
     ):
-        """推送人类用户消息"""
+        """推送人类用户消息
+
+        `suppress_trigger` 为真时消息照常落库、广播，但无论什么原因都不排 Agent 任务
+        （适配器判断这条消息已经没有可回应的内容，如私聊里只剩合成 @ 段的单发视频）。
+        """
         db_chat_channel = db_chat_channel or await DBChatChannel.get_channel(chat_key=message.chat_key)
 
         # 闸门必须排在本函数最前面，不能只挡 `schedule_agent_task`：
@@ -476,6 +489,11 @@ class MessageService:
             if any(seg.type in _MEDIA_TYPES for seg in message.content_data):
                 logger.info(f"私聊纯媒体消息，仅记录不触发: {message.content_text[:32]}...")
                 should_trigger = False
+
+        if suppress_trigger and should_trigger:
+            logger.info(f"适配器标记这条消息没有可回应的内容，仅记录不触发: {message.chat_key}")
+            should_trigger = False
+            should_notify_quota_exhausted = False
 
         # 好感度软门：只作用于非明示触发（随机搭话 / 关键词命中）——@、私聊、喊名字、
         # trigger_agent、FORCE_TRIGGER 这类直接召唤永远放行；被降的是环境里的自发参与。
@@ -873,6 +891,55 @@ class MessageService:
                 logger.info(f"系统消息 {content_text} 被插件阻止触发，跳过本次处理...")
                 return
             await self.schedule_agent_task(chat_key=chat_key, ctx=ctx)
+
+    async def push_tool_result(self, chat_key: str, result: UntrustedToolResult) -> None:
+        """落一条不可信的工具结果
+
+        身份既不是 SYSTEM（提示词要求模型信任它）也不是 Bot（会占回复配额）。正文存在消息段里，
+        不带令牌，渲染时才包裹；`content_text` 只放可信摘要，记忆整理与好感评估读的是它。
+        """
+        db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
+        if not await DBAdapterInstance.is_instance_active(db_chat_channel.adapter_key, db_chat_channel.instance_key):
+            logger.debug(f"实例或其所属租户已停用，丢弃工具结果: chat_key={chat_key}")
+            return
+
+        segment = ChatMessageSegmentUntrusted(
+            type=ChatMessageSegmentType.UNTRUSTED,
+            text=result.body,
+            kind=result.kind,
+            summary=result.summary,
+            attrs=result.attrs,
+        )
+        identity = {
+            "message_id": "",
+            "sender_name": TOOL_RESULT_SENDER_NAME,
+            "sender_nickname": TOOL_RESULT_SENDER_NAME,
+            "adapter_key": db_chat_channel.adapter_key,
+            "instance_key": db_chat_channel.instance_key,
+            "platform_userid": TOOL_RESULT_SENDER_ID,
+            "is_tome": 0,
+            "is_recalled": False,
+            "chat_key": chat_key,
+            "content_text": result.summary,
+            "raw_cq_code": "",
+            "ext_data": {},
+            "send_timestamp": int(time.time()),
+        }
+        await DBChatMessage.create(
+            sender_id=TOOL_RESULT_SENDER_ID,
+            chat_type=db_chat_channel.chat_type,
+            content_data=json.dumps([segment.model_dump()], ensure_ascii=False),
+            **identity,
+        )
+        await message_broadcaster.publish(
+            chat_key,
+            ChatMessage(
+                sender_id=TOOL_RESULT_SENDER_ID,
+                chat_type=ChatType(db_chat_channel.chat_type),
+                content_data=[segment],
+                **identity,
+            ),
+        )
 
 
 # 全局消息服务实例

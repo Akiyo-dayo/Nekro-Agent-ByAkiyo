@@ -64,6 +64,7 @@ class PlatformMessage(BaseModel):
     timestamp: int = Field(default_factory=lambda: int(time()), description="消息时间戳")
     is_self: bool = Field(default=False, description="是否为自己发送的消息")
     ext_data: Optional[PlatformMessageExt] = Field(default=PlatformMessageExt(), description="扩展数据")
+    suppress_trigger: bool = Field(default=False, description="照常记录，但不据此触发 Agent（不落库）")
 
 
 # ========================================================================================

@@ -32,6 +32,7 @@ from nekro_agent.schemas.chat_message import (
     ChatMessageSegmentType,
     ChatType,
 )
+from nekro_agent.services.plugin.scope import is_plugin_active
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 # JSON卡片处理常量
@@ -40,6 +41,8 @@ logger = get_sub_logger("adapter.onebot_v11")
 JSON_CARD_FALLBACK_TEXT = "[JSON卡片]"  # i18n: JSON Card fallback placeholder
 FORWARD_FALLBACK_TEXT = "[合并转发消息]"  # i18n: Forward message fallback placeholder
 VOICE_FALLBACK_TEXT = "[语音]"  # i18n: Voice fallback placeholder
+# 只用字符串判断开关，适配器不 import 插件
+VIDEO_ANALYSIS_PLUGIN_KEY = "Akiyo_dayo.video_analysis"
 MAX_FORWARD_DEPTH = 3  # 合并转发最大递归深度
 # 合并转发的内容完全由发送方构造，以下上限用于抑制解析阶段的 CPU/网络/磁盘放大，
 # 以及避免单条消息挤占上下文。深度已有限制，但广度此前是无界的。
@@ -799,6 +802,20 @@ def _extract_detail_from_meta(json_data: dict) -> dict | None:
     return None
 
 
+def is_skipped_video_only(ob_event: object, content_data: List[ChatMessageSegment]) -> bool:
+    """私聊里的消息是否只剩合成的 @ 段，而原消息带着一个被跳过的视频段
+
+    视频插件关着时 `convert_chat_message` 会跳过视频段；私聊没有真正的 @，`msg_to_me` 补上的
+    @ 段就成了整条消息的全部内容，下游把它当成一条“叫了 Bot”的消息，白烧一轮空文本 Agent。
+    只管这一种：别的认不出的段类型、群聊里明确 @ 了 Bot 的消息，行为都与改造前一致。
+    """
+    if getattr(ob_event, "message_type", "") != "private":
+        return False
+    if not content_data or not all(isinstance(seg, ChatMessageSegmentAt) for seg in content_data):
+        return False
+    return any(seg.type == "video" for seg in (getattr(ob_event, "message", None) or []))
+
+
 async def convert_chat_message(
     ob_event: Union[MessageEvent, GroupMessageEvent, GroupUploadNoticeEvent],
     msg_to_me: bool,
@@ -1002,6 +1019,16 @@ async def convert_chat_message(
             else:
                 logger.warning(f"OneBot file message without url or file: {seg}")
                 continue
+
+        elif seg.type == "video":
+            # 插件关着时跳过这一段，与改造前（这里没有 video 分支，和别的认不出的段类型同一条路）一样：
+            # - 群里单发视频，转换结果为空，被匹配器丢弃；
+            # - 私聊里单发视频，下面会补一个合成的 @ 段，消息照旧落库；但整条消息已经没有任何内容，
+            #   不该再触发一轮空文本的 Agent，由 `is_skipped_video_only` 判出来、经 `suppress_trigger` 交给收集器。
+            # 开着时只留占位：不下载（群里的视频动辄几十 MB，会拖住消息链路），也不留链接
+            # （带 rkey，不该进日志、聊天记录和提示词），分析时由插件用 message_id 取新链接。
+            if is_plugin_active(VIDEO_ANALYSIS_PLUGIN_KEY, db_chat_channel.instance_key, db_chat_channel.chat_key):
+                ret_list.append(ChatMessageSegment(type=ChatMessageSegmentType.VIDEO, text=f"[Video: message:{message_id}]"))
 
         elif seg.type in VOICE_SEGMENT_TYPES:
             if voice_transcript_text is None:

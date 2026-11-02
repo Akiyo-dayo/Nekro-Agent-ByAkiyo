@@ -17,9 +17,11 @@ import asyncio
 import json
 import os
 import posixpath
+import re
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
@@ -29,9 +31,13 @@ from nekro_agent.core.logger import logger
 from nekro_agent.services.docker_guard.policy import (
     Decision,
     PolicyContext,
+    bind_recheck_target,
+    body_forbidden,
     body_guard_rule,
     container_ownership_target,
     evaluate,
+    evaluate_container_bind_sources,
+    invisible_bind_roots,
     is_safe_container_ref,
     labels_indicate_ownership,
     network_connect_target,
@@ -55,6 +61,37 @@ _HOP_BY_HOP = frozenset(
 )
 
 _MAX_CREATE_BODY = 1 * 1024 * 1024  # create 请求体上限 1MB，足够容纳任何合法配置
+
+# 碰文件系统的判据（bind source 解析）的执行环境：专用小线程池 + 单次超时。
+# 超时即拒绝（fail-closed）；线程杀不掉，所以解析工作量另有上限（bindpath.ResolveBudget）。
+_POLICY_WORKERS = 4
+_POLICY_TIMEOUT_SECONDS = 5.0
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _contains_lone_surrogate(root: Any) -> bool:
+    """请求体里任何键或字符串值含孤立代理项（合法的代理对 json 已合成为一个字符，不会残留）。迭代遍历，不递归。"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if _LONE_SURROGATE.search(node):
+                return True
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if _LONE_SURROGATE.search(key):
+                    return True
+                stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
+def _reject_json_constant(name: str) -> Any:
+    """`json.loads` 默认接受 NaN / Infinity，Go 的解码器不接受：两边对「这是不是合法 JSON」要一致。"""
+    raise ValueError(f"非法 JSON 常量: {name}")
 
 # 记住本代理亲手建出来的容器 ID 的上限。沙盒容器是一次性的（AutoRemove），删除时会从集合里摘掉；
 # 这个上限只是防御性兜底，避免异常情形下无界增长。超限时清空（大不了退回按 Labels 现查归属）。
@@ -87,6 +124,9 @@ class DockerGuardProxy:
         # 本代理亲手 create 出来的容器 ID（快路径：这些容器的后续 exec/logs/… 无需再 inspect 判归属）。
         # 长命容器（NapCat / CC 工作区）跨代理重启后不在此集合里，会走 inspect + Labels 兜底判归属。
         self._owned_ids: "OrderedDict[str, None]" = OrderedDict()
+        # 碰文件系统的判据（bind source 解析）专用的小线程池 + 超时，见 `_run_blocking`
+        self._executor = ThreadPoolExecutor(max_workers=_POLICY_WORKERS, thread_name_prefix="docker-guard-policy")
+        self._policy_timeout = _POLICY_TIMEOUT_SECONDS
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -98,9 +138,14 @@ class DockerGuardProxy:
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _decide(self, method: str, raw_path: str, body: Optional[Dict[str, Any]]) -> Decision:
-        return evaluate(method, raw_path, self._ctx, body=body)
+        try:
+            return evaluate(method, raw_path, self._ctx, body=body)
+        except RecursionError:
+            # 嵌套过深的请求体：解析能过、深拷贝会爆栈。拒绝，别让它变成 500
+            return Decision(False, "请求体嵌套过深", "body.too_deep")
 
     def _remember_owned(self, container_id: str) -> None:
         if not container_id:
@@ -134,18 +179,15 @@ class DockerGuardProxy:
             return any(full.startswith(container_ref) for full in self._owned_ids)
         return False
 
-    async def _inspect_labels(self, container_ref: str) -> Optional[Dict[str, Any]]:
-        """用代理自己的上游连接 inspect 目标容器，取出 Labels（判归属用，本身不受归属门限制）。
-
-        返回 None 表示容器不存在或 inspect 失败——归属无法确证，调用方按「非本部署」处理。
-        """
+    async def _inspect_json(self, container_ref: str) -> Optional[Dict[str, Any]]:
+        """用代理自己的上游连接 inspect 目标容器，返回整份 JSON；容器不存在或 inspect 失败返回 None。"""
         if not is_safe_container_ref(container_ref):
             # 请求体里来的引用可能含 `/` 或 `..`，会被 yarl 改写成对另一个容器的 inspect
-            logger.warning(f"[docker-guard] 非法容器引用，拒绝判归属: {container_ref!r}")
+            logger.warning(f"[docker-guard] 非法容器引用，拒绝 inspect: {container_ref!r}")
             return None
         session = await self._get_session()
         url = f"http://docker/containers/{container_ref}/json"
-        # 归属判定是同步挡在转发前的一步：inspect 必须自带超时，不能让一次慢 inspect 把请求挂死
+        # inspect 是同步挡在转发前的一步：必须自带超时，不能让一次慢 inspect 把请求挂死
         # （§2.6 教训②：任何等待类调用都要有超时）。inspect 是控制面小请求，10s 足够宽。
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -153,11 +195,49 @@ class DockerGuardProxy:
                     return None
                 data = await resp.json()
         except (aiohttp.ClientError, ValueError, asyncio.TimeoutError) as e:
-            logger.debug(f"[docker-guard] 归属 inspect 失败 {container_ref}: {e}")
+            logger.debug(f"[docker-guard] inspect 失败 {container_ref}: {e}")
             return None
-        config = data.get("Config") if isinstance(data, dict) else None
+        return data if isinstance(data, dict) else None
+
+    async def _inspect_labels(self, container_ref: str) -> Optional[Dict[str, Any]]:
+        """inspect 目标容器取出 Labels（判归属用，本身不受归属门限制）。
+
+        返回 None 表示容器不存在或 inspect 失败——归属无法确证，调用方按「非本部署」处理。
+        """
+        data = await self._inspect_json(container_ref)
+        if data is None:
+            return None
+        config = data.get("Config")
         labels = config.get("Labels") if isinstance(config, dict) else None
         return labels if isinstance(labels, dict) else {}
+
+    async def _inspect_bind_sources(self, container_ref: str) -> Optional[List[str]]:
+        """已存在容器的全部 bind source（`Mounts` 里 Type=bind 的 Source ∪ `HostConfig.Binds` 的 source）。
+
+        取并集而不是二选一：两处本该一致，不一致时宁可多判。inspect 失败返回 None。
+        """
+        data = await self._inspect_json(container_ref)
+        if data is None:
+            return None
+        sources: List[str] = []
+        mounts = data.get("Mounts")
+        if isinstance(mounts, list):
+            for m in mounts:
+                if isinstance(m, dict) and m.get("Type") == "bind" and isinstance(m.get("Source"), str):
+                    sources.append(m["Source"])
+        host_config = data.get("HostConfig")
+        binds = host_config.get("Binds") if isinstance(host_config, dict) else None
+        if isinstance(binds, list):
+            sources.extend(b.split(":", 1)[0] for b in binds if isinstance(b, str))
+        return sources
+
+    async def _verify_container_binds(self, container_ref: str) -> Decision:
+        """start / restart 前复核已存在容器的 bind source（Docker 在 start 时才解析它们）。"""
+        sources = await self._inspect_bind_sources(container_ref)
+        if sources is None:
+            return Decision(False, f"无法 inspect 容器以复核挂载源: {container_ref}", "start.binds.unverifiable")
+        # 同样要碰文件系统：放线程里带超时跑
+        return await self._run_blocking(evaluate_container_bind_sources, sources, self._ctx)
 
     async def _is_owned_container(self, container_ref: str) -> bool:
         """目标容器是否归属本部署：先查亲手建的快表，未命中再 inspect 看 Labels。"""
@@ -171,6 +251,24 @@ class DockerGuardProxy:
             self._remember_owned(container_ref)
             return True
         return False
+
+    async def _run_blocking(self, fn: Callable[..., Decision], *args: Any) -> Decision:
+        """把会碰文件系统的判据放到专用线程里跑，并带超时；超时 / 异常一律拒绝（fail-closed）。
+
+        bind source 的解析要对宿主路径做 `lstat` / `readlink`。在事件循环里同步做的话，一次慢的（NFS、
+        被卡住的挂载点、恶意构造的长链）调用会拖住整个 guard，所有请求一起挂住。线程池是专用的、很小，
+        被卡死的线程只会让后续的判据排队超时（同样拒绝），不会拖住循环。超时后线程本身杀不掉，
+        所以工作量另有上限（`bindpath.ResolveBudget`），两道一起兜。
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(self._executor, fn, *args), timeout=self._policy_timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"[docker-guard] 判据执行超时（>{self._policy_timeout}s），按拒绝处理")
+            return Decision(False, f"判据执行超时（>{self._policy_timeout:g}s），按安全侧拒绝", "policy.timeout")
+        except Exception as e:  # noqa: BLE001 - 判据里的任何意外都不能变成放行，也不该变成 500 泄露细节
+            logger.exception(f"[docker-guard] 判据执行异常，按拒绝处理: {e}")
+            return Decision(False, "判据执行异常，按安全侧拒绝", "policy.error")
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         method = request.method.upper()
@@ -186,16 +284,37 @@ class DockerGuardProxy:
         wants_body = bool(guard_rule)
         if request.can_read_body:
             body_bytes = await request.read()
+        if body_bytes and body_forbidden(method, raw_path):
+            # API <1.24 的 start 会把请求体解码成 HostConfig；NA 与 docker CLI 都不会给 start / restart 发体
+            return self._deny(
+                Decision(False, "start / restart 不允许携带请求体", "containers.body_forbidden"),
+                method,
+                path,
+            )
         if wants_body:
             if len(body_bytes) > _MAX_CREATE_BODY:
                 return self._deny(Decision(False, "请求体过大", "body.too_large"), method, path)
             try:
-                loaded = json.loads(body_bytes.decode("utf-8")) if body_bytes else None
+                loaded = (
+                    json.loads(body_bytes.decode("utf-8"), parse_constant=_reject_json_constant) if body_bytes else None
+                )
                 parsed_body = loaded if isinstance(loaded, dict) else None
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 return self._deny(Decision(False, "请求体非合法 JSON", "body.invalid"), method, path)
+            if parsed_body is not None and _contains_lone_surrogate(parsed_body):
+                # `"\ud800"` 这样的孤立代理项 Python 照单全收，Go 把它换成 U+FFFD：两边看到的字符串不同。
+                # 键名 / 容器引用 / 路径里出现它，判据与 Docker 就不是在判同一个值。NA 的请求里没有这种字符串
+                return self._deny(
+                    Decision(False, "请求体含孤立的 UTF-16 代理项（\\ud800-\\udfff）", "body.invalid"),
+                    method,
+                    path,
+                )
 
-        decision = self._decide(method, raw_path, parsed_body)
+        if needs_create_capture:
+            # create 要解析 bind source（碰文件系统），放线程里带超时跑
+            decision = await self._run_blocking(self._decide, method, raw_path, parsed_body)
+        else:
+            decision = self._decide(method, raw_path, parsed_body)
         if not decision.allow:
             return self._deny(decision, method, path)
 
@@ -204,10 +323,38 @@ class DockerGuardProxy:
         # exec 进宿主上别人的容器（挂了 docker.sock 的 → 宿主 root）、或 inspect 兄弟 postgres 读凭据。
         # 第二个出口在**请求体**里：`POST /networks/{id}/connect` 的目标容器写在 body 上。
         target = container_ownership_target(method, raw_path)
-        body_target = network_connect_target(method, raw_path, parsed_body)
+        # 归属门读的必须是判过的那一份（与实际转发的字节同源），而不是客户端原始结构
+        judged_body = decision.rewritten_body if decision.rewritten_body is not None else parsed_body
+        body_target = network_connect_target(method, raw_path, judged_body)
         for checked in (target, body_target):
             if checked is not None and not await self._is_owned_container(checked):
                 return self._deny_foreign(checked, method, path)
+
+        # 挂载源复核：Docker 在 start / restart 时才解析 bind source，create 时判过的目录此刻可能已被
+        # 换成指向宿主别处的符号链接。归属已确认之后再复核（foreign 容器连 inspect 都不该为它做）。
+        recheck = bind_recheck_target(method, raw_path)
+        if recheck is not None:
+            verdict = await self._verify_container_binds(recheck)
+            if not verdict.allow:
+                return self._deny(verdict, method, path)
+
+        # 凡是判过请求体的端点（create / exec 创建 / exec 启动 / 网络 connect），放行后转发**判过的那一份**
+        # （create 的 bind source 已换成解析后的规范路径；重复键已被 Python 折成一份），而不是客户端原始字节：
+        # 判据看到的结构与 Docker 最终解析的结构必须是同一个。没有判过的结构 = 接线漏了，宁可拒绝。
+        if wants_body:
+            if decision.rewritten_body is None:
+                return self._deny(
+                    Decision(False, "判据放行了请求体却没有给出判过的结构（内部接线错误）", "body.unjudged"),
+                    method,
+                    path,
+                )
+            try:
+                body_bytes = json.dumps(decision.rewritten_body, allow_nan=False).encode("utf-8")
+            except (ValueError, RecursionError):
+                # 例如 `1e999` 能被 Python 解析成 inf，但无法再序列化成 Go 认的 JSON：拒绝，别变成 500
+                return self._deny(Decision(False, "请求体无法按判过的结构重新序列化", "body.invalid"), method, path)
+        elif body_forbidden(method, raw_path):
+            body_bytes = b""  # 上面已确认本来就是空的；这里把「不带体」固定下来，转发不依赖客户端的分块/长度头
 
         # create 成功后要记住新容器 ID（快路径判归属），因此对它缓冲整段响应而非流式透传。
         if needs_create_capture:
@@ -221,7 +368,8 @@ class DockerGuardProxy:
 
     def _deny(self, decision: Decision, method: str, path: str) -> web.Response:
         logger.warning(f"[docker-guard] 拒绝 {method} {path} | rule={decision.rule} | {decision.reason}")
-        payload = {"message": f"docker-guard denied: {decision.reason}"}
+        # `rule` 只是多给调用方 / 运维一个稳定的机读标识；Docker 客户端读的是 `message`
+        payload = {"message": f"docker-guard denied: {decision.reason}", "rule": decision.rule}
         return web.json_response(payload, status=403)
 
     def _deny_foreign(self, container_ref: str, method: str, path: str) -> web.Response:
@@ -335,6 +483,13 @@ async def create_app() -> tuple[web.Application, DockerGuardProxy]:
     logger.info(
         f"[docker-guard] 上游 socket={proxy._upstream_socket} | 允许的 bind 根={list(ctx.allowed_bind_roots)}",
     )
+    for root in invisible_bind_roots(ctx):
+        # 看不到允许根 = 没法验证 bind source 有没有经符号链接逃出去，之后凡是挂在它之下的 create /
+        # start 都会被拒绝（fail-closed）。让运维启动时就看见，别等沙盒起不来。
+        logger.error(
+            f"[docker-guard] 看不到允许的 bind 根目录 {root}：边车需要把数据目录以**同一路径**只读挂进来"
+            "（见 docker/docker-compose-x-hardened.yml），否则挂载在它之下的容器都会被拒绝。详见 docs/docker-guard.md",
+        )
     return app, proxy
 
 

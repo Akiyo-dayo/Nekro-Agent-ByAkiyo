@@ -9,7 +9,7 @@ import re
 import socket
 from functools import lru_cache
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import aiofiles
@@ -57,9 +57,20 @@ DEFAULT_EXTRA_ALLOWED_NETWORKS = "198.18.0.0/15"
 _IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 _IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
+# `is_global` 对这几类返回 True，而它们能绕到 IPv4 内网：地址里嵌着 IPv4（`64:ff9b::7f00:1` 经 NAT64
+# 就是 127.0.0.1，`::127.0.0.1` 是兼容格式，`2002::/16` 是 6to4），`fec0::/10` 是废弃的站点本地段。
+# 都不是正常公网服务会用的地址，整段拒绝，要用的部署写进 DOWNLOAD_EXTRA_ALLOWED_NETWORKS。
+_DENIED_IPV6_NETWORKS: Tuple[ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.IPv6Network(entry) for entry in ("::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "fec0::/10")
+)
+
 
 class UnsafeDownloadUrlError(ValueError):
     """下载链接指向不允许访问的目标"""
+
+
+class UnresolvableDownloadHostError(UnsafeDownloadUrlError):
+    """主机名解析失败：不是策略拒绝，调用方需要时可以和“指向内网”区分开（仍是 `UnsafeDownloadUrlError`，老的捕获不受影响）"""
 
 
 @lru_cache(maxsize=8)
@@ -108,9 +119,13 @@ def _normalize_ip(raw: str) -> _IPAddress:
     return ip
 
 
+def _is_denied_ipv6_form(ip: _IPAddress) -> bool:
+    return ip.version == 6 and any(ip in network for network in _DENIED_IPV6_NETWORKS)
+
+
 def _is_allowed_target_ip(ip: _IPAddress) -> bool:
     """判断出站目标 IP 是否允许访问"""
-    if ip.is_global:
+    if ip.is_global and not _is_denied_ipv6_form(ip):
         return True
     return any(ip.version == network.version and ip in network for network in parse_extra_allowed_networks(OsEnv.DOWNLOAD_EXTRA_ALLOWED_NETWORKS))
 
@@ -142,7 +157,7 @@ async def _assert_url_targets_public_network(url: str, subject: str) -> None:
     try:
         addr_infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
-        raise UnsafeDownloadUrlError(f"{subject}主机名解析失败: {host}") from e
+        raise UnresolvableDownloadHostError(f"{subject}主机名解析失败: {host}") from e
 
     for addr_info in addr_infos:
         ip = _normalize_ip(addr_info[4][0])
@@ -177,6 +192,26 @@ async def assert_download_url_safe(url: str) -> None:
     await _assert_url_targets_public_network(url, "下载链接")
 
 
+def assert_connected_peer_safe(peer_ip: Optional[str]) -> None:
+    """校验已经建立的连接的对端 IP
+
+    `assert_download_url_safe` 解析一次，httpx 连接时再解析一次，DNS 重绑定就发生在这两次之间。
+    读响应体之前按实际对端再判一次，取不到对端按不安全处理。
+
+    Raises:
+        UnsafeDownloadUrlError: 对端不是允许访问的地址，或取不到对端地址
+    """
+    if OsEnv.ALLOW_PRIVATE_NETWORK_DOWNLOAD:
+        return
+    try:
+        ip = _normalize_ip(peer_ip or "")
+    except ValueError as e:
+        raise UnsafeDownloadUrlError("无法确认下载连接的对端地址") from e
+    if not _is_allowed_target_ip(ip):
+        logger.warning(f"拒绝连接到非公网对端的下载: {ip}")
+        raise UnsafeDownloadUrlError("下载连接的对端不是公网地址")
+
+
 async def assert_tenant_endpoint_url_safe(url: str) -> None:
     """校验租户提交的出站接口地址
 
@@ -203,7 +238,7 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
 # `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求 git tag 恰为 `v<版本号>`。
-FORK_VERSION = "0.2.0"
+FORK_VERSION = "0.3.0"
 FORK_AUTHOR = "Akiyo_dayo"
 
 

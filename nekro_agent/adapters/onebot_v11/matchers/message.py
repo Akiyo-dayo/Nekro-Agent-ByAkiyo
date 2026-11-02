@@ -19,7 +19,7 @@ from nekro_agent.adapters.interface import (
 )
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
 from nekro_agent.adapters.onebot_v11.core.instance import resolve_instance_key, set_current_instance
-from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message
+from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message, is_skipped_video_only
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
     gen_chat_text,
     get_chat_info,
@@ -136,6 +136,8 @@ def register_matcher(adapter: BaseAdapter):
             is_tome=bool(is_tome or msg_tome),
             timestamp=int(time.time()),
             ext_data=PlatformMessageExt(ref_msg_id=ref_msg_id),
+            # 视频插件关着、私聊里只剩合成的 @ 段：照常记录，但不触发 Agent
+            suppress_trigger=is_skipped_video_only(event, content_data),
         )
 
         # 提交收集消息

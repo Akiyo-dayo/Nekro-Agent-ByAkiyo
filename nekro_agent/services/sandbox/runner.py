@@ -522,7 +522,10 @@ async def run_code_in_sandbox(
                         f"{USER_UPLOAD_DIR}/{_sanitize_docker_name_part(from_chat_key)}:{CONTAINER_UPLOAD_DIR}:ro",
                     ],
                     "Memory": 512 * 1024 * 1024,  # 内存限制 (512MB)
-                    "NanoCPUs": 1000000000,  # CPU 限制 (1 core)
+                    # CPU 限制 (1 core)。键名必须是 Docker 的规范拼写 `NanoCpus`：Docker 的 JSON 解码大小写不敏感，
+                    # 所以旧拼写 `NanoCPUs` 也能生效，但 docker-guard 对请求体键名按精确键白名单校验、
+                    # 一律拒绝大小写变体（见 docs/docker-guard.md），写成变体会让硬化部署下的沙盒起不来
+                    "NanoCpus": 1000000000,
                     # `no-new-privileges` 阻断容器内通过 setuid/setgid 程序提权。
                     # 它在项目最初是开启的，1.0.0 重构时随着「NA 跑在容器里就整段清空 SecurityOpt」
                     # 一起被注释掉，提交里没有留下任何说明，也没有配套的 issue 或失败记录——
@@ -544,7 +547,12 @@ async def run_code_in_sandbox(
                     "ExtraHosts": list(network_plan.extra_hosts),
                 },
                 "User": "nobody",  # 非特权用户
-                "AutoRemove": True,
+                # 这里曾经还有一个顶层的 `"AutoRemove": True`。`AutoRemove` 是 `HostConfig` 的字段，写在顶层
+                # Docker 并不读（只有「请求里没有 HostConfig 键」的旧扁平写法才会读顶层的 HostConfig 字段，
+                # 而本请求带着 HostConfig），所以它从来没有生效过；docker-guard 把「顶层出现 HostConfig 字段」
+                # 当作扁平写法绕过一律拒绝，保留它会让硬化部署下的沙盒起不来。删除不改变任何 Docker 行为：
+                # 沙盒容器的回收仍由显式清理负责（`_remove_container_by_id` / `_schedule_container_cleanup`）。
+                # 不要「顺手」把它挪进 HostConfig——那会让容器退出即被删，而退出后 NA 还要读日志与退出码。
             },
             network_mode=network_plan.network_mode,
         )

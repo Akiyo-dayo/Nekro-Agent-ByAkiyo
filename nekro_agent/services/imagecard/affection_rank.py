@@ -64,6 +64,7 @@ from PIL import Image, ImageChops, ImageDraw
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_affection import DBAffection
 from nekro_agent.models.db_chat_message import DBChatMessage
+from nekro_agent.schemas.chat_message import TOOL_RESULT_SENDER_ID
 from nekro_agent.services.affection.key import AffectionKey
 from nekro_agent.services.identity_scope import (
     ChannelLike,
@@ -95,6 +96,7 @@ DEFAULT_SCAN_LIMIT = 20000
 
 # Bot 自身发言在消息表里以 sender_id "-1" 记录，不该出现在榜上
 BOT_SENDER_ID = "-1"
+NON_HUMAN_SENDER_IDS = (BOT_SENDER_ID, TOOL_RESULT_SENDER_ID)
 
 
 class RankChannel(ChannelLike, Protocol):
@@ -295,7 +297,7 @@ async def collect_rank_entries(
             chat_key=channel.chat_key,
             send_timestamp__gte=cutoff,
         )
-        .exclude(sender_id=BOT_SENDER_ID)
+        .exclude(sender_id__in=NON_HUMAN_SENDER_IDS)
         .order_by("-send_timestamp")
         .limit(scan_limit)
         .values("platform_userid", "sender_nickname")
@@ -305,7 +307,7 @@ async def collect_rank_entries(
     latest_nickname: Dict[str, str] = {}
     for row in recent:
         userid = str(row["platform_userid"] or "")
-        if not userid or userid == BOT_SENDER_ID:
+        if not userid or userid in NON_HUMAN_SENDER_IDS:
             continue
         latest_nickname.setdefault(userid, str(row["sender_nickname"] or ""))
 

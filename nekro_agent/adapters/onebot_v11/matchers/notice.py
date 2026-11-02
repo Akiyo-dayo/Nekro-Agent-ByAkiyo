@@ -16,6 +16,7 @@ from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
 from nekro_agent.adapters.utils import AdapterUtils
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.chat_message import ChatMessage, ChatMessageSegmentPoke, ChatMessageSegmentType, ChatType
 from nekro_agent.services.message_service import message_service
@@ -165,6 +166,21 @@ class GroupRecallNoticeHandler(BaseNoticeHandler):
         return f"(成员 (qq:{info['user_id']}) 的一条消息被管理员 (qq:{info['operator_id']}) 撤回，但该消息仍然对你可见)"
 
 
+async def mark_message_recalled(chat_key: str, message_id: str) -> int:
+    """把被撤回的消息在库里标出来
+
+    消息内容仍留在聊天记录里（提示词里写明“该消息仍然对你可见”），这个标记是给需要“撤回了就不该再碰”的功能用的，
+    如视频分析按消息编号向协议端要链接之前会先看它。失败只记日志：撤回通知本身还要照常交给 Agent。
+    """
+    if not message_id:
+        return 0
+    try:
+        return await DBChatMessage.filter(chat_key=chat_key, message_id=message_id).update(is_recalled=True)
+    except Exception:
+        logger.warning(f"标记撤回消息失败: chat_key={chat_key} message_id={message_id}", exc_info=True)
+        return 0
+
+
 class GroupAdminNoticeHandler(BaseNoticeHandler):
     """群管理员变动通知处理器"""
 
@@ -273,6 +289,9 @@ async def _(_: Matcher, event: NoticeEvent, bot: Bot):
     info = result["info"]
     # 收到该事件的账号号码是"这条通知是不是冲我来的"的唯一权威来源
     info["self_id"] = bot.self_id
+
+    if isinstance(handler, GroupRecallNoticeHandler):
+        await mark_message_recalled(chat_key, info["message_id"])
 
     # 戳一戳事件：解析目标用户和发送者昵称
     if isinstance(handler, PokeNoticeHandler):

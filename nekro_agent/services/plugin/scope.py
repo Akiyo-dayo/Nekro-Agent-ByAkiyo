@@ -242,6 +242,18 @@ def resolve_plugin_scope_state(
     )
 
 
+def is_plugin_active(plugin_key: str, instance_key: str = "", chat_key: str = "") -> bool:
+    """某个作用域下该插件是否生效。只按配置判，不要求插件已加载，核心代码用它不必 import 插件"""
+    from nekro_agent.core.config import config
+
+    return resolve_plugin_scope_state(
+        plugin_key,
+        plugin_key in config.PLUGIN_ENABLED,
+        get_scope_overrides(OverrideScope.INSTANCE, instance_key),
+        get_scope_overrides(OverrideScope.SESSION, chat_key),
+    ).enabled
+
+
 def resolve_scope_states(instance_key: str = "", chat_key: str = "") -> List[PluginScopeState]:
     """解析全部已加载插件在给定作用域下的生效状态"""
     from nekro_agent.core.config import config

@@ -20,7 +20,7 @@ from nekro_agent.services.agent.provider_refusal import (
     detect_provider_refusal,
     normalize_for_match,
 )
-from nekro_agent.services.agent.session_token import register_session_token
+from nekro_agent.services.agent.session_token import attach_untrusted_result, register_session_token
 from nekro_agent.services.model_group_service import enforce_channel_model_group_scope
 from nekro_agent.services.plugin.prompt_activation import build_plugin_activation_rules
 from nekro_agent.services.plugin.scope import resolve_active_plugins
@@ -846,7 +846,7 @@ async def run_agent(
             msg = msg.extend(
                 OpenAIChatMessage.from_text(
                     "user",
-                    f"[Agent Method Response] {sandbox_output}\nPlease continue based on this agent response. Attention: the code after the agent method is NOT EXECUTED!",
+                    f"[Agent Method Response] {attach_untrusted_result(sandbox_output, build_container_key(chat_key), one_time_code)}\nPlease continue based on this agent response. Attention: the code after the agent method is NOT EXECUTED!",
                 ),
             )
 

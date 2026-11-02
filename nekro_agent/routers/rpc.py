@@ -1,5 +1,6 @@
 import json
 import pickle
+from dataclasses import replace
 
 from fastapi import APIRouter, Header, Request, Response
 
@@ -7,6 +8,7 @@ from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.schemas.errors import NotFoundError, UnauthorizedError
 from nekro_agent.schemas.rpc import RPCRequest
+from nekro_agent.services.agent.session_token import hold_untrusted_result
 from nekro_agent.services.message_service import message_service
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.isolation import observe_loop_blocking
@@ -20,6 +22,7 @@ from nekro_agent.services.sandbox.credential_guard import (
     redact_sandbox_text,
     resolve_sandbox_call_grant,
 )
+from nekro_agent.tools.untrusted_content import UNTRUSTED_RESULT_PLACEHOLDER, UntrustedToolResult
 
 logger = get_sub_logger("rpc_bridge")
 router = APIRouter(prefix="/ext", tags=["Tools"])
@@ -82,6 +85,21 @@ async def rpc_exec(
             content=redact_sandbox_text(error_message, secret_values),
             media_type="application/octet-stream",
             headers={"Method-Type": method_type.value, "Run-Error": "True"},
+        )
+
+    if isinstance(result, UntrustedToolResult):
+        # 外部内容不落 SYSTEM、不进沙盒，见 `UntrustedToolResult`。其他返回值逐字走下面的老路
+        result = replace(
+            result,
+            body=redact_sandbox_text(result.body, secret_values),
+            summary=redact_sandbox_text(result.summary, secret_values),
+        )
+        hold_untrusted_result(container_key, result)
+        await message_service.push_tool_result(chat_key=from_chat_key, result=result)
+        return Response(
+            content=pickle.dumps(UNTRUSTED_RESULT_PLACEHOLDER),
+            media_type="application/octet-stream",
+            headers={"Method-Type": method_type.value, "Run-Error": "False"},
         )
 
     result = redact_sandbox_payload(result, secret_values)

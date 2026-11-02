@@ -27,6 +27,7 @@ from nekro_agent.core.config import CoreConfig
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
+from nekro_agent.schemas.chat_message import TOOL_RESULT_SENDER_ID
 from nekro_agent.services.identity_scope import ChannelLike, resolve_identity_scope, resolve_identity_scopes
 from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untrusted_block
 
@@ -37,7 +38,7 @@ from .store import MAX_EVENT_TEXT_LENGTH, MAX_NICKNAME_LENGTH, MAX_STATE_TEXT_LE
 logger = get_sub_logger("affection")
 
 # Bot 与系统消息的发送者标识，不参与好感度
-BOT_SENDER_IDS = frozenset({"-1", "0", ""})
+BOT_SENDER_IDS = frozenset({"-1", TOOL_RESULT_SENDER_ID, "0", ""})
 
 # 提示词块的类型标识，与 `wrap_untrusted_block` 的标签名一致
 AFFECTION_BLOCK_KIND = "AffectionState"

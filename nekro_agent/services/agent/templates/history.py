@@ -13,6 +13,7 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import (
+    TOOL_RESULT_SENDER_ID,
     ChatMessageSegmentImage,
 )
 from nekro_agent.services.identity_scope import ChannelLike
@@ -120,7 +121,7 @@ def _build_rule_based_memory_recall_query(recent_messages: List[DBChatMessage]) 
     non_bot_messages = [
         msg
         for msg in recent_messages
-        if msg.sender_id != "-1" and msg.content_text and msg.content_text.strip()
+        if msg.sender_id not in ("-1", TOOL_RESULT_SENDER_ID) and msg.content_text and msg.content_text.strip()
     ]
     if not non_bot_messages:
         logger.debug("规则记忆检索规划跳过: 最近消息中没有可用的非机器人文本")
