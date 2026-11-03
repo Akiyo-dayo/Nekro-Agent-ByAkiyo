@@ -2,8 +2,8 @@
 
 ## 这里钉的是什么
 
-上一轮把 `/config/set/...` 与 `/config/batch/...` 接上了 `_assert_config_key_accessible`
-（PROJECT_STATE §3 #28），**读侧一条都没接**。于是同一个 `config_key` 命名空间上，
+之前把 `/config/set/...` 与 `/config/batch/...` 接上了 `_assert_config_key_accessible`，
+**读侧一条都没接**。于是同一个 `config_key` 命名空间上，
 写是收着的、读是敞开的：
 
 1. `GET /config/{info,list,get}/{config_key}` 从路径原样收下 `config_key`，而它能编码

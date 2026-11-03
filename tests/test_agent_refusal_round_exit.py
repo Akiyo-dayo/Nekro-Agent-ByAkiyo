@@ -547,7 +547,7 @@ class TestOrdinarySandboxErrorsKeepTheOldSemantics:
             await harness.run()
 
         assert harness.sandbox_calls == 2, "普通沙盒错误的重试语义被改动了"
-        # §3 #58：`max_retry=2` 的回合发 2 次请求（改造前 3 次，最后那次结果无人消费）
+        # `max_retry=2` 的回合发 2 次请求（改造前 3 次，最后那次结果无人消费）
         assert harness.llm_calls == 2
         assert NORMAL_CODE_EXTRACTED in contexts[1], "模型原文没有像既有语义那样回喂进上下文"
         assert "invalid syntax" in contexts[1], "沙盒报错原文没有回喂进上下文"

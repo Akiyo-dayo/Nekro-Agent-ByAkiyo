@@ -35,6 +35,7 @@ import BasicInfo from './detail-tabs/BasicInfo'
 import MessageHistory from './detail-tabs/MessageHistory'
 import OverrideSettings from './detail-tabs/OverrideSettings'
 import PluginData from './detail-tabs/PluginData'
+import CommandPermissions from './detail-tabs/CommandPermissions'
 import DangerZone from './detail-tabs/DangerZone'
 import { CARD_VARIANTS } from '../../../theme/variants'
 import { useMediaQuery } from '@mui/material'
@@ -56,6 +57,7 @@ const CHAT_CHANNEL_TAB_ORDER: ChatChannelDetailTab[] = [
   'override-settings',
   'basic-info',
   'plugin-data',
+  'command-permissions',
 ]
 
 export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, onBack }: ChatChannelDetailProps) {
@@ -313,6 +315,7 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
           <Tab label={t('channelDetail.tabs.overrideSettings')} />
           <Tab label={t('channelDetail.tabs.basicInfo')} />
           <Tab label={t('channelDetail.tabs.pluginData')} />
+          <Tab label={t('channelDetail.tabs.commandPermissions')} />
         </InlineTabs>
       </Card>
 
@@ -359,6 +362,11 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
             {currentTab === 'plugin-data' && (
               <Card sx={{ ...CARD_VARIANTS.default.styles, height: '100%', minWidth: 0, overflowY: 'auto', overflowX: 'hidden' }}>
                 <PluginData chatKey={chatKey} />
+              </Card>
+            )}
+            {currentTab === 'command-permissions' && (
+              <Card sx={{ ...CARD_VARIANTS.default.styles, height: '100%', minWidth: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+                <CommandPermissions chatKey={chatKey} />
               </Card>
             )}
           </Box>

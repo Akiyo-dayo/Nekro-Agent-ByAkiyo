@@ -143,7 +143,7 @@ class ModelGroupInfo(BaseModel):
     owner_tenant_id: Optional[int] = Field(default=None, description="归属租户；平台组为 None")
     # **刻意没有默认值。** 这里曾经写着 `default="shared"` —— 那是"新建组默认可见性"这个
     # 判据的第**五**份副本（另外四份：字段默认、`create_group()` 形参、
-    # `upsert_platform_group()`、`import_config_group()`，round-22 已收敛到
+    # `upsert_platform_group()`、`import_config_group()`，现已收敛到
     # `models/db_model_group.DEFAULT_VISIBILITY`）。它今天恰好走不到（唯一的构造点
     # `build_model_group_info()` 每次都显式传 `group.visibility`，把它改成 "private"
     # 一条用例都不会红），但它会通过 OpenAPI schema 把 "shared" 宣称成默认值，

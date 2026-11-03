@@ -23,7 +23,7 @@
 以及任何 `row.api_key` 的读取点**一个字都不用改**——也不需要在各处撒解密调用。
 威胁模型（挡库 dump、不挡宿主被拿下）见 `tools/credential_cipher.py`。
 
-## 解不开的密文在一次普通保存中原样保留（PROJECT_STATE §3 #64）
+## 解不开的密文在一次普通保存中原样保留
 
 密钥丢了之后那一行的 ORM 属性是空串（fail-closed，正确），但改造前任何一次
 `row.save()` 都会把空串加密写回、**把还可能被原密钥救回来的密文永久抹掉**。
@@ -39,7 +39,7 @@
   原密钥救回的密文覆盖掉。想替换就填新 Key（非空属性不受守卫限制）；
   想找回原值就先恢复密钥。真正的"丢弃密文"只应发生在恢复过密钥之后。
 
-## 配置文件里的占位符（PROJECT_STATE §3 #61）
+## 配置文件里的占位符
 
 `CoreConfig.dump_config` 把非空 Key 写成 `MODEL_GROUP_API_KEY_PLACEHOLDER`，
 `import_config_group` 识别到它时按"没有可导入的 Key"处理（空 Key 落库 + 点名 WARNING），
@@ -47,7 +47,7 @@
 
 生产路径上占位符在 `CoreConfig.load_config` 时已被归一成空串，所以走到这里的不是占位符本身：
 `bootstrap_model_groups()` 按加载时的记账把这些组还原成占位符再交给本方法，上面的告警分支
-因此在真实启动路径上可达（round-27；此前只有测试直接传占位符才走得到）。
+因此在真实启动路径上可达（此前只有测试直接传占位符才走得到）。
 """
 
 from enum import Enum
@@ -102,7 +102,7 @@ class EncryptedTextField(fields.TextField):
 
     ⚠️ 建表 DDL 仍是 `TEXT`，`api_key` 这个列名也没变：**列名不承诺明文**，而值自己带
     `nkenc1:` 前缀说明自己是密文。刻意不新造一个叫 `xxx_encrypted` 的列，
-    见 PROJECT_STATE 里 `secret_payload_encrypted` 那条教训（名字写着加密、存的是明文）。
+    `secret_payload_encrypted` 就是前车之鉴（名字写着加密、存的是明文）。
     """
 
     def to_db_value(self, value: Any, instance: "Union[type[Model], Model]") -> Any:
@@ -134,7 +134,7 @@ class DBModelGroup(Model):
     # NULL 表示归平台方。未启用多租户时全表恒为 NULL，判定一律走"归平台方"分支
     owner_tenant_id = fields.IntField(null=True, index=True, description="归属租户ID；平台组为 NULL")
     # 默认值取自 `DEFAULT_VISIBILITY`（private），理由见那里。
-    # 存量行不受影响：字段默认只作用于新建行，存量组的逐个复核见 上线前的存量模型组可见性复核。
+    # 存量行不受影响：字段默认只作用于新建行，存量组的可见性要由运维逐个确认。
     # ⚠️ 前端表单的默认值必须与这里一致
     # （`frontend/src/components/model-group/ModelGroupFormDialog.tsx` 的 `DEFAULT_VISIBILITY`）；
     # 两侧相反踩过一次（`ENABLE_VISION` 前端 true / 后端 false，#32），
@@ -225,7 +225,7 @@ class DBModelGroup(Model):
         db = using_db or Tortoise.get_connection("default")
         # 主键转 int 后内联进 SQL，**不用占位符**：SQLite 驱动认 `?`，asyncpg 不转换占位符
         # （只认 `$n`），Postgres 上 `WHERE "id" = ?` 是语法错误——任何空 Key 的已有行
-        # （含内置 `default` 组）的保存都会因此失败，而 SQLite 测试看不见（PROJECT_STATE §2）。
+        # （含内置 `default` 组）的保存都会因此失败，而 SQLite 测试看不见。
         # `int()` 同时是注入防线：`pk` 是 IntField，这里不会有任何字符串能溜进 SQL。
         # 判据见 `tests/test_model_group_postgres_dialect.py`（全仓禁 `?` + 真 PG 用例）。
         rows = await db.execute_query_dict(

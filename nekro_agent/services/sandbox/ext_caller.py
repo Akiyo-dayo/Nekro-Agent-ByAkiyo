@@ -1,9 +1,12 @@
+import inspect
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from nekro_agent.core import config
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.services.plugin.collector import plugin_collector
+from nekro_agent.tools.rpc_codec import sandbox_limits
 
 from .credential_guard import issue_sandbox_call_grant
 
@@ -18,6 +21,35 @@ METHOD_REG_TEMPLATE = """
 def {method_name}(*args, **kwargs):
     pass
 """  #! 沙盒环境下不需要使用异步方式调用，因为实际执行是通过 RPC 调用的
+
+# 方法的参数名与类型说明：沙盒侧按它把超限提示写对（只接受字符串的参数让它截短或分段，路径参数才建议写文件）
+METHOD_PARAMS_TEMPLATE = """
+_RPC_METHOD_PARAMS[{method_name}] = {params}
+"""
+
+_MAX_ANNOTATION_CHARS = 60
+
+
+def describe_method_params(func: Callable[..., Any]) -> List[Tuple[str, str]]:
+    """`[(参数名, 类型说明), ...]`，跳过第一个参数（`_ctx`）与 `*args` / `**kwargs`；取不到签名时返回空表"""
+    try:
+        parameters = list(inspect.signature(func).parameters.values())[1:]
+    except (TypeError, ValueError):
+        return []
+    described: List[Tuple[str, str]] = []
+    for parameter in parameters:
+        if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        annotation = parameter.annotation
+        if annotation is inspect.Parameter.empty:
+            text = ""
+        elif isinstance(annotation, str):
+            text = annotation
+        else:
+            text = inspect.formatannotation(annotation)
+        described.append((parameter.name, text[:_MAX_ANNOTATION_CHARS]))
+    return described
+
 
 # 本地实现的方法本轮不在作用域时，把名字从模块命名空间里删掉。
 # `globals().pop` 而不是 `del`：模板将来若不再定义该函数，`del` 会在导入期抛 NameError 把整个
@@ -97,10 +129,18 @@ async def get_api_caller_code(container_key: str, from_chat_key: str, ctx: Optio
         .replace("{FROM_CHAT_KEY}", from_chat_key)
         .replace("{RPC_SECRET_KEY}", rpc_token)
         .replace("{RPC_READ_TIMEOUT_SECONDS}", str(resolve_rpc_read_timeout()))
+        # 宿主解码的全部上限写进容器：超限的调用在沙盒里就抛一个说得清楚、能捕获的异常，
+        # 而不是发出去被宿主拒绝（或被中途掐断、在沙盒里看起来像「回调不通」）
+        .replace("{RPC_LIMITS_JSON}", json.dumps(sandbox_limits()))
     )
 
+    exposed = {method.func.__name__: method.func for method in methods}
     for method_name in exposed_method_names:
         base_code += METHOD_REG_TEMPLATE.format(method_name=method_name)
+        base_code += METHOD_PARAMS_TEMPLATE.format(
+            method_name=repr(method_name),
+            params=repr(describe_method_params(exposed[method_name])),
+        )
 
     # 本地实现的方法（`dynamic_importer`）函数体直接写在模板里，不受上面那份清单约束。
     # 不摘掉的话「关掉这个插件」在模型侧毫无效果——它照样能在沙盒里装包，

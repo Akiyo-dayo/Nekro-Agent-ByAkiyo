@@ -2,11 +2,11 @@
 
 ## 缺陷是什么
 
-round-26 给 #47 加了 `NEKRO_SELF_HOSTNAME`（应用层三级回落，见 `tests/test_self_hostname_resolution.py`），
+此前给 #47 加了 `NEKRO_SELF_HOSTNAME`（应用层三级回落，见 `tests/test_self_hostname_resolution.py`），
 文档让运维把它写进 `docker/.env`。但 compose 的 `environment:` 是**显式白名单**、`nekro_agent`
 服务也没有 `env_file`，于是写进 `.env` 的值**进不了容器**——应用层照旧回落到
 `NEKRO_INSTANCE_NAME`，#47 的修复在 Docker 部署（主力形态）里等于没做
-（PROJECT_STATE §2.32 第 2 点是同一种形态：`.env.example` 登记了不等于容器里有）。
+（以前出过同一种形态：`.env.example` 登记了不等于容器里有）。
 
 ## 修法与这里钉的东西
 
@@ -24,8 +24,8 @@ round-26 给 #47 加了 `NEKRO_SELF_HOSTNAME`（应用层三级回落，见 `tes
 3. 一份 compose 若根本没有 `nekro_agent` 服务（dev 文件），要被**明确登记**为豁免，
    并断言它真的没有——哪天有人往里加了 NA 服务，豁免项会先红；
 4. `.env.prod` 里**必须没有**这个键：它被 COPY 进镜像，`run_bot.py` 会把其中 `NEKRO_` 前缀的键
-   无条件覆盖进 `os.environ`，一行空值就会抹掉 compose 传进来的值（§2.32 第 3 点，同一个坑）；
-5. 判据本身带反向对照（§2.34）：删掉那行、默认值改错、`container_name` 改掉，判据都必须报警。
+   无条件覆盖进 `os.environ`，一行空值就会抹掉 compose 传进来的值（以前踩过同一个坑）；
+5. 判据本身带反向对照：删掉那行、默认值改错、`container_name` 改掉，判据都必须报警。
 """
 
 import re
@@ -236,7 +236,7 @@ class TestEnvProdMustNotCarryIt:
         assert SELF_HOSTNAME_KEY not in env_prod
 
     def test_the_reason_is_still_true_run_bot_overrides_nekro_keys_unconditionally(self) -> None:
-        """只钉结论的话，哪天 run_bot 改了行为，这条禁令会变成没人敢动的迷信（§2.32）——
+        """只钉结论的话，哪天 run_bot 改了行为，这条禁令会变成没人敢动的迷信——
         把理由一起钉住：run_bot 仍是把环境文件（`.env.{env}`，镜像里是 `.env.prod`）里
         `NEKRO_` 前缀的键无条件写进 os.environ"""
         source = (REPO_ROOT / "run_bot.py").read_text(encoding="utf-8")

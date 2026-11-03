@@ -68,7 +68,7 @@ class BotManager:
             raise ValidationError(reason=f"实例 {instance_key} 绑定二维码生成超时") from e
         self._bind_clients[instance_key] = client
 
-        instance = await adapter_instance_service.set_status(
+        instance = await adapter_instance_service.set_runtime_status(
             instance,
             "binding",
             "绑定二维码已生成",
@@ -102,13 +102,13 @@ class BotManager:
             return result
         if result.status == BindStatus.EXPIRED:
             await self._set_bind_state(instance, "expired", "绑定会话已过期")
-            await adapter_instance_service.set_status(instance, "session_expired", "绑定会话已过期")
+            await adapter_instance_service.set_runtime_status(instance, "session_expired", "绑定会话已过期")
             self._bind_clients.pop(instance_key, None)
             return result
 
         message = result.error_message or "绑定失败"
         await self._set_bind_state(instance, "failed", message)
-        await adapter_instance_service.set_status(instance, "error", message)
+        await adapter_instance_service.set_runtime_status(instance, "error", message)
         self._bind_clients.pop(instance_key, None)
         return result
 
@@ -120,7 +120,8 @@ class BotManager:
         if connection is None:
             raise ValidationError(reason=f"实例 {instance_key} 缺少有效会话，无法续期")
         await connection.renew_once()
-        return connection.instance
+        # 返回库里的当前行：连接内存里记的是它自己的运行态，实例停用 / 归档时库里并没有跟着变
+        return await DBAdapterInstance.get(id=connection.instance.id)
 
     async def start_instance(self, instance_key: str, *, manual: bool = True) -> BotConnection | None:
         existing = self._connections.get(instance_key)
@@ -140,10 +141,10 @@ class BotManager:
         session = await DBAdapterInstanceSession.get_or_none(instance_id=instance.id)
         if session is None or not session.credentials_json:
             if manual:
-                await adapter_instance_service.set_status(instance, "session_expired", "实例缺少有效会话凭据")
+                await adapter_instance_service.set_runtime_status(instance, "session_expired", "实例缺少有效会话凭据")
             return None
         if self._is_session_expired(session) and not manual:
-            await adapter_instance_service.set_status(instance, "session_expired", "实例会话已过期")
+            await adapter_instance_service.set_runtime_status(instance, "session_expired", "实例会话已过期")
             return None
 
         await self.stop_instance(instance_key)
@@ -169,7 +170,7 @@ class BotManager:
 
         instance = await adapter_instance_service.get_instance(self.adapter_key, instance_key)
         if update_status and instance is not None and instance.status not in ("deleted", "session_expired"):
-            await adapter_instance_service.set_status(instance, "offline", "实例已停止")
+            await adapter_instance_service.set_runtime_status(instance, "offline", "实例已停止")
 
     async def restart_instance(self, instance_key: str) -> BotConnection | None:
         await self.stop_instance(instance_key)
@@ -200,9 +201,13 @@ class BotManager:
         provider_account_id = result.provider_account_id or result.credentials.provider_account_id
         await self._ensure_provider_account_available(instance, provider_account_id)
 
+        # 写新会话之前先停掉可能还在跑的旧连接。`start_bind` 停过一次，但绑定期间实例可能又被拉起来
+        # （手动启动、续期接口）；旧连接的游标回调和消息若落在新凭据写入之后，库里就成了「新凭据 + 旧游标」，
+        # 下次启动带着错的游标。`stop()` 会等监控任务结束，返回之后不会再有回调。
+        await self.stop_instance(instance.instance_key, update_status=False)
         await self._set_bind_state(instance, "login_confirmed", "绑定登录已确认")
         instance.provider_account_id = provider_account_id
-        await instance.save()
+        await instance.save(update_fields=["provider_account_id", "update_time"])
         sync_state = SyncState()
         session = await adapter_instance_service.upsert_session(
             instance=instance,
@@ -219,6 +224,8 @@ class BotManager:
             )
         await self._set_bind_state(instance, "session_persisted", "绑定会话已持久化")
 
+        # 挂新连接之前再停一次：上面几次写库期间若有人把实例拉了起来，那条连接会被下面的赋值顶掉，
+        # 既不在管理器里也没人停它，同一账号就成了两路长轮询。
         await self.stop_instance(instance.instance_key, update_status=False)
         adapter_obj = cast("WeChatILinkMultiAdapter", self._adapter_getter())
         connection = BotConnection(
@@ -256,7 +263,8 @@ class BotManager:
     ) -> None:
         previous_session = await DBAdapterInstanceSession.get_or_none(instance_id=instance.id)
         previous_state = previous_session.session_state if previous_session is not None else ""
-        await adapter_instance_service.set_session_state(instance, bind_status, payload=payload)
+        # payload 只进下面的审计事件，不能交给 set_session_state：它曾经覆盖 sync_state_json（同步游标的载体）
+        await adapter_instance_service.set_session_state(instance, bind_status)
         if previous_state == bind_status:
             return
         await adapter_instance_service.record_event(

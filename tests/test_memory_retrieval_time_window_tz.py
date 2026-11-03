@@ -1,7 +1,7 @@
 """检索时间窗的时区一致性回归（`#5h` 的**读出侧**另一半）。
 
 `#6` 定的规矩是「凡是写进 `DatetimeField` **或拿去与它比较**的时间，一律带时区」。
-round-16 把 `event_time` 的两处写入补齐了，但**拿去比较**的那一半没动：
+之前已经把 `event_time` 的两处写入补齐了，但**拿去比较**的那一半没动：
 
 `MemoryRetriever.retrieve(time_from=..., time_to=...)` 的入参**可能是朴素值**——
 规划模型吐的 JSON（`recall_contract.RecallQuery.time_from` 是 `datetime | None`，

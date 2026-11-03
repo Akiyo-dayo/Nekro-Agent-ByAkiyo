@@ -74,7 +74,7 @@
       "expandAdvanced": "展开高级选项 ▶",
       "collapseAdvanced": "收起高级选项 ▼",
       "nameCopy": "请为复制的模型组设置一个新名称",
-      "nameChar": "组名不能包含URL特殊字符 (如 / ? & # = %)，创建后不可修改",
+      "nameChar": "可用中文、字母数字、空格与常见标点（如 - _ . ( ) : （ ） 【 】 、 ·），最长 64 字符，创建后不可修改",
       "fetchPrecondition": "请先填写 API 地址与密钥后再获取可用模型",
       "modelCapabilities": "模型功能",
       "temperature": "控制输出的随机性 (0-2)",
@@ -96,13 +96,14 @@
       "searchPlaceholder": "搜索组名、模型名或地址",
       "selectAllTestable": "全选可检测项（{{count}}）",
       "clearSelection": "清空选择",
+      "batchDelete": "批量删除（{{count}}）",
       "batchTest": "批量测试模型（{{count}}）",
       "test": "连接测试",
       "createPlatformBtn": "新建平台模型组"
     },
     "validation": {
       "nameRequired": "组名不能为空",
-      "nameInvalid": "组名不能包含URL特殊字符 (如 / ? & # = %)",
+      "nameInvalid": "组名可用中文（及日文假名、韩文）、半角字母数字、空格与 _ . - ( ) + : @ · （ ） 【 】 、 ：；需以文字、字母、数字或左括号开头，不能有连续空格，不能含 / ? # % & = 等字符，最长 64 字符",
       "nameExists": "基础模型组名称 \"{{name}}\" 已存在，请使用其他名称",
       "fetchSuccess": "已获取到 {{count}} 个可用模型",
       "fetchEmpty": "未获取到模型列表，请手动输入模型名称",
@@ -193,12 +194,50 @@
       "testCompleted": "模型测试完成，请查看结果",
       "testFailed": "模型测试失败，请检查配置",
       "testPassed": "模型连通性测试通过",
-      "testError": "测速请求失败"
+      "testError": "测速请求失败",
+      "batchDeleteSuccess": "已删除 {{count}} 个模型组",
+      "batchDeletePartial": "已删除 {{succeeded}} 个，{{failed}} 个未删除：{{details}}"
     },
     "deleteDialog": {
       "title": "确认删除基础模型组",
       "content": "确定要删除基础模型组 \"{{name}}\" 吗？此操作不可恢复！",
       "confirm": "确认删除"
+    },
+    "batchDelete": {
+      "title": "确认批量删除模型组",
+      "content": "确定要删除以下 {{count}} 个模型组吗？此操作不可恢复！",
+      "confirm": "确认删除",
+      "selectAllAria": "全选当前列表中可删除的模型组",
+      "selectRowAria": "选择模型组 {{name}}",
+      "failureItem": "{{name}}（{{reason}}）",
+      "failureSeparator": "；",
+      "failureMore": "…等另外 {{count}} 个",
+      "tenantOwned": "（租户 #{{id}} 自建）",
+      "reasons": {
+        "not_found": "不存在或当前身份不可见",
+        "forbidden": "无权删除",
+        "default_group": "默认模型组不可删除",
+        "error": "删除时出错，详见服务端日志"
+      }
+    },
+    "references": {
+      "checking": "正在检查是否有配置引用要删除的模型组…",
+      "none": "未发现引用要删除的模型组的配置",
+      "noneInScope": "在你能管理的配置中未发现引用要删除的模型组",
+      "failed": "无法检查配置引用（{{error}}），仍可继续删除",
+      "title": "以下配置仍在引用要删除的模型组",
+      "hint": "删除后这些配置会找不到模型组：作为主模型组的引用会让对话直接失败，备用、插件等其他引用会回落到主模型组或报错。建议先把它们改到别的模型组再删除。",
+      "more": "…等另外 {{count}} 处",
+      "entry": "{{where}} · {{field}}",
+      "fieldWithTitle": "{{title}}（{{field}}）",
+      "scopes": {
+        "system": "系统配置",
+        "adapter": "适配器 {{target}} 的覆盖配置",
+        "instance": "实例 {{target}} 的覆盖配置",
+        "channel": "频道 {{target}} 的覆盖配置",
+        "plugin": "插件 {{target}} 的配置",
+        "plugin_instance": "插件 {{target}} 在实例 {{instance}} 上的配置"
+      }
     },
     "visibility": {
       "shared": "开放给租户",
@@ -442,7 +481,7 @@
     "permissions": {
       "public": "公开",
       "user": "用户",
-      "advanced": "高级",
+      "advanced": "频道管理员",
       "super_user": "超级管理员"
     },
     "messages": {

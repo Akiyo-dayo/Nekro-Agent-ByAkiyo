@@ -35,7 +35,7 @@ OneBot V11 的反向 WS 鉴权发生在 **HTTP 握手阶段**，`Adapter._handle
 而 `register_adapter` 发生在 `run_bot.py` 里、**早于** `nonebot.load_from_toml`，
 也就是早于本包被导入。想换成子类就得在 `run_bot.py` 里导入它，
 而 `import nekro_agent.<任何子模块>` 会提前执行 `nekro_agent/__init__.py`
-（§2 #37 记过这条：后果不是报错而是插件静默不加载）。
+（后果不是报错而是插件静默不加载）。
 
 ASGI 中间件挂在 `routers/__init__.py:mount_middlewares()`，那里在应用启动**之前**执行、
 拿得到 `app`，且天然能看见 `scope["type"] == "websocket"` 的握手。
@@ -100,15 +100,18 @@ NoneBot 的 `_handle_http` **完全不校验 access token**（只在配了 `oneb
 """
 
 import secrets
+from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, MutableMapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, MutableMapping, Optional, Set, Tuple
 
 from nonebot.adapters.onebot.utils import get_auth_bearer
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import resolve_deployment_onebot_access_token
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+from nekro_agent.services.user.token_exposure import token_fingerprint
 
 from .channel import ADAPTER_KEY
 
@@ -132,7 +135,11 @@ WS_CLOSE_CODE_POLICY_VIOLATION = 1008
 
 
 class TokenSource(str, Enum):
-    """期望令牌是从哪儿解析出来的（只进日志，不参与判定）"""
+    """期望令牌是从哪儿解析出来的
+
+    握手放不放行不看它（只进日志）；放行之后它跟着握手上下文走（`HandshakeRecord`），
+    超级用户的来源判定只认 `INSTANCE` 与 `DEPLOYMENT` 两档（`services/user/super_users.py`）。
+    """
 
     INSTANCE = "instance"
     """该账号所属实例元数据里的令牌"""
@@ -163,6 +170,60 @@ class ExpectedToken:
     只在「账号还没绑给任何实例」这一格非空，见模块文档「有令牌、还没有账号」那一节。
     里面**只放非空令牌**：空串喂给 `check_token` 会变成"谁都放行"。
     """
+
+
+@dataclass(frozen=True)
+class HandshakeRecord:
+    """一次放行的握手凭的是什么
+
+    中间件放行时把它放进 `_current_handshake` 再交给下游。NoneBot 在这条请求的任务里用
+    `asyncio.create_task(bot.handle_event(event))` 派发事件（反向 WS 与 HTTP 上报都是），
+    新任务复制的是当时的上下文，于是这条连接上派发的每一个事件都能回查到它是怎么握手的；
+    两条连接、两次 HTTP 上报各在各的上下文里，互相读不到。
+
+    事件归属只看握手请求头里的账号（`bot.self_id`），而握手时这个账号可能还没绑定、
+    靠的是备选令牌，或者事后被并进了别的实例——光看事件归属的实例判不出这条连接背后是谁。
+    """
+
+    self_id: str
+    source: TokenSource
+    instance_key: str
+    """握手时账号解析到的实例；账号还没绑定时为空"""
+
+    token_fingerprint: str
+    """放行时匹配上的那枚期望令牌的指纹；期望令牌为空（不校验）时为空串"""
+
+
+_current_handshake: ContextVar[Optional[HandshakeRecord]] = ContextVar("onebot_handshake", default=None)
+
+
+def current_handshake() -> Optional[HandshakeRecord]:
+    """当前事件所在连接的握手记录；没经过本中间件的路径（含 NA 主动连出去的正向 WS）为 None"""
+    return _current_handshake.get()
+
+
+# 账号还没绑定实例时握手出示过的令牌指纹。账号之后被并进 / 改绑到租户实例上时，这些令牌就在那个租户手里了
+# （`token_exposure.record_account_landing_on_tenant`）。已绑定账号出示的就是所属实例的令牌，按库里的行就能算出来，不必记。
+# 只在内存里、重启清空；条目有上限，按最近使用淘汰：备选令牌对任意未绑定账号都有效，不设上限就能被刷账号号码撑大
+_PRESENTED_ACCOUNT_LIMIT = 65536
+_presented_by_unbound_account: "OrderedDict[str, Set[str]]" = OrderedDict()
+
+
+def _remember_unbound_presentation(record: HandshakeRecord) -> None:
+    # 备选令牌那一格的 `instance_key` 是匹配上的那个待绑实例，账号本身同样还没绑定
+    unbound = not record.instance_key or record.source is TokenSource.AWAITING_ACCOUNT
+    if not unbound or not record.self_id or not record.token_fingerprint:
+        return
+    fingerprints = _presented_by_unbound_account.pop(record.self_id, set())
+    fingerprints.add(record.token_fingerprint)
+    _presented_by_unbound_account[record.self_id] = fingerprints
+    while len(_presented_by_unbound_account) > _PRESENTED_ACCOUNT_LIMIT:
+        _presented_by_unbound_account.popitem(last=False)
+
+
+def fingerprints_presented_by(account: str) -> FrozenSet[str]:
+    """这个账号在还没绑定实例时、本进程里握手出示过的令牌指纹"""
+    return frozenset(_presented_by_unbound_account.get(account, ()))
 
 
 @dataclass(frozen=True)
@@ -311,13 +372,15 @@ async def authorize_handshake(self_id: str, presented: Optional[str]) -> Tuple[T
     if verdict.allowed:
         return verdict, expected
 
-    for instance_key, token in expected.awaiting:
-        if check_token(token, presented).allowed:
-            return TokenVerdict(allowed=True), ExpectedToken(
-                token=token,
-                source=TokenSource.AWAITING_ACCOUNT,
-                instance_key=instance_key,
-            )
+    matched = [(instance_key, token) for instance_key, token in expected.awaiting if check_token(token, presented).allowed]
+    if matched:
+        # 放不放行只看有没有匹配上；记哪个实例要求**只匹配上一个**：同一枚令牌对应多个待绑实例时，
+        # 判不出这个协议端是谁建的，实例留空，超级用户的来源判定因此对不上任何实例
+        return TokenVerdict(allowed=True), ExpectedToken(
+            token=matched[0][1],
+            source=TokenSource.AWAITING_ACCOUNT,
+            instance_key=matched[0][0] if len(matched) == 1 else "",
+        )
     return verdict, expected
 
 
@@ -441,7 +504,19 @@ class OneBotAccessTokenMiddleware:
             return
 
         _endorse(scope, resolve_deployment_onebot_access_token())
-        await self.app(scope, receive, send)
+        record = HandshakeRecord(
+            self_id=self_id,
+            source=expected.source,
+            instance_key=expected.instance_key,
+            token_fingerprint=token_fingerprint(expected.token),
+        )
+        _remember_unbound_presentation(record)
+        # 用完复位：同一个任务里后面的请求（HTTP keep-alive）不该继承这一次的握手
+        reset = _current_handshake.set(record)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _current_handshake.reset(reset)
 
 
 async def _reject(scope: MutableMapping[str, Any], receive: Any, send: Any, message: str) -> None:

@@ -300,7 +300,7 @@ class TestReviewTakesTheRowLock:
         assert lock_calls == ["DBIdentityAliasRequest"]
 
     async def test_cancel_locks_the_request_row(self, db, lock_calls) -> None:
-        """撤回与批准/拒绝用同一把行锁（round-27 复核 P2-4）"""
+        """撤回与批准/拒绝用同一把行锁"""
         await submit("r1", "old-1")
 
         canceled = await cancel_alias_request(DOMAIN, "r1")
@@ -355,7 +355,7 @@ class TestReviewTakesTheRowLock:
 
 
 class TestApprovalInvalidatesTheAffectionCacheAfterCommit:
-    """批准的补偿经 `apply_delta` 在事务里写入，缓存失效必须有一次发生在提交**之后**（round-27 第二轮复核 P2-7）
+    """批准的补偿经 `apply_delta` 在事务里写入，缓存失效必须有一次发生在提交**之后**
 
     只在提交之前失效：并发读者在失效与提交之间读到旧分数并重新缓存，补进去的好感在 TTL 内读不到。
     事务内 `apply_delta` 自带的那次失效无害（被提交后的那次覆盖），要钉住的是「最后一次在提交之后」。
@@ -469,7 +469,7 @@ async def pg_env():
     """独占 schema 里的 `identity_*` 三张表（由 Tortoise 按模型建，**不含**迁移 26 的索引）
 
     索引由各用例按需 `apply_migration_26()` 铺——有的用例要先摆出「铺索引之前的存量重复行」。
-    EXECUTOR_CACHE 进出两端都清（进程级、不含方言，见 PROJECT_STATE §2.43）。
+    EXECUTOR_CACHE 进出两端都清（进程级、不含方言）。
     """
     dsn = _pg_dsn_or_skip()
     import asyncpg
@@ -683,7 +683,7 @@ class TestConcurrentReviewsDoNotOverwriteEachOther:
         assert final.reviewed_by == ("ops-a" if approve_ok else "ops-b")
 
     async def test_approve_and_cancel_race_never_turns_approved_into_canceled(self, pg_env: str, monkeypatch) -> None:
-        """撤回与批准并发（round-27 复核 P2-4）：撤回无锁时先读到 pending，写入阻塞在批准持有的行锁上，
+        """撤回与批准并发：撤回无锁时先读到 pending，写入阻塞在批准持有的行锁上，
         批准提交之后撤回把 approved 覆盖成 canceled——别名已建、补偿已记，单子却显示申报人撤回了"""
         await apply_migration_26()
         request = await submit("r1", "old-1")

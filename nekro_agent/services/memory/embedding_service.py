@@ -164,7 +164,7 @@ class EmbeddingService:
 
             except httpx.HTTPStatusError as e:
                 last_error = e
-                # §3 #39 的同一条判据：`detail` 抄的是**上游响应体原文**，而供应商在 4xx 体里
+                # 上游异常脱敏的同一条判据：`detail` 抄的是**上游响应体原文**，而供应商在 4xx 体里
                 # 回显 `Authorization` 头 / `Incorrect API key provided: sk-…` 是常见形态。
                 # Embedding 是第二个直连上游的通道（第一个是 chat），判据共用 `upstream_redaction`
                 # 那一份，不在这里另写一套（另写就是 §2.10 的判据分叉）。

@@ -53,7 +53,7 @@ class ModelConfigGroup(ConfigBase):
     EXTRA_BODY: Optional[str] = Field(default=None, title="额外参数 (JSON)")
 
 
-# 配置文件里 `MODEL_GROUPS.*.API_KEY` 的占位符（PROJECT_STATE §3 #61）
+# 配置文件里 `MODEL_GROUPS.*.API_KEY` 的占位符
 #
 # `refresh_runtime_view()` 会把运行时视图 dump 回 `<DATA_DIR>/configs/nekro-agent.yaml`，
 # 改造前那份 YAML 里的 Key 是**明文**——整目录打包的备份照样带出全部 Key。现在 dump 侧
@@ -186,7 +186,11 @@ class CoreConfig(ConfigBase):
     SUPER_USERS: List[str] = Field(
         default=[],
         title="管理员列表",
-        description="此处指定的管理员用户可在 OneBot V11 适配器频道中使用指令 (填写 QQ 号)",
+        description=(
+            "此处指定的管理员用户可在聊天里使用超级用户指令。纯号码为 OneBot V11 的 QQ 号；"
+            "其他平台写成「适配器标识:用户ID」，例如 telegram:123456。只在平台方可信的来源生效："
+            "租户名下的实例、待认领实例、发送者 ID 可由调用方填写的适配器（SSE、邮件等）里不生效。只有超级管理员可以修改"
+        ),
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
                 zh_CN="基础设置",
@@ -197,8 +201,17 @@ class CoreConfig(ConfigBase):
                 en_US="Administrator List",
             ),
             i18n_description=i18n_text(
-                zh_CN="此处指定的管理员用户可在 OneBot V11 适配器频道中使用指令 (填写 QQ 号)",
-                en_US="Administrators specified here can use commands in the OneBot V11 adapter channel (fill in QQ number)",
+                zh_CN=(
+                    "此处指定的管理员用户可在聊天里使用超级用户指令。纯号码为 OneBot V11 的 QQ 号；"
+                    "其他平台写成「适配器标识:用户ID」，例如 telegram:123456。只在平台方可信的来源生效："
+                    "租户名下的实例、待认领实例、发送者 ID 可由调用方填写的适配器（SSE、邮件等）里不生效。只有超级管理员可以修改"
+                ),
+                en_US=(
+                    "Users listed here can use super user commands in chat. A plain number is a OneBot V11 QQ number; "
+                    "for other platforms write adapter_key:user_id, e.g. telegram:123456. Only honoured from sources the "
+                    "platform can vouch for: not in tenant-owned instances, unclaimed instances, or adapters whose sender "
+                    "IDs are supplied by the caller (SSE, email, ...). Only super admins can change it"
+                ),
             ),
         ).model_dump(),
     )
@@ -513,6 +526,92 @@ class CoreConfig(ConfigBase):
                 zh_CN="知识库向量化使用的维度，需要与所选 embedding 模型和 Qdrant 索引保持一致",
                 en_US="Embedding dimension used by the knowledge base, which must match the selected embedding model and Qdrant index",
             ),
+        ).model_dump(),
+    )
+    # 默认 2（上游 3）：工作区文档与全局素材各一个信号量，实际并发翻倍；
+    # 每个索引任务在切换前要把整份文档的向量留在内存里，小内存部署按 2 × 2 估算峰值
+    KB_INDEX_CONCURRENCY: int = Field(
+        default=2,
+        title="知识库索引并发数",
+        description="同时进行的知识库索引任务数（工作区文档与全局资产各按此值限制）。设为 1 时逐个串行索引，调大可加快批量索引，但会增加 Embedding 服务与 Qdrant 负载。修改后需重启服务生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="知识库", en_US="Knowledge Base"),
+            i18n_title=i18n_text(zh_CN="知识库索引并发数", en_US="Knowledge Base Index Concurrency"),
+            i18n_description=i18n_text(
+                zh_CN="同时进行的知识库索引任务数（工作区文档与全局资产各按此值限制）。设为 1 时逐个串行索引，调大可加快批量索引，但会增加 Embedding 服务与 Qdrant 负载。修改后需重启服务生效",
+                en_US="Number of concurrent knowledge base indexing tasks (workspace documents and global assets are each limited by this value). Set to 1 for fully serial indexing; higher values speed up batch indexing at the cost of heavier Embedding service and Qdrant load. Restart required after changing",
+            ),
+            placeholder="建议 1~8",
+        ).model_dump(),
+    )
+    KB_ZIP_MAX_UPLOAD_SIZE_MB: int = Field(
+        default=100,
+        title="知识库 Zip 单包大小上限 (MB)",
+        description="知识库 zip 批量导入时单个压缩包的大小上限（MB），超限拒绝上传。修改后需重启服务生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="知识库", en_US="Knowledge Base"),
+            i18n_title=i18n_text(zh_CN="知识库 Zip 单包大小上限 (MB)", en_US="Knowledge Base Zip Upload Size Limit (MB)"),
+            i18n_description=i18n_text(
+                zh_CN="知识库 zip 批量导入时单个压缩包的大小上限（MB），超限拒绝上传。修改后需重启服务生效",
+                en_US="Size limit (MB) for a single zip archive when batch-importing into the knowledge base; uploads exceeding it are rejected. Restart required after changing",
+            ),
+            placeholder="建议 50~500",
+        ).model_dump(),
+    )
+    KB_ZIP_MAX_EXTRACT_SIZE_MB: int = Field(
+        default=500,
+        title="知识库 Zip 解压总大小上限 (MB)",
+        description="知识库 zip 批量导入时解压后文件总大小上限（MB），用于防止 zip 炸弹。修改后需重启服务生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="知识库", en_US="Knowledge Base"),
+            i18n_title=i18n_text(zh_CN="知识库 Zip 解压总大小上限 (MB)", en_US="Knowledge Base Zip Extract Size Limit (MB)"),
+            i18n_description=i18n_text(
+                zh_CN="知识库 zip 批量导入时解压后文件总大小上限（MB），用于防止 zip 炸弹。修改后需重启服务生效",
+                en_US="Total extracted size limit (MB) for knowledge base zip import, used to guard against zip bombs. Restart required after changing",
+            ),
+            placeholder="建议 100~2000",
+        ).model_dump(),
+    )
+    KB_ZIP_MAX_FILES: int = Field(
+        default=500,
+        title="知识库 Zip 文件数上限",
+        description="知识库 zip 批量导入时单个压缩包允许的最大文件条目数。修改后需重启服务生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="知识库", en_US="Knowledge Base"),
+            i18n_title=i18n_text(zh_CN="知识库 Zip 文件数上限", en_US="Knowledge Base Zip File Count Limit"),
+            i18n_description=i18n_text(
+                zh_CN="知识库 zip 批量导入时单个压缩包允许的最大文件条目数。修改后需重启服务生效",
+                en_US="Maximum number of file entries allowed in a single zip archive for knowledge base import. Restart required after changing",
+            ),
+            placeholder="建议 100~2000",
+        ).model_dump(),
+    )
+    KB_BATCH_MAX_SIZE: int = Field(
+        default=1000,
+        title="知识库批量操作单请求上限",
+        description="知识库批量删除/解绑/重建索引的单请求 ID 数量上限，超限拒绝。修改后需重启服务生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="知识库", en_US="Knowledge Base"),
+            i18n_title=i18n_text(zh_CN="知识库批量操作单请求上限", en_US="Knowledge Base Batch Operation Size Limit"),
+            i18n_description=i18n_text(
+                zh_CN="知识库批量删除/解绑/重建索引的单请求 ID 数量上限，超限拒绝。修改后需重启服务生效",
+                en_US="Maximum number of IDs per batch request for knowledge base delete/unbind/reindex; exceeding it is rejected. Restart required after changing",
+            ),
+            placeholder="建议 100~5000",
+        ).model_dump(),
+    )
+    KB_BATCH_CONCURRENCY: int = Field(
+        default=8,
+        title="知识库批量操作并发数",
+        description="知识库批量删除/解绑/重建索引时服务端并发处理数。修改后需重启服务生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="知识库", en_US="Knowledge Base"),
+            i18n_title=i18n_text(zh_CN="知识库批量操作并发数", en_US="Knowledge Base Batch Operation Concurrency"),
+            i18n_description=i18n_text(
+                zh_CN="知识库批量删除/解绑/重建索引时服务端并发处理数。修改后需重启服务生效",
+                en_US="Server-side concurrency for knowledge base batch delete/unbind/reindex. Restart required after changing",
+            ),
+            placeholder="建议 1~32",
         ).model_dump(),
     )
     MEMORY_CONSOLIDATION_FORCE_JSON_OUTPUT: bool = Field(
@@ -1375,6 +1474,40 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    ONEBOT_RECORD_SELF_SENT: bool = Field(
+        default=True,
+        title="记录同账号其他程序发出的消息",
+        description=(
+            "OneBot V11：把账号自身发出、但不是 NA 发的消息（如接在同一协议端上的其他框架）记入聊天记录和 AI 上下文。"
+            "这些消息只记录，绝不触发回复。需要协议端开启「上报自身消息」（reportSelfMessage）：内置 NapCat 重启容器后自动开启；"
+            "远程的 NapCat、SnowLuma 默认关闭，要在协议端手动打开（SnowLuma 保存即生效，不用重启）。实例详情页会显示协议端有没有在上报"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="聊天配置",
+                en_US="Chat Configuration",
+            ),
+            overridable=True,
+            i18n_title=i18n_text(
+                zh_CN="记录同账号其他程序发出的消息",
+                en_US="Record Messages Sent by Other Programs on This Account",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "OneBot V11：把账号自身发出、但不是 NA 发的消息（如接在同一协议端上的其他框架）记入聊天记录和 AI 上下文。"
+                    "这些消息只记录，绝不触发回复。需要协议端开启「上报自身消息」（reportSelfMessage）：内置 NapCat 重启容器后自动开启；"
+                    "远程的 NapCat、SnowLuma 默认关闭，要在协议端手动打开（SnowLuma 保存即生效，不用重启）。实例详情页会显示协议端有没有在上报"
+                ),
+                en_US=(
+                    "OneBot V11: record messages this account sent that did not come from NA (such as another framework on the same "
+                    "protocol endpoint) in the chat history and AI context. They are recorded only and never trigger a reply. "
+                    "The endpoint must have \"Report Self Messages\" (reportSelfMessage) enabled: the built-in NapCat turns it on after "
+                    "the container restarts; remote NapCat and SnowLuma have it off by default and must be enabled on the endpoint "
+                    "(SnowLuma applies it on save without a restart). The instance detail page shows whether the endpoint reports them"
+                ),
+            ),
+        ).model_dump(),
+    )
     AI_CHAT_DAILY_REPLY_LIMIT: int = Field(
         default=0,
         title="每日回复数量限制",
@@ -2040,6 +2173,8 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    # 默认值首次启动就会落盘；之后部署端口变了，由启动钩子里的
+    # `services/sandbox/network_guard.reconcile_sandbox_chat_api_url` 纠正（它按这个形态逐字匹配，改形态要同步那边）
     SANDBOX_CHAT_API_URL: str = Field(
         default=f"http://host.docker.internal:{OsEnv.EXPOSE_PORT}/api",
         title="沙盒访问 Nekro API 地址",
@@ -2455,7 +2590,7 @@ class CoreConfig(ConfigBase):
         description="留空表示不启用。告警会以 JSON 形式 POST 到该地址；仅允许 http/https 且必须指向公网地址。按实例生效：频道层的覆盖不参与告警解析",
         json_schema_extra=ExtraField(
             # 按实例覆盖：定制版客户的 Bot 掉线，告警要能发到**他自己**的收件端，
-            # 而不是只落到平台方那一个邮箱（R15 目标 #4）。
+            # 而不是只落到平台方那一个邮箱。
             #
             # 三个标记缺一不可：
             # - `is_secret`：Slack / 飞书 / 钉钉的 webhook **URL 本身就是凭据**。不标的话
@@ -2463,7 +2598,7 @@ class CoreConfig(ConfigBase):
             #   全局那条地址当作"继承值"原样显示出来。
             # - `scope_owned_secret`：标了 secret 之后 `_assert_tenant_may_write` 会连租户写
             #   **自己实例层**都一起拒掉，功能当场死掉。这一项的凭据归属跟着作用域走：
-            #   写在自己实例上的地址就是自己的（DECISIONS「按归属分支，不能一刀切掩码」）。
+            #   写在自己实例上的地址就是自己的（按归属分支，不能一刀切掩码）。
             # - `is_outbound_url`：租户填的地址等于让 NA 代为发起出站请求，写入时强制公网。
             overridable=True,
             is_secret=True,
@@ -2809,6 +2944,28 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    # 上游无条件开启。本分支默认关：机器人归租户，群主 / 群管理员是租户的客户，
+    # 不该不经租户同意就能关掉租户的机器人。租户可以在自己实例或频道的覆盖配置里打开
+    COMMAND_GROUP_ADMIN_AS_CHANNEL_ADMIN: bool = Field(
+        default=False,
+        title="群主与群管理员自动成为频道管理员",
+        description="开启后，群主和群管理员在该群里自动拥有频道管理员命令权限（reset、stop、na_on、na_off、na_observe 等，只能操作本群）。可按实例或频道单独开启",
+        json_schema_extra=ExtraField(
+            overridable=True,
+            i18n_category=i18n_text(
+                zh_CN="基础设置",
+                en_US="Basic Settings",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="群主与群管理员自动成为频道管理员",
+                en_US="Group Owners and Admins Become Channel Admins",
+            ),
+            i18n_description=i18n_text(
+                zh_CN="开启后，群主和群管理员在该群里自动拥有频道管理员命令权限（reset、stop、na_on、na_off、na_observe 等，只能操作本群）。可按实例或频道单独开启",
+                en_US="When enabled, group owners and admins automatically get channel admin command permission in that group (reset, stop, na_on, na_off, na_observe and similar, limited to that group). Can be enabled per instance or channel",
+            ),
+        ).model_dump(),
+    )
     OPENAI_CLIENT_USER_AGENT: str = Field(
         default="nekro-agent",
         title="OpenAI Client User Agent",
@@ -3000,6 +3157,12 @@ class CoreConfig(ConfigBase):
         description="按插件 module_name 覆盖插件提示词激活策略",
         json_schema_extra=ExtraField(is_hidden=True).model_dump(),
     )
+    PLUGIN_CALL_PRIORITIES: Dict[str, Literal["high", "medium", "low"]] = Field(
+        default={},
+        title="插件调用优先级覆盖",
+        description="按插件 module_name 覆盖大模型在同类能力间的调用优先级",
+        json_schema_extra=ExtraField(is_hidden=True).model_dump(),
+    )
 
     # 插件故障隔离：本组配置**有意不标 overridable**。
     # 一个进程内每个插件只加载一份、被所有实例共用，隔离状态因此天然是进程级的；
@@ -3082,7 +3245,7 @@ class CoreConfig(ConfigBase):
             raise PermissionError("高级管理命令未启用，请在配置文件中启用")
         return True
 
-    # ==== 模型组 `API_KEY` 的「落盘形态」记账（#61，round-27 重做）====
+    # ==== 模型组 `API_KEY` 的「落盘形态」记账 ====
     #
     # 内存里 `API_KEY` 只有两种可用形态：明文 / 空串；而 YAML 里有三种：明文（首次部署手写）/
     # 占位符 `nkmask:1`（Key 在数据库里）/ 空串（这个组没配 Key）。`load_config` 把占位符归一成
@@ -3229,7 +3392,7 @@ except Exception as e:
 # 载体，先抹成占位符、随后 bootstrap 之前崩溃 = 首次部署的 Key 永久丢失。
 # 占位符组与空 Key 组在这次 dump 里原样写回（`CoreConfig._dump_data` 的表格）。
 # 掩码从 `bootstrap_model_groups()` 完成数据库接管那一刻开始：只要没有解不开的行，它**每次
-# 启动都落盘一次**，所以升级后首次启动 YAML 里的明文就被掩码（#61，round-27）。
+# 启动都落盘一次**，所以升级后首次启动 YAML 里的明文就被掩码。
 # `tests/test_model_group_yaml_persistence.py` 的 `start_process` 照这一句模拟导入期，并有
 # AST 用例钉住它——改这一句要同步改那边。
 config.dump_config(mask_model_group_secrets=False)
@@ -3249,8 +3412,8 @@ def reload_config():
     读 YAML 得到的新实例**只当字段来源，不注册**（`auto_register=False`）：`ConfigManager["system"]`
     必须始终是下面被就地更新的这个活对象。YAML 里的模型组 `API_KEY` 是占位符（#61），新实例里没有明文；
     若让它顶掉注册表项，`credential_guard.collect_platform_secrets()` 就收不到平台 Key，
-    沙盒 RPC 返回值与 cc_relay 的出口脱敏在下次重启之前都不再遮它们（API Key 隔离硬约束路径 3，
-    round-27 复核 P1-1）。`UnifiedConfigService.reload_config` 对 CoreConfig 也走本函数。
+    沙盒 RPC 返回值与 cc_relay 的出口脱敏在下次重启之前都不再遮它们。
+    `UnifiedConfigService.reload_config` 对 CoreConfig 也走本函数。
     """
     global config
 
@@ -3266,7 +3429,7 @@ def reload_config():
     set_system_lang(SupportedLang(config.SYSTEM_LANG))
 
     # 活对象的字段整体换了，按版本号缓存的频道有效配置（`DBChatChannel._effective_config`）必须作废，
-    # 否则 `conf_reload` 显示成功、实际仍用重载前合并出来的旧值（round-27 第二轮复核 P2-5）。
+    # 否则 `conf_reload` 显示成功、实际仍用重载前合并出来的旧值。
     # 放在这个共同路径本身：聊天命令与 `UnifiedConfigService.reload_config("system")` 都经过这里，
     # 不靠各调用方各写一遍。延迟导入：`config_resolver` 反过来依赖本模块的 `CoreConfig`。
     from nekro_agent.services.config_resolver import config_resolver

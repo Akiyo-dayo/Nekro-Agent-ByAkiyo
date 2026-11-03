@@ -28,7 +28,7 @@
 - 批准/拒绝读单时对该行加 `SELECT ... FOR UPDATE`，并发的两条审批互斥，不会互相覆盖；
 - 批准=手动合并的同一条代码路径，"别名不成链""已被合并"这些校验一条不少；
 - 每一条都落在表上留痕（谁报的、谁批的、什么时候、批语），**不做自动推断**——
-  这与 DECISIONS「把两个不同的人合并，代价远大于多点一下」是同一条原则。
+  原则是：把两个不同的人合并，代价远大于多点一下。
 """
 
 from __future__ import annotations
@@ -238,7 +238,7 @@ async def cancel_alias_request(domain: ScopeDomain, reporter_userid: str) -> DBI
     与批准/拒绝**同一把行锁**（`select_for_update`），写入再带 `status=pending` 条件：
     批准正持锁做合并时，撤回要等它提交，读到的是已审结的单子、直接报「没有待审批的申报」。
     原先无锁读取 + 整行 save，撤回与批准并发会把 `approved` 覆盖成 `canceled`——别名已经建了、
-    补偿已经记了，单子却显示申报人撤回了（round-27 复核 P2-4）。SQLite 没有行锁，
+    补偿已经记了，单子却显示申报人撤回了。SQLite 没有行锁，
     条件 UPDATE 本身是原子的，仍能挡住这种覆盖。
     """
     async with in_transaction():
@@ -314,8 +314,8 @@ async def approve_alias_request(
         await request.save(update_fields=["status", "reviewed_by", "review_note", "reviewed_at", "update_time"])
 
     # 补偿在上面的事务里经 `apply_delta` 写入，它自带的缓存失效发生在**提交之前**：并发读者在失效与提交之间
-    # 读到的还是旧分数、并把它重新缓存起来，补进去的好感在 TTL 内读不到（round-27 第二轮复核 P2-7，
-    # 与入域并入的 P2-6 同一类问题）。提交之后再失效一次才是权威的那一次；事务内的那次无害、被它覆盖。
+    # 读到的还是旧分数、并把它重新缓存起来，补进去的好感在 TTL 内读不到（与入域并入的缓存失效
+    # 是同一类问题）。提交之后再失效一次才是权威的那一次；事务内的那次无害、被它覆盖。
     # 全量失效而不是按键：合并让副号读到的「人」变了，缓存里副号名下的旧快照同样要丢。
     invalidate_cache()
 

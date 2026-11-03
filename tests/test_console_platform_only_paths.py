@@ -13,9 +13,9 @@
   （后端两个端点是 `Role.Super`，会一路 403，但那已经是「拦在最后一道」而不是「进不去」）；
 - 只写 `PLATFORM_ONLY_PATHS` —— 页面进不去，菜单却还画着一格点了就被踢走的入口。
 
-本轮新增 `/console/network-rules` 时正是漏了后者（`visibility: 'platformOnly'` 写了、
+当初新增 `/console/network-rules` 时正是漏了后者（`visibility: 'platformOnly'` 写了、
 数组没写），而前端没有任何测试、`tsc`/`eslint`/`vite build` 三道也全绿 —— 这条用例就是
-为这一类「同一份清单的第二个副本」补的看门人（PROJECT_STATE §2.12 的同一个形态）。
+为这一类「同一份清单的第二个副本」补的看门人。
 
 判据按 **`navigation.tsx` 的源码文本**做：前端没有测试设施，Python 侧解析源码是这个仓库
 已有的做法（见 `tests/test_upload_signed_url.py`）。

@@ -73,8 +73,13 @@ from nekro_agent.schemas.errors import ConflictError, NotFoundError, ValidationE
 from nekro_agent.services.adapter_instance_service import adapter_instance_service
 from nekro_agent.services.chat_key_migration import InstanceMigrationOutcome, migrate_instance_ownership
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
+from nekro_agent.services.user.token_exposure import record_account_landing_on_tenant, record_instances_exposure
 
 logger = get_sub_logger("console.instance")
+
+# 内置 qbob 实例接入的 AppID 存在元数据里（qbob_manager 也用它）；这里只在实例概要里带出
+# 这一个非敏感字段，前端删除确认框据此判断「bot 还接着、但账号可能已被清空」
+METADATA_QBOB_APPID = "qbob_appid"
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -131,6 +136,7 @@ _PROVIDER_MAP: Dict[str, InstanceProvider] = {
     InstanceProvider.BUILTIN_NAPCAT.value: InstanceProvider.BUILTIN_NAPCAT,
     InstanceProvider.REMOTE_ONEBOT.value: InstanceProvider.REMOTE_ONEBOT,
     InstanceProvider.NATIVE.value: InstanceProvider.NATIVE,
+    InstanceProvider.BUILTIN_QBOB.value: InstanceProvider.BUILTIN_QBOB,
     # 协议端自行连入时由 onebot_v11 适配器写入的取值
     "onebot_v11": InstanceProvider.REMOTE_ONEBOT,
 }
@@ -309,6 +315,7 @@ async def build_instance_info(instance: DBAdapterInstance, stats: InstanceStats)
         stats=stats,
         last_error=instance.last_error,
         offline_since=offline_since if isinstance(offline_since, str) else None,
+        qbob_appid=str(metadata.get(METADATA_QBOB_APPID) or ""),
     )
 
 
@@ -463,30 +470,47 @@ async def update_instance(instance: DBAdapterInstance, body: InstanceUpdateReque
     """更新实例的可变属性
 
     `instance_key` 与 `adapter_key` 不在可变集合里（见模块文档）。
+
+    只写本次改了的列：`instance` 是请求开头读出的，整行写回会把这之间别处改的列（租户改划、连接写的状态）冲回旧值。
     """
+    edited: List[str] = []
     if body.display_name is not None:
         instance.display_name = body.display_name.strip()
+        edited.append("display_name")
 
     account_changed = False
     if body.provider_account_id is not None:
         normalized = body.provider_account_id.strip()
         account_changed = normalized != instance.provider_account_id
+        if (
+            account_changed
+            and map_provider(instance.provider) is InstanceProvider.BUILTIN_QBOB
+            and str(load_metadata(instance).get(METADATA_QBOB_APPID) or "")
+        ):
+            # qbob 实例的账号由接入流程按 bot 的 self_id 写入：从这里改 / 清会让 bot 重连时
+            # 落到「未认领实例」，必须走协议端页的解绑，让 qbob 那边的 bot 一起删掉
+            # ConflictError 的文案是「{resource}已存在」，所以按「主体（说明）」的写法
+            raise ConflictError(resource="本实例在 qbob 里接入的 bot（请先在协议端页解绑 qbob，再改账号）")
         if account_changed:
             await assert_account_unbound(instance.adapter_key, normalized, exclude_id=instance.id)
+            # 改绑到租户实例上：这个账号的协议端此前出示过的令牌（比如它待认领时凭的部署级令牌）此刻在租户手里
+            await record_account_landing_on_tenant(instance, normalized, reason=f"账号改绑到租户实例 {instance.instance_key}")
         instance.provider_account_id = normalized
+        edited.append("provider_account_id")
 
     if body.is_default is not None:
         instance.is_default = body.is_default
+        edited.append("is_default")
         if body.is_default:
             # 默认实例在同一适配器下唯一
             await DBAdapterInstance.filter(adapter_key=instance.adapter_key).exclude(id=instance.id).update(
                 is_default=False,
             )
 
+    if edited:
+        await instance.save(update_fields=[*edited, "update_time"])
     if body.enabled is not None and body.enabled != instance.enabled:
         instance = await set_instance_enabled(instance, enabled=body.enabled)
-    else:
-        await instance.save()
 
     if account_changed:
         clear_instance_cache()
@@ -503,12 +527,15 @@ async def sync_account_binding_status(instance: DBAdapterInstance) -> DBAdapterI
 
     只改「描述连接现状」的那几个状态（`UNBOUND_REWRITABLE_STATUSES`）。管理员的停用/归档意图、
     以及适配器自己写的 `login_required` / `binding` 这类更精确的诊断一律不动。
+
+    上面的判断看的是调用方手里的对象，只决定「要不要写」；写入走 `set_runtime_status` 的条件更新，
+    读出之后实例若被停用 / 归档 / 软删（内置 NapCat 回写账号时由容器管理自动调用，窗口在别人手里），这次就不写。
     """
     desired = idle_status_for(instance)
     if instance.status == desired or instance.status.strip().lower() not in IDLE_SWAPPABLE_STATUSES:
         return instance
     message = "实例已解绑账号，暂无可用连接" if desired == STATUS_UNBOUND else "实例已绑定账号，等待协议端连接"
-    return await adapter_instance_service.set_status(instance, desired, message=message)
+    return await adapter_instance_service.set_runtime_status(instance, desired, message=message)
 
 
 async def set_instance_enabled(instance: DBAdapterInstance, enabled: bool) -> DBAdapterInstance:
@@ -542,9 +569,18 @@ async def set_instance_enabled(instance: DBAdapterInstance, enabled: bool) -> DB
     判据每次现查数据库、不带缓存，因此本函数返回即生效，不需要重启进程。
     也**不需要** `clear_instance_cache()`：那个缓存装的是账号与实例的绑定关系，启停不改绑定。
     """
+    if enabled and instance.status == STATUS_TOMBSTONE and instance.tenant_id is not None:
+        # 复活租户名下的软删实例：建档完成后的启动扫描不看软删行，换过的部署级令牌可能就是在它躺着时换的，
+        # 复活之后它此刻生效的令牌又到了租户手里。先记后改，记不下来就拒绝，什么都不动
+        record_instances_exposure([instance], reason="复活租户实例", refuse_on_failure=True)
     instance.enabled = enabled
     if not enabled:
-        return await adapter_instance_service.set_status(instance, STATUS_DISABLED, message="实例已被总后台停用")
+        return await adapter_instance_service.set_status(
+            instance,
+            STATUS_DISABLED,
+            message="实例已被总后台停用",
+            extra_fields=["enabled"],
+        )
 
     if instance.status in (STATUS_DISABLED, STATUS_ARCHIVED, STATUS_TOMBSTONE):
         # 墓碑复活是一条隐蔽的**账号写入路径**：墓碑不算账号占用（见模型层文档），躺着的这段
@@ -570,6 +606,7 @@ async def set_instance_enabled(instance: DBAdapterInstance, enabled: bool) -> DB
             instance,
             idle_status_for(instance),
             message=released or "实例已被总后台启用",
+            extra_fields=["enabled"],
         )
         if released:
             # `set_status` 只为 error/deleted 保留 message，而"我启用的实例怎么没了账号"
@@ -578,7 +615,7 @@ async def set_instance_enabled(instance: DBAdapterInstance, enabled: bool) -> DB
             await instance.save(update_fields=["last_error", "update_time"])
         return instance
 
-    await instance.save()
+    await instance.save(update_fields=["enabled", "update_time"])
     return instance
 
 
@@ -594,7 +631,12 @@ async def claim_instance(instance: DBAdapterInstance, display_name: str) -> DBAd
     instance.display_name = name
     instance.enabled = True
     # 认领只是把实例登记到总后台，此刻的真实连接状态未知，交由掉线监测刷新
-    return await adapter_instance_service.set_status(instance, STATUS_CONNECTING, message=f"实例已被认领: {name}")
+    return await adapter_instance_service.set_status(
+        instance,
+        STATUS_CONNECTING,
+        message=f"实例已被认领: {name}",
+        extra_fields=["display_name", "enabled"],
+    )
 
 
 # ==================== 认领流程：未认领协议端的两条出路 ====================
@@ -726,6 +768,12 @@ async def adopt_unclaimed_instance(
 
     account = source.provider_account_id.strip()
     await assert_account_can_move_to(source, target)
+    if account and target.provider_account_id.strip() != account:
+        # 并进租户实例：源实例是待认领行、没有自己的令牌，它的协议端凭的是部署级令牌，而这个协议端现在归租户了。
+        # 在搬历史之前先记，记不下来就拒绝，什么都不动
+        await record_account_landing_on_tenant(
+            target, account, reason=f"待认领协议端并入租户实例 {target.instance_key}", refuse_on_failure=True,
+        )
 
     migration = await migrate_instance_ownership(source.adapter_key, source.instance_key, target.instance_key)
     if migration.failed_channels:
@@ -752,6 +800,10 @@ async def adopt_unclaimed_instance(
         # 入站路由缓存装的正是「账号 -> 实例」，不清空的话下一条消息还会投给源实例
         clear_instance_cache()
         _warn_if_adoption_changes_the_expected_token(source, target, account)
+        # 不断开这条连接：它握手时账号还属于源实例，超级用户的来源判定不认它，协议端重连一次即恢复
+        logger.warning(
+            f"账号 {account} 已并入 {target.instance_key}：这个协议端要重连一次，聊天里的超级用户命令才会在该实例上生效",
+        )
 
     if target.enabled:
         # 连接此刻还挂在协议端上，真实状态交给掉线监测的下一轮刷新，与就地认领同一套处理
@@ -848,14 +900,16 @@ async def normalize_unbound_instance_status() -> List[str]:
         return []
 
     rewritten: List[str] = []
+    # 自动改判只动启用中的实例；写入仍走条件更新（`set_runtime_status`），候选读出之后被停用的也不会被改
     candidates = await DBAdapterInstance.filter(
         provider_account_id="",
         status__in=sorted(UNBOUND_REWRITABLE_STATUSES),
+        enabled=True,
     ).order_by("id")
     for instance in candidates:
         if not account_binding_required(instance.provider):
             continue
-        await adapter_instance_service.set_status(
+        await adapter_instance_service.set_runtime_status(
             instance,
             STATUS_UNBOUND,
             message="实例从未绑定账号，状态由离线改判为未绑定",
@@ -994,6 +1048,41 @@ async def unbind_duplicate_account_bindings() -> List[AccountBindingRepair]:
     return repairs
 
 
+async def warn_cross_adapter_instance_key_collisions() -> Dict[str, List[str]]:
+    """启动期只读自检：找出被多个适配器同时使用的 `instance_key`，逐个打 WARNING
+
+    数据库的唯一约束只到 `(adapter_key, instance_key)`，而人设、插件开关、记忆、协议端容器名
+    等数据只按 `instance_key` 存取，同名的几个实例会共用同一份；它们分属不同租户时就是跨租户读写。
+    现在的创建路径都会拒绝跨适配器重名，这里只是把升级前留下的存量指给管理员看。
+
+    **只读，不改任何数据**：哪个实例该改名、数据该归谁，只有管理员说得清。
+    空标识（单实例适配器）不算重名。
+
+    Returns:
+        `instance_key` -> 使用它的适配器标识（按字母序）；没有重名时为空字典
+    """
+    adapters_by_key: Dict[str, Set[str]] = {}
+    for adapter_key, instance_key in await DBAdapterInstance.all().values_list("adapter_key", "instance_key"):
+        key = str(instance_key)
+        if not key:
+            continue
+        adapters_by_key.setdefault(key, set()).add(str(adapter_key))
+
+    collisions: Dict[str, List[str]] = {}
+    for instance_key in sorted(adapters_by_key):
+        adapter_keys = sorted(adapters_by_key[instance_key])
+        if len(adapter_keys) < 2:
+            continue
+        collisions[instance_key] = adapter_keys
+        logger.warning(
+            f"实例标识 '{instance_key}' 同时被多个适配器使用：{', '.join(adapter_keys)}。"
+            "人设、插件开关、记忆、协议端容器名等数据只按实例标识存取，这几个实例会共用同一份；"
+            "若它们分属不同租户，就是跨租户读写。请为其中一个改用新的实例标识重建，并核对上述数据的归属。"
+            "本检查只读，不改任何数据。",
+        )
+    return collisions
+
+
 async def _adapter_instance_schema_ready() -> bool:
     """判断 `adapter_instance` 表是否已经具备当前模型的全部列
 
@@ -1022,7 +1111,12 @@ async def archive_instance(instance: DBAdapterInstance) -> DBAdapterInstance:
     """归档实例：停用并置为只读保留，数据全部保留可查"""
     instance.enabled = False
     logger.info(f"归档实例: instance_key={instance.instance_key}, adapter_key={instance.adapter_key}")
-    return await adapter_instance_service.set_status(instance, STATUS_ARCHIVED, message="实例已归档")
+    return await adapter_instance_service.set_status(
+        instance,
+        STATUS_ARCHIVED,
+        message="实例已归档",
+        extra_fields=["enabled"],
+    )
 
 
 async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
@@ -1031,7 +1125,9 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
     统计与删除同处一个事务，且**先落日志再删**：即便后续某步失败整体回滚，
     日志里仍留有这次操作原本要抹掉的数据规模，便于事后核对。
 
-    分区依据：`chat_channel` / `chat_message` / `mem_*` 自带 `instance_key` 列，按列精确匹配；
+    分区依据：`chat_channel` / `chat_message` / `instance_domain_binding` 同时带
+    `adapter_key` 与 `instance_key`，按这一对精确匹配；`mem_*` 只有 `instance_key`，
+    因此存在跨适配器同名实例时整个操作直接拒绝（见函数开头的冲突检查）；
     `exec_code` / `plugin_data` / `recurring_timer_job` 只有 `chat_key`，按
     `{adapter_key}-{instance_key}-` 前缀匹配（`instance_key` 不含 `-`，前缀不会误伤 `inst1` vs `inst10`）。
     定时任务必须一并清除，否则实例没了任务还会继续触发并消耗额度。
@@ -1047,13 +1143,26 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
     """
     instance_key = instance.instance_key
     chat_key_prefix = f"{instance.adapter_key}-{instance_key}-"
+
+    # 记忆与向量只按 instance_key 存：另一个适配器下的同名实例会被连带删掉，
+    # 而那一行实例本身还在，变成一个没有数据的空壳。宁可拒绝也不做不可逆的误删。
+    duplicate = await DBAdapterInstance.filter(instance_key=instance_key).exclude(id=instance.id).first()
+    if duplicate is not None:
+        raise ConflictError(
+            # 文案是「{resource}已存在」：按「主体（说明）」的写法
+            resource=(
+                f"另一个适配器下的同名实例 '{instance_key}'（记忆和向量只按实例标识存，"
+                "彻底删除会连带删掉它的数据；请先归档本实例，或先处理那个同名实例）"
+            ),
+        )
+
     # 容器形态必须在**删行之前**读：删完之后库里已经没有 provider 可查了
     had_builtin_container = instance.provider.strip().lower() == InstanceProvider.BUILTIN_NAPCAT.value
 
     async with in_transaction():
         counts: Dict[str, int] = {
-            "chat_channel": await DBChatChannel.filter(instance_key=instance_key).count(),
-            "chat_message": await DBChatMessage.filter(instance_key=instance_key).count(),
+            "chat_channel": await DBChatChannel.filter(adapter_key=instance.adapter_key, instance_key=instance_key).count(),
+            "chat_message": await DBChatMessage.filter(adapter_key=instance.adapter_key, instance_key=instance_key).count(),
             "exec_code": await DBExecCode.filter(chat_key__startswith=chat_key_prefix).count(),
             "plugin_data": await DBPluginData.filter(target_chat_key__startswith=chat_key_prefix).count(),
             "recurring_timer_job": await DBRecurringTimerJob.filter(chat_key__startswith=chat_key_prefix).count(),
@@ -1063,7 +1172,9 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
             "mem_relation": await DBMemRelation.filter(instance_key=instance_key).count(),
             "adapter_instance_event": await DBAdapterInstanceEvent.filter(instance_id=instance.id).count(),
             "adapter_instance_session": await DBAdapterInstanceSession.filter(instance_id=instance.id).count(),
-            "instance_domain_binding": await DBInstanceDomainBinding.filter(instance_key=instance_key).count(),
+            "instance_domain_binding": await DBInstanceDomainBinding.filter(
+                adapter_key=instance.adapter_key, instance_key=instance_key,
+            ).count(),
         }
         logger.warning(
             f"彻底删除实例 {instance_key}（adapter_key={instance.adapter_key}），级联删除统计: {counts}",
@@ -1076,14 +1187,14 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         await DBMemEntity.filter(instance_key=instance_key).delete()
         await DBMemEpisode.filter(instance_key=instance_key).delete()
         await DBMemParagraph.filter(instance_key=instance_key).delete()
-        await DBChatMessage.filter(instance_key=instance_key).delete()
-        await DBChatChannel.filter(instance_key=instance_key).delete()
+        await DBChatMessage.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBChatChannel.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBAdapterInstanceSession.filter(instance_id=instance.id).delete()
         await DBAdapterInstanceEvent.filter(instance_id=instance.id).delete()
         # 域归属必须一起删掉：`instance_key` 是可以被重新认领的 slug（见 `claim_unclaimed_instance`），
         # 残留的绑定行会让**同名的新实例**（可能属于另一个租户）直接继承被删实例的记忆/好感域。
         # 好感行不在本清单里、也不该在（它挂在域上而不是实例上），因此那份数据会被新实例原样读到。
-        await DBInstanceDomainBinding.filter(instance_key=instance_key).delete()
+        await DBInstanceDomainBinding.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBAdapterInstance.filter(id=instance.id).delete()
 
     clear_instance_cache()

@@ -508,7 +508,7 @@ FACTORY_DEFAULT_CREDENTIAL_CHECKS: Tuple[FactoryDefaultCheck, ...] = (
 
 
 # -----------------------------------------------------------------------------
-# JWT 两把签名密钥与 ADMIN 口令（#40 / docs/operations.md §1.1 §1.2，round-28）
+# JWT 两把签名密钥与 ADMIN 口令（docs/operations.md §1.1 §1.2）
 # -----------------------------------------------------------------------------
 #
 # 与上面 Postgres 那条的**缺键语义相反，且是有意的**：
@@ -518,7 +518,7 @@ FACTORY_DEFAULT_CREDENTIAL_CHECKS: Tuple[FactoryDefaultCheck, ...] = (
 # - ADMIN 口令没设 = admin 登录不可用，不是弱口令 → 不告警。
 #
 # 只在「设了、而且是示例值 / 占位符 / 过短」时告警；两把设成同一个值也告警（refresh 没有独立吊销能力）。
-# 同样有意**不拒绝启动**：拒绝启动会把一条提醒变成一次生产事故（沿用 round-16 口径）。
+# 同样有意**不拒绝启动**：拒绝启动会把一条提醒变成一次生产事故（与上面 Postgres 那条同一口径）。
 # 告警只说键名与后果，不复述取值。
 
 # docs/operations.md §1.1 的判据：长度 >= 32

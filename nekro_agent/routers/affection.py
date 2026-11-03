@@ -76,7 +76,7 @@ from nekro_agent.services.identity_admin import (
 from nekro_agent.services.identity_scope import ScopeDomain
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
-from nekro_agent.services.user.tenant_perm import assert_instance_accessible, get_tenant_scope
+from nekro_agent.services.user.tenant_perm import InstanceRef, assert_instance_accessible, get_tenant_scope
 
 router = APIRouter(prefix="/affection", tags=["Affection"])
 
@@ -280,22 +280,26 @@ def _to_event(event: DBAffectionEvent) -> AffectionEventItem:
     )
 
 
-async def resolve_instance_scope(user: DBUser, instance_key: str) -> str:
+async def resolve_instance_scope(user: DBUser, instance_key: str) -> InstanceRef:
     """把请求里的实例作用域参数解析成当前身份实际可用的作用域
 
-    平台方原样透传（空串即全局视图）；租户必须指定自己名下的实例，
-    传他人的实例标识按 404 处理，不暴露该实例是否存在。
+    Returns:
+        `(adapter_key, instance_key)`。平台方原样透传标识（空串即全局视图）、适配器留空；
+        租户拿到的是归属守卫认定的**那一行**的适配器。
+
+    租户必须指定自己名下的实例，传他人的实例标识按 404 处理，不暴露该实例是否存在。
+    适配器要一并带下去：另一个适配器下可以有归别人的同名实例，只凭标识换算好感域会换到那一边。
     """
     scope = instance_key.strip()
     if get_tenant_scope(user) is None:
-        return scope
+        return "", scope
     if not scope:
         raise ValidationError(reason="租户身份必须指定实例作用域")
-    await assert_instance_accessible(user, scope)
-    return scope
+    instance = await assert_instance_accessible(user, scope)
+    return instance.adapter_key, scope
 
 
-async def _scoped_query(scope: str) -> QuerySet[DBAffection]:
+async def _scoped_query(scope: str, adapter_key: str = "") -> QuerySet[DBAffection]:
     """按实例作用域筛出可见的好感度记录
 
     **作用域是实例，可见范围却是域**。实例被放进实例组之后它的好感行落在
@@ -316,15 +320,15 @@ async def _scoped_query(scope: str) -> QuerySet[DBAffection]:
     """
     if not scope:
         return DBAffection.all()
-    domain = await affection_domain_of_instance(scope)
+    domain = await affection_domain_of_instance(scope, adapter_key=adapter_key)
     if domain is None:
         return DBAffection.filter(instance_key=scope, domain_group_id=SELF_DOMAIN_GROUP_ID)
     return DBAffection.filter(**domain.as_columns())
 
 
-async def _get_visible_record(record_id: int, scope: str) -> DBAffection:
+async def _get_visible_record(record_id: int, scope: str, adapter_key: str = "") -> DBAffection:
     """取一条对该作用域可见的记录，越权一律按不存在处理"""
-    record = await (await _scoped_query(scope)).filter(id=record_id).first()
+    record = await (await _scoped_query(scope, adapter_key)).filter(id=record_id).first()
     if record is None:
         raise NotFoundError(resource="好感度记录")
     return record
@@ -341,8 +345,8 @@ async def get_affection_list(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionListResponse:
-    scope = await resolve_instance_scope(_current_user, instance_key)
-    query = await _scoped_query(scope)
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    query = await _scoped_query(scope, adapter_key)
 
     keyword = search.strip()
     if keyword:
@@ -373,8 +377,8 @@ async def get_affection_summary(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionSummary:
-    scope = await resolve_instance_scope(_current_user, instance_key)
-    query = await _scoped_query(scope)
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    query = await _scoped_query(scope, adapter_key)
 
     total = await query.count()
     counts = {stage.value: 0 for stage in all_stages()}
@@ -401,8 +405,8 @@ async def get_affection_detail(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionDetail:
-    scope = await resolve_instance_scope(_current_user, instance_key)
-    record = await _get_visible_record(record_id, scope)
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
     # 流水按**人**取并集（合并过的副账号那些行也在里面），来源账号逐条标在 `_to_event` 上
     events = await list_events(key_of_record(record), limit=30)
     return AffectionDetail(
@@ -444,8 +448,8 @@ async def adjust_affection(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionItem:
-    scope = await resolve_instance_scope(_current_user, instance_key)
-    record = await _get_visible_record(record_id, scope)
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
     key = key_of_record(record)
     reason = body.reason.strip() or "管理员手动调整"
 
@@ -474,7 +478,7 @@ async def adjust_affection(
     logger.info(
         f"好感度人工调整: operator={_current_user.username}, key={key}, score={snapshot.score}",
     )
-    refreshed = await _get_visible_record(record_id, scope)
+    refreshed = await _get_visible_record(record_id, scope, adapter_key)
     return _to_item(refreshed, await _merged_into_map([refreshed]))
 
 
@@ -490,8 +494,8 @@ async def reset_affection(
     描述文本没有单独的编辑入口，出现不合适的内容时用重置抹掉，
     下一轮评估会重新写一份。
     """
-    scope = await resolve_instance_scope(_current_user, instance_key)
-    record = await _get_visible_record(record_id, scope)
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
     await set_score(
         key_of_record(record),
         score=0,
@@ -501,7 +505,7 @@ async def reset_affection(
         clear_state_text=True,
     )
     logger.info(f"好感度重置: operator={_current_user.username}, record_id={record_id}")
-    refreshed = await _get_visible_record(record_id, scope)
+    refreshed = await _get_visible_record(record_id, scope, adapter_key)
     return _to_item(refreshed, await _merged_into_map([refreshed]))
 
 

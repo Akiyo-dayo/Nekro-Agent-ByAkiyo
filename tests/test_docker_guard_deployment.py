@@ -1,4 +1,4 @@
-"""硬化部署清单（compose + dockerfile）之间的一致性契约（RK3 / PROJECT_STATE §3 #19）。
+"""硬化部署清单（compose + dockerfile）之间的一致性契约（docs/docker-guard.md）。
 
 判据代码写得再对，边车起不来就等于没有这层。这份测试盯的是**代码之外的那两张清单**：
 `docker/docker-compose-x-hardened.yml` 与 `dockerfile`，它们由不同的人在不同的时候改，

@@ -13,6 +13,7 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import (
+    SELF_SENT_SENDER_ID,
     TOOL_RESULT_SENDER_ID,
     ChatMessageSegmentImage,
 )
@@ -121,7 +122,7 @@ def _build_rule_based_memory_recall_query(recent_messages: List[DBChatMessage]) 
     non_bot_messages = [
         msg
         for msg in recent_messages
-        if msg.sender_id not in ("-1", TOOL_RESULT_SENDER_ID) and msg.content_text and msg.content_text.strip()
+        if msg.sender_id not in ("-1", TOOL_RESULT_SENDER_ID, SELF_SENT_SENDER_ID) and msg.content_text and msg.content_text.strip()
     ]
     if not non_bot_messages:
         logger.debug("规则记忆检索规划跳过: 最近消息中没有可用的非机器人文本")
@@ -182,7 +183,7 @@ def _build_rule_based_memory_recall_query(recent_messages: List[DBChatMessage]) 
 
 
 def _redact_llm_error(exc: BaseException, model_group: Optional[ModelConfigGroup]) -> str:
-    """把 LLM 上游异常渲染成可安全落日志的文本（§3 #39 的共享判据）
+    """把 LLM 上游异常渲染成可安全落日志的文本（上游异常脱敏的共享判据）
 
     `model_group` 允许为 None：异常可能发生在拿到模型组之前（配置里根本没有这个组），
     此时只剩「活配置树 + 形态正则」两条判据 —— 仍然有效，只是少了覆盖层那一路的字面量。
@@ -219,7 +220,7 @@ async def _build_enhanced_memory_recall_plan(recent_messages: List[DBChatMessage
 
     prompt = build_enhanced_recall_user_prompt(conversation_lines)
 
-    # 这一跳直连上游，因此它是 §3 #39 的**第五个**出口：`gen_openai_chat_response` 内部
+    # 这一跳直连上游，因此它是上游异常脱敏这条共享判据的**第五个**出口：`gen_openai_chat_response` 内部
     # 打的那条日志已经脱敏，但它是 `raise` 原始异常出来的，下面两个 `except` 拿到的仍是原文。
     # 用的还是**平台方的**模型组（`MEMORY_ENHANCED_RETRIEVAL_MODEL_GROUP` 缺省回落到
     # `USE_MODEL_GROUP`），上游一旦回显 Key，这条 WARNING 就把它写进 `app.log` 与备份。
@@ -245,7 +246,7 @@ async def _build_enhanced_memory_recall_plan(recent_messages: List[DBChatMessage
         # ① 它只是 httpx 的 **read/write 超时**，管的是"两个字节之间等多久"，
         #    上游一直慢慢吐字节就永远不触发；这里要的是**整跳的总预算**。
         # ② 它进 `_get_http_client` 的缓存键，填一个与主链路不同的值会给同一个 base_url
-        #    另开一份连接池，等于把 §3 #9 修掉的那次握手开销又请回来 —— 而规划模型组
+        #    另开一份连接池，等于又请回一次握手开销 —— 而规划模型组
         #    默认回落到的正是主聊天模型组，同一个上游。
         # 顺带记一笔现状：不传 `max_wait_time` 时它取 `or 3600`，也就是一小时的读超时。
         planning_timeout = config.MEMORY_ENHANCED_RETRIEVAL_TIMEOUT_SECONDS

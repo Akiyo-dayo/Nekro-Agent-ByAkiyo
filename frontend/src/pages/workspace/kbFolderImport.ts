@@ -1,5 +1,11 @@
 export const KB_CATEGORY_MAX_LENGTH = 64
 
+/**
+ * 批量上传并发数，受网络带宽与后端内存限制。取 3：服务端每个上传要把整份文件读进内存，
+ * 小内存部署上 5 路 × 单文件上限的峰值太高；几路并发还会分摊上行带宽，单个文件更慢
+ */
+export const BATCH_UPLOAD_CONCURRENCY = 3
+
 export interface FolderImportMetadata {
   category: string
   sourcePath: string

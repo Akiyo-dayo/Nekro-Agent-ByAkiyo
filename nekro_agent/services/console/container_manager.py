@@ -33,7 +33,7 @@ WebUI 尚未就绪或接口形态变化时，退化为扫描容器日志提取�
 与「把账号写回该实例」（`bind_login_account`）。归属推导不猜、不靠日志文本，直接问容器自己的
 WebUI；容器与实例的对应关系是 NA 亲手建立的（容器名模板 + 归属标签），所以这条链上没有歧义。
 
-## 归属标签与容器名的过渡期双识别（§3 #46，**有明确的删除条件**）
+## 归属标签与容器名的过渡期双识别（**有明确的删除条件**）
 
 `nekro.napcat.owner` 的取值从 `OsEnv.INSTANCE_NAME or "default"` 换成了
 `core/os_env.py:deployment_scope()`（与 iptables 标记 / 沙盒容器归属标签同一套派生）；
@@ -123,9 +123,9 @@ DEFAULT_IMAGE_TAG = "latest"
 CONTAINER_NAME_TEMPLATE = "nekro_napcat_{instance_key}"
 """容器名的模板段。
 
-round-26 起新建容器的名字是 `{deployment_scope()}` 前缀 + 这段模板（见
+新建容器的名字是 `{deployment_scope()}` 前缀 + 这段模板（见
 `build_container_name`）；升级前建的存量容器用的则是裸模板名（见
-`build_legacy_container_name`），读认路径要两个都认（#46 容器名这一半的过渡期双识别）。
+`build_legacy_container_name`），读认路径要两个都认（过渡期双识别的容器名那一半）。
 """
 
 CONTAINER_NAME_MAX_LENGTH = 63
@@ -294,7 +294,7 @@ def validate_instance_key(instance_key: str) -> str:
 def build_unshortened_container_name(instance_key: str) -> str:
     """`deployment_scope()` 前缀 + 模板段的**原样展开形态**，不看长度。
 
-    这是 round-26 之前 `build_container_name` 的全部口径。名字总长超过 `CONTAINER_NAME_MAX_LENGTH`
+    这是引入稳定短名之前 `build_container_name` 的全部口径。名字总长超过 `CONTAINER_NAME_MAX_LENGTH`
     （63）时，当前口径改用稳定短名（见 `build_container_name`），而按这个口径建出来的容器
     （名字 64~67 字符，Docker 本身接受）仍在宿主上——所以它只用于**读认**，永不用于新建，
     与 `build_legacy_container_name` 同一类过渡期措施。名字不超长时它与 `build_container_name` 逐字相同。
@@ -396,7 +396,7 @@ def get_owner_tag() -> str:
 
     **不要退回 `OsEnv.INSTANCE_NAME or "default"`**：两种标准部署下那个变量默认都是空串，
     于是同宿主上的两套部署会把标签写成逐字相同的 `default`，控制台可以互相停 / 删 / 重启
-    对方的协议端容器（§3 #46）。
+    对方的协议端容器。
 
     调用时读、不在 import 期定死：测试要能 monkeypatch `OsEnv.INSTANCE_NAME` / `DATA_DIR`
     （§2.9：fake 里写死由环境变量派生的值，换台机器就在测另一件事）。
@@ -790,7 +790,7 @@ async def assert_container_owned(container: DockerContainer, instance_key: str) 
     WebUI 访问令牌**（前端 `logs.tsx` 的 `extractWebuiToken` 正是从这里抠它），`/restart`
     则是货真价实的生命周期操作。容器名此前是**宿主全局**的裸模板名，同宿主上另一套部署里
     同名的 `instance_key` 会解析到同一个容器——这正是 #46 描述的「互相重启对方的协议端容器」，
-    只不过它走的是第二个出口。round-26 起新建容器带部署前缀，但按名取容器仍要认升级前的
+    只不过它走的是第二个出口。现在新建容器带部署前缀，但按名取容器仍要认升级前的
     裸模板名，所以这里对**新旧两个名字**都做同一套判定。
 
     判据必须与 `_assert_owned` **同一份**：两处各写一套的话，同一个容器会出现
@@ -1494,24 +1494,45 @@ def is_managed_entry(entry: NetworkEntry) -> bool:
     return entry.managed_by_nekro or name == MANAGED_ENTRY_NAME or name in LEGACY_MANAGED_ENTRY_NAMES
 
 
+def resolve_self_listen_port() -> int:
+    """NA 进程实际监听的端口 —— 内置 NapCat 反连地址的端口部分
+
+    内置 NapCat 与 NA 在同一张容器网络里，反连走网桥内部直连，端口必须是 NA 进程 bind 的那个，
+    **不是** `OsEnv.EXPOSE_PORT`：标准 compose 是 `"${NEKRO_EXPOSE_PORT:-8021}:8021"`，容器内恒为
+    8021，`EXPOSE_PORT` 只改宿主侧映射。同机第二套部署把它设成 8022 时，连 `nekro_agent:8022`
+    会被拒，实例一直离线。默认部署两者都是 8021，行为不变。
+
+    与 CC 中继、qbob 端点同一个判据（`cc_credential.relay_listen_port`：问 nonebot 驱动，
+    拿不到再退回 `EXPOSE_PORT`）。这是反连 URL 两个写入点（`build_managed_entry` 与
+    `adapters/onebot_v11/routers.py` 的 `ADAPTER_TEMPLATE` 分支）取端口的唯一口径。
+    """
+    from nekro_agent.services.workspace import cc_credential
+
+    return cc_credential.relay_listen_port()
+
+
 def build_managed_entry(instance: DBAdapterInstance) -> NetworkEntry:
     """按当前部署推导 NekroAgent 托管的那条反向 WS 连接
 
-    地址指向 NA 自身（容器网络内的服务名），令牌取实例令牌，两者都不接受调用方传入。
+    地址指向 NA 自身（容器网络内的服务名 + 进程监听端口），令牌取实例令牌，都不接受调用方传入。
 
     主机名走 `resolve_self_hostname()`（#47 的显式可配项）：未配置 `NEKRO_SELF_HOSTNAME`
     时的回落顺序与改造前逐字相同（`INSTANCE_NAME or "nekro_agent"`），行为不变；
     标准 compose 多部署无需再配：`docker/*.yml` 里 NA 服务已默认传
     `NEKRO_SELF_HOSTNAME=${NEKRO_SELF_HOSTNAME:-${INSTANCE_NAME:-}nekro_agent}`（逐字等于容器名），
     「部署前缀」与「反连地址可解析」同时成立（`tests/test_compose_self_hostname.py` 钉住）。
+    端口走 `resolve_self_listen_port()`。
     """
     host = resolve_self_hostname()
     return NetworkEntry(
         type=MANAGED_ENTRY_TYPE,
         name=MANAGED_ENTRY_NAME,
         enable=True,
-        url=f"ws://{host}:{OsEnv.EXPOSE_PORT}/onebot/v11/ws",
+        url=f"ws://{host}:{resolve_self_listen_port()}/onebot/v11/ws",
         token=resolve_access_token(instance),
+        # 要看见同账号其他程序发的消息（`message_sent`），协议端得上报自身消息。NA 自己发的那部分
+        # 回传由适配器去重，见 `adapters/onebot_v11/core/self_sent.py`
+        report_self_message=True,
         managed_by_nekro=True,
     )
 
@@ -1863,7 +1884,7 @@ def _read_webui_token(instance_key: str) -> str:
 async def _resolve_container_dns_name(instance_key: str) -> str:
     """容器网络里这个实例的容器**此刻**该用哪个名字当主机名。
 
-    容器名 round-26 起带部署前缀，但升级前建的存量容器还顶着裸模板名——按新名拼 URL
+    容器名现在带部署前缀，但升级前建的存量容器还顶着裸模板名——按新名拼 URL
     会 DNS 解析失败，扫码 / 快速登录 / 登录账号推导（入站链路）在升级当天全部失效。
     所以按候选表找**归属校验通过**的那个：邻居同名裸模板容器即便解析得到，也不该被 probing。
 
@@ -2101,6 +2122,10 @@ async def bind_login_account(instance: DBAdapterInstance, account_id: str) -> bo
         )
         return False
 
+    # 登录回写到租户实例上：这个账号此前出示过的令牌在租户手里（与 `update_instance` 改绑同一条规矩）
+    from nekro_agent.services.user.token_exposure import record_account_landing_on_tenant
+
+    await record_account_landing_on_tenant(fresh, account, reason=f"登录账号回写到租户实例 {fresh.instance_key}")
     fresh.provider_account_id = account
     await fresh.save(update_fields=["provider_account_id", "update_time"])
     # 账号绑定关系变了就必须让入站路由缓存失效，与 `update_instance` 同一条规矩

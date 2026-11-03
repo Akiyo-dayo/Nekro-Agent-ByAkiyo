@@ -295,7 +295,7 @@ class TestRelayPortDerivation:
 
         这两个数分居两个模块：容器那边是 `resolve_relay_base_url`，防火墙那边是
         `prepare_workspace_network` 里的 `relay_port`。它们对不上是一次没有任何日志线索的黑洞
-        （§3 #33 现场就疑似这个形状），而两边各自的单测都只拿显式传进去的端口做输入，
+        （之前排查过的一次现场就疑似这个形状），而两边各自的单测都只拿显式传进去的端口做输入，
         谁都覆盖不到这次派生。所以这里按 AST 钉住「它只能由那两个函数算出来」：
         写死一个字面量端口、或换用别的来源，都会在这里变红。
         """
@@ -699,7 +699,7 @@ class TestForwarding:
         assert forwarded.headers["host"] == "api.nekro.ai"
 
     async def test_the_upstream_client_pool_is_reused(self, db, upstream) -> None:
-        """每请求新建客户端 = 每次 LLM 调用重做一次 TLS 握手（PROJECT_STATE §3 #9 的同一个坑）"""
+        """每请求新建客户端 = 每次 LLM 调用重做一次 TLS 握手（`anthropic.py` 踩过同一个坑，见 `tests/test_anthropic_http_client_reuse.py`）"""
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
         request_headers = {"authorization": f"Bearer {credential.auth_token}"}
@@ -712,7 +712,7 @@ class TestForwarding:
         assert len(upstream) == 2
 
     async def test_upstream_error_body_is_scrubbed(self, db, upstream) -> None:
-        """中转站的报错文案回显 Authorization 头是真实发生过的形态（PROJECT_STATE §5）"""
+        """中转站的报错文案回显 Authorization 头是真实发生过的形态"""
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
 

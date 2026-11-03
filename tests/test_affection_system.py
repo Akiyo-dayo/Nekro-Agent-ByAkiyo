@@ -654,6 +654,7 @@ class TestSystemPromptWiring:
             plugins_prompt="",
             plugins_runtime_prompt="",
             plugin_activation_rules="",
+            plugin_call_priority_rules="",
             enable_cot=False,
             chat_key_rules="- rule",
             enable_at=False,

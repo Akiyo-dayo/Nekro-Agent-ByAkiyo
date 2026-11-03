@@ -1,4 +1,4 @@
-"""内置 NapCat 容器的归属标签：切到 `deployment_scope()` 的过渡期双识别（§3 #46）
+"""内置 NapCat 容器的归属标签：切到 `deployment_scope()` 的过渡期双识别
 
 ## 这份测试在守什么
 
@@ -56,7 +56,7 @@ INSTANCE_KEY = "inst1"
 CONTAINER_NAME = "nekro_napcat_inst1"
 """升级前的裸模板容器名（#46 容器名这一半的过渡期读认对象）。
 
-round-26 起新建容器改用 `build_container_name()`（带 deployment_scope 前缀），名字与
+新建容器已改用 `build_container_name()`（带 deployment_scope 前缀），名字与
 标签一样读认新旧两套；带前缀名的契约见 `tests/test_napcat_container_name_scope.py`。
 """
 ACME_TENANT_ID = 1

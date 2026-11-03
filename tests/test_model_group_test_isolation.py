@@ -550,7 +550,7 @@ def _spy_on_test_runner(monkeypatch: MonkeyPatch) -> List[Tuple[ModelConfigGroup
         **_usage_attribution: Any,
     ) -> ModelGroupTestOutcome:
         # `**_usage_attribution` 吃掉 `group_name` / `tenant_id`：那两个是**用量归属**的
-        # 入参（round-22 复核加的，见 `services/model_group_test.run_model_group_test`），
+        # 入参（后来加的，见 `services/model_group_test.run_model_group_test`），
         # 与本文件要测的"凭据可见性"是两件事。替身若不接受它们，本文件会在调用点
         # 直接 TypeError —— 而那正是真实调用点确实传了它们的证据。
         # 它们**传对了没有**由 `tests/test_llm_usage_metering.py` 的

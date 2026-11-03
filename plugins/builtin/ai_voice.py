@@ -30,6 +30,7 @@ from nekro_agent.api.plugin import (
 )
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.command.base import CommandPermission
 from nekro_agent.services.command.ctl import CmdCtl
@@ -121,6 +122,8 @@ async def ai_voice(_ctx: AgentCtx, chat_key: str, text: str) -> bool:
     Returns:
         bool: 操作是否成功
     """
+    # 同一租户内允许对别的群出声，跨租户一律拒绝：否则 A 的模型能借 B 的 Bot 在 B 的群里说话
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
     db_chat_channel: DBChatChannel = await DBChatChannel.get_channel(chat_key=chat_key)
     chat_type = db_chat_channel.chat_type
     chat_id = db_chat_channel.channel_id

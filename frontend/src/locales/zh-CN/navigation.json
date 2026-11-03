@@ -1,4 +1,7 @@
 {
+  "versionTag": {
+    "compat": "插件兼容 NekroAgent {{version}}"
+  },
   "menu": {
     "cloud": "Nekro 云",
     "telemetry": "社区观测",
@@ -51,7 +54,6 @@
     "consoleUsage": "用量与费用"
   },
   "footer": {
-    "copyright": "版权所有",
     "builtOnPrefix": "基于 ",
     "builtOnSuffix": " 项目构建",
     "logout": "退出登录"

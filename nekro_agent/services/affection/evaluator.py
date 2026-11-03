@@ -53,6 +53,7 @@ from nekro_agent.core.config import CoreConfig
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
+from nekro_agent.schemas.chat_message import SELF_SENT_SENDER_ID
 from nekro_agent.services.identity_scope import resolve_identity_scopes
 from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untrusted_block
 
@@ -417,7 +418,12 @@ def _build_user_prompt(
 
     transcript_lines = []
     for message in messages:
-        speaker = "you" if str(message.sender_id) in BOT_SENDER_IDS else f"user_id={message.platform_userid}"
+        if str(message.sender_id) == SELF_SENT_SENDER_ID:
+            speaker = "another program on your account"
+        elif str(message.sender_id) in BOT_SENDER_IDS:
+            speaker = "you"
+        else:
+            speaker = f"user_id={message.platform_userid}"
         text = sanitize_inline_text(message.content_text, MAX_TRANSCRIPT_LINE_LENGTH)
         if not text:
             continue

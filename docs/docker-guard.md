@@ -15,7 +15,7 @@
 
 ## 为什么不用现成的 tecnativa/docker-socket-proxy
 
-风险登记原文建议的方案。它的粒度是「整类 API」（`CONTAINERS=1`），**只按 URL 路径放行、不看
+这是最直接的现成方案。它的粒度是「整类 API」（`CONTAINERS=1`），**只按 URL 路径放行、不看
 请求体**。而 NA 必须能 `POST /containers/create`（沙盒 / CC 工作区 / NapCat 都要建容器），一旦
 放行这个端点，攻击者就能在请求体里塞 `Privileged:true` + `Binds:["/:/host"]`。**实测**（同机独立
 lab）：经 `CONTAINERS=1,POST=1` 的 tecnativa 代理，`create`+`start` 均 201/204，容器读走宿主
@@ -167,7 +167,7 @@ events/volumes/swarm/archive/镜像删除…）一律 deny。
 - **host 网络只放行 netguard 形状**：`NetworkMode=host` 仅当「打了 `nekro.netguard=1` 标签 +
   能力只有 NET_ADMIN/NET_RAW + 实际执行的程序是 iptables + 不挂任何宿主目录」。**注意**判据看的是
   **实际执行的 argv0**——`Entrypoint` 非空时它覆盖 `Cmd`，所以 `Cmd=[iptables]` 配 `Entrypoint=
-  [/bin/sh,-c,…]` 这种「Cmd 摆样子、Entrypoint 塞 shell」的绕过也会被拒（本轮实测发现并修复）。
+  [/bin/sh,-c,…]` 这种「Cmd 摆样子、Entrypoint 塞 shell」的绕过也会被拒（实测发现并已修复）。
 - **exec / inspect / logs / start / stop / restart / kill / wait / delete 只作用于本部署的容器**
   （`proxy.py` 的归属门，`tests/test_docker_guard_proxy.py` 覆盖）。不加这道门，攻击者虽然建不出
   特权容器，却能 `exec` 进宿主上**别人**的容器——比如挂了 `docker.sock` 的兄弟容器 → 一步宿主

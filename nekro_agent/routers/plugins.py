@@ -25,6 +25,7 @@ from nekro_agent.services.model_group_service import (
     iter_model_group_ref_fields,
     resolve_console_identity,
 )
+from nekro_agent.services.plugin.call_priority import PluginCallPriority
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.manager import (
     disable_plugin,
@@ -37,6 +38,7 @@ from nekro_agent.services.plugin.manager import (
     save_plugin_instance_config,
     set_plugin_scope_override,
     update_plugin_activation_strategy,
+    update_plugin_call_priority,
 )
 from nekro_agent.services.plugin.scope import OverrideScope, VisibilitySource
 from nekro_agent.services.user.deps import get_current_active_user
@@ -230,6 +232,10 @@ class BatchUpdateConfig(BaseModel):
 
 class PluginActivationStrategyRequest(BaseModel):
     strategy: str
+
+
+class PluginCallPriorityRequest(BaseModel):
+    priority: PluginCallPriority
 
 
 class ActionResponse(BaseModel):
@@ -477,6 +483,21 @@ async def update_plugin_activation_strategy_handler(
     success, error = await update_plugin_activation_strategy(plugin_id, body.strategy)  # type: ignore[arg-type]
     if not success:
         raise ValidationError(reason=error or "插件激活策略更新失败")
+    return ActionResponse(ok=True)
+
+
+# 调用优先级同样是全进程一份（不进实例 / 会话覆盖），与激活策略同一档：
+# 租户在插件列表 / 详情里看得到档位，但改它会改到所有人的提示词上。
+@router.post("/call-priority/{plugin_id}", summary="更新插件调用优先级（全局）", response_model=ActionResponse)
+@require_role(Role.Super)
+async def update_plugin_call_priority_handler(
+    plugin_id: str,
+    body: PluginCallPriorityRequest = Body(...),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ActionResponse:
+    success, error = await update_plugin_call_priority(plugin_id, body.priority)
+    if not success:
+        raise ValidationError(reason=error or "插件调用优先级更新失败")
     return ActionResponse(ok=True)
 
 

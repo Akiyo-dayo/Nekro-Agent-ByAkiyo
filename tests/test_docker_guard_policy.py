@@ -1,4 +1,4 @@
-"""docker-guard 放行判据的表驱动单测（RK3 / PROJECT_STATE §3 #19）。
+"""docker-guard 放行判据的表驱动单测。
 
 判据核心 `policy.evaluate()` 是纯函数，这里用确定性表把两类契约钉死：
 
@@ -6,7 +6,7 @@
    console/container_manager.py / sandbox/network_guard.py 的实际请求体。改坏任一条 = 沙盒/CC/
    NapCat/网络隔离在硬化部署下静默失效。
 2. **提权形状必须拒绝**——特权容器、挂载宿主 `/`、host PID/IPC namespace、越界能力、
-   宿主设备、绕过 Binds 的 Mounts、非 iptables 的 host 网络容器等。这些正是 RK3 的攻击面：
+   宿主设备、绕过 Binds 的 Mounts、非 iptables 的 host 网络容器等。这些正是 docker.sock 提权的攻击面：
    实测（见 docs/docker-guard.md）攻击者用 `Privileged+Binds:/:/host` 起容器即可读宿主 `/etc/shadow`。
 
 `CONTAINERS=1` 那个结论（tecnativa 路径级代理放行 create 就等于放回提权路径）由本文件的
@@ -193,7 +193,7 @@ def test_denied_endpoints_rejected(method: str, path: str):
 # ---------------------------------------------------------------------------
 # 路径相对段：判据看到的路径必须就是 Docker 最终看到的路径
 #
-# 实测绕过（round-14 复核）：代理转发时用 yarl 拼 URL，而 yarl 会**自己消解 `..`**——
+# 实测绕过：代理转发时用 yarl 拼 URL，而 yarl 会**自己消解 `..`**——
 #   URL("http://docker/images/x/../../containers/victim/json").path == "/containers/victim/json"
 # 于是这条请求被判成 `images.inspect`（镜像引用本就含 `/`、这条端点不查归属）放行，
 # 发到 Docker 的却是对**任意容器**的 inspect：归属门被从另一个端点整条绕过，
@@ -266,7 +266,7 @@ def test_legit_create_bodies_pass(name: str, body: Dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
-# create 请求体：提权形状拒绝（RK3 攻击面）
+# create 请求体：提权形状拒绝（docker.sock 提权攻击面）
 # ---------------------------------------------------------------------------
 
 def _with_hostconfig(**hc: Any) -> Dict[str, Any]:
@@ -356,7 +356,7 @@ DANGEROUS_CREATE_BODIES = [
         _with_hostconfig(Sysctls={"net.ipv4.ip_forward": "1"}),
         "create.sysctls",
     ),
-    # —— round-14 复核补齐：Binds 判据的第三个入口与命名空间共享的第二种形态 ——
+    # —— 补齐：Binds 判据的第三个入口与命名空间共享的第二种形态 ——
     (
         # VolumesFrom 整份继承另一个容器的挂载表：宿主上只要有一个挂了 docker.sock 的容器
         # （guard 的威胁模型里这个前提成立），这一行就等价于把 docker.sock 挂进来 → 宿主 root，

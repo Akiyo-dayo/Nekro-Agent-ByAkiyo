@@ -38,6 +38,8 @@ from nekro_agent.api.plugin import (
     SandboxMethodType,
 )
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.services.plugin.scope_guard import require_own_chat_key
+from nekro_agent.tools.untrusted_content import echo_inline
 
 plugin = NekroPlugin(
     name="笔记系统插件",
@@ -335,6 +337,9 @@ async def get_note(_ctx: schemas.AgentCtx, chat_key: str, title: str) -> str:
         set_note(chat_key, "some_data", json.dumps(data, ensure_ascii=False), 0)
         ```
     """
+    # `chat_key` 是模型自由填写的参数：笔记会原样进入该频道的提示词，读写别的频道的笔记
+    # 就是跨频道（跨租户）读数据与注入指令，一律只认当前会话
+    chat_key = require_own_chat_key(_ctx, chat_key)
     data = await store.get(chat_key=chat_key, store_key="note")
     channel_data: ChannelNoteData = ChannelNoteData.model_validate_json(data) if data else ChannelNoteData()
     note: Optional[Note] = channel_data.get_note(title, fuzzy=True)
@@ -377,6 +382,7 @@ async def set_note(_ctx: schemas.AgentCtx, chat_key: str, title: str, descriptio
         set_note(chat_key, "xxx的电子邮箱", "[记忆] xxx@qq.com")
         ```
     """
+    chat_key = require_own_chat_key(_ctx, chat_key)
     data = await store.get(chat_key=chat_key, store_key="note")
     channel_data: ChannelNoteData = ChannelNoteData.model_validate_json(data) if data else ChannelNoteData()
     await channel_data.update_note(
@@ -401,13 +407,15 @@ async def remove_note(_ctx: schemas.AgentCtx, chat_key: str, title: str) -> str:
         remove_note(chat_key, "心情愉悦")
         ```
     """
+    chat_key = require_own_chat_key(_ctx, chat_key)
     data = await store.get(chat_key=chat_key, store_key="note")
     channel_data: ChannelNoteData = ChannelNoteData.model_validate_json(data) if data else ChannelNoteData()
     success: bool = await channel_data.remove_note(title, fuzzy=True)
     await store.set(chat_key=chat_key, store_key="note", value=channel_data.model_dump_json())
 
     if success:
-        return f"Note `{title}` removed"
+        # `remove_note` 是 BEHAVIOR 方法，返回值会落成 SYSTEM 消息；标题是模型传入的，压成单行再回显
+        return f"Note {echo_inline(title)} removed"
     raise ValueError(f"Note `{title}` not found. Make sure the spelling is correct!")
 
 

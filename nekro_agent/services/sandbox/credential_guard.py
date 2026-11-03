@@ -215,7 +215,7 @@ _MAX_WALK_DEPTH = 8
 # 漏登记不会有任何运行时信号（脱敏静默少遮一个值）。看门人是
 # `tests/test_sandbox_credential_isolation.py::TestEveryOsEnvSecretIsRegistered`：
 # 它按 `_SECRET_FIELD_NAME_PATTERN` 扫 `OsEnv` 的全部字符串字段，少一个就红。
-# round-22 的 `CREDENTIAL_SECRET_KEY` 正是漏登记后被那条用例补回来的。
+# `CREDENTIAL_SECRET_KEY` 就曾漏登记，是被那条用例补回来的。
 _OS_ENV_SECRET_ATTRS: Tuple[str, ...] = (
     "POSTGRES_PASSWORD",
     "QDRANT_API_KEY",
@@ -225,7 +225,7 @@ _OS_ENV_SECRET_ATTRS: Tuple[str, ...] = (
     "RPC_SECRET_KEY",
     "WEBHOOK_SECRET_KEY",
     "ADMIN_PASSWORD",
-    # 模型组 `api_key` 的静态加密主密钥（round-22，`tools/credential_cipher.py`）。
+    # 模型组 `api_key` 的静态加密主密钥（`tools/credential_cipher.py`）。
     # 它比这张表里任何一项都值钱：拿到它 + 一份库 dump = 全部租户与平台方的 API Key。
     # 走环境变量那一档（`.env*` / compose 里配了 NEKRO_CREDENTIAL_SECRET_KEY）时它就是
     # 一个进程级字符串，与 JWT 密钥同类，必须一并纳入出口脱敏
@@ -236,13 +236,17 @@ _OS_ENV_SECRET_ATTRS: Tuple[str, ...] = (
 def collect_platform_secrets() -> FrozenSet[str]:
     """收集当前进程内所有应视为平台凭据的取值
 
-    覆盖面来自两处：
+    覆盖面来自三处：
 
     - `OsEnv` 上的部署级密钥（数据库口令、JWT、RPC/Webhook 密钥等）；
     - `ConfigManager` 里注册的**全部**配置实例——核心配置、各适配器配置、各插件配置。
       逐个字段判断是否为凭据：显式标了 `is_secret`，或字段名命中凭据命名模式。
       嵌套模型（`CoreConfig.MODEL_GROUPS` 下的 `ModelConfigGroup`）会递归下钻，
-      所以新增模型组、新增插件配置都自动纳入，无需在此登记。
+      所以新增模型组、新增插件配置都自动纳入，无需在此登记；
+    - 本进程里已经解析过的实例级插件配置（`plugin_scope._scoped_config_cache` 里值不为 None
+      的合并结果）。这是兜底：实例覆盖不注册进 `ConfigManager`，默认参数的调用方看不到它。
+      指定了实例的出口应当用 `collect_instance_plugin_secrets()` 精确取，而不是依赖这里
+      「碰巧解析过」。
 
     不做缓存：一次遍历只是几百次字段访问，而缓存会让「刚在 WebUI 改完密钥」
     出现一段不受保护的窗口期。
@@ -267,6 +271,52 @@ def collect_platform_secrets() -> FrozenSet[str]:
             _walk_config(instance, is_secret_field=False, depth=0, out=secret_values)
         except Exception as e:  # 单个插件配置异常不应让整条防线失效
             logger.warning(f"收集配置 `{config_key}` 的凭据字段失败，该配置未纳入脱敏范围: {e}")
+
+    from nekro_agent.services.plugin import scope as plugin_scope
+
+    # 先拷一份再遍历：遍历期间可能有别的协程解析出新实例配置并写入缓存
+    for cached_config in list(plugin_scope._scoped_config_cache.values()):  # noqa: SLF001
+        if cached_config is None:
+            continue
+        try:
+            _walk_config(cached_config, is_secret_field=False, depth=0, out=secret_values)
+        except Exception as e:
+            logger.warning(f"收集实例级插件配置的凭据字段失败，该配置未纳入脱敏范围: {e}")
+
+    return frozenset(secret_values)
+
+
+def collect_instance_plugin_secrets(instance_key: str) -> FrozenSet[str]:
+    """收集某个实例下所有已加载插件的生效配置里的凭据
+
+    实例级覆盖不注册进 `ConfigManager`，所以 `collect_platform_secrets()` 看不到它；
+    沙盒方法按实例读到的值必须在这里单独收一遍，否则会原样回到沙盒。
+    空标识表示单实例 / 无实例，此时读到的就是全局配置，已由 `collect_platform_secrets()` 覆盖。
+
+    Args:
+        instance_key: 频道所属实例标识
+
+    Returns:
+        凭据原文集合
+    """
+    if not instance_key:
+        return frozenset()
+
+    # 延迟导入：插件收集器会拉起整套插件加载链路，模块级导入会成环
+    from nekro_agent.services.plugin.collector import plugin_collector
+    from nekro_agent.services.plugin.scope import resolve_scoped_config
+
+    secret_values: Set[str] = set()
+    for plugin in list(plugin_collector.loaded_plugins.values()):
+        config_cls = plugin.config_class
+        if config_cls is ConfigBase:
+            # 没注册配置类的插件没有可读的凭据字段，读全局配置反而会创建一份空配置
+            continue
+        try:
+            scoped_config = resolve_scoped_config(plugin.key, config_cls, plugin.get_global_config(), instance_key)
+            _walk_config(scoped_config, is_secret_field=False, depth=0, out=secret_values)
+        except Exception as e:  # 单个插件异常不应让整条防线失效
+            logger.warning(f"收集插件 `{plugin.key}` 在实例 `{instance_key}` 下的凭据字段失败，该插件未纳入脱敏范围: {e}")
 
     return frozenset(secret_values)
 

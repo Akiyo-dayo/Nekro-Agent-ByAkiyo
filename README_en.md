@@ -5,7 +5,7 @@
 > **This is an unofficial derivative edition.** It is modified from [KroMiose/nekro-agent](https://github.com/KroMiose/nekro-agent) (NekroAgent) and has no affiliation with, or endorsement from, the NekroAgent maintainers.
 > **Built on the NekroAgent project** — upstream project: <https://github.com/KroMiose/nekro-agent>.
 >
-> - Version: **0.3.0** (this edition's own version number; the upstream version it is based on is `2.3.3`)
+> - Version: **0.4.2** (this edition's own version number; the upstream version it is based on is `2.3.3`; plugin-compatible with upstream `2.4.0`, so plugins written for 2.4.0 install and run here)
 > - License: the upstream [Nekro Agent Open Source License V1.1](./LICENSE) (modified from Apache License 2.0); see "License" below and [`NOTICE`](./NOTICE)
 > - Changes: [`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -61,7 +61,7 @@ Images are published to the GitHub Container Registry (GHCR), built and pushed b
 
 Tags:
 
-- **version number** (e.g. `0.3.0`) and `latest`: built when a `v*.*.*` tag is pushed, suitable for production;
+- **version number** (e.g. `0.4.2`) and `latest`: built when a `v*.*.*` tag is pushed, suitable for production;
 - `preview` / `preview-<short commit SHA>`: built on every `main` update, includes the latest changes, suitable for testing.
 
 ```bash

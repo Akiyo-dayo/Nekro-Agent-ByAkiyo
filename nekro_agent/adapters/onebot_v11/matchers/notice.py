@@ -7,6 +7,7 @@ from nonebot import on_notice
 from nonebot.adapters.onebot.v11 import Bot, NoticeEvent
 from nonebot.matcher import Matcher
 
+from nekro_agent.adapters.onebot_v11.core.channel import ADAPTER_KEY
 from nekro_agent.adapters.onebot_v11.core.instance import resolve_instance_key, set_current_instance
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
 
@@ -25,6 +26,7 @@ from nekro_agent.services.notice_service import (
     NoticeConfig,
     NoticeResult,
 )
+from nekro_agent.services.unclaimed_dispatch import is_inbound_dispatch_allowed
 from nekro_agent.tools.time_util import format_duration
 
 
@@ -261,6 +263,10 @@ async def _(_: Matcher, event: NoticeEvent, bot: Bot):
     # 与消息匹配器一致：先把本条事件所属实例写入上下文，后续链路才能定位到正确账号
     instance_key = await resolve_instance_key(bot.self_id)
     set_current_instance(instance_key, bot.self_id)
+    # 入站闸门（`services/unclaimed_dispatch.py`）：挡在解析会话、落库之前。它也包含实例 / 租户停用那道判据，
+    # 所以停用实例的通知现在在这里就丢掉了，不再走到撤回标记、问群成员信息（`push_*` 里那道停用闸门仍在）
+    if not await is_inbound_dispatch_allowed(ADAPTER_KEY, instance_key):
+        return
 
     # 处理通知事件
     # 这个匹配器是 `on_notice(priority=99999, block=False)` 的兜底，协议端上报的**每一种**

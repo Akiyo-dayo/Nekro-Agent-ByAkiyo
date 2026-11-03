@@ -1,7 +1,7 @@
 """工作区知识库 / 工作区资源 / 全局素材库的租户作用域
 
-补上 PROJECT_STATE §3 #29 记的那个洞：`routers/workspaces.py` 那 72 个端点先修好了，
-同样挂在 `/workspaces/{workspace_id}/...` 下的 `routers/workspace_kb.py`(17) 与
+补上工作区端点缺租户作用域的那个洞：`routers/workspaces.py` 那 72 个端点先修好了，
+同样挂在 `/workspaces/{workspace_id}/...` 下的 `routers/workspace_kb.py`(当时 17 个) 与
 `routers/resources.py`(5) 是同一个洞的第二块。实测（改前，真实 HTTP，租户管理员身份）：
 
     GET    /api/workspaces/{别的租户的 ws}/kb/documents    -> 200，返回对方文档标题
@@ -11,16 +11,16 @@
 
 ## 为什么是整表而不是抽样
 
-上一轮修完只抽了 5 个知识库端点 + 1 个资源端点写测试，剩下 15 个的作用域**没有任何测试
-盯着**——而"一族端点里有几个漏了守卫"正是这个洞每次的形态（§3 #26 与 #29 是同一件事
-被发现了两次）。所以知识库那 17 条是**全表驱动**的 `KB_ENDPOINT_CASES`，
+之前修完只抽了 5 个知识库端点 + 1 个资源端点写测试，其余端点的作用域**没有任何测试
+盯着**——而"一族端点里有几个漏了守卫"正是这个洞每次的形态（同一件事已经
+被发现过两次）。所以知识库那一族是**全表驱动**的 `KB_ENDPOINT_CASES`，
 并由 `TestEveryLiveKnowledgeBaseEndpointHasACase` 反过来钉住"路由表里有、用例表里没有"
-直接红；新增第 18 个知识库端点必须同时在这里出现。资源那 5 条端点数量少、
+直接红；新增知识库端点必须同时在这里出现。资源那 5 条端点数量少、
 每条的判据各不相同（404 / 403 / 视角裁剪），逐条写成方法而不是拼一张表。
 
 ## 守卫测得再足，也不等于被守住的数据没漏
 
-上面那 17 条把 `search_workspace_kb` 整个桩掉了 —— 它们要测的是路由层的归属判定。
+上面那一族用例把 `search_workspace_kb` 整个桩掉了 —— 它们要测的是路由层的归属判定。
 但检索是本模块唯一直接吐**正文片段**的出口，它自己的过滤条件一旦漏掉，
 租户搜**自己的**工作区就会搜出别人的正文，而路由守卫全程无感。
 `TestSearchItselfStaysInsideTheWorkspace` 补的就是这一跳。
@@ -38,6 +38,8 @@ document 级端点在租户方向上传的 `(workspace_id, document_id)` 恰好�
 """
 
 import datetime
+import io
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -57,8 +59,12 @@ from nekro_agent.models.db_workspace_resource import DBWorkspaceResource
 from nekro_agent.models.db_workspace_resource_binding import DBWorkspaceResourceBinding
 from nekro_agent.routers import workspace_kb as workspace_kb_module
 from nekro_agent.routers.kb_library import (
+    batch_delete_kb_library_assets,
+    batch_reindex_kb_library_assets,
+    batch_unbind_kb_library_assets,
     bind_kb_library_asset_workspace,
     get_kb_library_asset_bindings,
+    import_kb_library_zip,
     unbind_kb_library_asset_workspace,
 )
 from nekro_agent.routers.resources import (
@@ -70,6 +76,8 @@ from nekro_agent.routers.resources import (
 )
 from nekro_agent.routers.workspace_kb import (
     add_document_reference_route,
+    batch_delete_workspace_kb_documents,
+    batch_reindex_workspace_kb_documents,
     create_workspace_kb_document,
     delete_workspace_kb_document,
     get_document_references_route,
@@ -78,6 +86,7 @@ from nekro_agent.routers.workspace_kb import (
     get_workspace_kb_raw_file,
     get_workspace_kb_source_file_info,
     get_workspace_kb_tree,
+    import_workspace_kb_zip,
     list_workspace_kb_documents,
     reindex_workspace_kb,
     reindex_workspace_kb_document,
@@ -87,10 +96,12 @@ from nekro_agent.routers.workspace_kb import (
     update_workspace_kb_document,
     upload_workspace_kb_file,
 )
-from nekro_agent.schemas.errors import NotFoundError
+from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.schemas.i18n import SupportedLang
 from nekro_agent.schemas.kb import (
     KBAddReferenceBody,
+    KBAssetBatchUnbindBody,
+    KBBatchIdsBody,
     KBCreateTextDocumentBody,
     KBSearchRequest,
     KBSearchResponse,
@@ -329,7 +340,7 @@ async def env(tmp_path, monkeypatch) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# 知识库 17 个端点的用例表
+# 知识库端点的用例表
 # ---------------------------------------------------------------------------
 
 
@@ -462,12 +473,46 @@ async def _check_source_file(result, env: Env) -> None:
     assert result.source_workspace_path == "/workspace/default/kb/files/plan.md"
 
 
+async def _check_batch_deleted(result, env: Env) -> None:
+    deleted_ids = [env.rival_plan, env.rival_notes]
+    assert result.deleted == 2
+    assert result.failed == 0
+    assert sorted(result.deleted_ids) == sorted(deleted_ids)
+    assert await DBKBDocument.filter(workspace_id=env.rival_ws).count() == 1
+    assert sorted(env.calls["cancel"]) == sorted(deleted_ids)
+    assert sorted(env.calls["delete_files"]) == sorted(deleted_ids)
+
+
+async def _check_batch_reindexed(result, env: Env) -> None:
+    queued_ids = [env.rival_plan, env.rival_appendix]
+    assert result.queued == 2
+    assert result.failed == 0
+    assert result.queued_ids == queued_ids
+    assert sorted(env.calls["schedule"]) == sorted(queued_ids)
+
+
+async def _check_zip_imported(result, env: Env) -> None:
+    assert (result.imported, result.skipped, result.failed) == (2, 0, 0)
+    assert await DBKBDocument.filter(workspace_id=env.rival_ws).count() == 5
+    document = await DBKBDocument.get(workspace_id=env.rival_ws, source_path="notes/zip-a.md")
+    assert document.category == "notes/"
+    assert len(env.calls["schedule"]) == 2
+
+
 def _upload_file() -> UploadFile:
     """每次调用现造一份，避免被读过一次的流在下一次调用里变成空文件"""
-    import io
-
     payload = b"uploaded body"
     return UploadFile(file=io.BytesIO(payload), filename="uploaded.md", size=len(payload))
+
+
+def _zip_upload_file() -> UploadFile:
+    """每次调用现造一份内存 zip，理由同上"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("notes/zip-a.md", b"zip a body")
+        archive.writestr("zip-b.txt", b"zip b body")
+    payload = buffer.getvalue()
+    return UploadFile(file=io.BytesIO(payload), filename="bundle.zip", size=len(payload))
 
 
 KB_ENDPOINT_CASES: List[Case] = [
@@ -592,12 +637,37 @@ KB_ENDPOINT_CASES: List[Case] = [
         ),
         _check_source_file,
     ),
+    Case(
+        "POST /kb/documents/batch-delete",
+        lambda ws, user, env: batch_delete_workspace_kb_documents(
+            workspace_id=ws,
+            body=KBBatchIdsBody(ids=[env.rival_plan, env.rival_notes]),
+            _current_user=user,
+        ),
+        _check_batch_deleted,
+    ),
+    Case(
+        "POST /kb/documents/batch-reindex",
+        lambda ws, user, env: batch_reindex_workspace_kb_documents(
+            workspace_id=ws,
+            body=KBBatchIdsBody(ids=[env.rival_plan, env.rival_appendix]),
+            _current_user=user,
+        ),
+        _check_batch_reindexed,
+    ),
+    Case(
+        "POST /kb/zip",
+        lambda ws, user, env: import_workspace_kb_zip(
+            workspace_id=ws, file=_zip_upload_file(), _current_user=user
+        ),
+        _check_zip_imported,
+    ),
 ]
 
 # 被拒时这几个桩必须一次都没被调到 —— 它们代表"端点已经开始干活了"。
 #
 # 后两个钉的是**顺序**，而顺序这件事此前一条测试都没有（复核时的变异测试实测：
-# 把守卫挪到它们之后，17×2 条用例全绿）：
+# 把守卫挪到它们之后，整族用例依然全绿）：
 #
 # - `ensure_collection`：`reindex` 那两条改前是"先建 Qdrant 集合再判归属"，
 #   于是一次越权请求能先在外部服务上建出东西来。集合是全局一份、不是泄露，
@@ -605,7 +675,7 @@ KB_ENDPOINT_CASES: List[Case] = [
 # - `get_document`：`_get_document_or_404` 必须**先**校验工作区再查文档。文档 ID 是
 #   全局自增的，反过来写（按 id 取出来再比 `workspace_id`）行为上同样是 404，
 #   却让"这个 ID 存在吗"从时序与查询次数上可分辨。这是记账的转发不是桩，
-#   正向那 17 条照常查得到文档。
+#   正向那一族用例照常查得到文档。
 WORK_STARTED_STUB_KEYS = ("schedule", "cancel", "delete_files", "delete_points", "rebuild_workspace",
                           "search", "detect_refs", "sync_metadata", "ensure_collection", "get_document")
 
@@ -635,7 +705,7 @@ class TestWorkspaceKnowledgeBaseIsScoped:
     ) -> None:
         """正向对照：同一组实参换成不受限身份必须真的跑通
 
-        没有这一条，上面那 17 条"租户拿到 404"可以被任何原因满足 ——
+        没有这一条，上面那一族"租户拿到 404"可以被任何原因满足 ——
         端点自己坏了（桩没接上、文件不存在、参数名写错）同样会抛异常。
         """
         result = await case.call(env.rival_ws, identity(), env)
@@ -688,10 +758,92 @@ class TestWorkspaceKnowledgeBaseIsScoped:
         assert await DBKBDocumentReference.filter(workspace_id=env.acme_ws).count() == 1
 
 
+class TestBatchEndpointsStayInsideTheWorkspace:
+    """批量接口是逐条调单条操作的，所以"混进一个别人工作区的 ID"只会让那一条失败
+
+    守卫仍然在 `_get_document_or_404` / `get_document(workspace_id=...)` 里：批量外壳
+    本身不查归属，反而更容易把"反正整批都是我的"当成前提。这里钉住两点 —— 跨工作区
+    的那一条记进 `failed_ids` 而不是被删掉/被重建，以及上限校验发生在动手之前。
+    """
+
+    async def _acme_plan(self, env: Env) -> DBKBDocument:
+        return await DBKBDocument.get(workspace_id=env.acme_ws, source_path="plan.md")
+
+    async def test_batch_delete_only_deletes_documents_of_the_named_workspace(self, env: Env) -> None:
+        acme_plan = await self._acme_plan(env)
+        result = await batch_delete_workspace_kb_documents(
+            workspace_id=env.acme_ws,
+            body=KBBatchIdsBody(ids=[acme_plan.id, env.rival_plan]),
+            _current_user=acme_admin(),
+        )
+
+        assert result.deleted_ids == [acme_plan.id]
+        assert result.failed_ids == [env.rival_plan]
+        assert any("不存在" in error for error in result.errors)
+        assert await DBKBDocument.filter(id=env.rival_plan).exists()
+        assert env.calls["cancel"] == [acme_plan.id]
+
+    async def test_batch_reindex_only_queues_documents_of_the_named_workspace(self, env: Env) -> None:
+        acme_plan = await self._acme_plan(env)
+        result = await batch_reindex_workspace_kb_documents(
+            workspace_id=env.acme_ws,
+            body=KBBatchIdsBody(ids=[acme_plan.id, env.rival_plan]),
+            _current_user=acme_admin(),
+        )
+
+        assert result.queued_ids == [acme_plan.id]
+        assert result.failed_ids == [env.rival_plan]
+        assert any("不存在" in error for error in result.errors)
+        assert env.calls["schedule"] == [acme_plan.id]
+
+    async def test_duplicate_ids_are_collapsed_before_acting(self, env: Env) -> None:
+        acme_plan = await self._acme_plan(env)
+        result = await batch_delete_workspace_kb_documents(
+            workspace_id=env.acme_ws,
+            body=KBBatchIdsBody(ids=[acme_plan.id, acme_plan.id]),
+            _current_user=acme_admin(),
+        )
+
+        assert result.deleted == 1
+        assert result.deleted_ids == [acme_plan.id]
+        assert env.calls["cancel"] == [acme_plan.id]
+
+    async def test_batch_size_limit_is_checked_before_any_document_is_deleted(
+        self, env: Env, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("nekro_agent.routers.workspace_kb.KB_BATCH_MAX_SIZE", 2)
+        ids = await DBKBDocument.filter(workspace_id=env.acme_ws).values_list("id", flat=True)
+        assert len(ids) == 3
+
+        with pytest.raises(ValidationError):
+            await batch_delete_workspace_kb_documents(
+                workspace_id=env.acme_ws,
+                body=KBBatchIdsBody(ids=list(ids)),
+                _current_user=acme_admin(),
+            )
+
+        assert await DBKBDocument.filter(workspace_id=env.acme_ws).count() == 3
+        assert env.calls["cancel"] == []
+
+    @pytest.mark.parametrize(
+        "ids",
+        [[0], [-1], [2_147_483_648], list(range(1, 10_002))],
+        ids=["zero", "negative", "beyond-int32", "over-hard-limit"],
+    )
+    def test_batch_body_rejects_out_of_range_and_oversized_id_lists(self, ids: List[int]) -> None:
+        """请求体在解析阶段就挡住：越界 ID 与超长列表不会走到逐条执行"""
+        from pydantic import ValidationError as PydanticValidationError
+
+        with pytest.raises(PydanticValidationError):
+            KBBatchIdsBody(ids=ids)
+        with pytest.raises(PydanticValidationError):
+            KBAssetBatchUnbindBody(asset_ids=ids, workspace_id=1)
+
+
 class TestSearchItselfStaysInsideTheWorkspace:
     """守卫说"这个工作区是你的"之后，**取数据那一步**也得真的只取这个工作区
 
-    上面 17 条用例把 `search_workspace_kb` 整个桩掉了（它们要测的是路由层的归属判定），
+    上面那一族用例把 `search_workspace_kb` 整个桩掉了（它们要测的是路由层的归属判定），
     于是检索**自己**那一跳一条测试都没有 —— 而它是全模块唯一一个直接吐**正文片段**的出口：
     过滤条件一旦漏掉，租户搜自己的工作区就会搜出别人的文档正文，而路由守卫全程无感
     （工作区确实是他自己的，越权发生在 SQL 里）。这与 §2.7 记的"零件全对、调用点没了"
@@ -802,7 +954,7 @@ class TestEveryLiveKnowledgeBaseEndpointHasACase:
             for case in KB_ENDPOINT_CASES
         }
         assert covered == live
-        assert len(KB_ENDPOINT_CASES) == 17
+        assert len(KB_ENDPOINT_CASES) == 20
         assert inspect.getmodule(workspace_kb).__name__ == "nekro_agent.routers.workspace_kb"
 
 
@@ -1027,3 +1179,134 @@ class TestKnowledgeBaseLibraryBindings:
             "acme-ws", "platform-ws", "rival-ws",
         ]
         assert owner_view.binding_count == 3
+
+    async def test_cannot_batch_unbind_from_a_foreign_workspace(self, env: Env, asset) -> None:
+        """批量解绑只是一层循环，目标工作区的归属判定仍在逐条动手之前"""
+        await bind_kb_library_asset_workspace(
+            asset_id=asset.id, workspace_id=env.rival_ws, _current_user=platform_owner(),
+        )
+        for workspace_id in env.foreign_workspace_ids():
+            with pytest.raises(NotFoundError):
+                await batch_unbind_kb_library_assets(
+                    body=KBAssetBatchUnbindBody(asset_ids=[asset.id], workspace_id=workspace_id),
+                    _current_user=acme_admin(),
+                )
+        remaining = await get_kb_library_asset_bindings(asset_id=asset.id, _current_user=platform_owner())
+        assert [item.workspace_id for item in remaining.items] == [env.rival_ws]
+
+    async def test_batch_unbind_only_removes_the_binding_of_the_named_workspace(self, env: Env, asset) -> None:
+        for workspace_id in (env.acme_ws, env.rival_ws):
+            await bind_kb_library_asset_workspace(
+                asset_id=asset.id, workspace_id=workspace_id, _current_user=platform_owner(),
+            )
+
+        result = await batch_unbind_kb_library_assets(
+            body=KBAssetBatchUnbindBody(asset_ids=[asset.id], workspace_id=env.acme_ws),
+            _current_user=acme_admin(),
+        )
+
+        assert result.unbound_ids == [asset.id]
+        assert result.failed_ids == []
+        remaining = await get_kb_library_asset_bindings(asset_id=asset.id, _current_user=platform_owner())
+        assert [item.workspace_id for item in remaining.items] == [env.rival_ws]
+
+    async def test_batch_unbind_isolates_a_missing_asset_id(self, env: Env, asset) -> None:
+        await bind_kb_library_asset_workspace(
+            asset_id=asset.id, workspace_id=env.acme_ws, _current_user=platform_owner(),
+        )
+
+        result = await batch_unbind_kb_library_assets(
+            body=KBAssetBatchUnbindBody(asset_ids=[asset.id, 987654], workspace_id=env.acme_ws),
+            _current_user=acme_admin(),
+        )
+
+        assert result.unbound_ids == [asset.id]
+        assert result.failed_ids == [987654]
+        assert any("不存在" in error for error in result.errors)
+        remaining = await get_kb_library_asset_bindings(asset_id=asset.id, _current_user=platform_owner())
+        assert remaining.items == []
+
+
+class TestLibraryBatchAndZipArePlatformOnly:
+    """批量删除 / 批量重建 / zip 导入改的是**共享**素材库本体，与单条操作同档
+
+    素材库没有归属列，一条素材被删掉对**所有**绑定它的工作区都是同一件事，
+    所以这不是"存在性"问题（404），而是能力边界（403）。
+    """
+
+    @pytest.fixture
+    async def asset(self, env: Env):
+        return await DBKBAsset.create(
+            title="platform batch runbook", category="doc", file_name="b.md", file_ext=".md",
+            mime_type="text/markdown", format="markdown", source_path="b.md",
+            content_hash="batch-asset", file_size=1,
+        )
+
+    async def test_tenant_cannot_batch_delete_assets(self, env: Env, asset) -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            await batch_delete_kb_library_assets(
+                body=KBBatchIdsBody(ids=[asset.id]), _current_user=acme_admin()
+            )
+        assert exc_info.value.status_code == 403
+        assert await DBKBAsset.filter(id=asset.id).exists()
+
+    async def test_tenant_cannot_batch_reindex_assets(self, env: Env, asset) -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            await batch_reindex_kb_library_assets(
+                body=KBBatchIdsBody(ids=[asset.id]), _current_user=acme_admin()
+            )
+        assert exc_info.value.status_code == 403
+        assert await DBKBAsset.filter(id=asset.id).exists()
+
+    async def test_tenant_cannot_import_a_zip_into_the_shared_library(self, env: Env, asset) -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            await import_kb_library_zip(file=_zip_upload_file(), _current_user=acme_admin())
+        assert exc_info.value.status_code == 403
+        # 包里那两个文件一个都没进库：素材表里仍只有 fixture 那一条
+        assert await DBKBAsset.all().values_list("id", flat=True) == [asset.id]
+
+    async def test_platform_owner_batch_deletes_an_unbound_asset(
+        self, env: Env, asset, monkeypatch
+    ) -> None:
+        async def _noop(*_args, **_kwargs):
+            return None
+
+        for name in (
+            "cancel_rebuild_asset",
+            "list_asset_chunk_ids",
+            "delete_asset_vector_points",
+            "delete_asset_files",
+        ):
+            monkeypatch.setattr(f"nekro_agent.routers.kb_library.{name}", _noop)
+
+        result = await batch_delete_kb_library_assets(
+            body=KBBatchIdsBody(ids=[asset.id]), _current_user=platform_owner()
+        )
+
+        assert result.deleted_ids == [asset.id]
+        assert result.failed == 0
+        assert not await DBKBAsset.filter(id=asset.id).exists()
+
+    async def test_bound_asset_is_refused_without_cancelling_its_rebuild(
+        self, env: Env, asset, monkeypatch
+    ) -> None:
+        """仍被绑定的素材删不掉；绑定判定在取消重建之前，正在跑的索引任务不能被白白丢掉"""
+        cancelled: List[int] = []
+
+        async def _record_cancel(asset_id: int) -> bool:
+            cancelled.append(asset_id)
+            return True
+
+        monkeypatch.setattr("nekro_agent.routers.kb_library.cancel_rebuild_asset", _record_cancel)
+        await bind_kb_library_asset_workspace(
+            asset_id=asset.id, workspace_id=env.acme_ws, _current_user=platform_owner(),
+        )
+
+        result = await batch_delete_kb_library_assets(
+            body=KBBatchIdsBody(ids=[asset.id]), _current_user=platform_owner()
+        )
+
+        assert result.failed_ids == [asset.id]
+        assert any("仍被" in error for error in result.errors)
+        assert cancelled == []
+        assert await DBKBAsset.filter(id=asset.id).exists()

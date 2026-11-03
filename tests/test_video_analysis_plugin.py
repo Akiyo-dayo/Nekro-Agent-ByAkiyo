@@ -9,9 +9,9 @@
 4. **账与归属**：每次上游请求一行账，失败也记；租户不能经由插件配置用到无权使用的模型组。
 5. **限额与清理**：超限有清晰错误，超时杀进程，任何路径都不留临时文件。
 
-端到端用例用**真实 ffmpeg 生成的样片**，假上游是 uvicorn + starlette 的真 HTTP 栈
-（PROJECT_STATE §2.15），断言落在上游实际收到的请求上。走的是 `analyze_video` 这个调用点，
-而不是逐个测零件（§2.7）。CI 的 `backend-tests.yml` 有一步断言依赖 ffmpeg 的用例没有被跳过。
+端到端用例用**真实 ffmpeg 生成的样片**，假上游是 uvicorn + starlette 的真 HTTP 栈，
+断言落在上游实际收到的请求上。走的是 `analyze_video` 这个调用点，
+而不是逐个测零件。CI 的 `backend-tests.yml` 有一步断言依赖 ffmpeg 的用例没有被跳过。
 """
 
 from __future__ import annotations
@@ -63,9 +63,11 @@ from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.schemas.chat_message import (
     TOOL_RESULT_SENDER_ID,
     TOOL_RESULT_SENDER_NAME,
+    VIDEO_ANALYSIS_PLUGIN_KEY,
+    VIDEO_UNAVAILABLE_NOTE,
     ChatMessage,
-    ChatMessageSegment,
     ChatMessageSegmentFile,
+    ChatMessageSegmentVideo,
     ChatType,
     segment_from_dict,
 )
@@ -91,7 +93,7 @@ from nekro_agent.services.plugin.schema import SandboxMethodType
 from nekro_agent.services.sandbox.credential_guard import issue_sandbox_call_grant, revoke_sandbox_call_grant
 from nekro_agent.services.usage import flush_llm_usage
 from nekro_agent.services.usage.ledger import reset_usage_recorder
-from nekro_agent.tools import file_utils
+from nekro_agent.tools import file_utils, path_convertor
 from nekro_agent.tools.common_util import UnsafeDownloadUrlError, assert_connected_peer_safe, assert_download_url_safe
 from nekro_agent.tools.file_utils import FileSystem
 from nekro_agent.tools.untrusted_content import (
@@ -852,22 +854,34 @@ class TestPathContainment:
         root.mkdir()
         src = root / "clip.mp4"
         src.write_bytes(b"x")
-        monkeypatch.setattr(source, "_opened_real_path", lambda fd: tmp_path / "configs" / "nekro-agent.yaml")
+        monkeypatch.setattr(path_convertor, "opened_real_path", lambda fd: tmp_path / "configs" / "nekro-agent.yaml")
         dest = tmp_path / "out.bin"
         with pytest.raises(VideoAnalysisError, match="沙盒目录内"):
             source._copy_within_roots(src, dest, (root,), 10)
         assert not dest.exists()
 
-    @pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="只有 Linux 才能读 /proc/self/fd")
-    def test_the_real_fd_lookup_sees_through_a_directory_symlink(self, tmp_path: Path) -> None:
+    @pytest.mark.skipif(not (Path("/proc/self/fd").exists() or sys.platform == "win32"), reason="只有 Linux（/proc/self/fd）与 Windows（文件句柄）能取到已打开文件的真实路径")
+    @pytest.mark.parametrize("kind", ["directory", "file"])
+    def test_the_real_fd_lookup_sees_through_a_symlink(self, tmp_path: Path, kind: str) -> None:
+        """Windows 没有 O_NOFOLLOW：以前没有 /proc 时打开后不复核，链接指到外面照样复制"""
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "clip.mp4").write_bytes(b"x")
         root = tmp_path / "shared"
         root.mkdir()
-        (root / "dir").symlink_to(outside)
-        with pytest.raises(VideoAnalysisError, match="沙盒目录内"):
-            source._copy_within_roots(root / "dir" / "clip.mp4", tmp_path / "out.bin", (root,), 10)
+        try:
+            if kind == "directory":
+                (root / "dir").symlink_to(outside, target_is_directory=True)
+                source_path = root / "dir" / "clip.mp4"
+            else:
+                (root / "clip.mp4").symlink_to(outside / "clip.mp4")
+                source_path = root / "clip.mp4"
+        except OSError:
+            pytest.skip("这台机器不允许创建符号链接")
+        dest = tmp_path / "out.bin"
+        with pytest.raises(VideoAnalysisError, match="沙盒目录内|无法读取"):
+            source._copy_within_roots(source_path, dest, (root,), 10)
+        assert not dest.exists()
 
     async def test_analyze_video_refuses_traversal_before_touching_ffmpeg(self, db: None, harness: Harness) -> None:
         harness.groups["vision"] = _group("https://upstream.invalid/v1")
@@ -1853,20 +1867,15 @@ class TestDeployment:
 
 @pytest.fixture
 def sandbox_call(harness: Harness, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Any]]:
-    """按沙盒回调的真实入口调方法：走 `routers/rpc.py:rpc_exec`，请求体是 pickle"""
+    """按沙盒回调的真实入口调方法：走 `routers/rpc.py:rpc_exec`，请求体由沙盒侧真实的编码器生成（JSON）"""
+    from tests.rpc_sandbox_client import FakeRpcRequest, request_body
+
     monkeypatch.setitem(plugin_collector.loaded_plugins, plugin.key, plugin)
     token = issue_sandbox_call_grant(container_key=CONTAINER_KEY, from_chat_key=CHAT_KEY, method_names=["analyze_video"])
 
-    class _Body:
-        def __init__(self, payload: bytes) -> None:
-            self._payload = payload
-
-        async def body(self) -> bytes:
-            return self._payload
-
     async def call(*args: Any) -> Any:
-        payload = pickle.dumps({"method": "analyze_video", "args": args, "kwargs": {}})
-        return await rpc_exec(CONTAINER_KEY, CHAT_KEY, _Body(payload), x_rpc_token=token)  # type: ignore[arg-type]
+        request = FakeRpcRequest(request_body("analyze_video", *args))
+        return await rpc_exec(CONTAINER_KEY, CHAT_KEY, request, x_rpc_token=token)  # type: ignore[arg-type]
 
     yield call
     revoke_sandbox_call_grant(CONTAINER_KEY)
@@ -2057,13 +2066,33 @@ class TestVideoSegmentSwitch:
         await DBChatChannel.create(adapter_key=ADAPTER, instance_key=INSTANCE, channel_id="private_1001", chat_key=chat_key, channel_type="private", data="{}")
         return chat_key
 
-    @pytest.mark.parametrize(("chat_type_name", "is_tome"), [("private", 0), ("private", 1), ("group", 0), ("group", 1)])
-    async def test_plugin_off_is_exactly_the_old_behaviour(self, private_key: str, switch: Callable[[bool], None], chat_type_name: str, is_tome: int) -> None:
+    # 夹具把触发正则设成 `.*`：私聊单发视频仍被“私聊纯媒体不触发”拦下；群聊不带 @ 的视频与群里单发图片一样
+    # 按群聊常规规则判，命中关键词就触发（默认配置下不触发，见下一条）
+    @pytest.mark.parametrize(("chat_type_name", "is_tome", "triggers"), [("private", 0, False), ("private", 1, False), ("group", 0, True), ("group", 1, True)])
+    async def test_plugin_off_the_video_is_still_recorded(self, private_key: str, switch: Callable[[bool], None], chat_type_name: str, is_tome: int, triggers: bool) -> None:
+        """真实用户反馈推翻了“关闭后零影响”：视频消失时 AI 会说“你是不是忘了发”，所以始终记录"""
         switch(False)
         chat_key = private_key if chat_type_name == "private" else CHAT_KEY
         await self._ingest({"file": "a.mp4", "url": self.URL}, chat_key=chat_key, chat_type=ChatType(chat_type_name), is_tome=is_tome)
-        assert await DBChatMessage.filter(chat_key=chat_key).count() == 0
-        assert chat_key not in message_service.pending_messages
+        row = await DBChatMessage.get(chat_key=chat_key)
+        assert [seg.type for seg in row.parse_content_data()] == ["video"]
+        assert (chat_key in message_service.pending_messages) is triggers
+
+    async def test_plugin_off_a_group_video_without_mention_or_text_does_not_trigger_by_default(
+        self, private_key: str, switch: Callable[[bool], None], monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """没有 @、没有文字、没配关键词、随机搭话为 0：只记录，不因为视频进了记录就多出一次触发"""
+        switch(False)
+        quiet = global_config.model_copy(update={"AI_CHAT_TRIGGER_REGEX": [], "AI_CHAT_RANDOM_REPLY_PROBABILITY": 0.0})
+
+        async def effective(self: DBChatChannel) -> CoreConfig:
+            return quiet
+
+        monkeypatch.setattr(DBChatChannel, "get_effective_config", effective)
+        await self._ingest({"file": "a.mp4", "url": self.URL}, chat_key=CHAT_KEY, chat_type=ChatType.GROUP, is_tome=0)
+        row = await DBChatMessage.get(chat_key=CHAT_KEY)
+        assert [seg.type for seg in row.parse_content_data()] == ["video"]
+        assert CHAT_KEY not in message_service.pending_messages
 
     async def test_plugin_on_a_lone_private_video_is_recorded_but_does_not_trigger(self, private_key: str, switch: Callable[[bool], None]) -> None:
         switch(True)
@@ -2084,7 +2113,7 @@ class TestVideoSegmentSwitch:
         for stored in (row.content_text, row.content_data, row.raw_cq_code):
             assert URL_SECRET not in stored and "multimedia" not in stored
         segments = row.parse_content_data()
-        assert type(segments[0]) is ChatMessageSegment
+        assert type(segments[0]) is ChatMessageSegmentVideo
         assert segments[0].text == "[Video: message:777]"
         assert "[Video: message:777]" in row.parse_chat_history_prompt("cafebabecafebabe", _prompt_config(768))
 
@@ -2095,13 +2124,15 @@ class TestVideoSegmentSwitch:
         switch(False)
         plugin_scope.set_scope_override(plugin_scope.OverrideScope.INSTANCE, INSTANCE, plugin.key, True)
         await self._ingest({"url": self.URL}, chat_key=CHAT_KEY, chat_type=ChatType.GROUP)
-        assert await DBChatMessage.filter(chat_key=CHAT_KEY).count() == 1
+        row = await DBChatMessage.get(chat_key=CHAT_KEY)
+        assert VIDEO_UNAVAILABLE_NOTE not in row.parse_chat_history_prompt("cafebabecafebabe", _prompt_config(768))
 
     async def test_session_scope_can_switch_it_off_again(self, private_key: str, switch: Callable[[bool], None]) -> None:
         switch(True)
         plugin_scope.set_scope_override(plugin_scope.OverrideScope.SESSION, CHAT_KEY, plugin.key, False)
         await self._ingest({"url": self.URL}, chat_key=CHAT_KEY, chat_type=ChatType.GROUP)
-        assert await DBChatMessage.filter(chat_key=CHAT_KEY).count() == 0
+        row = await DBChatMessage.get(chat_key=CHAT_KEY)
+        assert VIDEO_UNAVAILABLE_NOTE in row.parse_chat_history_prompt("cafebabecafebabe", _prompt_config(768))
 
     def test_the_adapter_does_not_import_the_plugin(self) -> None:
         tree = ast.parse(Path(convertor.__file__).read_text(encoding="utf-8"))
@@ -2110,7 +2141,7 @@ class TestVideoSegmentSwitch:
                 assert not (node.module or "").startswith("plugins")
 
     def test_the_constant_is_the_real_plugin_key(self) -> None:
-        assert convertor.VIDEO_ANALYSIS_PLUGIN_KEY == plugin.key
+        assert VIDEO_ANALYSIS_PLUGIN_KEY == plugin.key
 
 
 class TestRkeyStaysOutOfLogs:
@@ -2200,7 +2231,10 @@ class TestMessageSource:
             ("message:778", "这个频道里没有"),
             ("message:abc", "message:"),
             ("message:", "message:"),
-            ("message:-1", "message:"),
+            # 负数是合法编号（NapCat、SnowLuma 都是有符号哈希），频道里没有才拒绝；非规范写法才算格式错
+            ("message:-1", "这个频道里没有"),
+            ("message:--1", "message:"),
+            ("message:-0", "message:"),
         ],
     )
     async def test_bad_ids_are_refused(self, db: None, harness: Harness, monkeypatch: pytest.MonkeyPatch, source_text: str, message: str) -> None:

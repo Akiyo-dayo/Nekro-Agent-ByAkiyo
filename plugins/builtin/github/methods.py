@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core.logger import logger
 from nekro_agent.services.plugin.schema import SandboxMethodType
+from nekro_agent.tools.untrusted_content import echo_inline
 
 from .models import ChatSubscriptions
 from .plugin import plugin, store
@@ -39,10 +40,12 @@ async def subscribe_github_repo(_ctx: AgentCtx, repo_name: str, events: Optional
         if not events:
             events = ["push", "issues", "pull_request", "release", "star"]
         events_str = ", ".join(events)
+    # BEHAVIOR 方法的返回值会落成 SYSTEM 消息：仓库名、事件名是模型传入的，异常文本（如校验错误）也会带上它们，
+    # 一律压成单行再回显
     except Exception as e:
-        return f"订阅GitHub仓库失败: {e!s}"
+        return f"订阅GitHub仓库失败: {echo_inline(e, 200)}"
     else:
-        return f"成功订阅仓库 {repo_name} 的 {events_str} 事件"
+        return f"成功订阅仓库 {echo_inline(repo_name)} 的 {echo_inline(events_str, 200)} 事件"
 
 
 @plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "取消订阅GitHub仓库")
@@ -64,7 +67,7 @@ async def unsubscribe_github_repo(_ctx: AgentCtx, repo_name: str) -> str:
     await chat_subs.unsubscribe_repo(repo_name)
     # 保存订阅数据
     await store.set(chat_key=_ctx.chat_key, store_key="github_subs", value=chat_subs.model_dump_json())
-    return f"成功取消订阅仓库 {repo_name}"
+    return f"成功取消订阅仓库 {echo_inline(repo_name)}"
 
 
 @plugin.mount_sandbox_method(SandboxMethodType.TOOL, "获取GitHub仓库订阅列表")

@@ -1,4 +1,4 @@
-"""NA 反连地址的主机名口径：`NEKRO_SELF_HOSTNAME` 显式可配 + 三级回落（§3 #47）
+"""NA 反连地址的主机名口径：`NEKRO_SELF_HOSTNAME` 显式可配 + 三级回落
 
 ## 这份测试在守什么
 

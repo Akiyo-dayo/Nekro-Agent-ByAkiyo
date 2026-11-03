@@ -11,7 +11,8 @@
 `DBChatMessage.filter(...)` / `DBExecCode.filter(...)`，新加一个统计项时想绕过作用域
 就得先把这条约定破坏掉。
 
-两张表的分区依据不同：`chat_message` 自带 `instance_key` 列，按列精确匹配；
+两张表的分区依据不同：`chat_message` 自带 `adapter_key` / `instance_key` 两列，按列成对匹配
+（只按 `instance_key` 会把另一个适配器下归别人的同名实例一起算进来）；
 `exec_code` 只有 `chat_key`，走 `chat_channel` 的子查询把 `chat_key` 收敛到本身份的实例上。
 
 **不要改回 `{adapter_key}-{instance_key}-` 前缀匹配**：那个格式只是 `BaseAdapter.build_chat_key`
@@ -19,10 +20,10 @@
 （`qqoc-{channel_id}`，压根没有实例段）都不遵守它 —— 见
 `adapters/__init__.py:CHAT_KEY_PREFIX_ALIASES` 的登记。前缀匹配对这些适配器恒不命中，
 表现为租户在自己的首页上看到「有消息、零沙盒执行」这种自相矛盾的数字。
-频道归属的口径只有一处：`chat_key -> chat_channel.instance_key`，
+频道归属的口径只有一处：`chat_key -> chat_channel.(adapter_key, instance_key)`，
 与 `routers/chat_channel.py:assert_channel_accessible` 逐字相同。
 
-未启用多租户时 `get_tenant_scope()` 恒为 None，`DashboardScope.instance_keys` 为 None，
+未启用多租户时 `get_tenant_scope()` 恒为 None，`DashboardScope.instances` 为 None，
 每个查询都不加任何条件，行为与改造前逐字一致。
 """
 
@@ -49,7 +50,12 @@ from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.runtime_state import is_shutting_down
 from nekro_agent.services.user.deps import get_current_active_user
-from nekro_agent.services.user.tenant_perm import accessible_instance_keys, get_tenant_scope
+from nekro_agent.services.user.tenant_perm import (
+    InstanceRef,
+    accessible_instance_refs,
+    get_tenant_scope,
+    instance_refs_filter,
+)
 
 logger = get_sub_logger("dashboard")
 
@@ -102,21 +108,23 @@ class RankingItem(BaseModel):
 class DashboardScope:
     """当前身份能统计到的数据范围
 
-    `instance_keys is None` 表示平台方 / 未启用多租户，查询不加任何条件；
-    否则是该身份名下的实例，空元组表示"一个实例都没有"，统计结果全为 0。
+    `instances is None` 表示平台方 / 未启用多租户，查询不加任何条件；
+    否则是该身份名下的实例（`(adapter_key, instance_key)`），空元组表示"一个实例都没有"，统计结果全为 0。
     """
 
-    instance_keys: Optional[Tuple[str, ...]]
+    instances: Optional[Tuple[InstanceRef, ...]]
 
     @property
     def cache_tag(self) -> str:
         """历史桶缓存键里的作用域标签，平台方用 `*` 与任何租户都不相等"""
-        return "*" if self.instance_keys is None else ",".join(self.instance_keys)
+        if self.instances is None:
+            return "*"
+        return ",".join(f"{adapter_key}/{instance_key}" for adapter_key, instance_key in self.instances)
 
     def messages(self) -> QuerySet[DBChatMessage]:
-        if self.instance_keys is None:
+        if self.instances is None:
             return DBChatMessage.all()
-        return DBChatMessage.filter(instance_key__in=list(self.instance_keys))
+        return DBChatMessage.filter(instance_refs_filter(self.instances))
 
     def exec_codes(self) -> QuerySet[DBExecCode]:
         """`exec_code` 只有 `chat_key`，归属经 `chat_channel` 一跳推出来
@@ -125,11 +133,11 @@ class DashboardScope:
         绑定参数会撞上 SQLite 的上限。可见实例为空时子查询退化成 `WHERE 1=0`，
         整条条件恒空，不会退化成不受限。
         """
-        if self.instance_keys is None:
+        if self.instances is None:
             return DBExecCode.all()
         return DBExecCode.filter(
             chat_key__in=Subquery(
-                DBChatChannel.filter(instance_key__in=list(self.instance_keys)).values("chat_key"),
+                DBChatChannel.filter(instance_refs_filter(self.instances)).values("chat_key"),
             ),
         )
 
@@ -140,8 +148,8 @@ async def resolve_dashboard_scope(user: DBUser) -> DashboardScope:
     平台方在第一步就返回，一次实例查询都不做。
     """
     if get_tenant_scope(user) is None:
-        return DashboardScope(instance_keys=None)
-    return DashboardScope(instance_keys=tuple(await accessible_instance_keys(user)))
+        return DashboardScope(instances=None)
+    return DashboardScope(instances=tuple(sorted(await accessible_instance_refs(user))))
 
 
 async def get_time_range(time_range: str = "day") -> datetime:

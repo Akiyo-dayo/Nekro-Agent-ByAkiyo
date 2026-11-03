@@ -99,10 +99,9 @@ class LLMUsageContext:
     def with_identity(self, scope: object) -> "LLMUsageContext":
         """从一个 `identity_scope.IdentityScope` 填入域 / 人 / 人设
 
-        ⚠️ **当前全仓零调用方**（round-23 复核核对过），因此 `person_uid` 这一列恒为空串。
+        ⚠️ **当前全仓零调用方**，因此 `person_uid` 这一列恒为空串。
         这不是漏接线：一次 Agent 回合的 prompt 装的是整个频道的上下文，把这笔钱记在
-        "最后说话的那个人"头上是**错的归因**。按人计费要先有产品口径
-        （PROJECT_STATE §8 第 20 条），本方法留着是为了那一天到来时不用再造一遍。
+        "最后说话的那个人"头上是**错的归因**，所以对话链路刻意不调它。
         在它有调用方之前，**不要在读侧假装 `person_uid` 有值**。
 
         入参故意打成 `object`：本模块被 `services/agent/openai.py` 在模块级导入，

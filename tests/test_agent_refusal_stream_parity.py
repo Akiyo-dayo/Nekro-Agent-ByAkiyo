@@ -298,7 +298,7 @@ class TestWiringCoversTheStreamBranch:
         with pytest.raises(AgentProviderRefusalError):
             await harness.run()
 
-        # §3 #58 之后「末轮」= 本回合最后一次真正发出的请求，`max_retry=2` 时就是第 2 次
+        # 回合不再多发最后一次请求之后，「末轮」= 本回合最后一次真正发出的请求，`max_retry=2` 时就是第 2 次
         assert harness.llm_calls == 2, "脚本没有被跑到末轮，用例没测到目标路径"
         assert harness.sandbox_calls == 1
 

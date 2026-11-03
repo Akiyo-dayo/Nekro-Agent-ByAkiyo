@@ -1,4 +1,4 @@
-"""开 `ENABLE_OPENAPI_DOCS` 时 `/api/openapi.json` 必须能生成（裸机部署验收发现，round-27 第二轮）
+"""开 `ENABLE_OPENAPI_DOCS` 时 `/api/openapi.json` 必须能生成（裸机部署验收发现）
 
 `ExtraField(required=True)` 经 `json_schema_extra` 被原样写进**属性级** JSON Schema，而 JSON Schema 里
 `required` 是对象级的字符串数组：属性上出现 `required: true / false` 让 FastAPI 的 OpenAPI 校验
@@ -194,7 +194,7 @@ class TestExtraFieldNeverEmitsAPropertyLevelRequiredKeyword:
 
 
 class TestLiteralRequiredKeyIsNotDropped:
-    """字面量 `"required": True` 不能被丢弃（round-27 第三轮复核 P2-4）
+    """字面量 `"required": True` 不能被丢弃
 
     换名之后 `_extract_extra_fields` 只认 `x-field-required`：第三方插件（以及内置的 `email_utils`）手写的
     `json_schema_extra={"required": True}` 被丢掉，前端不再做必填校验；同时这种字面量同样会把

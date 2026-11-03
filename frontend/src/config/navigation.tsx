@@ -170,7 +170,7 @@ export const PLATFORM_ONLY_PATHS = [
   // 它是四层配置里「实例覆盖层」的唯一写入口：租户在实例作用域下改的是
   // `PUT /config/instance/{adapter}/{instance}`（后端接了 `assert_instance_accessible`
   // + `_assert_tenant_may_write`），共享层（system / adapter）的写入后端一律 403。
-  // 登记在这里等于把 R4「换模型组不用逐个频道点」整条链路封死 —— 页面自己按身份收敛，
+  // 登记在这里等于把「换模型组不用逐个频道点」整条链路封死 —— 页面自己按身份收敛，
   // 见 `pages/settings/system.tsx` 顶部的注释。
   '/settings/deployment',
   '/settings/models',
@@ -559,7 +559,7 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
       {
         // **不是** `platformOnly`（对照 `/console/quota`）：租户管理员也要能改自己实例的
         // 配置覆盖，尤其是 `USE_MODEL_GROUP` —— 否则换个模型组只能去 `/chat-channel`
-        // 逐个频道点，而那正是 R4 要消灭的痛点。作用域收敛与「共享层不可写」由页面 + 后端
+        // 逐个频道点。作用域收敛与「共享层不可写」由页面 + 后端
         // 各守一道。
         // 但也**不能完全不设 visibility**：整页（读与写）都是 `Role.Admin`，
         // 只读租户成员进来是一页纯 403，详见 `MenuVisibility.instanceConfigOverrides`。

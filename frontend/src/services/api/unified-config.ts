@@ -138,12 +138,13 @@ export const unifiedConfigApi = {
   },
 
   // 模型组管理API - 保持与原有API兼容
+  // 组名可以是中文，按路径段编码（与 `tenantApi` 的模型组接口同一做法）
   updateModelGroup: async (groupName: string, config: ModelGroupConfig): Promise<void> => {
-    await axios.post(`/config/model-groups/${groupName}`, config)
+    await axios.post(`/config/model-groups/${encodeURIComponent(groupName)}`, config)
   },
 
   deleteModelGroup: async (groupName: string): Promise<void> => {
-    await axios.delete(`/config/model-groups/${groupName}`)
+    await axios.delete(`/config/model-groups/${encodeURIComponent(groupName)}`)
   },
 
   fetchModels: async (body: FetchModelsRequest): Promise<string[]> => {

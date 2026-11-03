@@ -9,7 +9,7 @@
 2. **人设隔离真的成立，而且四条检索通道一条都不漏。** 段落（向量）、实体/关系（图谱）、
    Episode（叙事）都会直接进提示词，只堵一条等于没堵——#45 就是"四个消费点只测了一个"。
 3. **写入侧标人设、但不产生副本。** 一段对话在人设甲下发生就写一次、标成甲
-   （`DECISIONS.md`「好感度与记忆的隔离维度」的成本论证靠的正是这一条）。
+   （按人设隔离之所以不增加存储成本，靠的正是这一条）。
 4. **向量侧的"字段缺失"这一档。** 改造前写入的 point 的 payload 里没有 `preset_id`，
    Qdrant 的 `must` 对缺字段的 point 判为不匹配——照直写等值条件的话，升级那一刻
    **全部存量向量集体落选**。零配置逐字相同在向量侧就断在这里。
@@ -714,7 +714,7 @@ class TestPresetDimensionUsesTheEffectiveChain:
     ) -> None:
         """人设被删之后，挂在它下面的记忆**原地保留成孤儿**，不级联删、也不改判归属。
 
-        `DECISIONS.md`：人设可能是误删。删除后新数据落到回退链的下一档，旧数据留在原地。
+        人设可能是误删，所以删除后新数据落到回退链的下一档，旧数据留在原地。
         """
         preset = await _seed_preset(PRESET_JIA)
         channel = await _seed_channel(CHAT_A, INSTANCE_A, preset_id=preset.id)
@@ -787,7 +787,7 @@ class TestWriteSideTagsPresetWithoutCopies:
         scope_db: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """按人设隔离**不产生副本**——`DECISIONS.md` 的成本论证靠的正是这一条。
+        """按人设隔离**不产生副本**——隔离之所以不增加存储成本，靠的正是这一条。
 
         库里已经存在另一个人设时，一次沉淀仍然只落一行、只标一个人设。
         """
@@ -1301,17 +1301,17 @@ class TestDeliberateNonIsolationIsDocumented:
         scope_db: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """**既有余量，本轮不收**：同实例、同人设的两个群绑同一工作区仍然互相可见。
+        """**既有余量，有意保留**：同实例、同人设的两个群绑同一工作区仍然互相可见。
 
-        `origin_chat_key` 从来没有进过检索过滤，而 `DECISIONS.md` 明确写了隔离键**不含**
-        `chat_key`（"群聊与私聊合并记一份，同一个人在群里和私聊里是同一个人"）。
-        把 `chat_key` 加进过滤会当场推翻那条已拍板的决策。
+        `origin_chat_key` 从来没有进过检索过滤，隔离键按设计就**不含** `chat_key`：
+        群聊与私聊合并记一份，同一个人在群里和私聊里是同一个人。
+        把 `chat_key` 加进过滤会当场推翻这条设计。
 
         加了人设维之后这条余量**变窄但仍然成立**：两个群人设不同就自动分开
         （下一条用例），人设相同才共享。而"把两个频道绑进同一个工作区"本身是运营的显式动作。
 
         这条用例是**行为文档**：它保护的是"共享"而不是"隔离"，
-        哪天有人顺手给检索加上 `origin_chat_key` 过滤，这里会红，提醒他先去改 DECISIONS。
+        哪天有人顺手给检索加上 `origin_chat_key` 过滤，这里会红，提醒他这是在改隔离设计。
         """
         from_group_1 = await _seed_paragraph(TEXT_JIA, preset_id=1, origin_chat_key=CHAT_A)
         from_group_2 = await _seed_paragraph(TEXT_YI, preset_id=1, origin_chat_key=CHAT_A2)

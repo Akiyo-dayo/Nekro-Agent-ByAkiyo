@@ -6,11 +6,11 @@
  * 四层配置是 `会话 > 实例 > 适配器 > 全局`。租户能写的只有**自己名下实例**那一层，
  * 而本页是这一层在整个前端里的**唯一**写入口（`createInstanceConfigService` →
  * `PUT /config/instance/{adapter}/{instance}`）。把它关进 `PLATFORM_ONLY_PATHS` 的代价是
- * 租户换个模型组只能去 `/chat-channel` 逐个频道改 —— 正是 R4 要消灭的痛点。
+ * 租户换个模型组只能去 `/chat-channel` 逐个频道改。
  *
  * ## 租户身份下的三条硬约束（都在本文件里落地）
  *
- * 1. **作用域恒为某个具体实例**（PROJECT_STATE §1.4）。租户没有「全局视图」这一档：
+ * 1. **作用域恒为某个具体实例**。租户没有「全局视图」这一档：
  *    `instance_key` 为空对平台方是"看全部"，对租户是后端直接 400。因此租户身份下
  *    `configService` 宁可为 `null`（页面显示"没有可管理的实例"），也**不回落**
  *    `createConfigService('system')` —— 那会把全局配置表摆到租户面前，读得到、
@@ -121,7 +121,7 @@ export default function SettingsPage() {
   // 「名下没有实例」——而同一时刻 `/user/me/identity` 明写着他有实例。
   const tenantCannotReadInstanceConfig = isTenantScoped && isReadOnly
   // 租户身份下作用域恒为某个具体实例。一个都没有时要分清两种情形，
-  // 否则就是本轮自己在别处骂过的那件事：把一种失败说成另一种。
+  // 否则就会把一种失败说成另一种。
   // 判据取自身份接口的 `accessible_instance_keys`——它与实例列表是两条独立的请求，
   // 一条挂了另一条还在。
   const tenantScopeMissing = isTenantScoped && isScopeReady && !currentInstance

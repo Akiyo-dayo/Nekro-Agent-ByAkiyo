@@ -59,7 +59,7 @@ export interface Identity {
   /**
    * 能否触达**自己名下**实例的协议端运维面：重启 / 扫码 / 快速登录，以及健康流水
    *
-   * R19 明写过租户最多能「重启我的 NapCat」。这一族后端统一是 `Role.Admin` + 归属校验
+   * 租户最多能「重启自己的 NapCat」。这一族后端统一是 `Role.Admin` + 归属校验
    * （`/console/instances/{key}/container*` 的自助运维档与 `/console/health/*`），
    * 所以只读的租户普通用户同样不该看到这些入口 —— 他点了会收到 403。
    * 界面隐藏只是避免点了才发现无权，真正的边界在服务端。

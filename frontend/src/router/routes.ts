@@ -33,6 +33,7 @@ export const CHAT_CHANNEL_DETAIL_TABS = [
   'override-settings',
   'basic-info',
   'plugin-data',
+  'command-permissions',
 ] as const
 
 export type ChatChannelDetailTab = (typeof CHAT_CHANNEL_DETAIL_TABS)[number]

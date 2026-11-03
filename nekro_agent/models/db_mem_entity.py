@@ -47,7 +47,7 @@ class DBMemEntity(Model):
     # （`identity_scope.resolve_preset_id` → `DBChatChannel.get_effective_preset_id`），
     # 0 = 无人设档（回落到内置默认人设，库里没有那一行）。
     # 按人设隔离**不产生副本**：一段对话在人设甲下发生就写一次、标成甲，
-    # 不会因为存在人设乙而复制（`DECISIONS.md`「好感度与记忆的隔离维度」）。
+    # 不会因为存在人设乙而复制。
     preset_id = fields.IntField(default=0, index=True, description="人设标识；0 表示无人设档")
 
     # 实体核心信息

@@ -27,7 +27,7 @@ from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.errors import ConflictError
 from nekro_agent.schemas.user import UserCreate
 from nekro_agent.services.user.perm import Role
-from nekro_agent.services.user.util import get_or_create_platform_user, user_register
+from nekro_agent.services.user.util import get_or_create_platform_user, register_platform_user, user_register
 
 
 @pytest.fixture
@@ -146,6 +146,96 @@ class TestGetOrCreatePlatformUser:
             await get_or_create_platform_user("onebot_v11", "12345", "用户")
 
 
+class TestRegisterPlatformUserReportsCreation:
+    """`register_platform_user` 多报一个「是否由本次调用新建」：新用户的一次性处理只该由建行的那一路做
+
+    判据与并发兜底只有一份（`get_or_create_platform_user` 是它的薄封装），这里钉住
+    「新建」这个标志在每条路径上都说实话，尤其是输掉插入竞争、回读到赢家那一路必须是 False。
+    """
+
+    async def test_first_call_creates_and_second_does_not(self, db) -> None:
+        first, first_created = await register_platform_user("onebot_v11", "12345", "新用户")
+        second, second_created = await register_platform_user("onebot_v11", "12345", "改了昵称")
+
+        assert first is not None and second is not None
+        assert (first_created, second_created) == (True, False)
+        assert second.id == first.id
+        assert await DBUser.all().count() == 1
+
+    async def test_reserved_nickname_is_neither_created_nor_returned(self, db) -> None:
+        assert await register_platform_user("onebot_v11", "99999", "admin") == (None, False)
+        assert await DBUser.all().count() == 0
+
+    async def test_losing_the_insert_race_is_not_reported_as_created(self, db, monkeypatch) -> None:
+        """伪造与 `get_or_create_platform_user` 那条竞争用例同一个交错：查过、未插时赢家落库"""
+        real_create = DBUser.create
+        raced = {"done": False}
+
+        async def winner_lands_first(*args, **kwargs):
+            if not raced["done"]:
+                raced["done"] = True
+                await real_create(
+                    username="赢家",
+                    password="x",
+                    adapter_key="onebot_v11",
+                    platform_userid="12345",
+                    perm_level=Role.User,
+                    login_time=db_now(),
+                )
+                raise IntegrityError("duplicate key value violates unique constraint")
+            return await real_create(*args, **kwargs)
+
+        monkeypatch.setattr(DBUser, "create", winner_lands_first)
+
+        user, created = await register_platform_user("onebot_v11", "12345", "输家")
+
+        assert raced["done"], "没走到插入竞争那一步，这条用例没有测到它要测的东西"
+        assert user is not None and user.username == "赢家"
+        assert created is False
+        assert await DBUser.all().count() == 1
+
+    async def test_concurrent_first_messages_create_exactly_once(self, db, monkeypatch) -> None:
+        """同一新用户的两条首批消息并发进来：只有一路报「新建」，库里只有一行
+
+        sqlite 上复现不了真唯一索引的交错，这里让两路都先查到「不存在」，再让第二个插入撞
+        `IntegrityError`（与真库上唯一索引的表现一致），回读与判据全部是真的。
+        """
+        import asyncio
+
+        real_get = DBUser.get_by_union_id
+        real_create = DBUser.create
+        both_checked = asyncio.Event()
+        checked = {"n": 0}
+        inserted = {"n": 0}
+
+        async def get_after_both_checked(adapter_key, platform_userid):
+            row = await real_get(adapter_key, platform_userid)
+            checked["n"] += 1
+            if checked["n"] <= 2:
+                if checked["n"] == 2:
+                    both_checked.set()
+                await both_checked.wait()
+            return row
+
+        async def create_once(*args, **kwargs):
+            inserted["n"] += 1
+            if inserted["n"] > 1:
+                raise IntegrityError("duplicate key value violates unique constraint")
+            return await real_create(*args, **kwargs)
+
+        monkeypatch.setattr(DBUser, "get_by_union_id", get_after_both_checked)
+        monkeypatch.setattr(DBUser, "create", create_once)
+
+        results = await asyncio.gather(
+            register_platform_user("onebot_v11", "12345", "甲"),
+            register_platform_user("onebot_v11", "12345", "甲"),
+        )
+
+        assert sorted(created for _, created in results) == [False, True]
+        assert {user.id for user, _ in results if user is not None} == {(await DBUser.first()).id}
+        assert await DBUser.all().count() == 1
+
+
 class TestUserRegisterRaceGuard:
     async def test_duplicate_pair_raises_conflict(self, db) -> None:
         await user_register(_user_create())
@@ -159,6 +249,21 @@ class TestUserRegisterRaceGuard:
             raise IntegrityError("duplicate key")
 
         monkeypatch.setattr(DBUser, "create", boom)
+
+        with pytest.raises(ConflictError):
+            await user_register(_user_create())
+
+    async def test_existing_dirty_duplicates_still_map_to_conflict(self, db) -> None:
+        """库里已有同一联合键的历史重复行时，注册给出「用户已存在」，而不是 MultipleObjectsReturned 变成 500"""
+        kwargs = {
+            "password": "x",
+            "adapter_key": "onebot_v11",
+            "platform_userid": "12345",
+            "perm_level": Role.User,
+            "login_time": db_now(),
+        }
+        await DBUser.create(username="最早", **kwargs)
+        await DBUser.create(username="后来者", **kwargs)
 
         with pytest.raises(ConflictError):
             await user_register(_user_create())

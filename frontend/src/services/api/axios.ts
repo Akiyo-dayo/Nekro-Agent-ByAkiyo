@@ -73,7 +73,7 @@ export function isForbiddenError(error: unknown): boolean {
 /**
  * 这次失败是不是 404
  *
- * **404 在本项目里是有意的越权语义**（PROJECT_STATE §1.4：越权一律 404 而非 403，
+ * **404 在本项目里是有意的越权语义**（越权一律 404 而非 403，
  * 403 会泄露"该资源存在"）。所以页面拿到 404 时**必须**继续说「不存在」，
  * 不能改口说「你无权查看」—— 那等于把后端刻意藏起来的那条信息又讲了出来。
  * 这个判据存在的唯一理由就是把它从「其它失败」里摘出来，别被通用错误视图接管。
@@ -101,6 +101,13 @@ const axiosInstance = axios.create({
     'Content-Type': 'application/json',
     Accept: 'application/json',
   },
+})
+let redirectingToken: string | null = null
+
+useAuthStore.subscribe((state, previousState) => {
+  if (state.token !== previousState.token) {
+    redirectingToken = null
+  }
 })
 
 // 请求拦截器
@@ -147,17 +154,27 @@ axiosInstance.interceptors.response.use(
       const authError = isApiErrorResponse(data) ? data : null
       // 非登录接口的 401，执行登出
       if (!error.config?.url?.includes('/user/login')) {
-        const sessionMessage =
-          authError?.message ||
-          i18n.t('sessionExpired', { ns: 'errors', defaultValue: '登录已过期，请重新登录' })
-        try {
-          sessionStorage.setItem('auth_error', sessionMessage)
-        } catch {
-          // ignore storage errors
+        const authState = useAuthStore.getState()
+        const currentToken = authState.token
+        // 只有出错的这个请求带的就是当前 token 才登出：重新登录期间，旧 token 发出的请求迟到的 401
+        // 不能把刚建立的新会话也登出
+        const requestAuth = error.config?.headers?.Authorization
+        const isStaleRequest =
+          typeof requestAuth === 'string' && currentToken !== null && requestAuth !== `Bearer ${currentToken}`
+        if (currentToken && !isStaleRequest && redirectingToken !== currentToken) {
+          redirectingToken = currentToken
+          const sessionMessage =
+            authError?.message ||
+            i18n.t('sessionExpired', { ns: 'errors', defaultValue: '登录已过期，请重新登录' })
+          try {
+            sessionStorage.setItem('auth_error', sessionMessage)
+          } catch {
+            // ignore storage errors
+          }
+          authState.logout()
+          const redirectTarget = sanitizeRedirectTarget(getCurrentAppPath())
+          window.location.replace(`/#${loginPath(redirectTarget)}`)
         }
-        useAuthStore.getState().logout()
-        const redirectTarget = sanitizeRedirectTarget(getCurrentAppPath())
-        window.location.replace(`/#${loginPath(redirectTarget)}`)
       }
       // 使用后端返回的本地化消息，或使用前端翻译
       throw new ApiError(

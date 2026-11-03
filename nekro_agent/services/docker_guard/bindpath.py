@@ -1,4 +1,4 @@
-"""bind source 的真实路径解析（docker-guard 的符号链接防线，PROJECT_STATE §3 #73）。
+"""bind source 的真实路径解析（docker-guard 的符号链接防线）。
 
 ## 要解决的问题
 

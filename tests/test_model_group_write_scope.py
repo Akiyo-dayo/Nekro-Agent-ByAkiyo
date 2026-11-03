@@ -8,7 +8,7 @@
 
 于是租户对自己实例（或自己频道）写一次 `USE_MODEL_GROUP=<平台 private 组名>`，
 此后每一轮对话都走那把 Key。这不是密钥外泄（Key 不进响应体），而是**授权与计费边界被绕过**，
-`visibility=private` 这个字段从此没有意义——而它正是 R19「平台模型组 shared/private」的执行点。
+`visibility=private` 这个字段从此没有意义——平台模型组分 shared / private，靠的就是这里执行。
 
 这与已修的配额天花板是同一条边界上的另一扇门（`routers/console/quota.py` 的注释亲口写过
 「通用配置接口是同一条边界上的另一扇门」），模型组这一侧那扇门此前还开着。
@@ -20,10 +20,10 @@
    403 与 200 的差异本身就是一个组名存在性探针。
 2. **运行时兜底**（`TestRuntimeScopeGuard`）：接口层只管住"从今往后"，存量覆盖文件里
    可能早就写着越权的组名。越界引用就地回落 + WARNING，不抛异常。
-3. **接线**（`TestTheGuardsAreActuallyWiredIn`，见 PROJECT_STATE §2.7）：
+3. **接线**（`TestTheGuardsAreActuallyWiredIn`）：
    零件测得再漂亮也不构成"这段逻辑在生产路径上跑得到"的证据。把
    `_assert_tenant_may_write` 里那次调用删掉、或把 `run_agent` 里那次调用删掉，
-   必须各自有用例变红。写路径有**三个**调用点，每个都单独有红（§2.7 round-14 的教训）。
+   必须各自有用例变红。写路径有**三个**调用点，每个都单独有红。
 
 ## 判定不许有第二份实现
 
@@ -542,15 +542,16 @@ class TestRefMarkerDrivesEverything:
 
 
 def _run_agent_body() -> ast.AsyncFunctionDef:
+    # `run_agent` 只解析频道、设好实例上下文，正文在它调用的这个函数里
     source = Path(inspect.getsourcefile(run_agent_module) or "").read_text(encoding="utf-8")
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_agent":
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_agent_in_instance_scope":
             return node
-    raise AssertionError("run_agent 不见了")
+    raise AssertionError("_run_agent_in_instance_scope 不见了")
 
 
 class TestTheGuardsAreActuallyWiredIn:
-    """零件全对、调用点没了 —— 测试会全绿（PROJECT_STATE §2.7）"""
+    """零件全对、调用点没了 —— 测试会全绿"""
 
     async def test_run_agent_guards_before_touching_the_model_group(
         self,
@@ -629,7 +630,7 @@ class TestTheGuardsAreActuallyWiredIn:
             and node.value.attr == "MODEL_GROUPS"
         ]
         assert guard_lines, "run_agent 里没有模型组归属守卫"
-        assert lookup_lines, "run_agent 里没有模型组取用点，判据的另一半失效了（见 §2.10）"
+        assert lookup_lines, "run_agent 里没有模型组取用点，判据的另一半失效了"
         assert max(guard_lines) < min(lookup_lines)
 
     def test_the_guard_is_given_the_real_instance_key(self) -> None:
@@ -652,7 +653,7 @@ class TestTheGuardsAreActuallyWiredIn:
     async def test_every_write_path_is_gated(self, spy: ConfigServiceSpy, write: Any) -> None:
         """三条写路径各有一个 `_assert_tenant_may_write` 调用点，每个都要有自己的红
 
-        §2.7（round-14）：写接线用例前先数一遍这个 API 有几个调用点。
+        写接线用例前先数一遍这个 API 有几个调用点。
         只测其中一条的话，另外两条的守卫被删掉时测试全绿。
         """
         with pytest.raises(ModelGroupNotFoundError):

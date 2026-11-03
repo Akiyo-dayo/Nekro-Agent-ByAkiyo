@@ -1,4 +1,4 @@
-"""内置 NapCat 容器名的长度上限：超过 63 改用稳定短名（§3 #46 复核补上）
+"""内置 NapCat 容器名的长度上限：超过 63 改用稳定短名（复核时补上）
 
 ## 这份测试在守什么
 
@@ -384,7 +384,7 @@ class TestShortFormIsStableAndDistinct:
 
 
 def old_long_container(scope_env) -> Dict[str, Any]:
-    """按展开形态建出来的存量容器：名字 > 63、当前归属标签（round-26 起写的就是当前口径）"""
+    """按展开形态建出来的存量容器：名字 > 63、当前归属标签（展开形态出现时标签早已是当前口径）"""
     scope_env("")
     name = container_manager.build_unshortened_container_name(LONGEST_KEY)
     assert len(name) > DNS_LABEL_MAX

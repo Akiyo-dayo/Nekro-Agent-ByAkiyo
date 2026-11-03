@@ -16,7 +16,7 @@
 
 3. **无进展检测把 `MANUAL` 也算成了故障**（`TestManualStopIsNotAStall`）。
    `exit(9)` 是运行时契约里写给模型的调试手段
-   （`templates/j2/runtime_contract.j2:200`），与 `AGENT` 同属**有意的续跑点**，
+   （`templates/j2/runtime_contract.j2` 的 Warning 段，`print(...) + exit(9)` 那一条），与 `AGENT` 同属**有意的续跑点**，
    不是失败形态。
 
 每条断言都按「修复不存在时会不会红」挑选：`TestFenceInsideCode` 的期望值是**旧实现的

@@ -1,7 +1,7 @@
 import time
 from typing import Optional, Union
 
-from nonebot import on_message, on_notice
+from nonebot import on, on_message, on_notice
 from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupMessageEvent,
@@ -18,22 +18,40 @@ from nekro_agent.adapters.interface import (
     collect_message,
 )
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
+from nekro_agent.adapters.onebot_v11.core.endpoint_status import endpoint_status
 from nekro_agent.adapters.onebot_v11.core.instance import resolve_instance_key, set_current_instance
-from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message, is_skipped_video_only
+from nekro_agent.adapters.onebot_v11.core.message_id import parse_message_id
+from nekro_agent.adapters.onebot_v11.core.self_sent import (
+    VOICE_SEGMENT_TYPES,
+    GroupMessageSentEvent,
+    PrivateMessageSentEvent,
+    self_sent_channel,
+    self_sent_registry,
+)
+from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
     gen_chat_text,
     get_chat_info,
     get_message_reply_info,
     get_user_name,
 )
+from nekro_agent.adapters.onebot_v11.tools.video import build_video_segment, quoted_video_from_record
 from nekro_agent.core import config, logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_user import DBUser
-from nekro_agent.schemas.chat_message import ChatMessageSegment, ChatMessageSegmentForward
+from nekro_agent.services.unclaimed_dispatch import is_inbound_dispatch_allowed
+from nekro_agent.schemas.chat_message import (
+    SELF_SENT_NICKNAME_SUFFIX,
+    SELF_SENT_SOURCE_EXTERNAL,
+    ChatMessageSegment,
+    ChatMessageSegmentForward,
+    ChatMessageSegmentVideo,
+)
 
 
 def _build_content_text_from_segments(content_data: list[ChatMessageSegment]) -> str:
-    return "".join(seg.text for seg in content_data if seg.text).strip()
+    """没有文字时拿各段的文本拼一个；视频占位不算，它在落库时才补（`merge_video_placeholders`）"""
+    return "".join(seg.text for seg in content_data if seg.text and not isinstance(seg, ChatMessageSegmentVideo)).strip()
 
 
 def _merge_voice_content_text(content_text: str, content_data: list[ChatMessageSegment]) -> str:
@@ -48,16 +66,123 @@ def _merge_voice_content_text(content_text: str, content_data: list[ChatMessageS
     return "".join(merged_parts).strip()
 
 
+def _is_ignored_text(content_text: str) -> bool:
+    ignored_prefixes = (
+        [config.AI_COMMAND_OUTPUT_PREFIX, *config.AI_IGNORED_PREFIXES]
+        if config.AI_COMMAND_OUTPUT_PREFIX
+        else config.AI_IGNORED_PREFIXES
+    )
+    return any(content_text.startswith(prefix) for prefix in ignored_prefixes)
+
+
+async def _quoted_video_segment(event: MessageEvent, ref_msg_id: str, chat_key: str) -> Optional[ChatMessageSegmentVideo]:
+    """引用回复指向视频时补一个占位，让 AI 不用翻历史就知道说的是哪个视频
+
+    被引用的视频可能根本不在上下文窗口里，甚至不在记录里（升级前被跳过的、NA 离线时发的）。
+    `event.reply` 是 NoneBot 替我们 `get_msg` 回来的；那一步失败时再查记录。
+    """
+    if parse_message_id(ref_msg_id) is None:
+        return None
+    reply = event.reply
+    if reply is not None:
+        for seg in reply.message:
+            if seg.type == "video":
+                sender_id = str(reply.sender.user_id) if reply.sender.user_id is not None else ""
+                return build_video_segment(ref_msg_id, seg.data, quoted=True, quoted_sender_id=sender_id)
+    return await quoted_video_from_record(chat_key, ref_msg_id)
+
+
+async def handle_self_sent_event(adapter: BaseAdapter, event: MessageEvent, bot: Bot) -> None:
+    """记录账号自身发出、但不是 NA 发的消息；NA 自己的回传在这里丢掉
+
+    先去重再做别的：回传里 NA 发的图片不该再下载一遍。
+    """
+    endpoint_status.note_echo(str(bot.self_id))
+    channel = self_sent_channel(event)
+    if channel is None:
+        logger.debug(f"自身消息没有可归属的频道，已跳过: message_id={event.message_id}")
+        return
+    channel_id, chat_type = channel
+    file_names = [str(seg.data.get("file") or "") for seg in event.original_message if seg.type == "file"]
+    has_voice = any(seg.type in VOICE_SEGMENT_TYPES for seg in event.original_message)
+    if await self_sent_registry.is_own(bot.self_id, channel_id, str(event.message_id), file_names, has_voice=has_voice):
+        return
+
+    instance_key = await resolve_instance_key(bot.self_id)
+    set_current_instance(instance_key, bot.self_id)
+    if not await is_inbound_dispatch_allowed(adapter.key, instance_key):
+        return
+
+    plt_channel = PlatformChannel(channel_id=channel_id, channel_name="", channel_type=chat_type, instance_key=instance_key)
+    db_chat_channel: DBChatChannel = await plt_channel.get_db_chat_channel(adapter)
+    if not (await db_chat_channel.get_effective_config()).ONEBOT_RECORD_SELF_SENT:
+        return
+    if not db_chat_channel.channel_name:
+        plt_channel = await adapter.get_channel_info(channel_id)
+        plt_channel.instance_key = instance_key
+
+    content_data, _, message_id = await convert_chat_message(event, False, bot, db_chat_channel, adapter)
+    if not content_data:
+        return
+
+    content_text, _ = await gen_chat_text(event=event, bot=bot, db_chat_channel=db_chat_channel)
+    content_text = content_text or _build_content_text_from_segments(content_data)
+    if _is_ignored_text(content_text):
+        return
+    for seg in content_data:
+        if isinstance(seg, ChatMessageSegmentForward):
+            content_text = seg.text
+            break
+
+    ref_msg_id = await get_message_reply_info(event=event)
+    quoted = await _quoted_video_segment(event, ref_msg_id, db_chat_channel.chat_key)
+    if quoted is not None:
+        content_data.append(quoted)
+
+    nickname = event.sender.card or event.sender.nickname or (await db_chat_channel.get_preset()).name
+    plt_user = PlatformUser(platform_name="qq", user_id=str(bot.self_id), user_name=nickname)
+    plt_msg = PlatformMessage(
+        message_id=message_id,
+        sender_id=plt_user.user_id,
+        sender_name=nickname,
+        sender_nickname=f"{nickname}{SELF_SENT_NICKNAME_SUFFIX}",
+        content_data=content_data,
+        content_text=content_text,
+        is_tome=False,
+        timestamp=int(time.time()),
+        ext_data=PlatformMessageExt(ref_msg_id=ref_msg_id, self_sent_source=SELF_SENT_SOURCE_EXTERNAL),
+        self_sent_external=True,
+    )
+    await collect_message(adapter, plt_channel, plt_user, plt_msg)
+
+
+def register_self_sent_matcher(adapter: BaseAdapter) -> None:
+    """接 `message_sent`。协议端不上报时这个匹配器永远不会被调用"""
+
+    @on("message_sent", priority=99999, block=False).handle()
+    async def _(_: Matcher, event: Union[GroupMessageSentEvent, PrivateMessageSentEvent], bot: Bot):
+        await handle_self_sent_event(adapter, event, bot)
+
+
 def register_matcher(adapter: BaseAdapter):
 
     @on_message(priority=99999, block=False).handle()
     async def _(_: Matcher, event: Union[MessageEvent, GroupMessageEvent], bot: Bot):
         """消息匹配器"""
 
+        # 有的协议端把自身消息也按 `post_type=message` 上报。当成用户消息的话，NA 自己的回复
+        # 会再触发一轮 Agent，所以这条分流要排在最前面
+        if str(event.user_id) == str(bot.self_id):
+            await handle_self_sent_event(adapter, event, bot)
+            return
+
         # bot.self_id 是本条消息由哪个账号收到的唯一权威来源。先解析为稳定的实例标识并写入上下文，
         # 之后派生的异步任务与插件里既有的无参 get_bot() 才能解析到正确账号，而不是静默串号
         instance_key = await resolve_instance_key(bot.self_id)
         set_current_instance(instance_key, bot.self_id)
+        # 未认领实例的闸门要挡在建频道行、向协议端问群成员信息之前（collector 里那道是兜底）
+        if not await is_inbound_dispatch_allowed(adapter.key, instance_key):
+            return
 
         # 频道信息处理：channel_id 保持干净形态，账号维度由 instance_key 单独携带
         channel_id, chat_type = await get_chat_info(event=event, bot=bot)
@@ -109,12 +234,7 @@ def register_matcher(adapter: BaseAdapter):
 
         # 前缀过滤必须基于消息自身文本判定。若先用转发载荷覆盖 content_text，
         # 攻击者既能把任意内容包进合并转发绕过忽略前缀，也能构造忽略前缀让整条消息被静默丢弃。
-        ignored_prefixes = (
-            [config.AI_COMMAND_OUTPUT_PREFIX, *config.AI_IGNORED_PREFIXES]
-            if config.AI_COMMAND_OUTPUT_PREFIX
-            else config.AI_IGNORED_PREFIXES
-        )
-        if any(content_text.startswith(prefix) for prefix in ignored_prefixes):
+        if _is_ignored_text(content_text):
             logger.info(f"忽略前缀匹配的消息: {content_text[:32]}...")
             return
 
@@ -125,6 +245,9 @@ def register_matcher(adapter: BaseAdapter):
                 break
 
         ref_msg_id = await get_message_reply_info(event=event)
+        quoted_video = await _quoted_video_segment(event, ref_msg_id, db_chat_channel.chat_key)
+        if quoted_video is not None:
+            content_data.append(quoted_video)
 
         plt_msg: PlatformMessage = PlatformMessage(
             message_id=message_id,
@@ -132,12 +255,11 @@ def register_matcher(adapter: BaseAdapter):
             sender_name=sender_name,
             sender_nickname=sender_nickname,
             content_data=content_data,
+            # 不带视频占位：伪造检查、关键词、禁词都看这一份，占位在落库时才补
             content_text=content_text,
             is_tome=bool(is_tome or msg_tome),
             timestamp=int(time.time()),
             ext_data=PlatformMessageExt(ref_msg_id=ref_msg_id),
-            # 视频插件关着、私聊里只剩合成的 @ 段：照常记录，但不触发 Agent
-            suppress_trigger=is_skipped_video_only(event, content_data),
         )
 
         # 提交收集消息
@@ -148,6 +270,8 @@ def register_matcher(adapter: BaseAdapter):
         """上传事件匹配器"""
         instance_key = await resolve_instance_key(bot.self_id)
         set_current_instance(instance_key, bot.self_id)
+        if not await is_inbound_dispatch_allowed(adapter.key, instance_key):
+            return
 
         # 频道信息处理
         channel_id, chat_type = await get_chat_info(event=event, bot=bot)
@@ -161,11 +285,12 @@ def register_matcher(adapter: BaseAdapter):
 
         # 用户信息处理
         platform_userid: str = str(event.user_id)
+        # 账号自己上传的文件：NA 发的已经记过，别的程序发的走 `message_sent`，这里再记一遍就重复了
+        if platform_userid == str(bot.self_id):
+            return
         user: Optional[DBUser] = await DBUser.get_or_none(adapter_key=adapter.key, platform_userid=platform_userid)
 
         if not user:
-            if platform_userid == bot.self_id:
-                return
             raise ValueError(f"用户 {platform_userid} 尚未注册，请先发送任意消息注册后即可上传文件") from None
 
         if not user.is_active:

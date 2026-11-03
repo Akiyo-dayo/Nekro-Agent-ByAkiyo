@@ -34,7 +34,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useAuthStore } from '../stores/auth'
 import { registerInstanceScopeQueryClient } from '../stores/instanceScope'
 import InstanceScopeSwitcher from '../components/common/InstanceScopeSwitcher'
-import { configApi } from '../services/api/config'
+import { configApi, type VersionInfo } from '../services/api/config'
 import { motion } from 'framer-motion'
 import { UI_STYLES, getAnimationDuration } from '../theme/themeApi'
 import ThemeToggleButton from '../theme/ThemeToggleButton'
@@ -70,7 +70,7 @@ import { authApi } from '../services/api/auth'
 
 const DEV_MODE_SEQUENCE = ['nekro', 'nekro', 'nekro', 'agent', 'nekro', 'nekro', 'agent', 'agent']
 let initialLocaleSyncPromise: Promise<void> | null = null
-let initialVersionPromise: Promise<string> | null = null
+let initialVersionPromise: Promise<VersionInfo> | null = null
 
 /**
  * 顶栏当前身份标识
@@ -127,6 +127,7 @@ function MainLayoutContent() {
   const theme = useTheme()
   const [starCount, setStarCount] = useState<number | null>(null)
   const [version, setVersion] = useState('0.0.0')
+  const [compatVersion, setCompatVersion] = useState<string | null>(null)
   const [openMenus, setOpenMenus] = useState<Record<string, boolean>>({})
   const [drawerOpen, setDrawerOpen] = useState(true)
   const [refreshKey, setRefreshKey] = useState(0)
@@ -452,36 +453,40 @@ function MainLayoutContent() {
             </Box>
           </Typography>
 
-          {/* 版本号 - 相对于外层 Box 右上角 */}
-          <Chip
-            label={`v ${version}`}
-            size="small"
-            variant="outlined"
-            className="version-tag"
-            sx={{
-              ...CHIP_VARIANTS.base(true),
-              position: 'absolute',
-              top: '8px',
-              right: '8px',
-              fontSize: '0.65rem',
-              letterSpacing: '-0.02em',
-              backgroundColor: theme.palette.background.paper,
-              borderColor: 'rgba(255,255,255,0.2)',
-              color: theme.palette.primary.light,
-              transition: 'transform 0.3s ease',
-              transform: 'scale(1)',
-              height: '18px',
-              minWidth: 'auto',
-              '.MuiChip-label': {
-                px: 0.5,
-                py: 0,
-                lineHeight: 1,
-              },
-              '&:hover': {
-                transform: 'scale(1.05) translateY(-1px)',
-              },
-            }}
-          />
+          {/* 版本号 - 相对于外层 Box 右上角。显示分支版本；插件兼容版本只放在悬停提示里，避免被当成产品版本 */}
+          <SimpleTooltip
+            title={compatVersion ? t('versionTag.compat', { ns: 'navigation', version: compatVersion }) : ''}
+          >
+            <Chip
+              label={`v ${version}`}
+              size="small"
+              variant="outlined"
+              className="version-tag"
+              sx={{
+                ...CHIP_VARIANTS.base(true),
+                position: 'absolute',
+                top: '8px',
+                right: '8px',
+                fontSize: '0.65rem',
+                letterSpacing: '-0.02em',
+                backgroundColor: theme.palette.background.paper,
+                borderColor: 'rgba(255,255,255,0.2)',
+                color: theme.palette.primary.light,
+                transition: 'transform 0.3s ease',
+                transform: 'scale(1)',
+                height: '18px',
+                minWidth: 'auto',
+                '.MuiChip-label': {
+                  px: 0.5,
+                  py: 0,
+                  lineHeight: 1,
+                },
+                '&:hover': {
+                  transform: 'scale(1.05) translateY(-1px)',
+                },
+              }}
+            />
+          </SimpleTooltip>
 
           {/* 开发标志 - 相对于外层 Box 左上角 */}
           {devMode && (
@@ -640,24 +645,13 @@ function MainLayoutContent() {
         className="pb-2 -mt-2 text-center border-t"
         sx={{ borderColor: 'rgba(128,128,128,0.2)' }}
       >
-        <Typography variant="caption" color="text.secondary">
-          © {new Date().getFullYear()}{' '}
-          <Link
-            href="https://github.com/KroMiose/nekro-agent"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            NekroAgent
-          </Link>
-          . {t('footer.copyright', { ns: 'navigation' })}.
-        </Typography>
-        {/* LICENSE 要求：界面里以可点击超链接标明「基于 NekroAgent 项目构建」，字号不小于主文字的 80%（0.875rem 对侧栏 1rem 主文字为 87.5%）、对比度可读。任何分发版本都必须保留。 */}
+        {/* LICENSE 要求：界面里以可点击超链接标明「基于 NekroAgent 项目构建」，版权年份并在同一行，字号不小于主文字的 80%（0.875rem 对侧栏 1rem 主文字为 87.5%）、对比度可读。任何分发版本都必须保留。 */}
         <Typography
           component="div"
           color="text.secondary"
-          sx={{ fontSize: '0.875rem', lineHeight: 1.5, mt: 0.5 }}
+          sx={{ fontSize: '0.875rem', lineHeight: 1.5, pt: 0.5 }}
         >
-          {t('footer.builtOnPrefix', { ns: 'navigation' })}
+          © {new Date().getFullYear()} · {t('footer.builtOnPrefix', { ns: 'navigation' })}
           <Link
             href="https://github.com/KroMiose/nekro-agent"
             target="_blank"
@@ -688,17 +682,19 @@ function MainLayoutContent() {
 
   useEffect(() => {
     if (initialVersionPromise === null) {
-      initialVersionPromise = configApi.getVersion().catch((error) => {
+      initialVersionPromise = configApi.getVersionInfo().catch((error) => {
         initialVersionPromise = null
         throw error
       })
     }
     initialVersionPromise
-      .then(version => {
-        setVersion(version)
+      .then(info => {
+        setVersion(info.fork_version)
+        setCompatVersion(info.compat_version)
       })
       .catch(() => {
         setVersion('0.0.0')
+        setCompatVersion(null)
       })
   }, [])
 
@@ -709,7 +705,13 @@ function MainLayoutContent() {
         position: 'relative',
         background: UI_STYLES.BACKGROUND.PRIMARY,
         backgroundColor: theme.palette.mode === 'dark' ? '#181818' : '#f8f8f8',
-        minHeight: '100vh',
+        width: '100%',
+        height: '100vh',
+        minHeight: '100svh',
+        overflow: 'hidden',
+        '@supports (height: 100dvh)': {
+          height: '100dvh',
+        },
         transition: 'background 0.5s ease',
         padding: 0,
       }}
@@ -922,10 +924,13 @@ function MainLayoutContent() {
       </Box>
       <Box
         component="main"
-        className="flex-grow h-screen overflow-hidden flex flex-col"
+        className="flex-grow overflow-hidden flex flex-col"
         sx={{
           position: 'relative',
           flexGrow: 1,
+          height: '100%',
+          minHeight: 0,
+          minWidth: 0,
           width: {
             xs: '100%',
             md: drawerOpen ? `calc(100% - ${drawerWidth}px)` : '100%',
@@ -947,10 +952,15 @@ function MainLayoutContent() {
             duration: getAnimationDuration(0.36),
             ease: [0.4, 0, 0.2, 1],
           }}
-          className="h-full flex-grow overflow-auto rounded-xl performance-adaptive motion-div"
+          className="flex-grow overflow-auto rounded-xl performance-adaptive motion-div"
           style={{
             position: 'relative',
-            overflow: 'hidden',
+            flex: '1 1 auto',
+            minHeight: 0,
+            overflowX: 'hidden',
+            overflowY: 'auto',
+            WebkitOverflowScrolling: 'touch',
+            overscrollBehavior: 'contain',
           }}
         >
           <div

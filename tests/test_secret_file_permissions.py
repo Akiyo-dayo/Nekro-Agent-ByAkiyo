@@ -1,6 +1,6 @@
-"""密钥文件 `credential_secret.key` 的权限（round-28 任务 1）
+"""密钥文件 `credential_secret.key` 的权限
 
-这个文件是模型组凭据（档 B）的**主密钥**。DECISIONS「运营模式」的硬约束是租户拿不到平台方的 Key；
+这个文件是模型组凭据（档 B）的**主密钥**。租户拿不到平台方的 Key 是一条硬约束；
 主密钥全员可读，等于同机任何账户都能解开库里的全部模型组密文。应用自己建它时是 0600，
 但三份安装脚本都会在建好数据目录之后「放开」它的权限（`chmod -R 777` 或等价的 `find ... chmod 777`）。
 
@@ -361,7 +361,7 @@ class TestStartupWarnsWhenTheKeyFileIsTooOpen:
 
 
 def test_call_site_exists_in_the_key_file_reader() -> None:
-    """零件对、调用点没了会全绿（PROJECT_STATE §2.7）：读密钥文件的唯一函数里必须真的调用检查"""
+    """零件对、调用点没了会全绿：读密钥文件的唯一函数里必须真的调用检查"""
     import ast
 
     source = Path(credential_cipher.__file__).read_text(encoding="utf-8")

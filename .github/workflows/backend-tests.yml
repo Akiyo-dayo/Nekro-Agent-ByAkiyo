@@ -3,8 +3,8 @@ name: Backend Tests
 # 后端全量 pytest，带一个真实的 PostgreSQL service 容器。
 #
 # 为什么要有这个工作流：本仓库的测试默认跑 SQLite，而生产是 PostgreSQL。两者对原生 SQL 的占位符、
-# 类型宽松度、DDL 行为都不一样——#64 守卫里的 `WHERE "id" = ?` 就是这样在 5400+ 条全绿的
-# 测试下带着语法错误上线的（PROJECT_STATE §2「SQLite 测试掩盖 Postgres 行为」）。
+# 类型宽松度、DDL 行为都不一样——模型组保存守卫里的 `WHERE "id" = ?` 就是这样在 5400+ 条全绿的
+# 测试下带着语法错误上线的（SQLite 测试会掩盖 Postgres 的行为）。
 # 这里设 NA_TEST_PG_DSN，让「用 NA_TEST_PG_DSN 开门」的真 PG 用例在 PR 上真的跑起来，
 # 而不是永远 skip。
 #
@@ -51,7 +51,7 @@ jobs:
       # 绝不能把这两个变量指向有真实数据的库。
       NA54_TEST_PG_DSN: postgres://postgres:postgres@127.0.0.1:5432/natest
       # 测试里有一批对回环地址的 TCP 连接；runner 上若带系统代理，会把 127.0.0.1 的流量也劫走
-      # （PROJECT_STATE §2.41，本机踩过）。显式声明回环不走代理。
+      # （本机踩过）。显式声明回环不走代理。
       NO_PROXY: 127.0.0.1,localhost
 
     steps:
@@ -62,7 +62,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # python-magic 在 Linux 上要系统库 libmagic（PROJECT_STATE §2.8）；
+      # python-magic 在 Linux 上要系统库 libmagic；
       # ffmpeg 给视频分析插件的端到端用例用真实工具链（下面有一步断言这些用例没被跳过）
       - name: Install system packages
         run: |
@@ -79,7 +79,7 @@ jobs:
       - name: Install Dependencies
         run: uv sync --all-extras
 
-      # pytest 打印完摘要、写完 junit 之后，进程偶尔不退出（本仓库本机复现过，PROJECT_STATE 记过），
+      # pytest 打印完摘要、写完 junit 之后，进程偶尔不退出（本仓库本机复现过），
       # 会把这一步拖到 30 分钟超时、整个任务红在「超时」上而不是测试结果上。
       # 因此这一步**自己不以 pytest 的退出码失败**：后台跑 pytest，看到 junit 报告写出后给进程 60 秒
       # 自行退出，不退就强杀；但退出码与「是否被我们强杀」都落盘，由下一步连同 junit 一起判定——

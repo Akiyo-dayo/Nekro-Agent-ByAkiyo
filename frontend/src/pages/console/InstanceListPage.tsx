@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
+  Alert,
   Box,
   CircularProgress,
   SxProps,
@@ -448,6 +449,12 @@ export default function InstanceListPage() {
               ? t('deleteDialog.purgeDescription')
               : t('deleteDialog.archiveDescription')}
           </Typography>
+          {/* 删实例不会动 qbob：接着的 bot 会继续运行、带着本实例的令牌反复重连。先到协议端页解绑。
+              判据不能只看账号：账号被清空、qbob_appid 还在时 bot 同样接着 */}
+          {deleteTarget?.provider === 'builtin_qbob' &&
+          (deleteTarget.provider_account_id || deleteTarget.qbob_appid) ? (
+            <Alert severity="warning">{t('deleteDialog.qbobAttached')}</Alert>
+          ) : null}
           {deleteMode === 'purge' && deleteTarget && (
             <TextField
               size="small"

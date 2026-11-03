@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.services.plugin.base import NekroPlugin
+from nekro_agent.services.plugin.call_priority import PluginCallPriority, get_plugin_call_priority
 from nekro_agent.services.plugin.prompt_activation import (
     build_prompt_disclosure_view,
     get_plugin_brief,
@@ -18,6 +19,7 @@ class PluginPrompt(PromptTemplate):
     plugin_name: str
     module_name: str
     state: str
+    call_priority: PluginCallPriority = "auto"
     rounds_left: Optional[int] = None
     activation_hint: str = ""
     plugin_brief: str = ""
@@ -29,6 +31,7 @@ class PluginPromptRenderUnit(BaseModel):
     plugin_name: str
     module_name: str
     state: str
+    call_priority: PluginCallPriority = "auto"
     rounds_left: Optional[int] = None
     activation_hint: str = ""
     plugin_brief: str = ""
@@ -46,6 +49,7 @@ async def _render_plugin_prompt(unit: PluginPromptRenderUnit) -> str:
     return PluginPrompt(
         plugin_name=unit.plugin_name,
         module_name=unit.module_name,
+        call_priority=unit.call_priority,
         state=unit.state,
         rounds_left=unit.rounds_left,
         activation_hint=unit.activation_hint,
@@ -125,6 +129,7 @@ async def render_plugins_prompt_legacy(plugins: List[NekroPlugin], ctx: AgentCtx
             PluginPromptRenderUnit(
                 plugin_name=plugin.name,
                 module_name=plugin.module_name,
+                call_priority=get_plugin_call_priority(plugin.module_name),
                 state="always_awake",
                 plugin_brief=get_plugin_brief(plugin),
                 plugin_method_prompt=await plugin.render_sandbox_methods_prompt(ctx),

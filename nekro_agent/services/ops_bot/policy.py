@@ -18,6 +18,11 @@
    不做前缀匹配、不做"属于该实例即可"，避免运维实例被拉进别的群后在那边也生效。
 4. **发言人必须在运维人员白名单里**。这是"权限主体是人不是实例"的落点。
 
+第五道在本模块之外：运维频道所在的实例上报的发送者身份必须是平台方能担保的
+（`services/user/super_users.py` 的 `is_trusted_super_user_source`，与聊天命令的超级用户同一套来源判定）。
+白名单只比用户 ID，而 SSE 的 `from_id`、租户自运行的协议端上报的号码都能填成白名单里的值。
+它要查库，所以放在 `OpsBotCommand.check_permission`，本模块保持纯函数。
+
 ## 为什么不复用 `CommandPermission.SUPER_USER`
 
 命令系统的权限是**可被覆盖的**：`CommandManager.set_command_permission()`
@@ -48,6 +53,8 @@ class OpsAccessDecision(str, Enum):
     NON_IM_ORIGIN = "non_im_origin"
     WRONG_CHANNEL = "wrong_channel"
     NOT_OPERATOR = "not_operator"
+    UNTRUSTED_SOURCE = "untrusted_source"
+    """运维频道所在实例的发送者身份不是平台方能担保的（第五道闸门，判定不在本模块）"""
 
 
 @dataclass(frozen=True)

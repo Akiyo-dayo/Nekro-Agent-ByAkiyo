@@ -117,7 +117,7 @@ EXPOSE 8021
 # 端口跟随 `PORT`（NoneBot 的驱动配置项，也就是进程真正监听的那个端口），缺省 8021。
 # 写死 8021 时，只要有人在容器里改了 PORT（`docker run -e PORT=…` 或自写编排），
 # 容器就会**永久 unhealthy 而进程其实是好的**，依赖 healthcheck 做滚动更新 / 负载摘除的
-# 编排会因此判死一个健康实例（§3 #48）。
+# 编排会因此判死一个健康实例。
 # 注意这里必须是 shell 形态：`${PORT:-8021}` 由容器内的 /bin/sh 在**运行时**展开，
 # Dockerfile 的构建期变量替换不作用于 HEALTHCHECK CMD。
 # `NEKRO_EXPOSE_PORT` 不是监听端口（compose 里它只改宿主侧映射，容器内恒为 8021），不要用它。

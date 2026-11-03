@@ -370,8 +370,8 @@ export default function NapCatPanel({ instanceKey }: NapCatPanelProps) {
   //
   // - `canManageContainers`（平台方）：建 / 删容器、起 / 停、以及网络配置卡片。前两类是宿主级
   //   资源动作，网络配置的响应里还带着托管连接的 OneBot 访问令牌，整块对租户不渲染。
-  // - `canOperateProtocol`（平台方或租户管理员）：重启 / 扫码登录。R19 明写过租户
-  //   「最多能重启我的 NapCat」，掉线自愈要的就是这两个。
+  // - `canOperateProtocol`（平台方或租户管理员）：重启 / 扫码登录。租户最多能
+  //   重启自己的 NapCat，掉线自愈要的就是这两个。
   //
   // 隐藏入口只是避免点了才发现无权，真正的边界在服务端（归属校验落在实例与容器两维上）。
   const { canManageContainers, canOperateProtocol } = useIdentity()

@@ -37,9 +37,12 @@ from nekro_agent.schemas.errors import (
 )
 from nekro_agent.schemas.i18n import I18nDict, i18n_text
 from nekro_agent.schemas.user import UserCreate, UserUpdate
+from nekro_agent.services.command.base import CommandPermission
+from nekro_agent.services.command.manager import command_manager
 from nekro_agent.services.user.auth import get_hashed_password
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.role import Role, get_perm_role
+from nekro_agent.services.user.super_users import matches_super_users
 from nekro_agent.services.user.tenant_perm import (
     assert_managed_user_accessible,
     get_tenant_scope,
@@ -109,6 +112,7 @@ class UserInfo(BaseModel):
     unique_id: str
     perm_level: int
     perm_role: str
+    command_permission: str
     login_time: Optional[datetime]
     ban_until: Optional[datetime]
     prevent_trigger_until: Optional[datetime]
@@ -124,6 +128,25 @@ class UserListResponse(BaseModel):
     items: List[UserInfo]
     page: int
     page_size: int
+
+
+def _resolve_effective_command_permission(adapter_key: str, platform_userid: str) -> CommandPermission:
+    """聊天命令里的**全局**生效档位，与 `collector._resolve_user_command_flags` 同一套判据
+
+    - 后台账号（平台方 admin、租户成员）没有平台身份，`platform_userid` 为空，恒为普通用户；
+    - 超级用户只认 `SUPER_USERS`，这里只做**名单匹配**（号码属于哪个平台）：用户行不带实例，
+      判不了来源；真正执行命令时还要看消息来源是否可信（`services/user/super_users.py`）。
+      存储里的 `SUPER_USER` 按频道管理员展示；
+    - 按频道的授权不在这里：它只在那一个频道生效，展示在频道的用户列表里。
+    """
+    if not platform_userid:
+        return CommandPermission.USER
+    if matches_super_users(adapter_key, platform_userid):
+        return CommandPermission.SUPER_USER
+    permission = command_manager.get_user_permission(adapter_key=adapter_key, platform_userid=platform_userid)
+    if permission in (CommandPermission.ADVANCED, CommandPermission.SUPER_USER):
+        return CommandPermission.ADVANCED
+    return CommandPermission.USER
 
 
 @router.get("/list", summary="获取用户列表", response_model=UserListResponse)
@@ -174,6 +197,10 @@ async def list_users(
                 unique_id=user.unique_id,
                 perm_level=user.perm_level,
                 perm_role=get_perm_role(user.perm_level),
+                command_permission=_resolve_effective_command_permission(
+                    user.adapter_key,
+                    user.platform_userid,
+                ).value,
                 login_time=user.login_time,
                 ban_until=user.ban_until,
                 prevent_trigger_until=user.prevent_trigger_until,
@@ -211,6 +238,10 @@ async def get_user(
         unique_id=user.unique_id,
         perm_level=user.perm_level,
         perm_role=get_perm_role(user.perm_level),
+        command_permission=_resolve_effective_command_permission(
+            user.adapter_key,
+            user.platform_userid,
+        ).value,
         login_time=user.login_time,
         ban_until=user.ban_until,
         prevent_trigger_until=user.prevent_trigger_until,

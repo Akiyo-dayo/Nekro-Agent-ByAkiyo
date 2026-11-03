@@ -11,15 +11,18 @@ from nekro_agent.core.core_utils import ConfigBase, ExtraField
 
 if TYPE_CHECKING:
     from nekro_agent.schemas.agent_message import AgentMessageSegment
+    from nekro_agent.services.command.manager import UserPermissionSource
     from nekro_agent.services.command.schemas import CommandResponse
 from nekro_agent.core import config
 from nekro_agent.core.os_env import OsEnv
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.schemas.i18n import i18n_text
 from nekro_agent.services.agent.templates.base import PromptTemplate, register_template
+from nekro_agent.services.command.base import CommandPermission
 
 from .schemas.platform import (
     PlatformChannel,
+    PlatformMessage,
     PlatformSendRequest,
     PlatformSendResponse,
     PlatformUser,
@@ -317,6 +320,65 @@ class BaseAdapter(ABC, Generic[TConfig]):
     def supports_webui_send(self) -> bool:
         """是否支持从 WebUI 发送消息（默认不支持，适配器可按需覆盖）"""
         return False
+
+    # 下面三个方法的签名与上游 NekroAgent 2.4.x 逐字一致，框架也只按这个形状调用它们：
+    # 照上游写的子类覆写不能因为本分支多传一个参数而报错。框架额外需要的东西
+    # （会话标识、按频道的授权）在 `collector` 里补，不往这里加参数。
+
+    async def get_user_command_permission(
+        self,
+        platform_user: PlatformUser,
+        platform_channel: PlatformChannel,
+        platform_message: PlatformMessage,
+    ) -> CommandPermission:
+        """获取平台用户在命令系统中的权限等级。
+
+        默认使用命令管理器中的持久化授权；适配器可覆盖此方法接入平台侧管理员、群主等权限。
+        这里返回的 `SUPER_USER` 不会让人成为超级用户——超级用户只认 `SUPER_USERS`，
+        `collector` 会把它压成 `ADVANCED`。
+
+        与上游的差别：平台来源（`source="platform"`）的记录在这里不算数。它是某个群里群角色的
+        快照，只有适配器自己在**本条消息所在的群**实时识别才作数；照上游写法覆写成
+        「是群管理就给 ADVANCED，否则 `super()`」的适配器，若这里认快照，在租户 A 的群里
+        当过管理的人到了租户 B 的频道也是频道管理员。
+        """
+        del platform_channel, platform_message
+
+        from nekro_agent.services.command.manager import USER_PERMISSION_SOURCE_PLATFORM, command_manager
+
+        record = command_manager.get_user_permission_record(self.key, platform_user.user_id)
+        if record.source == USER_PERMISSION_SOURCE_PLATFORM:
+            return CommandPermission.USER
+        return record.permission
+
+    async def set_user_command_permission(
+        self,
+        platform_userid: str,
+        permission: CommandPermission | str,
+        *,
+        source: "UserPermissionSource" = "manual",
+        channel_id: str | None = None,
+    ) -> CommandPermission:
+        """设置平台用户在命令系统中的权限等级（全局一份，对该适配器的所有频道生效）。"""
+        from nekro_agent.services.command.manager import command_manager
+
+        normalized_permission = (
+            permission if isinstance(permission, CommandPermission) else CommandPermission(permission)
+        )
+        await command_manager.set_user_permission(
+            self.key,
+            platform_userid,
+            normalized_permission,
+            source=source,
+            channel_id=channel_id,
+        )
+        return normalized_permission
+
+    async def reset_user_command_permission(self, platform_userid: str) -> None:
+        """重置平台用户命令权限，回退为普通用户。"""
+        from nekro_agent.services.command.manager import command_manager
+
+        await command_manager.reset_user_permission(self.key, platform_userid)
 
     async def set_message_reaction(self, message_id: str, status: bool = True, chat_key: str = "") -> bool:  # noqa: ARG002
         """设置消息反应（可选实现）

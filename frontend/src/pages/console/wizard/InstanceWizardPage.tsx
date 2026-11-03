@@ -28,6 +28,7 @@ import { INSTANCE_KEY_PATTERN } from '../../../services/api/consoleContainer'
 import UnclaimedProtocolPanel from '../components/UnclaimedProtocolPanel'
 import BasicInfoStep from './steps/BasicInfoStep'
 import BuiltinNapCatStep from './steps/BuiltinNapCatStep'
+import BuiltinQbobStep from './steps/BuiltinQbobStep'
 import DoneStep from './steps/DoneStep'
 import NativeAdapterStep from './steps/NativeAdapterStep'
 import ProviderStep from './steps/ProviderStep'
@@ -105,6 +106,9 @@ export default function InstanceWizardPage() {
     }
     if (instance.provider === 'remote_onebot') {
       return <RemoteOneBotStep instanceKey={instance.instance_key} />
+    }
+    if (instance.provider === 'builtin_qbob') {
+      return <BuiltinQbobStep instanceKey={instance.instance_key} />
     }
     return (
       <NativeAdapterStep

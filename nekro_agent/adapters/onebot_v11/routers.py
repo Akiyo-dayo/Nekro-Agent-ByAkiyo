@@ -2,7 +2,7 @@
 
 ## 容器名从哪里来（多实例改造后）
 
-总后台按 `services/console/container_manager.py` 的模板逐实例建容器（round-26 起带
+总后台按 `services/console/container_manager.py` 的模板逐实例建容器（模板名带
 `deployment_scope()` 前缀），所以本模块的每个端点都接受一个 `instance_key` 查询参数，
 容器名一律由 `container_manager` 生成（候选表见下），不在这里另写一套查找逻辑。
 
@@ -12,13 +12,13 @@
 因此容器名是一个**候选列表**，按「越新越优先」排序：
 
 1. 当前口径的模板名（带部署前缀，`container_manager.build_container_name`）——新部署命中；
-2. 升级前的裸模板名（`nekro_napcat_{instance_key}`，round-26 之前建的容器顶着它）；
+2. 升级前的裸模板名（`nekro_napcat_{instance_key}`，模板加上部署前缀之前建的容器顶着它）；
 3. 单实例时代的 `NAPCAT_CONTAINER_NAME`——遗留部署命中。
 
 **命中前两个模板名的候选要过归属校验**（`container_manager.assert_container_owned`，
 与总后台 `_assert_owned` 同一份判据）：升级前的裸模板名在两套部署上逐字相同，同宿主上
 另一套部署里同名的 `instance_key` 会解析到同一个容器，而本模块的 `/logs` 会把带着
-WebUI 令牌的日志吐出来、`/restart` 会真的重启它（§3 #46）。第三个候选（配置遗留名）
+WebUI 令牌的日志吐出来、`/restart` 会真的重启它。第三个候选（配置遗留名）
 不校验——那个容器身上没有任何标签，校验它等于让所有单实例遗留部署集体 403。
 
 ## 为什么整组端点都是 Role.Super
@@ -54,7 +54,6 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import (
 
     NAPCAT_ONEBOT_ADAPTER_DIR,
-    OsEnv,
     resolve_deployment_onebot_access_token,
     resolve_self_hostname,
 )
@@ -241,7 +240,7 @@ async def get_container(instance_key: Optional[str] = None) -> AsyncGenerator[Do
                 raise OperationFailedError(operation="获取容器") from e
 
             # 模板名（带前缀的新名与升级前的裸模板名都是）在两套部署上可能逐字相同
-            # （§3 #46：裸模板名不带部署前缀），同宿主上另一套部署里同名的 `instance_key`
+            # （裸模板名不带部署前缀），同宿主上另一套部署里同名的 `instance_key`
             # 会解析到同一个容器。本模块的端点里 `/logs` 与 `/logs/stream` 会把 NapCat 日志
             # （**含 WebUI 访问令牌**）原样吐出、`/restart` 直接重启容器，因此必须与总后台
             # 走同一套归属校验，否则这里就是 #46 的第二个出口。
@@ -369,7 +368,7 @@ ADAPTER_TEMPLATE = """
         "enable": true,
         "name": "ws",
         "url": "ws://{instance_name}:{port}/onebot/v11/ws",
-        "reportSelfMessage": false,
+        "reportSelfMessage": true,
         "messagePostFormat": "array",
         "token": "{token}",
         "debug": false,
@@ -423,12 +422,13 @@ async def restart(
                 expected = await resolve_expected_token(str(adapter.config.BOT_QQ))
                 # 主机名与 `build_managed_entry` 同一个口径（#47）：`resolve_self_hostname()`
                 # 三级回落。改造前这里裸读 `OsEnv.INSTANCE_NAME` 无回落，空值时写出
-                # `ws://:8021/...` 这种必然连不上的 URL。
+                # `ws://:8021/...` 这种必然连不上的 URL。端口同理取 NA 进程监听的那个，
+                # 不是只改宿主侧映射的 `EXPOSE_PORT`（见 `resolve_self_listen_port`）。
                 adapter_file.write_text(
                     ADAPTER_TEMPLATE.format(
                         token=expected.token,
                         instance_name=resolve_self_hostname(),
-                        port=OsEnv.EXPOSE_PORT,
+                        port=container_manager.resolve_self_listen_port(),
                     ),
                     encoding="utf-8",
                 )

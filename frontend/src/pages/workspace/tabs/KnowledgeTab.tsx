@@ -40,6 +40,7 @@ import {
   LibraryBooks as LibraryIcon,
   FolderOpen as FolderOpenIcon,
   DriveFileMove as ImportFolderIcon,
+  Archive as ArchiveIcon,
   Clear as ClearIcon,
   CheckCircleOutline as CheckCircleIcon,
   ErrorOutline as ErrorOutlineIcon,
@@ -60,6 +61,10 @@ import {
   KBReferenceItem,
   KBSearchResponse,
   KBUploadFilePayload,
+  KBZipImportResponse,
+  EMPTY_BATCH_DELETE,
+  EMPTY_BATCH_REINDEX,
+  EMPTY_BATCH_UNBIND,
   kbLibraryApi,
   knowledgeBaseApi,
   WorkspaceDetail,
@@ -77,11 +82,13 @@ import ReferenceGraph from '../components/ReferenceGraph'
 import KBGraphDialog from '../components/KBGraphDialog'
 import KBBatchActionsButton from '../components/KBBatchActionsButton'
 import {
+  BATCH_UPLOAD_CONCURRENCY,
   findCategoryLengthOverflow,
   getFolderImportMetadata,
   KB_CATEGORY_MAX_LENGTH,
 } from '../kbFolderImport'
 import { buildCategoryTree, type KBCategoryTreeNode } from '../kbCategoryTree'
+import { createSingleFileUploadHandler, getZipImportNotice } from '../kbImportHandler'
 
 type KnowledgeSelection =
   | { kind: 'document'; id: number }
@@ -110,7 +117,7 @@ function isSupportedUploadFile(file: File): boolean {
   return SUPPORTED_UPLOAD_EXTENSIONS.includes(getFileExtension(file.name))
 }
 
-type BatchItemStatus = 'waiting' | 'uploading' | 'indexing' | 'done' | 'error'
+type BatchItemStatus = 'waiting' | 'uploading' | 'done' | 'error'
 
 interface BatchQueueItem {
   id: string
@@ -220,6 +227,12 @@ function kbProgressLabel(phase: string, t: (key: string, options?: Record<string
   return t(`knowledge.progress.phase.${phase}`, { defaultValue: phase })
 }
 
+/**
+ * 图谱引用批量拉取上限：文档+资产总数超过该值时，图谱默认折叠只显示根节点，
+ * 此时跳过对每个条目发起引用请求（否则大知识库会触发成千上万个并发请求导致卡死）。
+ */
+const GRAPH_REFERENCE_FETCH_LIMIT = 2000
+
 
 export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail }) {
   const theme = useTheme()
@@ -230,6 +243,7 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const batchInputRef = useRef<HTMLInputElement | null>(null)
   const dirInputRef = useRef<HTMLInputElement | null>(null)
+  const zipInputRef = useRef<HTMLInputElement | null>(null)
   const batchProcessingRef = useRef(false)
   const batchQueueRef = useRef<BatchQueueItem[]>([])
   const batchCancelRequestedRef = useRef(false)
@@ -254,11 +268,16 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   const [reuseOpen, setReuseOpen] = useState(false)
   const [listView, setListView] = useState<'grouped' | 'graph'>('graph')
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
+  const [userToggledCategories, setUserToggledCategories] = useState<Set<string>>(new Set())
+  // 没手动操作过的分类取这个默认状态：初始收起（大列表一次性渲染会卡），批量上传完成后整体展开
+  const [categoriesCollapsedByDefault, setCategoriesCollapsedByDefault] = useState(true)
+  const [zipImporting, setZipImporting] = useState(false)
   const [selectedEntryKeys, setSelectedEntryKeys] = useState<Set<string>>(new Set())
   const [addMenuAnchorEl, setAddMenuAnchorEl] = useState<HTMLElement | null>(null)
   const [reuseSearch, setReuseSearch] = useState('')
   const [reuseAssetIds, setReuseAssetIds] = useState<number[]>([])
   const [reuseCollapsedCategories, setReuseCollapsedCategories] = useState<Set<string>>(new Set())
+  const [userToggledReuseCategories, setUserToggledReuseCategories] = useState<Set<string>>(new Set())
 
   const [editMetaOpen, setEditMetaOpen] = useState(false)
   const [editMetaForm, setEditMetaForm] = useState({ title: '', category: '', tagsInput: '', summary: '' })
@@ -575,32 +594,46 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
 
   const bulkDeleteSelectedMutation = useMutation({
     mutationFn: async ({ documentIds, assetIds }: { documentIds: number[]; assetIds: number[] }) => {
-      const operations = [
-        ...documentIds.map(documentId => () => knowledgeBaseApi.deleteDocument(workspace.id, documentId)),
-        ...assetIds.map(assetId => () => kbLibraryApi.unbindWorkspace(assetId, workspace.id)),
-      ]
-      const results = await Promise.allSettled(operations.map(run => run()))
-      let deletedCount = 0
-      let failedCount = 0
-      results.forEach(result => {
-        if (result.status === 'fulfilled') deletedCount += 1
-        else failedCount += 1
+      const documentResult =
+        documentIds.length > 0
+          ? await knowledgeBaseApi.batchDeleteDocuments(workspace.id, documentIds)
+          : EMPTY_BATCH_DELETE
+      // 文档那一半已经删了：解绑这一半失败时按"这些素材失败"计数，照常走成功分支刷新列表，
+      // 不让已删掉的文档还挂在界面上
+      let unbindResult = EMPTY_BATCH_UNBIND
+      if (assetIds.length > 0) {
+        try {
+          unbindResult = await kbLibraryApi.batchUnbindWorkspace(assetIds, workspace.id)
+        } catch {
+          unbindResult = { ...EMPTY_BATCH_UNBIND, ok: false, failed: assetIds.length, failed_ids: assetIds }
+        }
+      }
+      return {
+        deletedCount: documentResult.deleted + unbindResult.unbound,
+        failedCount: documentResult.failed + unbindResult.failed,
+        deletedDocumentIds: documentResult.deleted_ids,
+        deletedAssetIds: unbindResult.unbound_ids,
+      }
+    },
+    onMutate: ({ documentIds, assetIds }) => {
+      notification.info(t('knowledge.notifications.bulkDeleting', { count: documentIds.length + assetIds.length }), {
+        key: 'kb-bulk-deleting-ws',
       })
-      return { deletedCount, failedCount, documentIds, assetIds }
     },
     onSuccess: async result => {
+      notification.close('kb-bulk-deleting-ws')
       setBulkDeleteSelectedOpen(false)
       setSelectedEntryKeys(prev => {
-        if (result.documentIds.length === 0 && result.assetIds.length === 0) return prev
+        if (result.deletedDocumentIds.length === 0 && result.deletedAssetIds.length === 0) return prev
         const next = new Set(prev)
-        result.documentIds.forEach(id => next.delete(getKnowledgeEntrySelectionKey('document', id)))
-        result.assetIds.forEach(id => next.delete(getKnowledgeEntrySelectionKey('asset', id)))
+        result.deletedDocumentIds.forEach(id => next.delete(getKnowledgeEntrySelectionKey('document', id)))
+        result.deletedAssetIds.forEach(id => next.delete(getKnowledgeEntrySelectionKey('asset', id)))
         return next
       })
       if (
         selectedItem != null &&
-        ((selectedItem.kind === 'document' && result.documentIds.includes(selectedItem.id)) ||
-          (selectedItem.kind === 'asset' && result.assetIds.includes(selectedItem.id)))
+        ((selectedItem.kind === 'document' && result.deletedDocumentIds.includes(selectedItem.id)) ||
+          (selectedItem.kind === 'asset' && result.deletedAssetIds.includes(selectedItem.id)))
       ) {
         setSelectedItem(null)
       }
@@ -616,23 +649,32 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
         )
       }
     },
-    onError: (err: Error) => notification.error(t('knowledge.notifications.deleteFailed', { message: err.message })),
+    onError: (err: Error) => {
+      notification.close('kb-bulk-deleting-ws')
+      notification.error(t('knowledge.notifications.deleteFailed', { message: err.message }))
+    },
   })
 
   const bulkReindexSelectedMutation = useMutation({
     mutationFn: async ({ documentIds, assetIds }: { documentIds: number[]; assetIds: number[] }) => {
-      const operations = [
-        ...documentIds.map(documentId => () => knowledgeBaseApi.reindexDocument(workspace.id, documentId)),
-        ...assetIds.map(assetId => () => kbLibraryApi.reindexAsset(assetId)),
-      ]
-      const results = await Promise.allSettled(operations.map(run => run()))
-      let queuedCount = 0
-      let failedCount = 0
-      results.forEach(result => {
-        if (result.status === 'fulfilled') queuedCount += 1
-        else failedCount += 1
-      })
-      return { queuedCount, failedCount }
+      const documentResult =
+        documentIds.length > 0
+          ? await knowledgeBaseApi.batchReindexDocuments(workspace.id, documentIds)
+          : EMPTY_BATCH_REINDEX
+      // 素材重建是平台方专属：租户身份下这半个请求会被拒。按"这些素材全部失败"计数，
+      // 不让它把已经排进队的文档那一半也报成失败
+      let assetResult = EMPTY_BATCH_REINDEX
+      if (assetIds.length > 0) {
+        try {
+          assetResult = await kbLibraryApi.batchReindexAssets(assetIds)
+        } catch {
+          assetResult = { ...EMPTY_BATCH_REINDEX, ok: false, failed: assetIds.length, failed_ids: assetIds }
+        }
+      }
+      return {
+        queuedCount: documentResult.queued + assetResult.queued,
+        failedCount: documentResult.failed + assetResult.failed,
+      }
     },
     onSuccess: async result => {
       await refreshAll()
@@ -996,6 +1038,33 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
     setBatchUploadOpen(true)
   }
 
+  const handleZipFileChange = createSingleFileUploadHandler<KBZipImportResponse>({
+    upload: file => knowledgeBaseApi.uploadZip(workspace.id, file),
+    onBusyChange: setZipImporting,
+    onResult: async result => {
+      try {
+        const notice = getZipImportNotice(result, t, 'knowledge')
+        if (notice.variant === 'success') notification.success(notice.message)
+        else if (notice.variant === 'warning') notification.warning(notice.message)
+        else notification.error(notice.message)
+      } catch (err) {
+        notification.error(
+          t('knowledge.notifications.zipImportFailed', {
+            message: err instanceof Error ? err.message : String(err),
+          })
+        )
+      }
+      await refreshAll()
+    },
+    onError: error => {
+      notification.error(
+        t('knowledge.notifications.zipImportFailed', {
+          message: error instanceof Error ? error.message : String(error),
+        })
+      )
+    },
+  })
+
   const removeBatchQueueItem = useCallback((id: string) => {
     setExpandedBatchItemId(prev => (prev === id ? null : prev))
     setBatchQueue(prev => prev.filter(item => item.id !== id))
@@ -1029,46 +1098,48 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
     setBatchPanelVisible(true)
     let uploadedAny = false
     try {
-      for (const item of items) {
-        if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-        if (!batchQueueRef.current.some(queueItem => queueItem.id === item.id && queueItem.status === 'waiting')) continue
-        setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'uploading', uploadProgress: 0 } : i))
-        try {
-          const data = await knowledgeBaseApi.uploadFile(
-            workspace.id,
-            {
-              file: item.file,
-              title: item.title || item.file.name.replace(/\.[^.]+$/, ''),
-              source_path: item.source_path || '',
-              category: item.category,
-              tags: normalizeTagsInput(item.tags),
-              summary: item.summary,
-              is_enabled: true,
-            },
-            pct => setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, uploadProgress: pct } : i)),
-          )
-          if (batchRunVersionRef.current !== runVersion) break
-          uploadedAny = true
-          setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'indexing', documentId: data.document.id } : i))
-          const deadline = Date.now() + 300_000
-          while (Date.now() < deadline) {
-            if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-            await new Promise(r => setTimeout(r, 1500))
-            if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-            const detail = await knowledgeBaseApi.getDocument(workspace.id, data.document.id)
-            if (detail.document.sync_status === 'ready' || detail.document.sync_status === 'failed') break
+      // 有限并发工作池：共享游标逐文件分配任务，最多 BATCH_UPLOAD_CONCURRENCY 个文件同时上传
+      let nextIndex = 0
+      const workerCount = Math.min(BATCH_UPLOAD_CONCURRENCY, items.length)
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (true) {
+          if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) return
+          const index = nextIndex
+          nextIndex += 1
+          if (index >= items.length) return
+          const item = items[index]
+          if (!batchQueueRef.current.some(queueItem => queueItem.id === item.id && queueItem.status === 'waiting')) continue
+          setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'uploading', uploadProgress: 0 } : i))
+          try {
+            const data = await knowledgeBaseApi.uploadFile(
+              workspace.id,
+              {
+                file: item.file,
+                title: item.title || item.file.name.replace(/\.[^.]+$/, ''),
+                source_path: item.source_path || '',
+                category: item.category,
+                tags: normalizeTagsInput(item.tags),
+                summary: item.summary,
+                is_enabled: true,
+              },
+              pct => setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, uploadProgress: pct } : i)),
+            )
+            if (batchRunVersionRef.current !== runVersion) return
+            uploadedAny = true
+            // 上传成功即视为该文件处理完成，索引由后端后台任务异步执行，无需在此等待。
+            // 取消只拦住还没开始的文件：这一个已经在服务端建出来了，照实标成完成
+            setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'done', documentId: data.document.id } : i))
+          } catch (err) {
+            if (batchRunVersionRef.current !== runVersion) return
+            setBatchQueue(prev => prev.map(i => i.id === item.id ? {
+              ...i,
+              status: 'error',
+              errorMessage: err instanceof Error ? err.message : String(err),
+            } : i))
           }
-          if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-          setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'done' } : i))
-        } catch (err) {
-          if (batchRunVersionRef.current !== runVersion) break
-          setBatchQueue(prev => prev.map(i => i.id === item.id ? {
-            ...i,
-            status: 'error',
-            errorMessage: err instanceof Error ? err.message : String(err),
-          } : i))
         }
-      }
+      })
+      await Promise.all(workers)
     } finally {
       const isCurrentRun = batchRunVersionRef.current === runVersion
       const cancelRequested = batchCancelRequestedRef.current
@@ -1083,6 +1154,8 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
         }
         if (uploadedAny) {
           setListView('grouped')
+          setCategoriesCollapsedByDefault(false)
+          setUserToggledCategories(new Set())
           setCollapsedCategories(new Set())
         }
         await refreshAll()
@@ -1096,13 +1169,18 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   }
 
   const toggleCategoryCollapse = useCallback((category: string) => {
+    // 按"当前看到的状态"取反：没操作过的分类当前是默认状态，不是 collapsedCategories 里有没有它
+    const collapsedNow = userToggledCategories.has(category)
+      ? collapsedCategories.has(category)
+      : categoriesCollapsedByDefault
+    setUserToggledCategories(prev => new Set(prev).add(category))
     setCollapsedCategories(prev => {
       const next = new Set(prev)
-      if (next.has(category)) next.delete(category)
+      if (collapsedNow) next.delete(category)
       else next.add(category)
       return next
     })
-  }, [])
+  }, [categoriesCollapsedByDefault, collapsedCategories, userToggledCategories])
 
   const toggleEntrySelection = useCallback((kind: 'document' | 'asset', id: number) => {
     const key = getKnowledgeEntrySelectionKey(kind, id)
@@ -1134,13 +1212,16 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   }
 
   const toggleReuseCategoryCollapse = useCallback((categoryKey: string) => {
+    // 没操作过的分类默认收起，第一次点击就该展开
+    const collapsedNow = userToggledReuseCategories.has(categoryKey) ? reuseCollapsedCategories.has(categoryKey) : true
+    setUserToggledReuseCategories(prev => new Set(prev).add(categoryKey))
     setReuseCollapsedCategories(prev => {
       const next = new Set(prev)
-      if (next.has(categoryKey)) next.delete(categoryKey)
+      if (collapsedNow) next.delete(categoryKey)
       else next.add(categoryKey)
       return next
     })
-  }, [])
+  }, [reuseCollapsedCategories, userToggledReuseCategories])
 
   const toggleReuseCategory = useCallback((assetIds: number[]) => {
     if (assetIds.length === 0) return
@@ -1181,9 +1262,11 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
     return next
   }, [workspaceProgresses])
 
-  // Batch-fetch all document references when the graph view is active
+  // Batch-fetch all document references when the graph view is active.
+  // 条目总数超过阈值时图谱默认折叠只显示根节点，跳过批量拉取，避免请求风暴
+  const graphReferencesDisabled = defaultListEntries.length > GRAPH_REFERENCE_FETCH_LIMIT
   const docRefResults = useQueries({
-    queries: listView === 'graph' && !hasSearchResult
+    queries: listView === 'graph' && !hasSearchResult && !graphReferencesDisabled
       ? documents.map(doc => ({
           queryKey: ['kb-document-references', workspace.id, doc.id],
           queryFn: () => knowledgeBaseApi.getReferences(workspace.id, doc.id),
@@ -1193,7 +1276,7 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   })
 
   const assetRefResults = useQueries({
-    queries: listView === 'graph' && !hasSearchResult
+    queries: listView === 'graph' && !hasSearchResult && !graphReferencesDisabled
       ? boundGlobalAssets.map(asset => ({
           queryKey: ['kb-asset-references', asset.id] as const,
           queryFn: () => kbLibraryApi.getReferences(asset.id),
@@ -1424,7 +1507,10 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   }
 
   const renderCategoryNode = (node: KBCategoryTreeNode<(typeof defaultListEntries)[number]>) => {
-    const isCollapsed = collapsedCategories.has(node.key)
+    // 用户手动操作过的分类尊重用户状态；未操作过的默认收起，避免大列表一次性渲染卡顿
+    const isCollapsed = userToggledCategories.has(node.key)
+      ? collapsedCategories.has(node.key)
+      : categoriesCollapsedByDefault
     const categoryEntryKeys = node.allItems.map(entry => getKnowledgeEntrySelectionKey(entry.kind, entry.id))
     const selectedCount = categoryEntryKeys.filter(key => selectedEntryKeys.has(key)).length
     const categoryChecked = selectedCount > 0 && selectedCount === categoryEntryKeys.length
@@ -1564,7 +1650,8 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
   }
 
   const renderReuseCategoryNode = (node: KBCategoryTreeNode<KBAssetListItem>) => {
-    const isCollapsed = reuseCollapsedCategories.has(node.key)
+    // 用户手动操作过的分类尊重用户状态；未操作过的默认收起，避免大列表一次性渲染卡顿
+    const isCollapsed = userToggledReuseCategories.has(node.key) ? reuseCollapsedCategories.has(node.key) : true
     const categoryAssetIds = node.allItems.map(asset => asset.id)
     const selectedCount = categoryAssetIds.filter(id => reuseAssetIdSet.has(id)).length
     const categoryChecked = selectedCount > 0 && selectedCount === categoryAssetIds.length
@@ -2424,8 +2511,19 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
                 >
                   {t('knowledge.actions.importFolder')}
                 </ActionButton>
+                <ActionButton
+                  tone="secondary"
+                  startIcon={zipImporting ? <CircularProgress size={16} /> : <ArchiveIcon />}
+                  onClick={() => zipInputRef.current?.click()}
+                  disabled={withEmbeddingGuard() || zipImporting}
+                >
+                  {t('knowledge.actions.importZip')}
+                </ActionButton>
                 <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'center' }}>
                   {t('knowledge.form.dirImportHint')}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'center' }}>
+                  {t('knowledge.form.zipImportHint')}
                 </Typography>
               </Stack>
             ) : (
@@ -2487,7 +2585,6 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
                           </>
                         )}
                         {item.status === 'uploading' && <CircularProgress size={14} />}
-                        {item.status === 'indexing' && <CircularProgress size={14} color="warning" />}
                         {item.status === 'done' && <CheckCircleIcon sx={{ fontSize: 16, color: 'success.main' }} />}
                         {item.status === 'error' && <ErrorOutlineIcon sx={{ fontSize: 16, color: 'error.main' }} />}
                       </Stack>
@@ -2570,6 +2667,13 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
               // @ts-expect-error webkitdirectory is non-standard but widely supported
               webkitdirectory=""
               onChange={handleDirFileChange}
+            />
+            <input
+              ref={zipInputRef}
+              type="file"
+              hidden
+              accept=".zip"
+              onChange={handleZipFileChange}
             />
           </Stack>
         </DialogContent>
@@ -2668,15 +2772,11 @@ export default function KnowledgeTab({ workspace }: { workspace: WorkspaceDetail
                     </>
                   )}
                   {item.status === 'uploading' && <CircularProgress size={14} />}
-                  {item.status === 'indexing' && <CircularProgress size={14} color="warning" />}
                   {item.status === 'done' && <CheckCircleIcon sx={{ fontSize: 16, color: 'success.main' }} />}
                   {item.status === 'error' && <ErrorOutlineIcon sx={{ fontSize: 16, color: 'error.main' }} />}
                 </Stack>
                 {item.status === 'uploading' && (
                   <LinearProgress variant="determinate" value={item.uploadProgress} sx={{ height: 3, borderRadius: 999 }} />
-                )}
-                {item.status === 'indexing' && (
-                  <LinearProgress color="warning" sx={{ height: 3, borderRadius: 999 }} />
                 )}
                 {item.status === 'error' && item.errorMessage && (
                   <Typography variant="caption" color="error" noWrap title={item.errorMessage}>{item.errorMessage}</Typography>

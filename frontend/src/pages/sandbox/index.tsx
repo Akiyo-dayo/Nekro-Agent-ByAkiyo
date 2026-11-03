@@ -552,7 +552,13 @@ export default function SandboxPage() {
     (logs?.items ?? []).some(log => !isChatKeyInScope(log.chat_key, currentInstanceKey))
 
   return (
-    <Box sx={{ ...UNIFIED_TABLE_STYLES.tableLayoutContainer, p: 3 }}>
+    <Box
+      sx={{
+        ...UNIFIED_TABLE_STYLES.tableLayoutContainer,
+        p: { xs: 1, sm: 2, md: 3 },
+        pb: { xs: 'calc(16px + env(safe-area-inset-bottom))', sm: 2, md: 3 },
+      }}
+    >
       {currentInstanceKey && (
         <Box sx={{ mb: 2, flexShrink: 0 }}>
           <InstanceScopeBanner

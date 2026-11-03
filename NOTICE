@@ -5,8 +5,10 @@ This distribution is a derivative work of NekroAgent.
 
   Upstream project : NekroAgent  <https://github.com/KroMiose/nekro-agent>
   Upstream authors : KroMiose and the NekroAgent contributors
-  Based on version : 2.3.3 (the "version" field of pyproject.toml, kept as upstream's)
-  This edition     : 0.3.0 (FORK_VERSION in nekro_agent/tools/common_util.py)
+  Based on version : 2.3.3 (UPSTREAM_BASE_VERSION in nekro_agent/tools/common_util.py)
+  Plugin compat    : 2.4.0 (the "version" field of pyproject.toml; plugins written for
+                     upstream 2.4.0 install and run here, other 2.4.0 features may be absent)
+  This edition     : 0.4.2 (FORK_VERSION in nekro_agent/tools/common_util.py)
   This repository  : <https://github.com/Akiyo-dayo/Nekro-Agent-ByAkiyo>
 
 This edition is NOT an official release of NekroAgent and is not affiliated with
@@ -43,7 +45,7 @@ Telemetry (on by default, unchanged from upstream)
 --------------------------------------------------
 The setting ENABLE_NEKRO_CLOUD ("Enable NekroAI cloud service") defaults to true. While it is
 on, the application sends an hourly usage report (instance ID derived from environment
-information, upstream version, Docker flag, basic system information including the hostname,
+information, plugin-compatibility version, Docker flag, basic system information including the hostname,
 and aggregate counts of users, channels, messages and sandbox executions; no chat or code
 content) to https://cloud.nekro.ai, a service operated by the upstream project. This edition does not change
 that behaviour.
@@ -55,5 +57,17 @@ certain, also set the environment variable NEKRO_NEKRO_CLOUD_API_BASE_URL (two N
 to an unreachable address such as http://127.0.0.1:9, or block cloud.nekro.ai at your egress
 firewall; this also disables the cloud features. Details: README.md / README_en.md.
 
+Third-party components
+----------------------
 Third-party components keep their own licenses (see pyproject.toml, uv.lock and
 frontend/package.json for the dependency lists).
+
+Optional component: qbob. qbob (a bridge from the QQ official bot platform to OneBot v11) is
+an independent project licensed under AGPL-3.0: <https://github.com/Loping151/qbob>. Its source
+code is not included in this distribution, and the LICENSE above does not apply to it. It is
+used only when you install with `install.sh --with-qbob`: the image is then built on your own
+machine from the upstream source at the commit pinned by QBOB_REF (docker/qbob/Dockerfile and
+docker/qbob/docker-compose.qbob.yml), this project does not publish it, and it runs as a
+separate container that talks to NekroAgent over OneBot v11. The build files under docker/qbob/
+are part of this distribution. Publishing a qbob image or a modified qbob is governed by
+AGPL-3.0, including its obligation to offer the corresponding source.

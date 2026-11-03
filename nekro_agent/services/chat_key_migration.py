@@ -342,7 +342,7 @@ class InstanceMigrationOutcome(NamedTuple):
 # 归属迁移**不搬**的数据，及其理由。它们会被原样列进预览，避免管理员事后才发现少了东西。
 INSTANCE_MIGRATION_RESIDUE_REASONS: Dict[str, str] = {
     "affection": "好感度按 (适配器, 实例, 平台用户) 唯一，同一个用户在两个实例下各有一行；"
-    "合并两份分数是产品口径问题（见 PROJECT_STATE §8），不由本操作替用户决定",
+    "合并两份分数怎么算没有唯一正确的口径，不由本操作替用户决定",
     "affection_event": "好感度变化流水随好感度一起留在源实例",
     "announcement_delivery": "公告投递流水是「当时发给了谁」的既成事实，改写它等于篡改审计记录",
 }
@@ -585,7 +585,7 @@ async def _count_instance_residual(adapter_key: str, source_instance_key: str) -
     chat_key_prefix = f"{adapter_key}-{source_instance_key}-"
     return {
         "chat_channel": await DBChatChannel.filter(adapter_key=adapter_key, instance_key=source_instance_key).count(),
-        "chat_message": await DBChatMessage.filter(instance_key=source_instance_key).count(),
+        "chat_message": await DBChatMessage.filter(adapter_key=adapter_key, instance_key=source_instance_key).count(),
         "exec_code": await DBExecCode.filter(chat_key__startswith=chat_key_prefix).count(),
         "plugin_data": await DBPluginData.filter(target_chat_key__startswith=chat_key_prefix).count(),
         "recurring_timer_job": await DBRecurringTimerJob.filter(chat_key__startswith=chat_key_prefix).count(),

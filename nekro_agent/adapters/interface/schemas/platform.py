@@ -64,7 +64,10 @@ class PlatformMessage(BaseModel):
     timestamp: int = Field(default_factory=lambda: int(time()), description="消息时间戳")
     is_self: bool = Field(default=False, description="是否为自己发送的消息")
     ext_data: Optional[PlatformMessageExt] = Field(default=PlatformMessageExt(), description="扩展数据")
-    suppress_trigger: bool = Field(default=False, description="照常记录，但不据此触发 Agent（不落库）")
+    self_sent_external: bool = Field(
+        default=False,
+        description="账号自身由其他程序发出的消息：只记录，不走命令、不算用户、绝不触发 Agent",
+    )
 
 
 # ========================================================================================

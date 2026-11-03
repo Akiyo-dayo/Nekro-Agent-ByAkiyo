@@ -249,15 +249,22 @@ class NaInfoCommand(BaseCommand):
     async def execute(self, context: CommandExecutionContext) -> CommandResponse:
         from nekro_agent.core.os_env import OsEnv
         from nekro_agent.models.db_chat_channel import DBChatChannel
-        from nekro_agent.tools.common_util import FORK_AUTHOR, get_app_version, get_fork_version
+        from nekro_agent.tools.common_util import (
+            FORK_AUTHOR,
+            get_app_version,
+            get_fork_version,
+            get_upstream_base_version,
+        )
 
         db_chat_channel = await DBChatChannel.get_channel(chat_key=context.chat_key)
         preset = await db_chat_channel.get_preset()
-        # `version` 是上游版本（兼容判定用），`fork_version` 是本分支的展示版本，两者都要露出：
-        # 只显示分支版本会让排查上游相关问题时无从下手。
+        # 三个版本号都要露出：`fork_version` 是本分支的展示版本，`base_version` 是代码所基于的上游发布版，
+        # `version` 是插件兼容版本（兼容判定用）。只显示分支版本会让排查上游相关问题时无从下手。
         version = get_app_version()
         fork_version = get_fork_version()
+        base_version = get_upstream_base_version()
         based_on_label = t(zh_CN="基于", en_US="Based on")
+        compat_label = t(zh_CN="插件兼容", en_US="plugin-compatible with")
         channel_status = db_chat_channel.channel_status.value
         channel_status_label = _format_channel_status(channel_status)
         runtime_status_label, runtime_status_phase = _resolve_channel_agent_runtime_status(context.chat_key)
@@ -278,7 +285,7 @@ class NaInfoCommand(BaseCommand):
             f"{title}\n"
             f"{subtitle}\n"
             f"Author: {FORK_AUTHOR}\n"
-            f"{based_on_label}: NekroAgent {version} (by KroMiose)\n"
+            f"{based_on_label}: NekroAgent {base_version} ({compat_label} {version}) (by KroMiose)\n"
             f"Version: {fork_version}\n"
             f"In-Docker: {OsEnv.RUN_IN_DOCKER}\n"
             f"{chat_settings}\n"
@@ -322,7 +329,7 @@ class NaHelpCommand(BaseCommand):
 
     async def execute(self, context: CommandExecutionContext) -> CommandResponse:
         from nekro_agent.services.command.registry import command_registry
-        from nekro_agent.tools.common_util import get_app_version, get_fork_version
+        from nekro_agent.tools.common_util import get_app_version, get_fork_version, get_upstream_base_version
 
         # 从注册表动态生成帮助信息
         commands = command_registry.list_all_commands()
@@ -351,6 +358,9 @@ class NaHelpCommand(BaseCommand):
             parts.extend(lines)
 
         parts.append(f"\n====== [{more_info}] ======")
-        parts.append(f"Version: {get_fork_version()}  (based on NekroAgent {get_app_version()})")
+        parts.append(
+            f"Version: {get_fork_version()}  "
+            f"(based on NekroAgent {get_upstream_base_version()}, plugin-compatible with {get_app_version()})",
+        )
 
         return CmdCtl.success("\n".join(parts))

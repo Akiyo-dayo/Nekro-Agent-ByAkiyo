@@ -1,4 +1,4 @@
-"""入域并入折叠与同组并发写入的互斥（round-27 第二轮复核 P2-1），真 Postgres
+"""入域并入折叠与同组并发写入的互斥，真 Postgres
 
 `merge_self_domain_into_group` 折叠时要拿目标行当前的分数算差额。目标行若无锁读取，
 同组另一个实例此刻也在并入（或评估正在落分）时，两边各按旧分算差额、再各自叠加，
@@ -45,7 +45,7 @@ def _pg_dsn_or_skip() -> str:
 
 @pytest.fixture
 async def pg_env():
-    """独占 schema 里的好感与身份表；EXECUTOR_CACHE 进出两端都清（进程级、不含方言，见 PROJECT_STATE §2.43）"""
+    """独占 schema 里的好感与身份表；EXECUTOR_CACHE 进出两端都清（进程级、不含方言）"""
     dsn = _pg_dsn_or_skip()
     import asyncpg
 
@@ -169,7 +169,7 @@ def hold_the_group_open_after_the_target_rows_are_locked(monkeypatch: pytest.Mon
 
 
 class TestSameGroupJoinsAreSerialisedEvenWhenThereIsNoRowToLock:
-    """目标域里还没有这个人时无行可锁（round-27 第三轮复核 P2-2，A5）
+    """目标域里还没有这个人时无行可锁
 
     行锁只能锁已存在的行。两个实例同时并入「目标域里还没有」的同一个人，各自读到空、各自把源行改键成目标键，
     后到的撞唯一约束（IntegrityError）；源行顺序相反的两个实例则各占一个目标键、再互相等对方（DeadlockDetectedError）。

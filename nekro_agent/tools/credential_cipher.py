@@ -1,8 +1,7 @@
 """凭据的静态加密（encryption at rest）
 
-模型组的 `api_key` 此前是明文落库（`db_model_group.api_key = TextField()`），而设计文档
-§3 数据模型那一行原文写的就是 `api_key(加密存储)`。卖点是凭据隔离，一次库泄露或一份备份
-就等于所有客户的 Key 全裸，所以这一列必须在库里是密文。
+模型组的 `api_key` 此前是明文落库（`db_model_group.api_key = TextField()`）。一次库泄露
+或一份备份就等于所有 Key 全裸，凭据隔离也就无从谈起，所以这一列必须在库里是密文。
 
 ## 威胁模型：这挡什么、不挡什么（**不要把它说成是万能的**）
 
@@ -22,7 +21,7 @@
 唯一的恢复路径是把密钥材料找回来（环境变量或 `credential_secret.key` 的备份），
 处置见 `docs/operations.md` §1.5 与 §2.1。
 
-⚠️ 前车之鉴（PROJECT_STATE §2 一族）：`db_workspace_resource.secret_payload_encrypted`
+⚠️ 前车之鉴：`db_workspace_resource.secret_payload_encrypted`
 这个字段名里写着 encrypted，存的却是明文 JSON。**不要再造一个名字骗人的东西**：
 本模块存进去的每一个值都带 `nkenc1:` 前缀，密文自己说明自己是密文；
 没有前缀的值就是明文，读的时候按明文处理，不假装。
@@ -164,8 +163,8 @@ _key_ring: Optional[_KeyRing] = None
 def reset_credential_cipher_cache() -> None:
     """丢掉进程内缓存的密钥
 
-    密钥来源全部从 `OsEnv` 与数据目录在**调用时**读取（PROJECT_STATE §2.9：
-    由环境派生的值不要在 import 期定死），测试改完 `OsEnv.DATA_DIR` /
+    密钥来源全部从 `OsEnv` 与数据目录在**调用时**读取
+    （由环境派生的值不要在 import 期定死），测试改完 `OsEnv.DATA_DIR` /
     `OsEnv.CREDENTIAL_SECRET_KEY` 之后调一次这个函数即可。
     """
     global _key_ring  # noqa: PLW0603
@@ -212,7 +211,7 @@ def _warn_if_key_file_permissions_too_open(path: Path) -> None:
     """密钥文件的组 / 其他用户有任何权限位就告警（POSIX）
 
     这个文件是模型组凭据的**主密钥**：同机任何能读它的账户都能解开库里全部模型组密文，
-    直接违反 DECISIONS「运营模式」的硬约束。应用自己建它时是 0600，会被放开通常是老版本
+    凭据隔离就形同虚设。应用自己建它时是 0600，会被放开通常是老版本
     安装脚本的 `chmod -R 777`（现已改成排除它并纠正回 0600，见 `docker/install.sh`）。
     判据是「组 / 其他有任何位」而不猜哪一位危险。只告警、不自动改：权限是运维的现场，
     应用不替他收（也可能根本不是属主），与出厂默认口令告警同一口径。
@@ -461,7 +460,7 @@ def needs_reencrypt(stored: str) -> bool:
     以及用历史密钥加密的密文（密钥搬过家）。
 
     解不开的密文**不算**——重写它只会把一个还有可能被原密钥救回来的值彻底抹掉。
-    普通保存路径上另有一道回查守卫兜着（`DBModelGroup.save()`，PROJECT_STATE §3 #64），
+    普通保存路径上另有一道回查守卫兜着（`DBModelGroup.save()`），
     完整口径见模块文档顶部那段说明。
     """
     if not stored:

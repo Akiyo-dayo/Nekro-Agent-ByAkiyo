@@ -1,8 +1,8 @@
-"""配置重载之后，沙盒出口脱敏仍要遮住平台模型组的明文 Key（round-27 复核 P1-1）
+"""配置重载之后，沙盒出口脱敏仍要遮住平台模型组的明文 Key
 
 ## 背景
 
-DECISIONS 的「API Key 隔离」硬约束路径 3：沙盒 RPC 方法的返回值与报错发回容器之前，
+平台 API Key 隔离在沙盒出口的那一道：沙盒 RPC 方法的返回值与报错发回容器之前，
 `credential_guard.collect_platform_secrets()` 遍历 `ConfigManager` 里注册的**全部**配置实例收集凭据，
 `routers/rpc.py` 与 `routers/cc_relay.py` 据此脱敏。#61 之后落盘的 YAML 里 `MODEL_GROUPS.*.API_KEY`
 是占位符，明文只在运行时视图（数据库接管后重建的 `config.MODEL_GROUPS`）里。
@@ -167,7 +167,7 @@ class TestReloadKeepsPlatformSecretsRedacted:
 
 
 class TestReloadInvalidatesTheEffectiveConfigCache:
-    """重载之后必须 bump 有效配置版本号（round-27 第二轮复核 P2-5）
+    """重载之后必须 bump 有效配置版本号
 
     `DBChatChannel._effective_config` 连同 `config_resolver.current_version()` 一起缓存，取用时版本号
     不一致才重新解析。`core.config.reload_config()` 是聊天命令 `conf_reload` 与

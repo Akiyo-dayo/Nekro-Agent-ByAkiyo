@@ -1,4 +1,4 @@
-"""启动期凭据卫生（PROJECT_STATE §3 #37）
+"""启动期凭据卫生
 
 被测契约：`nonebot.init()` 那条 `Loaded Config` DEBUG 日志里不得出现凭据明文，
 而 `driver.config` 上的取值必须在适配器注册之前恢复成明文。
@@ -213,7 +213,7 @@ def _is_deployment_env_key(key: str) -> bool:
 
 # 一个「裸小写标识符」形态的取值，与源码里正常出现的名字无法区分。
 # 实测：这台测试部署的 `NEKRO_POSTGRES_PASSWORD` 就是出厂默认 `nekro_agent`，
-# 与包名逐字相同（PROJECT_STATE §3 #38 已经把它单列为"扫描无法区分"）。
+# 与包名逐字相同（docs/operations.md §1.3：扫描无法把它与正常文本区分开）。
 # 拿它去查源码只会得到一串必然命中的假阳性（本文件顶上就 import 了 `nekro_agent.*`）。
 _BARE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
 

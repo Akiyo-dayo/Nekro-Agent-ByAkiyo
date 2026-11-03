@@ -6,9 +6,9 @@
 （`services/resources/registry.py` 里 `secret=True` 的那些）。它们**只该有一个出口**：
 `resolve_workspace_resources_to_env()` 把它们注入容器环境变量。
 
-历史上 `GET /resources/{id}` 把这些字段的明文原样放进响应体（PROJECT_STATE §3 #29）。
+历史上 `GET /resources/{id}` 把这些字段的明文原样放进响应体。
 上一轮把整族提到了 `Role.Super`，那只挡住"谁能发这个请求"——真正把私钥搬出服务端的是
-**响应体本身**：它会进浏览器缓存、devtools、抓包与工单截图（同类事故见 §3 #37，
+**响应体本身**：它会进浏览器缓存、devtools、抓包与工单截图（同类事故：
 一条 DEBUG 日志就把 `ADMIN_PASSWORD` 写进了日志文件）。所以现在还有第二层：
 `secret=True` 的取值一律换成 `CREDENTIAL_MASK`，写回时该哨兵表示"保持不变"。
 

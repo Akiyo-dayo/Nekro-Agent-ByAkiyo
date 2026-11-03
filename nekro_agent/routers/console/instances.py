@@ -16,6 +16,7 @@ from typing import List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends
 
+from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.console import (
@@ -62,27 +63,31 @@ from nekro_agent.services.console.instance_manager import (
     set_instance_enabled,
     update_instance,
 )
+from nekro_agent.services.unclaimed_dispatch import unclaimed_pause_reason
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import (
-    accessible_instance_keys,
+    InstanceRef,
+    accessible_instance_refs,
     assert_instance_accessible,
     get_tenant_scope,
 )
 
 router = APIRouter(tags=["Console"])
+logger = get_sub_logger("console.instances")
 
 
-async def _visible_instance_keys(user: DBUser) -> Optional[Set[str]]:
-    """当前身份能看到哪些实例；None 表示不受限（平台方）
+async def _visible_instance_keys(user: DBUser) -> Optional[Set[InstanceRef]]:
+    """当前身份能看到哪些实例（`(adapter_key, instance_key)`）；None 表示不受限（平台方）
 
     归属判定只此一处，两个列表端点共用：判据一旦分叉，一边能看到的实例另一边看不到，
-    而两边都不会报错。复用 `accessible_instance_keys` 而不是各自再写一次
-    `filter(tenant_id=...)`，它同时也是 `/user/me/identity` 下发可访问实例的那一个函数。
+    而两边都不会报错。复用 `accessible_instance_refs` 而不是各自再写一次
+    `filter(tenant_id=...)`，它与 `/user/me/identity` 下发的可访问实例出自同一条查询。
+    成对比较是因为另一个适配器下可以有归别人的同名实例。
     """
     if get_tenant_scope(user) is None:
         return None
-    return set(await accessible_instance_keys(user))
+    return await accessible_instance_refs(user)
 
 
 @router.get("/instances", summary="获取实例列表")
@@ -99,7 +104,7 @@ async def get_console_instances(
     if accessible is None:
         return response
 
-    items = [item for item in response.items if item.instance_key in accessible]
+    items = [item for item in response.items if (item.adapter_key, item.instance_key) in accessible]
     return InstanceListResponse(items=items, total=len(items))
 
 
@@ -125,7 +130,7 @@ async def get_console_instance_options(
     options = await list_instance_options()
     accessible = await _visible_instance_keys(_current_user)
     if accessible is not None:
-        options = [option for option in options if option.instance_key in accessible]
+        options = [option for option in options if (option.adapter_key, option.instance_key) in accessible]
     return InstanceOptionListResponse(items=options, total=len(options))
 
 
@@ -155,6 +160,16 @@ async def get_console_unclaimed_instances(
     targets = await list_adopt_targets({end.instance.adapter_key for end in ends})
     # 一次聚合拿全部候选目标的会话数：逐个查会在几十个实例的部署上退化成几十次往返
     target_stats = await collect_instance_stats([target.instance_key for target in targets])
+    # 未认领实例的消息此刻会不会被丢弃，只取决于部署级令牌的状态（与连接无关的那一半判据，见
+    # `services/unclaimed_dispatch.py`），所以整张清单算一次。判不出来（比如某行租户实例的元数据坏了）
+    # 按「暂停」显示，不能让管理员要用来认领的这块面板整个报错
+    paused_reason = ""
+    if ends:
+        try:
+            paused_reason = await unclaimed_pause_reason()
+        except Exception:  # noqa: BLE001 - 见上
+            logger.warning("判定未认领实例能否分发失败，待认领清单按「消息暂不处理」显示", exc_info=True)
+            paused_reason = "判定出错"
 
     return UnclaimedInstanceListResponse(
         items=[
@@ -167,6 +182,8 @@ async def get_console_unclaimed_instances(
                 message_count_today=end.stats.message_count_today,
                 last_active_at=end.stats.last_active_at,
                 first_seen_at=end.instance.create_time.isoformat() if end.instance.create_time else None,
+                dispatch_paused=bool(paused_reason),
+                dispatch_paused_reason=paused_reason,
             )
             for end in ends
         ],

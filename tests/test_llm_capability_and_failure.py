@@ -1,6 +1,6 @@
 """LLM 请求失败的可修复性与可辨识性回归测试
 
-由来是一次真实事故（PROJECT_STATE §3 #32）：一个模型组的 `ENABLE_VISION` 被 WebUI 的默认值
+由来是一次真实事故：一个模型组的 `ENABLE_VISION` 被 WebUI 的默认值
 带成了 true，而它接的 `deepseek-v4-pro` 不吃图片。于是——
 
 1. 历史图片取自**整个上下文窗口**，群里只要 30 分钟内有过图，连纯文字消息也会被拖下水；
@@ -1337,9 +1337,10 @@ class TestTheFixesAreActuallyWiredIn:
         改造前四个进度回调里有两个把 `retry_total` 收下就丢（`_retry_total`），
         另两个连收都不收，一律用外层那个 `AI_CHAT_LLM_API_MAX_RETRIES`。
         """
-        forwarded = _call_arg_names(self.RUN_AGENT_SOURCE, "run_agent", "publish_runtime_state")
+        # `run_agent` 的正文在 `_run_agent_in_instance_scope` 里（外层只设实例上下文）
+        forwarded = _call_arg_names(self.RUN_AGENT_SOURCE, "_run_agent_in_instance_scope", "publish_runtime_state")
         assert "retry_total" in forwarded, "回调收到的真实总数没有往下传，进度条的分母就是错的"
-        body = _source_of(self.RUN_AGENT_SOURCE, "run_agent")
+        body = _source_of(self.RUN_AGENT_SOURCE, "_run_agent_in_instance_scope")
         assert body.count("llm_retry_attempts=retry_total") == 4, "四个进度回调都要把真实总数透传下去"
         # 「收下了」不等于「用了」：形参在源码里恒存在，按文本断言杀不掉「收下就丢」这种变异
         assert "llm_retry_attempts" in _names_read_inside(self.RUN_AGENT_SOURCE, "publish_runtime_state"), (
@@ -1348,7 +1349,7 @@ class TestTheFixesAreActuallyWiredIn:
 
     def test_agent_round_exhaustion_is_no_longer_silent(self) -> None:
         """改造前迭代跑满后函数自然返回 None：不抛、不记 ERROR、聊天里也没有回执"""
-        assert "AgentRoundUnfinishedError" in _names_raised_inside(self.RUN_AGENT_SOURCE, "run_agent")
+        assert "AgentRoundUnfinishedError" in _names_raised_inside(self.RUN_AGENT_SOURCE, "_run_agent_in_instance_scope")
 
     def test_openai_layer_salvages_and_refuses_empty(self) -> None:
         openai_source = Path(

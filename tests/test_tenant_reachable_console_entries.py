@@ -3,11 +3,11 @@
 `tests/test_console_platform_only_paths.py` 守的是反面（标成平台方专属的页面两处都要登记）。
 这一份守的是正面：**后端已经为租户建好并测过的能力，前端要真的可达**。
 
-背景（round-19 前的实测）：
+背景（改前的实测）：
 
 | 能力 | 后端 | 前端 |
 |---|---|---|
-| 实例级配置覆盖（R4 / §3 #15） | `PUT /config/instance/{adapter}/{instance}`，接 `assert_instance_accessible` + `_assert_tenant_may_write` | 唯一调用点 `pages/settings/system.tsx` 关在 `PLATFORM_ONLY_PATHS` 里 → **0 可达** |
+| 实例级配置覆盖 | `PUT /config/instance/{adapter}/{instance}`，接 `assert_instance_accessible` + `_assert_tenant_may_write` | 唯一调用点 `pages/settings/system.tsx` 关在 `PLATFORM_ONLY_PATHS` 里 → **0 可达** |
 | 租户自管成员 | `POST/DELETE /console/tenants/{id}/members` 用 `require_tenant_admin()` | 只挂在 `/console/tenants` 下，整条路径平台方专属 → **0 可达** |
 
 两条后端分支都有用例守着，但用例守的是一段产品上永远跑不到的代码。本文件把
@@ -71,15 +71,15 @@ def _visibility_of(block: str) -> str:
 
 
 class TestInstanceConfigIsReachableByTenants:
-    """A1：实例级配置覆盖页对租户开着"""
+    """实例级配置覆盖页对租户开着"""
 
     def test_settings_system_is_not_url_blocked(self, navigation_source: str) -> None:
-        """兜底拦截清单里不能有它 —— 有它就等于 R4 那条链路整条封死"""
+        """兜底拦截清单里不能有它 —— 有它就等于「换模型组不用逐个频道点」那条链路整条封死"""
         paths = _platform_only_paths(navigation_source)
         assert not _covered(paths, "/settings/system"), (
             "/settings/system 又被登记进 PLATFORM_ONLY_PATHS 了。"
             "它是四层配置里实例覆盖层在整个前端的唯一写入口，关掉它，"
-            "租户换模型组只能回到 `/chat-channel` 逐个频道点（R4 要消灭的正是这件事）"
+            "租户换模型组只能回到 `/chat-channel` 逐个频道点"
         )
 
     def test_settings_system_menu_entry_is_not_platform_only(self, navigation_source: str) -> None:

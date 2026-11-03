@@ -3,7 +3,7 @@ name: Release Docker Images
 # 本 fork 只发布到 GHCR（ghcr.io/<owner 小写>/nekro-agent-byakiyo 与 nekro-agent-byakiyo-sandbox），
 # 只用内置的 GITHUB_TOKEN，不依赖任何 Docker Hub / PyPI 密钥。
 # 镜像 tag = 本 fork 的展示版本号 FORK_VERSION（nekro_agent/tools/common_util.py），
-# 不是 pyproject.toml 的 version：后者是上游版本，驱动云端插件兼容判定，不能改（见 common_util.py 里的说明）。
+# 不是 pyproject.toml 的 version：后者是插件兼容版本，驱动云端插件兼容判定，不能改成分支版本（见 common_util.py 里的说明）。
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
           fi
           # 打 tag 触发时，tag 必须与代码里的版本号一致，否则镜像 tag 与 git tag 对不上
           if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
-            echo "git tag ${GITHUB_REF_NAME} 与 FORK_VERSION v${VERSION} 不一致" >&2
+            echo "git tag ${GITHUB_REF_NAME} 与 FORK_VERSION 应有的标签 v${VERSION} 不一致" >&2
             exit 1
           fi
           echo "version=${VERSION}" >> $GITHUB_OUTPUT

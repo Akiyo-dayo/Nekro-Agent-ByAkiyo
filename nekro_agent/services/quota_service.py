@@ -171,7 +171,7 @@ quota_service = QuotaService()
 
 
 # ======================================================================
-# 实例级配额管理（需求文档风险登记 RK6）
+# 实例级配额管理
 #
 # `AI_CHAT_DAILY_REPLY_LIMIT` 本来就是 overridable 字段，能按实例设，但此前只有聊天命令
 # `/quota_set` 能改，而它写的是**频道层**。几十个实例时既没有总览也没有批量入口。
@@ -336,14 +336,15 @@ async def assert_tenant_quota_within_ceiling(config_key: str, submitted: Dict[st
     if QUOTA_LIMIT_FIELD not in submitted and QUOTA_LIMIT_TOGGLE not in submitted:
         return
 
-    instance_key = await _instance_key_of_override(config_key)
+    adapter_key, instance_key = await _instance_of_override(config_key)
     if not instance_key:
         return
 
     from nekro_agent.models.db_adapter_instance import DBAdapterInstance
     from nekro_agent.schemas.errors import PermissionDeniedError
 
-    instance = await DBAdapterInstance.filter(instance_key=instance_key).first()
+    # 上限挂在实例行上，必须取到被写的那一行：另一个适配器下的同名实例有它自己的上限
+    instance = await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=instance_key).order_by("id").first()
     ceiling = load_quota_ceiling(instance) if instance is not None else None
     if ceiling is None:
         return
@@ -359,8 +360,8 @@ async def assert_tenant_quota_within_ceiling(config_key: str, submitted: Dict[st
         )
 
 
-async def _instance_key_of_override(config_key: str) -> str:
-    """从覆盖层配置键反查它影响的实例；不是覆盖层配置时返回空串"""
+async def _instance_of_override(config_key: str) -> Tuple[str, str]:
+    """从覆盖层配置键反查它影响的实例 `(adapter_key, instance_key)`；不是覆盖层配置时返回两个空串"""
     from nekro_agent.services.config_service import (
         CHANNEL_OVERRIDE_KEY_PREFIX,
         INSTANCE_OVERRIDE_KEY_PREFIX,
@@ -368,14 +369,17 @@ async def _instance_key_of_override(config_key: str) -> str:
     )
 
     if config_key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
-        return config_key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(INSTANCE_OVERRIDE_KEY_SEP)[2]
+        adapter_key, _, instance_key = config_key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(
+            INSTANCE_OVERRIDE_KEY_SEP,
+        )
+        return adapter_key, instance_key
     if config_key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
         from nekro_agent.models.db_chat_channel import DBChatChannel
 
         chat_key = config_key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :]
         channel = await DBChatChannel.filter(chat_key=chat_key).first()
-        return channel.instance_key if channel is not None else ""
-    return ""
+        return (channel.adapter_key, channel.instance_key) if channel is not None else ("", "")
+    return "", ""
 
 
 async def _resulting_daily_limit(config_key: str, submitted: Dict[str, str]) -> int:

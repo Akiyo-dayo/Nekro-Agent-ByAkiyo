@@ -1,7 +1,9 @@
 import asyncio
 import inspect
+import mimetypes
 import re
 from pathlib import Path
+from posixpath import normpath
 from types import ModuleType
 from typing import (
     Any,
@@ -20,7 +22,8 @@ from typing import (
 )
 
 import aiofiles
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 
 from nekro_agent.core.config import config
 from nekro_agent.core.core_utils import ConfigBase
@@ -52,7 +55,7 @@ class ScopedPluginConfig:
     直接读 `config.FIELD`。若给 `get_config()` 增加实例参数，插件市场里的插件全部得改。
     因此这里不动 `get_config()` 的签名，改为返回代理对象，把解析推迟到属性访问时：
 
-    - 无实例上下文（单实例部署、沙盒 RPC 回调等）→ 直接取全局配置字段值，
+    - 无实例上下文（单实例部署，或调用方没有设置实例）→ 直接取全局配置字段值，
       行为与改造前**完全一致**；
     - 有实例上下文但该实例无覆盖 → 同样落到全局值；
     - 有实例上下文且该实例有覆盖 → 取实例级值。
@@ -118,6 +121,7 @@ class NekroPlugin:
         i18n_description: Optional[I18nDict] = None,
         allow_sleep: bool | None = None,
         sleep_brief: str = "",
+        webui_path: str | None = None,
     ):
         """
         Args:
@@ -130,6 +134,8 @@ class NekroPlugin:
             support_adapter: 支持的适配器
             i18n_name: 插件名称国际化
             i18n_description: 插件描述国际化
+            webui_path: 插件 WebUI 路径。以 / 开头时表示插件路由内页面路径；
+                相对路径时必须指向插件目录内的 HTML 文件。
 
         可用回调方法:
             init_method: 初始化方法
@@ -164,6 +170,7 @@ class NekroPlugin:
         self.i18n_description = i18n_description
         self.allow_sleep = allow_sleep
         self.sleep_brief = sleep_brief.strip()
+        self.webui_path = _normalize_webui_path(webui_path)
         self._is_enabled = True
         self._key = f"{self.author}.{self.module_name}"
 
@@ -407,26 +414,152 @@ class NekroPlugin:
             Optional[APIRouter]: 插件路由实例，如果插件没有注册路由则返回None
         """
 
-        if not self._router_func:
-            return None
-
         # 如果已有缓存的路由实例，直接返回
         if self._router is not None:
             return self._router
 
-        try:
-            # 调用路由生成函数
-            self._router = self._router_func()
+        if not self._router_func and not self._is_webui_html_file():
+            return None
 
-            if not isinstance(self._router, APIRouter):
-                self.logger.error(f"插件 {self.name} 的路由生成函数必须返回 APIRouter 实例，实际返回: {type(self._router)}")
+        try:
+            merged_router = APIRouter()
+            has_routes = False
+
+            if self._router_func:
+                # 调用路由生成函数
+                plugin_router = self._router_func()
+
+                if not isinstance(plugin_router, APIRouter):
+                    self.logger.error(f"插件 {self.name} 的路由生成函数必须返回 APIRouter 实例，实际返回: {type(plugin_router)}")
+                    return None
+                if plugin_router.routes:
+                    merged_router.include_router(plugin_router)
+                    has_routes = True
+
+            webui_router = self._create_webui_file_router()
+            if webui_router:
+                merged_router.include_router(webui_router)
+                has_routes = True
+
+            if not has_routes:
                 return None
+            self._router = merged_router
         except Exception:
             self.logger.exception(f"插件 {self.name} 生成路由时出错")
             return None
         else:
             self.logger.info(f"插件 {self.name} 路由生成成功，路由数量: {len(self._router.routes)}")
             return self._router
+
+    def get_webui_url_path(self) -> str | None:
+        """获取前端可直接加载的插件 WebUI URL 路径。"""
+        if not self.webui_path:
+            return None
+        if self.webui_path.startswith("/"):
+            if not self._router_func:
+                return None
+            return f"/plugins/{self.key}{self.webui_path}"
+        html_file = self._resolve_webui_html_file()
+        if not html_file:
+            return None
+        return f"/plugins/{self.key}/__webui__/{html_file.name}"
+
+    def get_webui_type(self) -> Literal["route", "file"] | None:
+        """获取插件 WebUI 类型，用于前端决定可用操作。"""
+        if not self.webui_path:
+            return None
+        if self.webui_path.startswith("/"):
+            return "route" if self._router_func else None
+        return "file" if self._resolve_webui_html_file() else None
+
+    def _is_webui_html_file(self) -> bool:
+        return bool(self.webui_path and not self.webui_path.startswith("/"))
+
+    def _get_source_dir(self) -> Path | None:
+        if not self._module or not self._module.__file__:
+            return None
+        return Path(self._module.__file__).resolve().parent
+
+    def _is_package_module(self) -> bool:
+        """插件是否以包的形式加载（有自己的目录），而不是共用目录里的单个 `.py` 文件"""
+        return bool(self._module and self._module.__file__ and Path(self._module.__file__).name == "__init__.py")
+
+    def _resolve_webui_html_file(self) -> Path | None:
+        if not self._is_webui_html_file() or not self.webui_path:
+            return None
+
+        source_dir = self._get_source_dir()
+        if not source_dir:
+            self.logger.error(f"插件 {self.name} 未绑定模块文件，无法解析 WebUI HTML: {self.webui_path}")
+            return None
+
+        html_path = (source_dir / Path(*self.webui_path.split("/"))).resolve()
+        source_root = source_dir.resolve()
+        if not html_path.is_relative_to(source_root):
+            self.logger.error(f"插件 {self.name} 的 WebUI HTML 越界: {self.webui_path}")
+            return None
+        if not html_path.is_file():
+            self.logger.error(f"插件 {self.name} 的 WebUI HTML 文件不存在: {html_path}")
+            return None
+        return html_path
+
+    def _create_webui_file_router(self) -> APIRouter | None:
+        html_file = self._resolve_webui_html_file()
+        if not html_file:
+            return None
+
+        router = APIRouter(include_in_schema=False)
+        static_root = html_file.parent.resolve()
+        # 本分支额外的安全硬化（与上游的有意差异）。上游以 HTML 所在目录为静态根、不加筛选，而这些路由不鉴权：
+        # - HTML 放在插件根目录时，插件源码、本地数据库、配置文件都会被当成静态文件提供。这里只提供网页资源后缀，
+        #   并拒绝 __pycache__ 与点开头的路径（白名单而不是黑名单：`.pyd`、`*.db` 之类不会漏网）；
+        # - 单文件插件的模块文件位于所有插件共用的目录里，静态根会把别的插件的文件也带出来，
+        #   因此只提供 HTML 入口本身，不提供同目录的其他文件。
+        entry_only = not self._is_package_module()
+        not_found = HTTPException(status_code=404, detail="File not found")
+
+        async def serve_file(file_path: str) -> FileResponse:
+            normalized_path = normpath(file_path).lstrip("/")
+            if not normalized_path or normalized_path == ".":
+                target_file = html_file
+            else:
+                if entry_only:
+                    raise not_found
+                relative_parts = tuple(part for part in normalized_path.split("/") if part not in {"", "."})
+                if _is_forbidden_webui_asset(relative_parts):
+                    raise not_found
+                try:
+                    target_file = (static_root / Path(*relative_parts)).resolve()
+                    # 解析后的真实路径同样要检查：符号链接不能把越界或被拒绝的文件带进来
+                    servable = (
+                        target_file.is_relative_to(static_root)
+                        and not _is_forbidden_webui_asset(target_file.relative_to(static_root).parts)
+                        and target_file.is_file()
+                    )
+                except (OSError, ValueError):
+                    # 路径里带 NUL 等非法字符时 resolve() / is_file() 会抛错，按「文件不存在」处理，不让它变成 500
+                    servable = False
+                if not servable:
+                    raise not_found
+
+            media_type, _encoding = mimetypes.guess_type(target_file.name)
+            if target_file.suffix.lower() in {".html", ".htm"}:
+                media_type = "text/html"
+            return FileResponse(target_file, media_type=media_type)
+
+        @router.get("/__webui__")
+        async def plugin_webui_root() -> FileResponse:
+            return await serve_file("")
+
+        @router.get("/__webui__/")
+        async def plugin_webui_index() -> FileResponse:
+            return await serve_file("")
+
+        @router.get("/__webui__/{file_path:path}")
+        async def plugin_webui_static(file_path: str) -> FileResponse:
+            return await serve_file(file_path)
+
+        return router
 
     def mount_sandbox_method(
         self,
@@ -1122,3 +1255,60 @@ def _validate_name(name: str, field_name: str) -> str:
     if re.match(r"^\d", name):
         raise ValueError(f"{field_name} must not start with a number")
     return name
+
+
+# 插件 WebUI 静态路由允许提供的文件后缀：只有网页本身需要的资源
+_WEBUI_ASSET_SUFFIXES = frozenset(
+    {
+        ".html", ".htm", ".js", ".mjs", ".css", ".map", ".json", ".wasm", ".txt",
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif", ".ico",
+        ".woff", ".woff2", ".ttf", ".otf",
+        ".mp3", ".ogg", ".wav", ".mp4", ".webm",
+    },
+)
+
+
+def _is_forbidden_webui_asset(path_parts: tuple[str, ...]) -> bool:
+    """WebUI 静态请求路径是否不该提供：不在网页资源后缀白名单内，或经过 __pycache__ / 点开头的路径段"""
+    if not path_parts:
+        return False
+    if any(part == "__pycache__" or part.startswith(".") for part in path_parts):
+        return True
+    return Path(path_parts[-1]).suffix.lower() not in _WEBUI_ASSET_SUFFIXES
+
+
+def _normalize_webui_path(webui_path: str | None) -> str | None:
+    """规范化插件 WebUI 路径，只允许插件路由路径或插件内 HTML 相对路径。"""
+    if webui_path is None:
+        return None
+
+    normalized = webui_path.strip()
+    if not normalized:
+        return None
+    if "\\" in normalized:
+        raise ValueError("webui_path 不支持反斜杠路径")
+    if "://" in normalized or normalized.startswith("//"):
+        raise ValueError("webui_path 不支持外部 URL")
+
+    if normalized.startswith("/"):
+        if "?" in normalized or "#" in normalized:
+            raise ValueError("webui_path 路由模式只支持路径，不支持查询参数或锚点")
+        if any(part in {".", ".."} for part in normalized.split("/")):
+            raise ValueError("webui_path 路由模式包含非法路径片段")
+
+        route_path = normpath(normalized)
+        if not route_path.startswith("/"):
+            raise ValueError("webui_path 路由模式必须是插件内绝对路径")
+        if normalized.endswith("/") and route_path != "/":
+            route_path = f"{route_path}/"
+        return route_path
+
+    normalized = normpath(normalized)
+    path = Path(normalized)
+    if normalized == ".." or normalized.startswith("../") or path.is_absolute():
+        raise ValueError("webui_path 不允许越过插件目录")
+    if path.suffix.lower() not in {".html", ".htm"}:
+        raise ValueError("webui_path 使用相对路径时必须指向 .html 或 .htm 文件")
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("webui_path 包含非法路径片段")
+    return normalized

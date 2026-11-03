@@ -1025,12 +1025,12 @@ async def get_identity_orphans(
     key = instance_key.strip()
     if scope is not None and not key:
         raise ValidationError(reason="租户身份必须指定实例作用域")
-    instance_keys: Optional[List[str]] = None
+    instances: Optional[List[Tuple[str, str]]] = None
     if key:
         instance = await assert_instance_accessible(_current_user, key)
-        instance_keys = [instance.instance_key]
+        instances = [(instance.adapter_key, instance.instance_key)]
 
-    buckets = await list_orphan_buckets(instance_keys)
+    buckets = await list_orphan_buckets(instances)
     return OrphanListResponse(
         items=[
             OrphanBucketItem(
@@ -1073,7 +1073,7 @@ async def cleanup_identity_orphans(
     instance, domain = await _resolve_domain(_current_user, body.instance_key)
     buckets = [
         bucket
-        for bucket in await list_orphan_buckets([instance.instance_key])
+        for bucket in await list_orphan_buckets([(instance.adapter_key, instance.instance_key)])
         if bucket.preset_id == body.preset_id and bucket.domain_id == body.domain_id
     ]
     if not buckets:

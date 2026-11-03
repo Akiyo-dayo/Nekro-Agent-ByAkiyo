@@ -218,6 +218,11 @@ export default function UnclaimedProtocolPanel({
                   {item.instance_key} · {t('unclaimedPanel.firstSeen')}{' '}
                   {formatDateTime(item.first_seen_at, '—')}
                 </Typography>
+                {item.dispatch_paused && (
+                  <Typography variant="caption" color="warning.main" component="div">
+                    {t('unclaimedPanel.dispatchPaused')}
+                  </Typography>
+                )}
               </Box>
               <Chip
                 size="small"

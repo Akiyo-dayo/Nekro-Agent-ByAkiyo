@@ -468,7 +468,7 @@ class OpenAIErrResponse(OpenAIResponse):
         `error_msg` 的唯一去向就是落盘（`prompts_error/*.json` 的 `error.message` 与文本日志
         的「失败原因」小节），而这些文件会进 `/deployment/backup` 的打包。把脱敏放在构造函数里，
         意味着「这个类的实例天生不带凭据」——将来多一个调用点也不会多一处漏洞，
-        而放在调用点则要求每个调用者都记得（§3 #39 之前正是这样漏的）。
+        而放在调用点则要求每个调用者都记得（以前正是有调用点忘了脱敏才漏的）。
 
         Args:
             secret_values: 本次请求的字面量凭据集合；省略时现场收集
@@ -1187,7 +1187,7 @@ async def gen_openai_chat_stream(
     这是一个简化版的流式生成器，直接返回生成的文本片段，而不是复杂的OpenAIResponse对象。
     适用于需要简单流式输出的场景，如网页UI中的实时代码生成。
 
-    ## 它是同一套判据的**第三个**入口（§3 #57）
+    ## 它是同一套判据的**第三个**入口
 
     `gen_openai_chat_response` 的流式与非流式两条分支各自都有「先判 `finish_reason` 再判空」
     这道闸门，而本函数此前**一条判据都没有**：既不判上游拒答、也不抛 `EmptyLLMResponseError`，

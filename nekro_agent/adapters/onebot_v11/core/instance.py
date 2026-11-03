@@ -164,6 +164,11 @@ async def _register_unclaimed_instance(self_id: str) -> DBAdapterInstance:
     for candidate in _instance_key_candidates(self_id):
         existing = await DBAdapterInstance.get_or_none(adapter_key=ADAPTER_KEY, instance_key=candidate)
         if existing is None:
+            if await DBAdapterInstance.filter(instance_key=candidate).exclude(adapter_key=ADAPTER_KEY).exists():
+                # 标识已被别的适配器占用：同名实例会在只按 `instance_key` 存取的数据上串到一起
+                # （见 `AdapterInstanceService.create_instance`），退让到下一个候选
+                logger.warning(f"实例标识 {candidate} 已被其他适配器的实例占用，改用下一个候选标识登记账号 {self_id}")
+                continue
             try:
                 created = await DBAdapterInstance.create(
                     adapter_key=ADAPTER_KEY,

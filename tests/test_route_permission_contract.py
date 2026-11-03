@@ -56,10 +56,12 @@ CC 预设的凭据裸奔、通用配置写入的归属、账号管理的平台�
 换个写法收口守卫不会让这条测试误报，而真的绕过守卫会。
 """
 
+import ast
 import importlib
 import inspect
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pytest
@@ -79,7 +81,8 @@ ROUTER_MODULES: Sequence[str] = (
     "console.model_groups",
     "console.napcat_orphans",
     "console.network_rules",
-    "console.ops_actions", "console.overview", "console.quota", "console.tenants",
+    "console.onebot_endpoint",
+    "console.ops_actions", "console.overview", "console.qbob", "console.quota", "console.tenants",
     "console.usage",
     "cloud.announcement", "cloud.auth", "cloud.favorites", "cloud.plugins_market",
     "cloud.presets_market", "cloud.telemetry",
@@ -99,6 +102,7 @@ SCOPE_GUARDS: Set[str] = {
     # 单列一个名字是为了让 `USAGE_SCOPE_GUARDS` 能对这一族提出更强的要求。
     "resolve_usage_scope",
     "accessible_instance_keys",
+    "accessible_instance_refs",
     "accessible_workspace_ids",
     "get_tenant_scope",
     "require_tenant_admin",
@@ -296,6 +300,15 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("console.containers", "POST", "/instances/{instance_key}/container/start"),
     ("console.containers", "POST", "/instances/{instance_key}/container/stop"),
     ("console.containers", "PUT", "/instances/{instance_key}/network-config"),
+    # 附带 qbob 的部署级与接入拓扑那一半（另一半是自助运维，见 PROTOCOL_SELF_SERVICE）：
+    # 服务账号是能管全部 bot 的凭据；接入决定哪个 QQ 机器人接到哪个实例、并写入带实例令牌的出站端点
+    ("console.qbob", "GET", "/qbob/service"),
+    ("console.qbob", "PUT", "/qbob/service/credential"),
+    ("console.qbob", "POST", "/instances/{instance_key}/qbob/qrconnect"),
+    ("console.qbob", "GET", "/instances/{instance_key}/qbob/qrconnect/{task_id}"),
+    ("console.qbob", "POST", "/instances/{instance_key}/qbob/attach"),
+    ("console.qbob", "POST", "/instances/{instance_key}/qbob/rewire"),
+    ("console.qbob", "DELETE", "/instances/{instance_key}/qbob"),
     ("console.instances", "DELETE", "/instances/{instance_key}"),
     ("console.instances", "PATCH", "/instances/{instance_key}"),
     ("console.instances", "POST", "/instances"),
@@ -351,6 +364,10 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("kb_library", "DELETE", "/kb-library/assets/{asset_id}/references/{target_id}"),
     ("kb_library", "POST", "/kb-library/assets"),
     ("kb_library", "POST", "/kb-library/assets/files"),
+    # 批量删除 / 批量重建 / zip 导入与对应的单条操作同档；批量解绑走默认的租户作用域桶
+    ("kb_library", "POST", "/kb-library/assets/batch-delete"),
+    ("kb_library", "POST", "/kb-library/assets/batch-reindex"),
+    ("kb_library", "POST", "/kb-library/assets/zip"),
     ("kb_library", "POST", "/kb-library/assets/{asset_id}/references"),
     ("kb_library", "POST", "/kb-library/assets/{asset_id}/reindex"),
     ("kb_library", "PUT", "/kb-library/assets/{asset_id}"),
@@ -372,7 +389,7 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("plugin_editor", "POST", "/plugin-editor/generate"),
     ("plugin_editor", "POST", "/plugin-editor/generate/stream"),
     ("plugin_editor", "POST", "/plugin-editor/template"),
-    # 插件族的平台方一侧：全局启停 / 激活策略 / 重载 / 路由重建都是**全进程一份**的动作，
+    # 插件族的平台方一侧：全局启停 / 激活策略 / 调用优先级 / 重载 / 路由重建都是**全进程一份**的动作，
     # 一个进程跑着所有租户的实例，租户点一下就落到所有人头上；
     # 三条路由自省吐的是整个进程的路由表；云端插件的装卸等于写服务端可信代码。
     # 租户改自己的可见范围走 `/plugins/scope/...`（实例/会话层覆盖），不动这些。
@@ -381,6 +398,7 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("plugins", "GET", "/plugins/router-info"),
     ("plugins", "GET", "/plugins/verify-plugin-routes/{plugin_key}"),
     ("plugins", "POST", "/plugins/activation-strategy/{plugin_id}"),
+    ("plugins", "POST", "/plugins/call-priority/{plugin_id}"),
     ("plugins", "POST", "/plugins/package/update/{module_name}"),
     ("plugins", "POST", "/plugins/refresh-routes"),
     ("plugins", "POST", "/plugins/reload"),
@@ -391,7 +409,7 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("presets", "POST", "/presets/refresh-shared-status"),
     ("resources", "DELETE", "/resources/{resource_id}"),
     ("resources", "GET", "/resources"),
-    # 悬空绑定的体检与清理（PROJECT_STATE §3 #41）：读写的是整张
+    # 悬空绑定的体检与清理：读写的是整张
     # `workspace_resource_binding`，天然跨工作区跨租户，没有可收敛的作用域。
     ("resources", "GET", "/resources/binding-health"),
     ("resources", "GET", "/resources/secret-health"),
@@ -478,6 +496,7 @@ TENANT_AGNOSTIC: Set[Tuple[str, str, str]] = {
     # 两条都按默认的 TENANT_SCOPED 要求。
     ("config", "GET", "/config/model-types"),
     ("config", "GET", "/config/version"),
+    ("config", "GET", "/config/version-info"),
     ("config", "GET", "/config/ui-onboarding-guide/status"),
     ("commands", "GET", "/commands/completions"),
     ("commands", "GET", "/commands/tools"),
@@ -548,11 +567,13 @@ TENANT_AGNOSTIC: Set[Tuple[str, str, str]] = {
 # 不是按租户资源签的，作用域仍是待办，因此留在 `UNSCOPED_TODO` 里不动。
 SIGNATURE_SCOPED: Set[Tuple[str, str, str]] = {
     ("common", "GET", "/common/uploads/{chat_key}/{filename}"),
+    # 要被 `<video src>` 直接加载。签名绑定频道、消息与用户，签发点是同族的 `video-access`
+    ("chat_channel", "GET", "/chat-channel/{chat_key}/messages/{message_id}/video"),
 }
 
 # 判定 `SIGNATURE_SCOPED` 的结构特征：端点必须真的调用签名校验。
 # 校验函数换名字会让这条断言直接红，而不是安静地放行一个不再验签的端点。
-SIGNATURE_VERIFIERS: Set[str] = {"verify_upload_access_token"}
+SIGNATURE_VERIFIERS: Set[str] = {"verify_upload_access_token", "verify_video_access_token"}
 
 # 调用方是容器而不是人、作用域由容器专属令牌唯一确定的端点。
 #
@@ -577,9 +598,9 @@ UNSCOPED_TODO: Dict[Tuple[str, str, str], str] = {
 }
 
 # ---------------------------------------------------------------------------
-# PROJECT_STATE §3 #29：`workspace_kb` 与 `resources` 两个模块的整表登记
+# `workspace_kb` 与 `resources` 两个模块的整表登记
 #
-# 这两族历史上是"整族零租户校验"，而且**同一个洞被发现了两次**（#26 修 workspaces.py
+# 这两族历史上是"整族零租户校验"，而且**同一个洞被发现了两次**（修 workspaces.py
 # 时漏了它们）。麻烦在于 `TENANT_SCOPED` 是**默认桶**：不登记也能通过，于是上面那套
 # 契约对这两个模块只能保证"接了某个守卫"，保证不了"这一族到底有几个端点、
 # 有没有谁被悄悄挪进/挪出租户可达的范围"。
@@ -609,6 +630,9 @@ KB_AND_RESOURCE_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
     ("workspace_kb", "PUT", "/workspaces/{workspace_id}/kb/documents/{document_id}/references/{target_id}"),
     ("workspace_kb", "DELETE", "/workspaces/{workspace_id}/kb/documents/{document_id}/references/{target_id}"),
     ("workspace_kb", "GET", "/workspaces/{workspace_id}/kb/documents/{document_id}/source-file"),
+    ("workspace_kb", "POST", "/workspaces/{workspace_id}/kb/documents/batch-delete"),
+    ("workspace_kb", "POST", "/workspaces/{workspace_id}/kb/documents/batch-reindex"),
+    ("workspace_kb", "POST", "/workspaces/{workspace_id}/kb/zip"),
     # 资源侧租户能碰的只有这三条：看自己工作区上绑了什么、解绑、重排。
     # "绑定"与"检查绑定冲突"在 PLATFORM_ONLY 里——绑定 = 把平台方的生产 SSH 私钥
     # 交给那个工作区里的 Claude Code，那是能力边界（403）而不是存在性问题（404）。
@@ -619,8 +643,40 @@ KB_AND_RESOURCE_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
 
 # #29 原文记的是"17 + 4"，那个 4 数的是**路径**；
 # `/workspaces/{workspace_id}/resources/{resource_id}` 上挂着 POST（绑定）与
-# DELETE（解绑）两个方法，按端点算是 5，合计 22。
-ISSUE_29_WORKSPACE_SCOPED_ENDPOINT_COUNT = 22
+# DELETE（解绑）两个方法，按端点算是 5，合计 22；之后知识库新增批量删除、批量重建、zip 导入三条，合计 25。
+ISSUE_29_WORKSPACE_SCOPED_ENDPOINT_COUNT = 25
+
+
+# ---------------------------------------------------------------------------
+# 改聊天命令权限的后台入口：整表登记
+#
+# 命令权限有两种：命令本身要求的档位（平台方专属，能把 `sh` 降成 PUBLIC），与某个平台用户的
+# 档位（频道管理员）。后者按频道存，租户只能写自己名下实例的频道，越权与不存在一律 404。
+# `TENANT_SCOPED` 是默认桶，只要求「接了某个守卫、至少 Role.Admin」——把按频道授权换成
+# 别的守卫、或者再加一条写全局用户档位的端点，都不会让上面的通用断言变红。所以这里按
+# 「端点源码里调了哪个写函数」把这一族整体钉死：多一条、少一条、换了档，都要在表上显式改。
+# 行为一侧（跨租户 404、只读成员 403、平台方正向对照）在 `tests/test_command_user_permission_tenant_scope.py`。
+# ---------------------------------------------------------------------------
+
+COMMAND_PERMISSION_WRITERS: Set[str] = {
+    "set_command_permission",
+    "reset_command_permission",
+    "set_user_permission",
+    "reset_user_permission",
+    "set_channel_user_permission",
+    "set_user_command_permission",
+    "reset_user_command_permission",
+}
+
+COMMAND_PERMISSION_PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
+    ("commands", "POST", "/commands/set-permission"),
+    ("commands", "POST", "/commands/reset-permission"),
+}
+
+# 按频道授权：判据必须就是频道归属（`assert_channel_accessible`），不能只是「接了某个守卫」
+COMMAND_PERMISSION_CHANNEL_SCOPED: Set[Tuple[str, str, str]] = {
+    ("chat_channel", "PUT", "/chat-channel/{chat_key}/users/{platform_userid}/command-permission"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +692,7 @@ ISSUE_29_WORKSPACE_SCOPED_ENDPOINT_COUNT = 22
 # 都必须在下面这张表上显式改一次。
 # ---------------------------------------------------------------------------
 
-PROTOCOL_SELF_SERVICE_MODULES: Set[str] = {"console.containers", "console.health"}
+PROTOCOL_SELF_SERVICE_MODULES: Set[str] = {"console.containers", "console.health", "console.onebot_endpoint", "console.qbob"}
 
 # 租户（`Role.Admin` + 实例作用域）能达到的那一档，一条不多一条不少
 PROTOCOL_SELF_SERVICE_TENANT_REACHABLE: Set[Tuple[str, str, str]] = {
@@ -652,16 +708,22 @@ PROTOCOL_SELF_SERVICE_TENANT_REACHABLE: Set[Tuple[str, str, str]] = {
     ("console.health", "GET", "/health/events"),
     # 租户给自己实例配的告警 Webhook 得能试发，否则一个静默失效的地址与没配是同一回事
     ("console.health", "POST", "/health/test-notification"),
+    # 附带 qbob 的自助运维：读状态（响应不含凭据）、启停与两项开关、重载——与「重启我的 NapCat」同一定位
+    ("console.qbob", "GET", "/instances/{instance_key}/qbob"),
+    ("console.qbob", "PATCH", "/instances/{instance_key}/qbob"),
+    ("console.qbob", "POST", "/instances/{instance_key}/qbob/reload"),
+    # 自己实例的只读状态：连的是哪种协议端、有没有上报自身消息
+    ("console.onebot_endpoint", "GET", "/instances/{instance_key}/onebot/endpoint"),
 }
 
 
 # ---------------------------------------------------------------------------
-# 技能库（A4）：`skills` 模块的整表登记
+# 技能库：`skills` 模块的整表登记
 #
 # 这一族是"默认桶太松"这条缝的**教科书案例**：13 个读端点被一句"共享库的只读面"
 # 塞进 `TENANT_AGNOSTIC`，剩下的写端点全是 `Role.Super`。于是两头都错 ——
 # 租户读得到平台方技能的**全文**（技能正文是给 AI 看的运维工作流），
-# 又一个字都写不了（`需求文档 §R8`「可以自己制作并使用 skills」对定制版客户不成立）。
+# 又一个字都写不了（租户应当能自己制作并使用 skills，这一点就不成立了）。
 #
 # 光把它们挪进默认桶 `TENANT_SCOPED` 是不够的：那一档只要求「至少 `Role.Admin` +
 # 接了某个守卫」，而 `require_tenant_admin` 这类名字出现在源码里就算数。
@@ -974,7 +1036,7 @@ class TestProtocolSelfServiceSplitIsPinned:
 
 
 class TestIssue29ModulesAreAuditedEndpointByEndpoint:
-    """`workspace_kb` 与 `resources` 的整表登记（PROJECT_STATE §3 #29）
+    """`workspace_kb` 与 `resources` 的整表登记
 
     上面的通用契约对这两个模块只能说"每条都接了某个守卫"。这一组补的是
     **集合层面**的约束：一族端点里悄悄多一条、少一条、或者从平台方专属滑到
@@ -1028,6 +1090,50 @@ class TestIssue29ModulesAreAuditedEndpointByEndpoint:
             if route.module == "resources" and "{workspace_id}" not in route.path and not is_platform_only(route)
         )
         assert leaked == []
+
+
+def _endpoint_source(route: RouteFacts) -> str:
+    module = importlib.import_module(f"nekro_agent.routers.{route.module}")
+    for candidate in module.router.routes:
+        endpoint = getattr(candidate, "endpoint", None)
+        methods = sorted(getattr(candidate, "methods", None) or ["WS"])
+        if endpoint is not None and candidate.path == route.path and methods[0] == route.method:
+            return _source_of(endpoint)
+    return ""
+
+
+class TestCommandPermissionWritersAreRegistered:
+    """改聊天命令权限的端点一条不多一条不少，档位与守卫都钉死"""
+
+    def test_every_writer_endpoint_is_registered(self, routes: List[RouteFacts]) -> None:
+        """端点源码里调了任何一个写函数，就必须出现在下面两张表之一"""
+        actual = {_key(route) for route in routes if COMMAND_PERMISSION_WRITERS & _identifiers(_endpoint_source(route))}
+        assert actual == COMMAND_PERMISSION_PLATFORM_ONLY | COMMAND_PERMISSION_CHANNEL_SCOPED
+
+    def test_command_level_overrides_stay_platform_only(self, routes: List[RouteFacts]) -> None:
+        by_key = {_key(route): route for route in routes}
+        for key in sorted(COMMAND_PERMISSION_PLATFORM_ONLY):
+            assert _categorize(by_key[key]) == "PLATFORM_ONLY", key
+            assert is_platform_only(by_key[key]), key
+
+    def test_channel_grant_is_admin_and_checks_the_channel_itself(self, routes: List[RouteFacts]) -> None:
+        """租户可达，所以必须：落在默认的租户作用域桶、至少 Role.Admin、而且端点自己调了频道归属守卫"""
+        by_key = {_key(route): route for route in routes}
+        for key in sorted(COMMAND_PERMISSION_CHANNEL_SCOPED):
+            route = by_key[key]
+            assert _categorize(route) == "TENANT_SCOPED", key
+            assert route.min_role is Role.Admin, key
+            assert "assert_channel_accessible" in _identifiers(_endpoint_source(route)), key
+
+    def test_the_writer_detector_is_not_vacuous(self, routes: List[RouteFacts]) -> None:
+        """对照组：探测器看得见写函数，也分得出没写的端点"""
+        by_key = {_key(route): route for route in routes}
+        assert COMMAND_PERMISSION_WRITERS & _identifiers(
+            _endpoint_source(by_key[("commands", "POST", "/commands/set-permission")]),
+        )
+        assert not COMMAND_PERMISSION_WRITERS & _identifiers(
+            _endpoint_source(by_key[("chat_channel", "GET", "/chat-channel/{chat_key}/users")]),
+        )
 
 
 def _reaches_skill_library_guard(route: RouteFacts) -> bool:
@@ -1358,3 +1464,371 @@ class TestRequireRoleIsActuallyWired:
             if route.min_role is not None and "_current_user" not in route.parameter_names
         ]
         assert broken == []
+
+
+# ==================== 实例归属必须按 (adapter_key, instance_key) 判 ====================
+#
+# `instance_key` 只在同一适配器内唯一：另一个适配器下可以有同名实例归别的租户。
+# 上面的契约只看"端点走没走到守卫"，看不出守卫问的是不是**那一行**——
+# 把 `adapter_key` 丢掉、或拿标识清单去 `instance_key__in` 过滤，守卫照样"走到了"，
+# 却会把别人的同名实例判给自己。下面两条把这两种写法变成静态可查。
+# 行为面（两个租户、两个适配器、同名实例）见 `tests/test_instance_key_cross_adapter_scope.py`。
+
+# 手上有适配器、却有意不交给归属守卫的调用点。每条带理由。
+INSTANCE_GUARD_WITHOUT_ADAPTER: Dict[Tuple[str, str], str] = {}
+
+# `accessible_instance_keys` 只用于把可访问实例**展示**给前端（身份接口），不能拿去过滤数据。
+INSTANCE_KEY_LIST_CALLERS: Set[Tuple[str, str]] = {
+    ("services/user/tenant_perm.py", "resolve_current_identity"),
+}
+
+
+def _package_sources() -> Dict[str, str]:
+    import nekro_agent
+
+    root = Path(nekro_agent.__file__).parent
+    return {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8") for path in root.rglob("*.py")}
+
+
+def _calls_named(tree: ast.AST, name: str) -> List[Tuple[str, ast.Call, Set[str]]]:
+    """找出对 `name` 的全部调用，连同所在函数名与该函数的形参名"""
+    found: List[Tuple[str, ast.Call, Set[str]]] = []
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = {arg.arg for arg in [*function.args.args, *function.args.kwonlyargs, *function.args.posonlyargs]}
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if callee == name:
+                found.append((function.name, node, params))
+    return found
+
+
+def _instance_guard_violations(path: str, source: str) -> Set[Tuple[str, str]]:
+    """调用 `assert_instance_accessible` 却没把手上的适配器交给它的位置
+
+    两种"手上有适配器"的形态：
+
+    1. 标识取自某个对象的 `.instance_key`（频道行、公告引用、请求体）——同一个对象上的
+       `.adapter_key` 必须一起传；
+    2. 所在函数有名为 `adapter_key` 的形参（路径或查询参数）——必须传下去。
+    """
+    violations: Set[Tuple[str, str]] = set()
+    for function_name, call, params in _calls_named(ast.parse(source), "assert_instance_accessible"):
+        keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg}
+        instance_arg = call.args[1] if len(call.args) > 1 else keywords.get("instance_key")
+        passed = ast.unparse(keywords["adapter_key"]) if "adapter_key" in keywords else None
+        if isinstance(instance_arg, ast.Attribute) and instance_arg.attr == "instance_key":
+            if passed != f"{ast.unparse(instance_arg.value)}.adapter_key":
+                violations.add((path, function_name))
+        if "adapter_key" in params and passed is None:
+            violations.add((path, function_name))
+    return violations
+
+
+class TestInstanceOwnershipIsJudgedByPair:
+    def test_the_instance_guard_is_given_the_adapter_whenever_the_caller_has_it(self) -> None:
+        violations: Set[Tuple[str, str]] = set()
+        for path, source in _package_sources().items():
+            if "assert_instance_accessible(" in source:
+                violations |= _instance_guard_violations(path, source)
+        assert violations - set(INSTANCE_GUARD_WITHOUT_ADAPTER) == set()
+
+    def test_the_allowlist_has_no_stale_entries(self) -> None:
+        sources = _package_sources()
+        for path, function_name in INSTANCE_GUARD_WITHOUT_ADAPTER:
+            assert (path, function_name) in _instance_guard_violations(path, sources[path]), (path, function_name)
+
+    def test_the_instance_key_list_is_not_used_as_a_filter(self) -> None:
+        callers = {
+            (path, function_name)
+            for path, source in _package_sources().items()
+            if "accessible_instance_keys(" in source
+            for function_name, _call, _params in _calls_named(ast.parse(source), "accessible_instance_keys")
+        }
+        assert callers == INSTANCE_KEY_LIST_CALLERS
+
+    def test_the_detector_is_not_vacuous(self) -> None:
+        """检测器自己失效会让上面的断言空转：两种形态各合成一处，必须都被认出来"""
+        source = (
+            "async def by_attribute(user, channel):\n"
+            "    await assert_instance_accessible(user, channel.instance_key)\n"
+            "async def by_param(user, adapter_key, instance_key):\n"
+            "    await assert_instance_accessible(user, instance_key)\n"
+            "async def wrong_object(user, channel, ref):\n"
+            "    await assert_instance_accessible(user, channel.instance_key, adapter_key=ref.adapter_key)\n"
+            "async def fine(user, channel, adapter_key, instance_key):\n"
+            "    await assert_instance_accessible(user, channel.instance_key, adapter_key=channel.adapter_key)\n"
+            "    await assert_instance_accessible(user, instance_key, adapter_key=adapter_key)\n"
+        )
+        assert _instance_guard_violations("x.py", source) == {
+            ("x.py", "by_attribute"),
+            ("x.py", "by_param"),
+            ("x.py", "wrong_object"),
+        }
+
+
+# ==================== 适配器子路由的租户作用域契约 ====================
+#
+# 适配器子路由由各适配器在 `get_adapter_router()` 里动态创建，不经过 `ROUTER_MODULES`，
+# 所以上面的路由契约覆盖不到它们，这里改用 AST 静态扫描源码，不 import 适配器模块
+# （各适配器在导入时可能读配置、连宿主资源）。
+# 没有 `require_role` 的端点（回调、凭令牌接入）不在这条契约的范围内。
+
+
+@dataclass(frozen=True)
+class AdapterEndpoint:
+    role: Optional[str]
+    owner_dep: bool
+    reaches_guard: bool
+
+
+ADAPTER_ROUTE_METHODS: Set[str] = {"get", "post", "put", "patch", "delete", "websocket"}
+
+
+def _is_platform_owner_dependency(node: Optional[ast.expr]) -> bool:
+    """判断一个默认值表达式是不是 `Depends(require_platform_owner())`"""
+    if not isinstance(node, ast.Call):
+        return False
+    if not isinstance(node.func, ast.Name) or node.func.id != "Depends":
+        return False
+    dependency = node.args[0] if node.args else None
+    return (
+        isinstance(dependency, ast.Call)
+        and isinstance(dependency.func, ast.Name)
+        and dependency.func.id == "require_platform_owner"
+    )
+
+
+def _adapter_guarded_helpers(tree: ast.Module, source: str) -> Set[str]:
+    """模块级函数里哪些（直接或间接）走到了作用域守卫
+
+    与 `_guarded_helpers` 同一套两层展开，只是数据来自 AST 而不是已经导入的模块。
+    """
+    sources = {
+        node.name: ast.get_source_segment(source, node) or ""
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    direct = {name for name, text in sources.items() if SCOPE_GUARDS & _identifiers(text)}
+    indirect = {name for name, text in sources.items() if direct & _identifiers(text)}
+    return direct | indirect
+
+
+def _adapter_endpoint_role(function: ast.AST) -> Optional[str]:
+    """读出 `@require_role(Role.X)` 里的 `X`"""
+    for decorator in getattr(function, "decorator_list", []):
+        if not isinstance(decorator, ast.Call):
+            continue
+        if not isinstance(decorator.func, ast.Name) or decorator.func.id != "require_role":
+            continue
+        if not decorator.args:
+            continue
+        role = decorator.args[0]
+        if isinstance(role, ast.Attribute):
+            return role.attr
+        if isinstance(role, ast.Constant) and isinstance(role.value, str):
+            return role.value
+    return None
+
+
+def _is_adapter_endpoint(function: ast.AST) -> bool:
+    """函数的装饰器里有没有 `@router.get` 这类路由注册"""
+    for decorator in getattr(function, "decorator_list", []):
+        if (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr in ADAPTER_ROUTE_METHODS
+        ):
+            return True
+    return False
+
+
+def _has_platform_owner_dependency(function: ast.AST) -> bool:
+    defaults = [*function.args.defaults, *function.args.kw_defaults]
+    return any(_is_platform_owner_dependency(default) for default in defaults)
+
+
+def _scan_adapter_router_source(adapter: str, source: str) -> Dict[Tuple[str, str], AdapterEndpoint]:
+    """静态扫描一个适配器路由文件的源码，按端点函数名给出权限结构"""
+    tree = ast.parse(source)
+    helpers = _adapter_guarded_helpers(tree, source)
+    endpoints: Dict[Tuple[str, str], AdapterEndpoint] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _is_adapter_endpoint(node):
+            continue
+        endpoint_source = ast.get_source_segment(source, node) or ""
+        endpoints[(adapter, node.name)] = AdapterEndpoint(
+            role=_adapter_endpoint_role(node),
+            owner_dep=_has_platform_owner_dependency(node),
+            reaches_guard=bool((SCOPE_GUARDS | helpers) & _identifiers(endpoint_source)),
+        )
+    return endpoints
+
+
+def _scan_adapter_routers() -> Dict[Tuple[str, str], AdapterEndpoint]:
+    """扫描 `nekro_agent/adapters/*/routers.py`，adapter 取上级目录名"""
+    import nekro_agent
+
+    adapters_dir = Path(nekro_agent.__file__).parent / "adapters"
+    endpoints: Dict[Tuple[str, str], AdapterEndpoint] = {}
+    for path in sorted(adapters_dir.glob("*/routers.py")):
+        endpoints.update(_scan_adapter_router_source(path.parent.name, path.read_text(encoding="utf-8")))
+    return endpoints
+
+
+# 平台方的运维动作：实例生命周期与续期策略，租户身份一律 403
+ADAPTER_PLATFORM_ONLY: Set[Tuple[str, str]] = {
+    ("wechat_ilink_multi", "create_instance"),
+    ("wechat_ilink_multi", "delete_instance"),
+    ("wechat_ilink_multi", "start_instance"),
+    ("wechat_ilink_multi", "stop_instance"),
+    ("wechat_ilink_multi", "renew_instance"),
+    ("wechat_ilink_multi", "update_renew_policy"),
+    # 单账号适配器的维护面作用于整个部署，不是某个租户的实例
+    ("qqbot_openclaw", "status"),
+    ("qqbot_openclaw", "restart"),
+    ("qqbot_openclaw", "clear_refs"),
+    ("qqbot_openclaw", "session_clear"),
+    ("qqbot_openclaw", "token_test"),
+    ("wechat_openilink", "get_status"),
+}
+# 租户能碰的实例面：看自己的实例、看事件、给自己的 Bot 扫码登录
+ADAPTER_TENANT_SCOPED: Set[Tuple[str, str]] = {
+    ("wechat_ilink_multi", "list_instances"),
+    ("wechat_ilink_multi", "get_instance"),
+    ("wechat_ilink_multi", "start_bind"),
+    ("wechat_ilink_multi", "get_bind_status"),
+    ("wechat_ilink_multi", "list_instance_events"),
+}
+# 审计过、确认租户够得着、本轮没收的适配器端点。只减不增。
+ADAPTER_TENANT_REACHABLE_TODO: Dict[Tuple[str, str], str] = {}
+
+
+class TestAdapterRoutersAreScoped:
+    """适配器子路由的权限分档必须与登记表一致"""
+
+    @pytest.fixture(scope="class")
+    def adapter_endpoints(self) -> Dict[Tuple[str, str], AdapterEndpoint]:
+        return _scan_adapter_routers()
+
+    def test_every_tenant_reachable_endpoint_is_registered(
+        self,
+        adapter_endpoints: Dict[Tuple[str, str], AdapterEndpoint],
+    ) -> None:
+        unregistered = sorted(
+            key
+            for key, endpoint in adapter_endpoints.items()
+            if endpoint.role in {"Admin", "User"}
+            and not endpoint.owner_dep
+            and key not in ADAPTER_TENANT_SCOPED
+            and key not in ADAPTER_TENANT_REACHABLE_TODO
+        )
+        assert unregistered == []
+
+    def test_tenant_scoped_endpoints_really_reach_a_guard(
+        self,
+        adapter_endpoints: Dict[Tuple[str, str], AdapterEndpoint],
+    ) -> None:
+        for key in sorted(ADAPTER_TENANT_SCOPED):
+            endpoint = adapter_endpoints.get(key)
+            assert endpoint is not None, key
+            assert endpoint.role == "Admin", key
+            assert not endpoint.owner_dep, key
+            assert endpoint.reaches_guard, key
+
+    def test_platform_only_endpoints_really_require_platform_identity(
+        self,
+        adapter_endpoints: Dict[Tuple[str, str], AdapterEndpoint],
+    ) -> None:
+        for key in sorted(ADAPTER_PLATFORM_ONLY):
+            endpoint = adapter_endpoints.get(key)
+            assert endpoint is not None, key
+            assert endpoint.owner_dep or endpoint.role == "Super", key
+
+    def test_tenant_reachable_todo_is_still_reachable(
+        self,
+        adapter_endpoints: Dict[Tuple[str, str], AdapterEndpoint],
+    ) -> None:
+        for key in sorted(ADAPTER_TENANT_REACHABLE_TODO):
+            endpoint = adapter_endpoints.get(key)
+            assert endpoint is not None, key
+            assert endpoint.role in {"Admin", "User"}, key
+            assert not endpoint.owner_dep, key
+        assert len(ADAPTER_TENANT_REACHABLE_TODO) <= 6
+
+    def test_the_three_tables_do_not_overlap(self) -> None:
+        platform_only = set(ADAPTER_PLATFORM_ONLY)
+        tenant_scoped = set(ADAPTER_TENANT_SCOPED)
+        tenant_reachable_todo = set(ADAPTER_TENANT_REACHABLE_TODO)
+        assert platform_only & tenant_scoped == set()
+        assert platform_only & tenant_reachable_todo == set()
+        assert tenant_scoped & tenant_reachable_todo == set()
+
+    def test_wechat_ilink_surface_is_exactly_the_registered_one(
+        self,
+        adapter_endpoints: Dict[Tuple[str, str], AdapterEndpoint],
+    ) -> None:
+        scanned = {key for key in adapter_endpoints if key[0] == "wechat_ilink_multi"}
+        registered = {
+            key
+            for key in ADAPTER_PLATFORM_ONLY | ADAPTER_TENANT_SCOPED
+            if key[0] == "wechat_ilink_multi"
+        }
+        assert len(scanned) == 11
+        assert scanned == registered
+
+    def test_the_adapter_detector_itself_is_not_vacuous(self) -> None:
+        source = (
+            "from fastapi import Depends\n"
+            "\n"
+            "\n"
+            "async def _guarded(user, key):\n"
+            "    await assert_instance_accessible(user, key, adapter_key='x')\n"
+            "\n"
+            "\n"
+            "def create_router():\n"
+            "    @router.get('/unguarded')\n"
+            "    @require_role(Role.Admin)\n"
+            "    async def unguarded(_current_user=Depends(get_current_active_user)):\n"
+            "        return None\n"
+            "\n"
+            "    @router.get('/guarded')\n"
+            "    @require_role(Role.Admin)\n"
+            "    async def guarded(_current_user=Depends(get_current_active_user)):\n"
+            "        await assert_instance_accessible(_current_user, 'k', adapter_key='x')\n"
+            "\n"
+            "    @router.post('/platform')\n"
+            "    async def platform(_owner=Depends(require_platform_owner())):\n"
+            "        return None\n"
+            "\n"
+            "    @router.get('/indirect')\n"
+            "    @require_role(Role.Admin)\n"
+            "    async def indirect(_current_user=Depends(get_current_active_user)):\n"
+            "        await _guarded(_current_user, 'k')\n"
+        )
+        scanned = _scan_adapter_router_source("synthetic", source)
+        assert scanned[("synthetic", "unguarded")] == AdapterEndpoint(
+            role="Admin",
+            owner_dep=False,
+            reaches_guard=False,
+        )
+        assert scanned[("synthetic", "guarded")] == AdapterEndpoint(
+            role="Admin",
+            owner_dep=False,
+            reaches_guard=True,
+        )
+        assert scanned[("synthetic", "platform")] == AdapterEndpoint(
+            role=None,
+            owner_dep=True,
+            reaches_guard=False,
+        )
+        assert scanned[("synthetic", "indirect")] == AdapterEndpoint(
+            role="Admin",
+            owner_dep=False,
+            reaches_guard=True,
+        )

@@ -232,18 +232,17 @@ async def resolve_instance_scope(user: DBUser, instance_key: str) -> str:
     return scope
 
 
-async def _require_instance(instance_key: str) -> DBAdapterInstance:
-    """按实例标识取实例行，不存在时抛 404
+async def _require_instance(user: DBUser, instance_key: str) -> DBAdapterInstance:
+    """按实例标识取当前身份够得着的那一行实例，不存在时抛 404
 
-    与总后台一致，`instance_key` 在本项目里被当作全局唯一标识使用
-    （数据库层的唯一约束是 `(adapter_key, instance_key)`，是它之上更宽的一层）。
+    总后台的创建接口把 `instance_key` 当全局唯一标识，但数据库层的唯一约束只到
+    `(adapter_key, instance_key)`，另一个适配器下可以有同名实例归别的租户。
+    这里取回的行接下来会被**写**（默认人设存在实例元数据里），所以必须走归属守卫取，
+    而不是按标识随便取一行。
     """
     if not instance_key:
         raise ValidationError(reason="实例标识不能为空")
-    instance = await DBAdapterInstance.filter(instance_key=instance_key).first()
-    if instance is None:
-        raise NotFoundError(resource=f"实例 '{instance_key}'")
-    return instance
+    return await assert_instance_accessible(user, instance_key)
 
 
 def _load_instance_metadata(instance: DBAdapterInstance) -> Dict[str, Any]:
@@ -330,7 +329,7 @@ async def get_instance_default_preset(
     人设视同未设置，与回退链的运行时行为保持一致。
     """
     scope = await resolve_instance_scope(_current_user, instance_key)
-    instance = await _require_instance(scope)
+    instance = await _require_instance(_current_user, scope)
     preset_id = _load_instance_metadata(instance).get(INSTANCE_METADATA_DEFAULT_PRESET_ID)
     if not isinstance(preset_id, int):
         return InstanceDefaultPresetResponse(instance_key=scope)
@@ -426,7 +425,7 @@ async def get_instance_default_preset_impact(
 ) -> InstanceDefaultPresetImpact:
     """二次确认弹窗要显示的那段内容"""
     scope = await resolve_instance_scope(_current_user, instance_key)
-    instance = await _require_instance(scope)
+    instance = await _require_instance(_current_user, scope)
     return await _instance_default_preset_impact(instance, preset_id)
 
 
@@ -447,7 +446,7 @@ async def set_instance_default_preset(
     闸门与 `POST /chat-channel/{chat_key}/preset` 同形，理由见那里。
     """
     scope = await resolve_instance_scope(_current_user, instance_key)
-    instance = await _require_instance(scope)
+    instance = await _require_instance(_current_user, scope)
     metadata = _load_instance_metadata(instance)
 
     if body.preset_id is None:
@@ -533,7 +532,7 @@ async def create_preset(
     scope = await resolve_instance_scope(_current_user, instance_key)
     if scope:
         # 归属写错会让人设对所有视图都不可见（只剩平台方全局视图看得到），提前挡掉
-        await _require_instance(scope)
+        await _require_instance(_current_user, scope)
 
     await DBPreset.create(
         name=name,

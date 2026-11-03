@@ -4,8 +4,7 @@
 - `ledger`：算钱与落库（后台任务，不占主链路）
 - `query`：读侧的作用域与聚合，供 `routers/console/usage.py` 使用
 
-**本轮只做账本与视图，不做扣费。** 扣费策略（按量计费还是包月、超支停机还是降级、
-预警阈值给谁）是产品决策，见 `PROJECT_STATE.md` §8。
+**这里只有账本与视图，不做扣费。**
 """
 
 from .context import (

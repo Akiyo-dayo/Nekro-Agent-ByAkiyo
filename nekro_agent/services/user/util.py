@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from tortoise.exceptions import IntegrityError
 from tortoise.timezone import now as db_now
@@ -38,7 +38,9 @@ async def user_register(data: UserCreate) -> None:
     logger.info(f"正在注册用户 {data.username} ...")
     if data.username == "admin":
         raise ConflictError(resource="用户名")
-    if await DBUser.get_or_none(adapter_key=data.adapter_key, platform_userid=data.platform_userid):
+    # 走 `get_by_union_id` 而不是 `get_or_none`：库里残留历史重复行时，后者会抛 MultipleObjectsReturned，
+    # 注册接口就从「用户已存在」变成 500
+    if await DBUser.get_by_union_id(adapter_key=data.adapter_key, platform_userid=data.platform_userid):
         raise ConflictError(resource="用户")
     try:
         await DBUser.create(
@@ -58,7 +60,11 @@ async def user_register(data: UserCreate) -> None:
         raise OperationFailedError(operation="注册用户") from e
 
 
-async def get_or_create_platform_user(adapter_key: str, platform_userid: str, username: str) -> Optional[DBUser]:
+async def register_platform_user(
+    adapter_key: str,
+    platform_userid: str,
+    username: str,
+) -> Tuple[Optional[DBUser], bool]:
     """入站消息的平台用户登记：存在即取回，不存在才建
 
     nonebot 按事件并发处理，同一新用户的首批消息会同时走到这里——"先查后建"输掉
@@ -67,19 +73,21 @@ async def get_or_create_platform_user(adapter_key: str, platform_userid: str, us
     `(adapter_key, platform_userid)` 的部分唯一索引（迁移 24）。
 
     Returns:
-        用户行；`None` 表示**新建**时昵称被保留词护住——`user_login` 按 username 单列查
+        `(用户行, 是否由本次调用新建)`。并发里输掉、回读到赢家那行的一路算「不是新建」：
+        新用户的一次性处理（注册登记命令权限）只该由真正建行的那一路做。
+        用户行为 `None` 表示**新建**时昵称被保留词护住——`user_login` 按 username 单列查
         "admin"，放进来一个同名平台用户会把后台登录炸成 MultipleObjectsReturned。
         保留名检查只拦建行：已登记的用户此后把平台昵称改成 "admin"，库里并不会多出
         同名行，必须照常取回，否则他的每条消息都被调用方静默丢弃。
     """
     existing = await DBUser.get_by_union_id(adapter_key, platform_userid)
     if existing is not None:
-        return existing
+        return existing, False
     if username == "admin":
         logger.warning(f"昵称 'admin' 是平台方保留名，拒绝登记平台用户: {adapter_key}:{platform_userid}")
-        return None
+        return None, False
     try:
-        return await DBUser.create(
+        created = await DBUser.create(
             username=username,
             password=get_hashed_password(""),
             adapter_key=adapter_key,
@@ -92,7 +100,14 @@ async def get_or_create_platform_user(adapter_key: str, platform_userid: str, us
         raced = await DBUser.get_by_union_id(adapter_key, platform_userid)
         if raced is None:
             raise
-        return raced
+        return raced, False
+    return created, True
+
+
+async def get_or_create_platform_user(adapter_key: str, platform_userid: str, username: str) -> Optional[DBUser]:
+    """`register_platform_user` 只取用户行的形态；判据与并发兜底全在那一个函数里"""
+    user, _ = await register_platform_user(adapter_key, platform_userid, username)
+    return user
 
 
 def build_identity_claims(user: DBUser) -> Dict[str, Any]:

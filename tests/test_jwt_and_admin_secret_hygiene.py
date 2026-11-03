@@ -1,4 +1,4 @@
-"""JWT 两把签名密钥与 ADMIN 口令的仓库侧卫生（round-28 任务 2；#40 / A1 / PRELAUNCH §1.1 §1.2）
+"""JWT 两把签名密钥与 ADMIN 口令的仓库侧卫生（docs/operations.md §1.1 §1.2）
 
 ## 为什么这条最严重
 
@@ -10,7 +10,7 @@
 ## 这一轮钉的五件事
 
 1. **启动审计**（`core/logger.py:audit_factory_default_credentials`）扩到 JWT 两把与 ADMIN 口令：
-   示例值 / 占位符 / 过短 / 两把相同 → WARNING，**不拒启动**（沿用 round-16 口径）。
+   示例值 / 占位符 / 过短 / 两把相同 → WARNING，**不拒启动**（与 Postgres 出厂口令那条告警同一口径）。
    **缺键语义与 Postgres 那条相反，且是有意的**：JWT 没设 = `OsEnv` 兜底每进程随机 = 安全（只是重启即全员重登），
    ADMIN 没设 = 登录不可用，都不告警；Postgres 没设 = 生效的正是出厂默认，所以告警。
 2. **空串等于没设**：`.env` 里一行 `NEKRO_JWT_SECRET_KEY=`（或 compose 的 `${X:-}` 透传空值）
@@ -125,7 +125,7 @@ class TestJwtSecretAudit:
         assert not [a for a in alerts if JWT_REFRESH in a and "示例" in a]
 
     def test_the_two_keys_being_equal_is_its_own_alert(self) -> None:
-        """refresh 与 access 用同一把 = refresh 没有独立吊销能力（PRELAUNCH §1.1 判据第二句）"""
+        """refresh 与 access 用同一把 = refresh 没有独立吊销能力（docs/operations.md §1.1）"""
         same = _audit({JWT: STRONG_A, JWT_REFRESH: STRONG_A})
         different = _audit({JWT: STRONG_A, JWT_REFRESH: STRONG_B})
 
@@ -272,7 +272,7 @@ class TestBlankSigningSecretFallsBackToRandom:
 
 
 # ============================================================
-# 2b. NEKRO_SUPER_ACCESS_KEY：环境变量读得到，没设仍 fail-closed（round-28 复核 P2-7）
+# 2b. NEKRO_SUPER_ACCESS_KEY：环境变量读得到，没设仍 fail-closed
 #
 # `OsEnv.SUPER_ACCESS_KEY` 原先是 `OsEnvTypes.Str("SUPER_ACCESS_KEY", default=lambda: ...)`，而
 # `OsEnvTypes.Str` 遇到可调用默认值**根本不读环境变量**：`NEKRO_SUPER_ACCESS_KEY` 设了也读不到，

@@ -4,7 +4,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import magic
 
@@ -34,6 +34,7 @@ from nekro_agent.schemas.chat_message import (
     ChatMessageSegmentType,
     ChatMessageSegmentUntrusted,
     ChatType,
+    merge_video_placeholders,
 )
 from nekro_agent.schemas.errors import AdapterUnavailableError
 from nekro_agent.schemas.signal import MsgSignal
@@ -42,6 +43,7 @@ from nekro_agent.services.memory.feature_flags import is_memory_system_enabled
 from nekro_agent.services.message_broadcaster import message_broadcaster
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.quota_service import quota_service
+from nekro_agent.services.user.super_users import is_super_user
 from nekro_agent.tools.at_markup import AT_MARKUP_PATTERN, normalize_malformed_at_markup
 from nekro_agent.tools.common_util import (
     check_content_trigger,
@@ -68,6 +70,21 @@ async def _notify_memory_scheduler(chat_key: str, workspace_id: int | None, cont
         )
     except Exception as e:
         logger.debug(f"记忆调度器通知失败（可忽略）: {e}")
+
+
+async def is_quota_exempt(message: ChatMessage, config: Any) -> bool:
+    """这条消息的发送者是否免配额：配额白名单，或（开了豁免时）超级用户
+
+    超级用户按聊天命令同一套判定（名单匹配 ∧ 来源可信）。只比 `sender_id` 的话，邮件的 `From`、
+    SSE 的 `from_id`、租户自运行协议端上报的号码都能填成名单里的值，白用平台的配额。
+    """
+    if message.sender_id in config.AI_CHAT_QUOTA_WHITELIST_USERS:
+        return True
+    return bool(config.AI_CHAT_QUOTA_SUPER_USERS_EXEMPT) and await is_super_user(
+        message.adapter_key,
+        message.instance_key,
+        message.sender_id,
+    )
 
 
 class MessageService:
@@ -383,12 +400,14 @@ class MessageService:
         user: Optional[DBUser] = None,
         trigger_agent: bool = False,
         db_chat_channel: Optional[DBChatChannel] = None,
-        suppress_trigger: bool = False,
+        self_sent: bool = False,
     ):
         """推送人类用户消息
 
-        `suppress_trigger` 为真时消息照常落库、广播，但无论什么原因都不排 Agent 任务
-        （适配器判断这条消息已经没有可回应的内容，如私聊里只剩合成 @ 段的单发视频）。
+        `self_sent` 为真表示这条是 Bot 账号自己由其他程序发出的（OneBot 的 `message_sent`）：
+        只落库、广播，不调 `on_user_message`，也不进后面任何触发判断。两边都接在同一账号上时，
+        这里只要漏出一条触发，NA 回话会让对方再回话，就是死循环；好感、配额、随机搭话、关键词
+        也都在这条返回之后，一并绕开。
         """
         db_chat_channel = db_chat_channel or await DBChatChannel.get_channel(chat_key=message.chat_key)
 
@@ -418,13 +437,20 @@ class MessageService:
             logger.info(f"消息 {message.content_text} 被禁止，跳过本次处理...")
             return
 
-        ctx: AgentCtx = await AgentCtx.create_by_chat_key(chat_key=message.chat_key)
-        ctx._trigger_db_user = user  # noqa: SLF001
+        signal = MsgSignal.CONTINUE
+        ctx: Optional[AgentCtx] = None
+        if not self_sent:
+            ctx = await AgentCtx.create_by_chat_key(chat_key=message.chat_key)
+            ctx._trigger_db_user = user  # noqa: SLF001
 
-        signal = await plugin_collector.handle_on_user_message(ctx, message)
-        if signal == MsgSignal.BLOCK_ALL:
-            logger.info(f"用户消息 {message.content_text} 被插件阻止响应，跳过本次处理...")
-            return
+            signal = await plugin_collector.handle_on_user_message(ctx, message)
+            if signal == MsgSignal.BLOCK_ALL:
+                logger.info(f"用户消息 {message.content_text} 被插件阻止响应，跳过本次处理...")
+                return
+
+        # 落库的文本补上 OneBot 视频占位；上面的伪造检查、禁词与下面的触发判断都用不带占位的原文
+        stored_text = merge_video_placeholders(message.content_text, message.content_data)
+        stored_message = message if stored_text == message.content_text else message.model_copy(update={"content_text": stored_text})
 
         # 添加聊天记录
         await DBChatMessage.create(
@@ -439,7 +465,7 @@ class MessageService:
             is_recalled=message.is_recalled,
             chat_key=message.chat_key,
             chat_type=message.chat_type,
-            content_text=message.content_text,
+            content_text=stored_text,
             content_data=json.dumps(content_data, ensure_ascii=False),
             raw_cq_code=message.raw_cq_code,
             ext_data=json.dumps(message.ext_data, ensure_ascii=False),
@@ -451,12 +477,12 @@ class MessageService:
             _notify_memory_scheduler(
                 chat_key=message.chat_key,
                 workspace_id=db_chat_channel.workspace_id,
-                content_length=len(message.content_text),
+                content_length=len(stored_text),
             ),
         )
 
-        # 广播消息到所有订阅者
-        await message_broadcaster.publish(message.chat_key, message)
+        # 广播消息到所有订阅者：与库里的那一行一致
+        await message_broadcaster.publish(message.chat_key, stored_message)
 
         # 同时广播频道更新事件，使频道列表实时更新（新消息会将频道移到最上面）
         await channel_broadcaster.publish_update(
@@ -466,6 +492,9 @@ class MessageService:
             is_active=db_chat_channel.is_active,
             status=db_chat_channel.channel_status,
         )
+
+        if self_sent or ctx is None:
+            return
 
         should_ignore = (user and user.is_prevent_trigger) or (user and not user.is_active)
 
@@ -489,11 +518,6 @@ class MessageService:
             if any(seg.type in _MEDIA_TYPES for seg in message.content_data):
                 logger.info(f"私聊纯媒体消息，仅记录不触发: {message.content_text[:32]}...")
                 should_trigger = False
-
-        if suppress_trigger and should_trigger:
-            logger.info(f"适配器标记这条消息没有可回应的内容，仅记录不触发: {message.chat_key}")
-            should_trigger = False
-            should_notify_quota_exhausted = False
 
         # 好感度软门：只作用于非明示触发（随机搭话 / 关键词命中）——@、私聊、喊名字、
         # trigger_agent、FORCE_TRIGGER 这类直接召唤永远放行；被降的是环境里的自发参与。
@@ -530,9 +554,7 @@ class MessageService:
                 return
 
             # 配额豁免检查（用户白名单/管理员）
-            _is_quota_exempt = message.sender_id in config.AI_CHAT_QUOTA_WHITELIST_USERS or (
-                config.AI_CHAT_QUOTA_SUPER_USERS_EXEMPT and message.sender_id in config.SUPER_USERS
-            )
+            _is_quota_exempt = await is_quota_exempt(message, config)
 
             if not _is_quota_exempt:
                 # 配额检查（使用频道级 effective config）

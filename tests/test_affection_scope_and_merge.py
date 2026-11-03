@@ -709,7 +709,7 @@ class TestAccountMergeGuards:
     async def test_merge_stays_inside_its_own_domain(self, scope_db: None) -> None:
         """跨域串号：在 A 的域里合并，绝不能影响 B 的域
 
-        这是本轮第二条高危风险面在服务层的落点——接口层的越权 404 是另一道门。
+        这是第二条高危风险面在服务层的落点——接口层的越权 404 是另一道门。
         """
         await merge_accounts(self_domain(INSTANCE_A), person_uid=MAIN_ACCOUNT, alias_platform_userid=ALT_ACCOUNT)
 

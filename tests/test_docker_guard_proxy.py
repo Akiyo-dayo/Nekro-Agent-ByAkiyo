@@ -1,4 +1,4 @@
-"""docker-guard 代理层的归属门单测（RK3 / PROJECT_STATE §3 #19）。
+"""docker-guard 代理层的归属门单测（docs/docker-guard.md）。
 
 `policy.py` 的表驱动判据只回答「NA 能对 Docker 做哪个动作」，回答不了「对哪个容器做」。
 按 ID 指向具体容器的端点（exec/logs/inspect/start/stop/…）若不加归属校验，NA 一旦被攻破就能

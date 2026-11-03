@@ -214,6 +214,7 @@
     "restartSent": "System restart request sent, please wait...",
     "restartFailed": "Failed to restart system, check connection",
     "currentModelGroupMissing": "Selected model group not found",
+    "tenantOwnedModelGroup": "Tenant #{{id}}",
     "currentEmailAccountMissing": "The selected email account no longer exists or is not send-enabled",
     "goToModelGroup": "Go to Model Group Config",
     "ModelGroup": "{{label}} Model Group",

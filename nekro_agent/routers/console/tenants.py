@@ -52,6 +52,7 @@ from nekro_agent.services.user.tenant_perm import (
     tenant_perm_level,
     tenant_role_of,
 )
+from nekro_agent.services.user.token_exposure import record_instances_exposure
 
 logger = get_sub_logger("console.tenant")
 
@@ -346,17 +347,22 @@ async def bind_tenant_instances(
     if len(set(wanted)) != len(wanted):
         raise ValidationError(reason="实例标识存在重复")
 
+    # 按标识取回的是**全部同名行**：`instance_key` 只在同一适配器内唯一，下面的整批更新也会
+    # 落到每一行上。冲突判定因此必须逐行看——按标识折叠成一行的话，留下来的恰好是未归属的
+    # 那一行时判定放行，更新却把另一个适配器下已归属别的租户的同名实例一并改判过来。
     instances = await DBAdapterInstance.filter(instance_key__in=wanted) if wanted else []
-    found = {instance.instance_key: instance for instance in instances}
-    missing = [key for key in wanted if key not in found]
+    found_keys = {instance.instance_key for instance in instances}
+    missing = [key for key in wanted if key not in found_keys]
     if missing:
         raise NotFoundError(resource=f"实例 {missing}")
 
-    conflicted = [
-        instance.instance_key
-        for instance in found.values()
-        if instance.tenant_id is not None and instance.tenant_id != tenant.id
-    ]
+    conflicted = sorted(
+        {
+            instance.instance_key
+            for instance in instances
+            if instance.tenant_id is not None and instance.tenant_id != tenant.id
+        },
+    )
     if conflicted:
         raise ValidationError(reason=f"实例 {conflicted} 已归属其他租户，请先解绑")
 
@@ -364,7 +370,13 @@ async def bind_tenant_instances(
     if wanted:
         stale = stale.exclude(instance_key__in=wanted)
     # 解绑是覆盖语义里唯一有破坏性的一步，先取出被摘掉的实例再更新，让它在日志里留痕
-    released = list(await stale.values_list("instance_key", flat=True))
+    stale_rows = await stale
+    released = [row.instance_key for row in stale_rows]
+    # 划入与收回的实例，令牌此刻都已经（或马上）在租户手里：先记下来再改归属，记不下来就拒绝这次操作、库里什么都不改。
+    # 收回之后它就是平台方实例了，不记的话前租户手里那枚令牌又成了冒充超级用户的钥匙，而全量重建补不回它
+    record_instances_exposure(
+        [*stale_rows, *instances], reason=f"租户 {tenant.id} 的实例归属变更", refuse_on_failure=True,
+    )
     await stale.update(tenant_id=None)
     if wanted:
         await DBAdapterInstance.filter(instance_key__in=wanted).update(tenant_id=tenant.id)
@@ -374,7 +386,7 @@ async def bind_tenant_instances(
     # 之后读侧不复查（每条消息多查两张表的代价见 `services/identity_scope.py` 的缓存取舍）。
     # 不清的话，被划走的实例会继续读原租户的记忆与好感，被划入的实例会把自己的带进新租户。
     # **只清归属真的变了的**：本接口是幂等覆盖语义，原样重放一次不该把域配置一并抹掉。
-    reassigned = [key for key, instance in found.items() if instance.tenant_id != tenant.id]
+    reassigned = sorted({instance.instance_key for instance in instances if instance.tenant_id != tenant.id})
     dropped = await DBInstanceDomainBinding.release_instances(
         [*released, *reassigned],
         reason=f"租户实例归属变更: tenant={tenant.name}",

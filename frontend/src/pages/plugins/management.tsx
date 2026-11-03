@@ -61,9 +61,12 @@ import {
   Bookmark as BookmarkIcon,
   MoreVert as MoreVertIcon,
   Close as CloseIcon,
+  WebAsset as WebAssetIcon,
+  OpenInNew as OpenInNewIcon,
+  LowPriority as CallPriorityIcon,
 } from '@mui/icons-material'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Method, Plugin, pluginsApi } from '../../services/api/plugins'
+import { Method, Plugin, PluginCallPriority, pluginsApi } from '../../services/api/plugins'
 
 import { unifiedConfigApi, createConfigService } from '../../services/api/unified-config'
 import ConfigTable from '../../components/common/ConfigTable'
@@ -85,6 +88,7 @@ import { PageTabs } from '../../components/common/NekroTabs'
 import InstanceScopeBanner from '../../components/common/InstanceScopeBanner'
 import ScopeOverrideControl from '../../components/common/ScopeOverrideControl'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
+import { useAuthStore } from '../../stores/auth'
 import {
   instanceScopeApi,
   isScopeEndpointUnavailable,
@@ -94,6 +98,9 @@ import {
 // 添加 server_addr 配置
 const server_addr = window.location.origin
 
+// 后端 `Role.Super` 的数值，全进程一份的插件设置（调用优先级）按它放行
+const SUPER_PERM_LEVEL = 3
+
 // 插件国际化辅助函数
 const getPluginName = (plugin: Plugin, language: string) => {
   return getLocalizedText(plugin.i18n_name, plugin.name, language)
@@ -102,6 +109,8 @@ const getPluginName = (plugin: Plugin, language: string) => {
 const getPluginDescription = (plugin: Plugin, language: string) => {
   return getLocalizedText(plugin.i18n_description, plugin.description, language)
 }
+
+type PluginTabKey = 'info' | 'config' | 'webui' | 'methods' | 'webhook' | 'data'
 
 interface PluginDetailProps {
   plugin: Plugin
@@ -131,7 +140,8 @@ function PluginDetails({
   scopeUnavailable,
   onRestoreInherit,
 }: PluginDetailProps) {
-  const [activeTab, setActiveTab] = useState(0)
+  const [activeTab, setActiveTab] = useState<PluginTabKey>('info')
+  const [webuiLoaded, setWebuiLoaded] = useState(false)
   const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false)
   const [resetDataConfirmOpen, setResetDataConfirmOpen] = useState(false)
   const [errorDetailOpen, setErrorDetailOpen] = useState(false)
@@ -150,6 +160,7 @@ function PluginDetails({
   const isSmall = useMediaQuery(theme.breakpoints.down('sm'))
   const notification = useNotification()
   const { t, i18n } = useTranslation('plugins')
+  const permLevel = useAuthStore(state => state.userInfo?.perm_level ?? 0)
 
   // 获取插件配置：实例作用域下读写实例级配置，全局视图保持原行为
   const { data: pluginConfig, isLoading: configLoading } = useQuery({
@@ -158,7 +169,7 @@ function PluginDetails({
       scopeInstanceKey
         ? instanceScopeApi.getPluginInstanceConfig(plugin.id, scopeInstanceKey)
         : unifiedConfigApi.getPluginConfig(plugin?.id),
-    enabled: !!plugin && activeTab === 1 && plugin.hasConfig,
+    enabled: !!plugin && activeTab === 'config' && plugin.hasConfig,
     retry: false,
   })
 
@@ -186,14 +197,14 @@ function PluginDetails({
   } = useQuery({
     queryKey: ['plugin-docs', plugin?.id],
     queryFn: () => pluginsApi.getPluginDocs(plugin.id),
-    enabled: !!plugin && activeTab === 0,
+    enabled: !!plugin && activeTab === 'info',
   })
 
   // 获取插件数据
   const { data: pluginData = [], isLoading: isDataLoading } = useQuery({
     queryKey: ['plugin-data', plugin?.id],
     queryFn: () => pluginsApi.getPluginData(plugin.id),
-    enabled: !!plugin && activeTab === 4,
+    enabled: !!plugin && activeTab === 'data',
   })
 
   // 重载插件
@@ -239,6 +250,19 @@ function PluginDetails({
     },
     onError: (error: Error) => {
       notification.error(`${t('messages.resetFailed')}: ${error.message}`)
+    },
+  })
+
+  const updateCallPriorityMutation = useMutation({
+    mutationFn: (priority: PluginCallPriority) =>
+      pluginsApi.updatePluginCallPriority(plugin.id, priority),
+    onSuccess: () => {
+      notification.success(t('messages.callPriorityUpdated'))
+      queryClient.invalidateQueries({ queryKey: ['plugins'] })
+      queryClient.invalidateQueries({ queryKey: ['plugin-detail', plugin.id] })
+    },
+    onError: (error: Error) => {
+      notification.error(error.message)
     },
   })
 
@@ -312,6 +336,13 @@ function PluginDetails({
     !!activationStrategy && !plugin.loadFailed && activationStrategy.canChangeStrategy
   const activationControllerEnabled = activationStrategy?.controller.enabled ?? true
 
+  // 调用优先级全进程一份：租户看得到档位（用来理解提示词），只有平台方能改。
+  // 判据与后端 `require_role(Role.Super)` 相同：`/user/me` 回的 `perm_level` 就是后端比较的那个字段。
+  // 按租户角色判会放过两种人：身份接口出错时兜底成平台方的租户，以及未启用多租户时的普通管理员，
+  // 他们看到一个可用的下拉框、点了必然 403。登录信息还没取到时按 0 处理，即只读
+  const callPriority = plugin.callPriority
+  const canEditCallPriority = permLevel >= SUPER_PERM_LEVEL
+
   // 实例作用域下，生效值来自分层叠加的结果；接口不可用时退回全局值并禁用开关
   const effectiveEnabled = scopeStatus ? scopeStatus.enabled : plugin.enabled
   const hasInstanceOverride = scopeStatus?.instance_override !== null && scopeStatus !== null
@@ -321,23 +352,54 @@ function PluginDetails({
     navigate('/plugins/editor')
   }
 
-  useEffect(() => {
-    // 如果当前tab不存在（例如从有配置的插件切换到没配置的），则重置
-    const tabCount = 1 + (plugin.hasConfig ? 1 : 0) + 1 + 1 + 1 // info + config? + methods + webhook + data
-    if (activeTab >= tabCount) {
-      setActiveTab(0)
+  const pluginTabs = useMemo(
+    () =>
+      [
+        { key: 'info' as const, label: t('tabs.info'), icon: <InfoIcon />, isVisible: true },
+        {
+          key: 'config' as const,
+          label: t('tabs.config'),
+          icon: <SettingsIcon />,
+          isVisible: plugin.hasConfig,
+        },
+        {
+          key: 'webui' as const,
+          label: t('tabs.webui'),
+          icon: <WebAssetIcon />,
+          // 停用的插件不挂载路由，WebUI 打开只会是 404，这时不显示该标签页
+          isVisible: Boolean(plugin.webuiPath && !plugin.loadFailed && plugin.enabled),
+        },
+        { key: 'methods' as const, label: t('tabs.methods'), icon: <CodeIcon />, isVisible: true },
+        { key: 'webhook' as const, label: t('tabs.webhook'), icon: <WebhookIcon />, isVisible: true },
+        { key: 'data' as const, label: t('tabs.data'), icon: <StorageIcon />, isVisible: true },
+      ].filter(tab => tab.isVisible),
+    [plugin.hasConfig, plugin.loadFailed, plugin.webuiPath, plugin.enabled, t]
+  )
+
+  const handleOpenWebuiInNewPage = () => {
+    if (!plugin.webuiPath) return
+    const openedWindow = window.open(plugin.webuiPath, '_blank', 'noopener,noreferrer')
+    if (openedWindow) {
+      openedWindow.opener = null
     }
-  }, [plugin, activeTab])
+  }
 
-  if (!plugin) return null
+  useEffect(() => {
+    if (!pluginTabs.some(tab => tab.key === activeTab)) {
+      setActiveTab('info')
+    }
+  }, [activeTab, pluginTabs])
 
-  const pluginTabs = [
-    { label: t('tabs.info'), icon: <InfoIcon />, isVisible: true },
-    { label: t('tabs.config'), icon: <SettingsIcon />, isVisible: plugin.hasConfig },
-    { label: t('tabs.methods'), icon: <CodeIcon />, isVisible: true },
-    { label: t('tabs.webhook'), icon: <WebhookIcon />, isVisible: true },
-    { label: t('tabs.data'), icon: <StorageIcon />, isVisible: true },
-  ].filter(tab => tab.isVisible)
+  // 离开 WebUI 标签页时 iframe 会被卸载，回来时重新加载；加载状态要一起重置，否则看到的是一片空白而不是加载提示
+  useEffect(() => {
+    if (activeTab !== 'webui') {
+      setWebuiLoaded(false)
+    }
+  }, [activeTab])
+
+  useEffect(() => {
+    setWebuiLoaded(false)
+  }, [plugin.id, plugin.webuiPath])
 
   return (
     <Box
@@ -466,7 +528,7 @@ function PluginDetails({
         <Box sx={{ display: 'flex', alignItems: 'center', px: { xs: 1, sm: 1.5 } }}>
           <PageTabs
             value={activeTab}
-            onChange={(_, newValue) => setActiveTab(newValue)}
+            onChange={(_, newValue: PluginTabKey) => setActiveTab(newValue)}
             variant="scrollable"
             scrollButtons="auto"
             allowScrollButtonsMobile
@@ -486,7 +548,7 @@ function PluginDetails({
             }}
           >
             {pluginTabs.map(tab => (
-              <Tab key={tab.label} label={tab.label} icon={tab.icon} />
+              <Tab key={tab.key} value={tab.key} label={tab.label} icon={tab.icon} />
             ))}
           </PageTabs>
 
@@ -632,7 +694,7 @@ function PluginDetails({
 
       {/* 选项卡内容 */}
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
-        {activeTab === 0 && (
+        {activeTab === 'info' && (
           <Stack spacing={2}>
             {/* 插件信息 */}
             <Card sx={CARD_VARIANTS.default.styles}>
@@ -840,6 +902,57 @@ function PluginDetails({
                       </Box>
                     </Stack>
                   )}
+                  {!plugin.loadFailed && callPriority && (
+                    <Stack direction="row" spacing={1.5} alignItems="center">
+                      <CallPriorityIcon color="action" />
+                      <Box sx={{ minWidth: 0, flex: 1 }}>
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          spacing={1}
+                          alignItems={{ xs: 'stretch', sm: 'center' }}
+                        >
+                          <Typography variant="body2" sx={{ whiteSpace: 'nowrap', minWidth: 'fit-content' }}>
+                            <strong>{t('callPriority.label')}：</strong>
+                          </Typography>
+                          <Tooltip
+                            arrow
+                            placement="top"
+                            title={
+                              <Stack spacing={0.5} sx={{ maxWidth: 320, py: 0.25 }}>
+                                <Typography variant="body2" sx={{ lineHeight: 1.6 }}>
+                                  {t('callPriority.description')}
+                                </Typography>
+                                <Typography variant="body2" sx={{ lineHeight: 1.6 }}>
+                                  {t('callPriority.globalNote')}
+                                </Typography>
+                                {!canEditCallPriority && (
+                                  <Typography variant="body2" sx={{ lineHeight: 1.6, fontWeight: 600 }}>
+                                    {t('callPriority.platformOnly')}
+                                  </Typography>
+                                )}
+                              </Stack>
+                            }
+                          >
+                            <TextField
+                              select
+                              size="small"
+                              value={callPriority.configured}
+                              disabled={!canEditCallPriority || updateCallPriorityMutation.isPending}
+                              onChange={e =>
+                                updateCallPriorityMutation.mutate(e.target.value as PluginCallPriority)
+                              }
+                              sx={{ minWidth: { xs: '100%', sm: 112 }, maxWidth: { sm: 140 } }}
+                            >
+                              <MenuItem value="auto">{t('callPriority.options.auto')}</MenuItem>
+                              <MenuItem value="high">{t('callPriority.options.high')}</MenuItem>
+                              <MenuItem value="medium">{t('callPriority.options.medium')}</MenuItem>
+                              <MenuItem value="low">{t('callPriority.options.low')}</MenuItem>
+                            </TextField>
+                          </Tooltip>
+                        </Stack>
+                      </Box>
+                    </Stack>
+                  )}
                 </Box>
               </CardContent>
             </Card>
@@ -879,7 +992,7 @@ function PluginDetails({
         )}
 
         {/* 配置项 */}
-        {plugin.hasConfig && activeTab === 1 && (
+        {plugin.hasConfig && activeTab === 'config' && (
           <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
             {pluginConfig && pluginConfig.length > 0 ? (
               <ConfigTable
@@ -902,8 +1015,86 @@ function PluginDetails({
           </Box>
         )}
 
+        {/* 插件页面 */}
+        {activeTab === 'webui' && plugin.webuiPath && (
+          <Card
+            sx={{
+              ...CARD_VARIANTS.default.styles,
+              height: '100%',
+              minHeight: { xs: 520, md: 640 },
+              overflow: 'hidden',
+            }}
+          >
+            <Box
+              sx={{
+                position: 'relative',
+                height: '100%',
+                minHeight: { xs: 520, md: 640 },
+                '& iframe': {
+                  width: '100%',
+                  height: '100%',
+                  border: 'none',
+                  opacity: webuiLoaded ? 1 : 0,
+                  transition: 'opacity 0.3s ease',
+                },
+              }}
+            >
+              {plugin.webuiType === 'route' && (
+                <ActionButton
+                  size="small"
+                  startIcon={<OpenInNewIcon fontSize="small" />}
+                  onClick={handleOpenWebuiInNewPage}
+                  sx={{
+                    position: 'absolute',
+                    top: 12,
+                    right: 12,
+                    zIndex: 2,
+                    bgcolor: 'background.paper',
+                    boxShadow: 1,
+                    opacity: 0.55,
+                    transition: 'opacity 0.2s ease, background-color 0.2s ease, box-shadow 0.2s ease',
+                    '&:hover': {
+                      opacity: 1,
+                      bgcolor: 'background.paper',
+                      boxShadow: 2,
+                    },
+                  }}
+                >
+                  {t('webui.openInNewPage')}
+                </ActionButton>
+              )}
+              <Box
+                component="iframe"
+                title={t('webui.title', { name: getPluginName(plugin, i18n.language) })}
+                src={plugin.webuiPath}
+                onLoad={() => setWebuiLoaded(true)}
+              />
+              <Box
+                sx={{
+                  position: 'absolute',
+                  inset: 0,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 2,
+                  bgcolor: 'background.paper',
+                  opacity: webuiLoaded ? 0 : 1,
+                  pointerEvents: webuiLoaded ? 'none' : 'auto',
+                  transition: 'opacity 0.3s ease',
+                }}
+              >
+                <CircularProgress size={32} />
+                <Typography variant="body2" color="text.secondary">
+                  {t('webui.loading')}
+                </Typography>
+              </Box>
+            </Box>
+          </Card>
+        )}
+
         {/* 方法列表 */}
-        {activeTab === (plugin.hasConfig ? 2 : 1) && (
+        {activeTab === 'methods' && (
           <Card sx={CARD_VARIANTS.default.styles}>
             <CardContent sx={{ p: isSmall ? 1.5 : 2 }}>
               {plugin.methods && plugin.methods.length > 0 ? (
@@ -992,7 +1183,7 @@ function PluginDetails({
         )}
 
         {/* Webhook 列表 */}
-        {activeTab === (plugin.hasConfig ? 3 : 2) && (
+        {activeTab === 'webhook' && (
           <Card sx={CARD_VARIANTS.default.styles}>
             <CardContent sx={{ p: isSmall ? 1.5 : 2 }}>
               {plugin.webhooks && plugin.webhooks.length > 0 ? (
@@ -1143,7 +1334,7 @@ function PluginDetails({
         )}
 
         {/* 数据管理 */}
-        {activeTab === 4 && (
+        {activeTab === 'data' && (
           <Card sx={CARD_VARIANTS.default.styles}>
             <CardContent>
               {isDataLoading ? (

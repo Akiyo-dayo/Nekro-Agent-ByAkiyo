@@ -69,6 +69,7 @@ from nekro_agent.tools.path_convertor import (
     convert_filename_to_sandbox_upload_path,
     convert_to_host_path,
 )
+from nekro_agent.tools.untrusted_content import echo_inline
 
 plugin = NekroPlugin(
     name="表情包插件",
@@ -1213,9 +1214,11 @@ async def collect_emotion(
         logger.info(f"已添加表情包描述新向量到Qdrant: {emotion_id}")
     except Exception as e:
         raise ValueError(f"添加到向量数据库失败: {e}") from e
+    # 这句话会落成 SYSTEM 消息：描述、标签、来源路径都是模型传入的，压成单行、加引号再回显
     await message_service.push_system_message(
         _ctx.chat_key,
-        f"Successfully collected emotion: {emotion_id} - {description} {' '.join(tags)} ({source_path=})",
+        f"Successfully collected emotion: {emotion_id} - description={echo_inline(description)} "
+        f"tags={echo_inline(' '.join(str(tag) for tag in tags))} source_path={echo_inline(source_path)}",
     )
 
     return emotion_id
@@ -1314,7 +1317,7 @@ async def update_emotion(
 
     await message_service.push_system_message(
         _ctx.chat_key,
-        f"Successfully updated emotion metadata: {emotion_id}",
+        f"Successfully updated emotion metadata: {echo_inline(emotion_id)}",
     )
 
     return emotion_id
@@ -1394,7 +1397,7 @@ async def remove_emotion(_ctx: schemas.AgentCtx, emotion_id: str) -> str:
 
     await message_service.push_system_message(
         _ctx.chat_key,
-        f"Successfully removed emotion: {emotion_id}",
+        f"Successfully removed emotion: {echo_inline(emotion_id)}",
     )
 
     return f"表情包 {emotion_id} 已成功删除"

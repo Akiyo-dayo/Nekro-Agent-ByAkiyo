@@ -67,6 +67,7 @@ def _render_runtime_contract(*, plugin_activation_rules: str = "", enable_cot: b
         chat_key_rules="- example rule",
         enable_at=False,
         plugin_activation_rules=plugin_activation_rules,
+        plugin_call_priority_rules="",
     ).render(env)
 
 

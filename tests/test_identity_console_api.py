@@ -1156,7 +1156,7 @@ class TestOrphanCleanupServiceGuardStandsOnItsOwn:
         await seed_affection(domain, platform_userid="1001", preset_id=4242, score=20, events=2)
 
         # 列清单的那一刻它确实是孤儿
-        buckets = [item for item in await list_orphan_buckets([OWN_INSTANCE]) if item.preset_id == 4242]
+        buckets = [item for item in await list_orphan_buckets([(ADAPTER, OWN_INSTANCE)]) if item.preset_id == 4242]
         assert len(buckets) == 1
 
         # 执行之前人设被重新导入回来（同一个 ID）
@@ -1184,7 +1184,7 @@ class TestOrphanCleanupServiceGuardStandsOnItsOwn:
 
         domain = ScopeDomain.of_instance(ADAPTER, OWN_INSTANCE)
         await seed_affection(domain, platform_userid="1001", preset_id=4242, score=20, events=2)
-        buckets = [item for item in await list_orphan_buckets([OWN_INSTANCE]) if item.preset_id == 4242]
+        buckets = [item for item in await list_orphan_buckets([(ADAPTER, OWN_INSTANCE)]) if item.preset_id == 4242]
 
         counts = await cleanup_orphan_preset(buckets[0])
 

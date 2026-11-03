@@ -208,8 +208,11 @@ interface MarkdownRendererProps {
    */
   enableSyntaxHighlight?: boolean
   /**
-   * 是否启用HTML渲染（默认：true）
-   * ⚠️ 安全警告：启用HTML渲染可能存在XSS风险，请确保内容来源可信
+   * 是否渲染内容里的原始 HTML（默认：false）
+   *
+   * ⚠️ 打开后不做任何过滤：`<iframe srcdoc="<script>…">`、事件属性等会以当前登录管理员的身份执行。
+   * 只能用于随本项目一起发布的内容（例如适配器自带文档）。聊天消息、邮件与附件、第三方插件文档、
+   * 技能内容、云端公告都来自外部，一律不要打开。
    */
   enableHtml?: boolean
   /**
@@ -222,7 +225,7 @@ export default function MarkdownRenderer({
   children,
   sx,
   enableSyntaxHighlight = true,
-  enableHtml = true,
+  enableHtml = false,
   className,
 }: MarkdownRendererProps) {
   const theme = useTheme()

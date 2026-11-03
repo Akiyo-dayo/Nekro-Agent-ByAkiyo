@@ -24,7 +24,7 @@ from .ops_bot_cmd import OpsBotCommand
 from .plugin_cmd import NaPluginsCommand, PluginCtlCommand, PluginInfoCommand, ResetPluginCommand
 from .quota_cmd import QuotaBoostCommand, QuotaCommand, QuotaResetCommand, QuotaSetCommand, QuotaWhitelistCommand
 from .switch import NaObserveCommand, NaOffCommand, NaOnCommand
-from .user import SetUsernameCommand
+from .user import GrantAdvancedCommand, RevokeAdvancedCommand, SetUsernameCommand
 
 
 def register_built_in_commands() -> None:
@@ -81,6 +81,8 @@ def register_built_in_commands() -> None:
         ModelTestCommand(),
         # 用户类
         SetUsernameCommand(),
+        GrantAdvancedCommand(),
+        RevokeAdvancedCommand(),
         MergeRequestCommand(),
     ]
     for cmd in commands:

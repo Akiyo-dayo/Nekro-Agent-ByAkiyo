@@ -1,10 +1,10 @@
 """工作区知识库路由 —— 整组租户作用域
 
-17 个端点全部挂在 `/workspaces/{workspace_id}/kb/...` 下，改前一次归属判定都没有
+本模块的端点全部挂在 `/workspaces/{workspace_id}/kb/...` 下（最初 17 个时一次归属判定都没有）
 （`tenant` / `assert_workspace_accessible` 出现 0 次），而其中包含
 **原始文件下载**（`/documents/{id}/raw`）、全文读取与删除 —— 换个 `workspace_id`
 就能读走并删掉别的租户投喂给自己 Claude Code 的资料。
-这是 `routers/workspaces.py` 那 72 个端点同一个洞的第二块（PROJECT_STATE §3 #29）。
+这是 `routers/workspaces.py` 那 72 个端点同一个洞的第二块。
 
 守卫收在 `_get_workspace_or_404` / `_get_document_or_404` 两个函数里，
 沿用 `routers/workspaces.py` 的 `_get_memory_target` 那种收口方式：
@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -28,6 +29,9 @@ from nekro_agent.schemas.errors import ConflictError, NotFoundError, ValidationE
 from nekro_agent.schemas.kb import (
     KBActionResponse,
     KBAddReferenceBody,
+    KBBatchDeleteResponse,
+    KBBatchIdsBody,
+    KBBatchReindexResponse,
     KBCreateTextDocumentBody,
     KBDocumentDetailResponse,
     KBDocumentListResponse,
@@ -41,8 +45,11 @@ from nekro_agent.schemas.kb import (
     KBTreeResponse,
     KBUpdateDocumentBody,
     KBUpdateReferenceBody,
+    KBZipImportResponse,
 )
+from nekro_agent.services.kb.batch_ops import aggregate_batch_results, normalize_batch_ids, run_batched_ids
 from nekro_agent.services.kb.config_guard import ensure_kb_embedding_configured
+from nekro_agent.services.kb.constants import KB_BATCH_CONCURRENCY, KB_BATCH_MAX_SIZE
 from nekro_agent.services.kb.document_service import (
     add_document_reference,
     create_file_document,
@@ -70,6 +77,7 @@ from nekro_agent.services.kb.index_service import (
 )
 from nekro_agent.services.kb.reference_detector import detect_and_sync_document_references
 from nekro_agent.services.kb.search_service import search_workspace_kb
+from nekro_agent.services.kb.zip_import import ZipImportEntry, import_zip_with_upload
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.workspace.manager import WorkspaceService
@@ -89,7 +97,7 @@ def _is_document_index_ready(document: DBKBDocument) -> bool:
 async def _get_workspace_or_404(user: DBUser, workspace_id: int) -> DBWorkspace:
     """取工作区，同时校验当前身份能否访问它
 
-    本模块 17 个端点全部只经由这个函数与 `_get_document_or_404` 拿到目标，
+    本模块的端点全部只经由这个函数与 `_get_document_or_404` 拿到目标，
     守卫收在这两处而不是撒在每个端点里 —— 这与 `routers/workspaces.py` 的
     `_get_memory_target` 是同一种收口方式，新增端点只要照常调用就自动带上作用域。
 
@@ -304,6 +312,44 @@ async def upload_workspace_kb_file(
     )
 
 
+@router.post("/{workspace_id}/kb/zip", summary="上传 zip 批量导入知识库文档", response_model=KBZipImportResponse)
+@require_role(Role.Admin)
+async def import_workspace_kb_zip(
+    workspace_id: int,
+    file: UploadFile = File(...),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> KBZipImportResponse:
+    """上传 zip 压缩包，解压后按包内目录结构批量导入工作区知识库文档（分类=相对目录，路径=相对完整路径）。"""
+    await _get_workspace_or_404(_current_user, workspace_id)
+    ensure_kb_embedding_configured()
+    await ensure_kb_collection()
+
+    async def create_from_upload(entry: ZipImportEntry, content: bytes) -> tuple[object, bool]:
+        upload_file = UploadFile(
+            filename=Path(entry.source_path).name,
+            file=io.BytesIO(content),
+        )
+        document = await create_file_document(
+            workspace_id=workspace_id,
+            upload_file=upload_file,
+            source_path=entry.source_path,
+            title="",
+            category=entry.category,
+            tags=[],
+            summary="",
+            is_enabled=True,
+        )
+        return document, False
+
+    return await import_zip_with_upload(
+        file=file,
+        allowed_exts=ALLOWED_KB_EXTENSIONS,
+        create_from_upload=create_from_upload,
+        schedule_rebuild=schedule_rebuild_document,
+        max_entry_size=KB_MAX_UPLOAD_SIZE,
+    )
+
+
 @router.put(
     "/{workspace_id}/kb/documents/{document_id}", summary="更新知识库文档", response_model=KBDocumentDetailResponse
 )
@@ -358,16 +404,20 @@ async def update_workspace_kb_document(
     )
 
 
-@router.delete("/{workspace_id}/kb/documents/{document_id}", summary="删除知识库文档", response_model=KBActionResponse)
-@require_role(Role.Admin)
-async def delete_workspace_kb_document(
-    workspace_id: int,
-    document_id: int,
-    _current_user: DBUser = Depends(get_current_active_user),
-) -> KBActionResponse:
+async def _delete_document_record(user: DBUser, workspace_id: int, document_id: int) -> list[str]:
+    """删除单个知识库文档记录，并尽力清理关联外部资源（分块、文件等）。
+
+    行为约定:
+    - 文档经 `_get_document_or_404` 取得：单删与批量逐条都先过工作区归属判定，
+      批量列表里混进别的工作区的文档 ID 只会让那一条记为"不存在"；
+    - 文档记录不存在或删除记录本身失败时抛出异常；
+    - 外部资源（Qdrant 向量点 / 源文件）清理为 best-effort，失败不抛异常，
+      以警告字符串列表返回；调用方（单删或批量）自行决定是否展示。
+    返回: 清理警告列表（为空表示无清理问题）。
+    """
     from nekro_agent.models.db_kb_document_reference import DBKBDocumentReference
 
-    document = await _get_document_or_404(_current_user, workspace_id, document_id)
+    document = await _get_document_or_404(user, workspace_id, document_id)
     await cancel_rebuild_document(document.id)
     chunk_ids = await list_document_chunk_ids(document.id)
 
@@ -388,10 +438,91 @@ async def delete_workspace_kb_document(
     except Exception as e:
         logger.warning(f"删除知识库文档文件失败: document_id={document_id}, error={e}")
         cleanup_warnings.append("files")
+    return cleanup_warnings
 
+
+@router.delete("/{workspace_id}/kb/documents/{document_id}", summary="删除知识库文档", response_model=KBActionResponse)
+@require_role(Role.Admin)
+async def delete_workspace_kb_document(
+    workspace_id: int,
+    document_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> KBActionResponse:
+    cleanup_warnings = await _delete_document_record(_current_user, workspace_id, document_id)
     return KBActionResponse(
         ok=True,
         message="文档记录已删除，但部分外部资源清理失败" if cleanup_warnings else None,
+    )
+
+
+@router.post(
+    "/{workspace_id}/kb/documents/batch-delete",
+    summary="批量删除知识库文档",
+    response_model=KBBatchDeleteResponse,
+)
+@require_role(Role.Admin)
+async def batch_delete_workspace_kb_documents(
+    workspace_id: int,
+    body: KBBatchIdsBody,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> KBBatchDeleteResponse:
+    """一次请求批量删除多个文档：服务端限流并发处理，返回成功/失败统计，单条失败不中断整批。"""
+    await _get_workspace_or_404(_current_user, workspace_id)
+
+    async def op(document_id: int) -> list[str] | None:
+        return await _delete_document_record(_current_user, workspace_id, document_id)
+
+    ids = normalize_batch_ids(body.ids, KB_BATCH_MAX_SIZE)
+    results = await run_batched_ids(ids, KB_BATCH_CONCURRENCY, op)
+    deleted_ids, failed_ids, warnings, errors = aggregate_batch_results(results, "文档")
+    return KBBatchDeleteResponse(
+        ok=len(failed_ids) == 0,
+        deleted=len(deleted_ids),
+        failed=len(failed_ids),
+        deleted_ids=deleted_ids,
+        failed_ids=failed_ids,
+        warnings=warnings,
+        errors=errors,
+    )
+
+
+@router.post(
+    "/{workspace_id}/kb/documents/batch-reindex",
+    summary="批量重建知识库文档索引",
+    response_model=KBBatchReindexResponse,
+)
+@require_role(Role.Admin)
+async def batch_reindex_workspace_kb_documents(
+    workspace_id: int,
+    body: KBBatchIdsBody,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> KBBatchReindexResponse:
+    """一次请求批量提交文档重建索引任务，服务端限流并发处理。
+
+    守卫排在配置检查与建集合之前，理由同单条重建；逐条按 `workspace_id` 过滤取文档，
+    别的工作区的文档 ID 只会记为该条不存在。
+    """
+    await _get_workspace_or_404(_current_user, workspace_id)
+    ensure_kb_embedding_configured()
+    await ensure_kb_collection()
+
+    async def op(document_id: int) -> None:
+        document = await get_document(workspace_id, document_id)
+        if document is None:
+            raise NotFoundError(resource=f"知识库文档 {document_id}")
+        await schedule_rebuild_document(document)
+
+    ids = normalize_batch_ids(body.ids, KB_BATCH_MAX_SIZE)
+    results = await run_batched_ids(ids, KB_BATCH_CONCURRENCY, op)
+    queued_ids, failed_ids, warnings, errors = aggregate_batch_results(results, "文档")
+    return KBBatchReindexResponse(
+        ok=len(failed_ids) == 0,
+        queued=len(queued_ids),
+        failed=len(failed_ids),
+        queued_ids=queued_ids,
+        failed_ids=failed_ids,
+        warnings=warnings,
+        errors=errors,
     )
 
 
@@ -455,7 +586,7 @@ async def reindex_workspace_kb_document(
     document_id: int,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> KBReindexResponse:
-    # 守卫排在配置检查与建集合之前：本模块其余 16 个端点都是"先判归属再干活"，
+    # 守卫排在配置检查与建集合之前：本模块其余端点都是"先判归属再干活"，
     # 只有这一条反过来，于是一次越权请求会先在 Qdrant 上建出集合来。
     # 那不是泄露（集合是全局一份），但"能不能进这个函数"不该由外部服务的状态决定。
     document = await _get_document_or_404(_current_user, workspace_id, document_id)

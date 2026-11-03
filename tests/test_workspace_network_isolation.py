@@ -660,7 +660,7 @@ _GROUP_SUBNETS = {
 class TestRelayExceptionIsDerivedTheSameWayForEveryGroup:
     """租户分组与平台分组必须推出**结构相同**的规则集
 
-    这一组存在的直接理由（PROJECT_STATE §3 #33）：测试服务器上曾出现平台组网桥带着
+    这一组存在的直接理由：测试服务器上曾出现平台组网桥带着
     `-d <网关> --dport 8021 ACCEPT`、而租户组网桥只有 `ESTABLISHED + DNS + DROP` 的现场，
     形态与 §2.6 那次「装了兜底 DROP 却没装对应放行」的生产事故一模一样。
     实测结论是虚惊——两份规则由相隔约 36 小时的两个代码版本装上，租户那份是中继特性

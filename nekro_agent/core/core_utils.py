@@ -209,7 +209,7 @@ class ExtraField(BaseModel):
 
         这个字典会被 pydantic 原样并进**属性级** JSON Schema。`required` 在 JSON Schema 里是对象级的字符串数组，
         属性上出现 `required: true / false` 会让 FastAPI 的 OpenAPI 校验直接拒绝：开着 `ENABLE_OPENAPI_DOCS` 时
-        `/api/openapi.json` 返回 400、`/api/docs` 打不开（裸机部署验收发现，round-27 第二轮）。
+        `/api/openapi.json` 返回 400、`/api/docs` 打不开（裸机部署验收时发现）。
         换名放在这里而不是各使用处：全仓 180 多处 `ExtraField(...).model_dump()`（含适配器 / 插件的配置，
         以及邮箱账户这类嵌套的普通 BaseModel）都经过它，以后谁写 `required=True` 也不会再撞。
         读取方 `config_service._extract_extra_fields` 按 `EXTRA_FIELD_DUMP_KEYS` 换回来，WebUI 看到的仍是 `required`。

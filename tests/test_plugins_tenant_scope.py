@@ -17,7 +17,7 @@
    该接口解析出来的是「全局值 + 本实例覆盖」，未被覆盖的凭据字段回落的正是平台方全局配好的
    真实 Key（`google_search` 的 API_KEY/CX、`github` 的 TOKEN 都是 `is_secret=True`）。
    作用域守卫只挡得住"读别人的实例"，挡不住"从自己的实例读平台方的 Key"——
-   这与 `cc_model_presets` 曾经的凭据裸奔（PROJECT_STATE §3 #27）是同一种洞。
+   这与 `cc_model_presets` 曾经的凭据裸奔是同一种洞。
    读侧脱敏之后写侧必须认掩码哨兵，否则一次无意的保存会把凭据覆盖成 `********`。
    哨兵必须能穿透 dict/list：读侧的 `mask_credentials` 是递归的，只判「整值等于掩码」
    接不住复杂字段里嵌着的凭据。

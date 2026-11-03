@@ -31,6 +31,7 @@ from nekro_agent.api.plugin import (
 )
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
+from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
 
 plugin = NekroPlugin(
     name="定时器工具集",
@@ -236,6 +237,27 @@ async def timer_prompt(_ctx: AgentCtx) -> str:
     return "\n\n".join(parts)
 
 
+async def _require_own_job(_ctx: AgentCtx, job_id: str) -> DBRecurringTimerJob:
+    """周期任务必须挂在当前会话所属的租户内，否则按"任务不存在"回答
+
+    `job_id` 只有 4 位小写字母数字（约 170 万种），模型可以直接枚举；任务触发时会把
+    `event_desc` 当作系统事件推给任务所属频道的 Agent。不校验归属，就能改写、暂停、删除别的
+    租户的任务，或往那边的 Agent 里注入指令。拒绝与不存在同文，探测不出 ID 是否存在。
+
+    同租户内允许管理别的频道的任务（与 `set_timer(别的频道)` 同口径）；平台方和无租户部署的行为与之前一致。
+    """
+    missing = f"定时任务不存在: {job_id}"
+    try:
+        job = await recurring_timer.get_job(job_id)
+    except ValueError as e:
+        raise ValueError(missing) from e
+    try:
+        await require_same_tenant_chat_key(_ctx, job.chat_key)
+    except ValueError as e:
+        raise ValueError(missing) from e
+    return job
+
+
 @plugin.mount_sandbox_method(SandboxMethodType.TOOL, "设置定时器")
 async def set_timer(
     _ctx: AgentCtx,
@@ -282,6 +304,9 @@ async def set_timer(
         )
         ```
     """
+    # 定时器到点会以系统事件唤醒该频道的 Agent（`trigger_time == 0` 是立即唤醒）：
+    # 给别的租户的频道设定时器等于往别人的 Agent 里注入事件并烧别人的额度；同租户内允许
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
     if trigger_time < 0:
         return await timer.clear_timers(chat_key, temporary=temporary)
     if temporary:
@@ -321,6 +346,7 @@ async def create_recurring_timer(
     Returns:
         str: 新任务的任务ID（默认4位，必要时自动扩展；全局唯一）
     """
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
     tz = timezone.strip() or config.DEFAULT_TIMEZONE
     mode = workday_mode.strip() or "none"
     if mode not in ("none", "mon_fri", "weekend", "cn_workday", "cn_restday"):
@@ -358,6 +384,7 @@ async def list_recurring_timers(
     Returns:
         dict: 任务列表（JSON 可序列化）
     """
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
     status_filter = status.strip() or None
     jobs = await recurring_timer.list_jobs(chat_key=chat_key, status=status_filter, limit=limit)
 
@@ -407,6 +434,7 @@ async def update_recurring_timer(
     Returns:
         bool: 是否更新成功
     """
+    await _require_own_job(_ctx, job_id)
     patch_workday: str | None = None
     if workday_mode.strip():
         mode = workday_mode.strip()
@@ -436,8 +464,10 @@ async def pause_recurring_timer(_ctx: AgentCtx, job_id: str) -> str:
     Args:
         job_id: 任务ID（UUID）
     """
+    # BEHAVIOR 方法的返回值会落成 SYSTEM 消息：回显库里的任务 ID，不回显模型传入的参数
+    job = await _require_own_job(_ctx, job_id)
     await recurring_timer.pause_job(job_id)
-    return f"周期定时任务 {job_id} 已暂停"
+    return f"周期定时任务 {job.job_id} 已暂停"
 
 
 @plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "恢复周期定时任务")
@@ -447,8 +477,9 @@ async def resume_recurring_timer(_ctx: AgentCtx, job_id: str) -> str:
     Args:
         job_id: 任务ID（UUID）
     """
+    job = await _require_own_job(_ctx, job_id)
     await recurring_timer.resume_job(job_id)
-    return f"周期定时任务 {job_id} 已恢复"
+    return f"周期定时任务 {job.job_id} 已恢复"
 
 
 @plugin.mount_sandbox_method(SandboxMethodType.BEHAVIOR, "删除周期定时任务")
@@ -458,8 +489,9 @@ async def delete_recurring_timer(_ctx: AgentCtx, job_id: str) -> str:
     Args:
         job_id: 任务ID（UUID）
     """
+    job = await _require_own_job(_ctx, job_id)
     await recurring_timer.delete_job(job_id)
-    return f"周期定时任务 {job_id} 已删除"
+    return f"周期定时任务 {job.job_id} 已删除"
 
 
 @plugin.mount_cleanup_method()

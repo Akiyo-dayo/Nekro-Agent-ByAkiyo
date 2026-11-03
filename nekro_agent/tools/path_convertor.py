@@ -1,9 +1,12 @@
 import hashlib
+import os
 import re
+import stat
+import sys
 import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 from nekro_agent.core.logger import logger
 from nekro_agent.core.os_env import SANDBOX_SHARED_HOST_DIR, USER_UPLOAD_DIR
@@ -56,6 +59,121 @@ def assert_path_within(base_dir: Path, target_path: Path) -> Path:
         logger.warning(f"拒绝越界路径访问: {target_path} 不在 {base_dir} 内")
         raise ValueError(f'路径 "{target_path}" 越出了允许访问的目录范围')
     return target_path
+
+
+# Linux 上已打开 fd 的符号链接目录
+PROC_FD_DIR = "/proc/self/fd"
+
+
+class LocalFileRefused(ValueError):
+    """`open_regular_file_within` 拒绝打开；`kind` 是 unreadable / not_regular / swapped / outside 之一"""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def _windows_final_path(fd: int) -> Optional[Path]:
+    """Windows：按已打开文件的句柄取它的真实路径（`GetFinalPathNameByHandleW`），取不到返回 None"""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_final_path = getattr(ctypes, "windll").kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get_final_path.restype = wintypes.DWORD
+    handle = msvcrt.get_osfhandle(fd)
+    size = 512
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        length = get_final_path(handle, buffer, size, 0)  # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+        if length == 0:
+            return None
+        if length < size:
+            break
+        size = length + 1
+    text = buffer.value
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[len("\\\\?\\UNC\\") :]
+    elif text.startswith("\\\\?\\"):
+        text = text[len("\\\\?\\") :]
+    return Path(text)
+
+
+def _darwin_fd_path(fd: int) -> Optional[Path]:
+    """macOS：`fcntl(F_GETPATH)` 取已打开文件的路径"""
+    import fcntl
+
+    command = getattr(fcntl, "F_GETPATH", None)
+    if command is None:
+        return None
+    raw = fcntl.fcntl(fd, command, bytes(4096))
+    return Path(os.fsdecode(raw.split(b"\0", 1)[0]))
+
+
+def opened_real_path(fd: int) -> Optional[Path]:
+    """已打开 fd 的真实路径；取不到返回 None，调用方改用 (dev, ino) 核对
+
+    按平台分支，**不看 `/proc` 存不存在**：Windows 上 `/proc/self/fd/N` 会被当成当前盘的 `\\proc\\self\\fd\\N`，
+    而盘根目录普通用户就能建子目录，在那里放一个文件或链接就能让读到的“真实路径”由别人决定。
+
+    - Linux：`/proc/self/fd/N`，内核给的，读不出来（没有挂 /proc 的容器）返回 None；
+    - Windows：按文件句柄问 `GetFinalPathNameByHandleW`；
+    - macOS：`fcntl(F_GETPATH)`。
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            return Path(os.readlink(f"{PROC_FD_DIR}/{fd}"))
+        if sys.platform == "win32":
+            return _windows_final_path(fd)
+        if sys.platform == "darwin":
+            return _darwin_fd_path(fd)
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None
+
+
+def open_regular_file_within(path: Path, roots: Sequence[Path], *, resolve_roots: bool = True) -> Tuple[int, int]:
+    """打开一个普通文件，并确认**打开的那个**文件在 `roots` 之内；返回 (fd, 大小)，失败抛 `LocalFileRefused`
+
+    路径校验与打开之间，能写这个目录的一方可以把文件或上级目录换成符号链接，所以判据落在已打开的 fd 上：
+
+    - 不跟随最后一级符号链接（`O_NOFOLLOW`，Windows 没有）；带 `O_NONBLOCK`，换成 FIFO 时不至于把线程永久占住；
+    - `fstat` 必须是普通文件；
+    - 真实路径取自 fd 本身（`opened_real_path`）；取不到时先 `resolve(strict=True)` 拿真实路径，
+      再要求那个位置上的文件（不跟随链接）与 fd 是同一个（dev, ino）；
+    - 真实路径必须落在某个根目录里。
+
+    `resolve_roots=False` 时根目录按原样比较：调用方给的已经是先前核对过的真实路径，再 `resolve()` 一次
+    反而会跟着“核对之后被换成链接”的根目录走出去。
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    allowed = [root.resolve() for root in roots] if resolve_roots else list(roots)
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        raise LocalFileRefused("unreadable", "文件打不开") from e
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise LocalFileRefused("not_regular", "不是普通文件")
+        real_path = opened_real_path(fd)
+        if real_path is None:
+            try:
+                real_path = path.resolve(strict=True)
+                # 不跟随链接：resolve 之后这个位置又被换成链接时，看的是链接本身，对不上 fd
+                current = os.stat(real_path, follow_symlinks=False)
+            except OSError as e:
+                raise LocalFileRefused("swapped", "打开之后文件不见了") from e
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise LocalFileRefused("swapped", "打开的文件与路径上的文件不是同一个")
+        if not any(real_path.is_relative_to(root) for root in allowed):
+            logger.warning("打开的文件不在允许的目录里，已拒绝")
+            raise LocalFileRefused("outside", "文件不在允许的目录里")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, info.st_size
 
 
 def _detect_path_location(path: Path) -> Optional[PathLocation]:

@@ -45,6 +45,7 @@ import {
   FileUpload as FileUploadIcon,
   FolderOpen as FolderOpenIcon,
   DriveFileMove as ImportFolderIcon,
+  Archive as ArchiveIcon,
   Hub as GraphViewIcon,
   InsertLink as RefLinkIcon,
   Link as BindIcon,
@@ -70,6 +71,7 @@ import {
   KBCreateTextDocumentBody,
   type KBReferenceItem,
   KBUploadFilePayload,
+  KBZipImportResponse,
   kbLibraryApi,
   workspaceApi,
 } from '../../services/api/workspace'
@@ -85,14 +87,16 @@ import KBGraphDialog from './components/KBGraphDialog'
 import ReferenceGraph from './components/ReferenceGraph'
 import KBBatchActionsButton from './components/KBBatchActionsButton'
 import {
+  BATCH_UPLOAD_CONCURRENCY,
   findCategoryLengthOverflow,
   getFolderImportMetadata,
   KB_CATEGORY_MAX_LENGTH,
 } from './kbFolderImport'
 import { buildCategoryTree, type KBCategoryTreeNode } from './kbCategoryTree'
+import { createSingleFileUploadHandler, getZipImportNotice } from './kbImportHandler'
 
 type FilterStatus = 'all' | 'ready' | 'indexing' | 'failed'
-type BatchItemStatus = 'waiting' | 'uploading' | 'indexing' | 'done' | 'error'
+type BatchItemStatus = 'waiting' | 'uploading' | 'done' | 'error'
 
 interface BatchQueueItem {
   id: string
@@ -179,6 +183,8 @@ export default function KbLibraryPage() {
   const lastProgressTerminalRef = useRef('')
   const batchInputRef = useRef<HTMLInputElement | null>(null)
   const dirInputRef = useRef<HTMLInputElement | null>(null)
+  const zipInputRef = useRef<HTMLInputElement | null>(null)
+  const [zipImporting, setZipImporting] = useState(false)
   const batchProcessingRef = useRef(false)
   const batchQueueRef = useRef<BatchQueueItem[]>([])
   const batchCancelRequestedRef = useRef(false)
@@ -470,19 +476,14 @@ export default function KbLibraryPage() {
 
   const bulkDeleteMutation = useMutation({
     mutationFn: async (assetIds: number[]) => {
-      const results = await Promise.allSettled(assetIds.map(assetId => kbLibraryApi.deleteAsset(assetId)))
-      const deletedIds: number[] = []
-      let failedCount = 0
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          deletedIds.push(assetIds[index])
-          return
-        }
-        failedCount += 1
-      })
-      return { deletedCount: deletedIds.length, failedCount, deletedIds }
+      const result = await kbLibraryApi.batchDeleteAssets(assetIds)
+      return { deletedCount: result.deleted, failedCount: result.failed, deletedIds: result.deleted_ids }
+    },
+    onMutate: assetIds => {
+      notification.info(t('kbLibrary.notifications.bulkDeleting', { count: assetIds.length }), { key: 'kb-bulk-deleting-lib' })
     },
     onSuccess: async result => {
+      notification.close('kb-bulk-deleting-lib')
       setBulkDeleteOpen(false)
       if (selectedAssetId != null && result.deletedIds.includes(selectedAssetId)) {
         setSelectedAssetId(null)
@@ -506,19 +507,16 @@ export default function KbLibraryPage() {
         )
       }
     },
-    onError: (err: Error) => notification.error(t('kbLibrary.notifications.deleteFailed', { message: err.message })),
+    onError: (err: Error) => {
+      notification.close('kb-bulk-deleting-lib')
+      notification.error(t('kbLibrary.notifications.deleteFailed', { message: err.message }))
+    },
   })
 
   const bulkReindexMutation = useMutation({
     mutationFn: async (assetIds: number[]) => {
-      const results = await Promise.allSettled(assetIds.map(assetId => kbLibraryApi.reindexAsset(assetId)))
-      let queuedCount = 0
-      let failedCount = 0
-      results.forEach(result => {
-        if (result.status === 'fulfilled') queuedCount += 1
-        else failedCount += 1
-      })
-      return { queuedCount, failedCount }
+      const result = await kbLibraryApi.batchReindexAssets(assetIds)
+      return { queuedCount: result.queued, failedCount: result.failed }
     },
     onSuccess: async result => {
       await refreshAll()
@@ -723,6 +721,33 @@ export default function KbLibraryPage() {
     setBatchQueue(nextQueue)
   }
 
+  const handleZipFileChange = createSingleFileUploadHandler<KBZipImportResponse>({
+    upload: kbLibraryApi.uploadZip,
+    onBusyChange: setZipImporting,
+    onResult: async result => {
+      try {
+        const notice = getZipImportNotice(result, t, 'kbLibrary')
+        if (notice.variant === 'success') notification.success(notice.message)
+        else if (notice.variant === 'warning') notification.warning(notice.message)
+        else notification.error(notice.message)
+      } catch (err) {
+        notification.error(
+          t('kbLibrary.notifications.zipImportFailed', {
+            message: err instanceof Error ? err.message : String(err),
+          })
+        )
+      }
+      await refreshAll()
+    },
+    onError: error => {
+      notification.error(
+        t('kbLibrary.notifications.zipImportFailed', {
+          message: error instanceof Error ? error.message : String(error),
+        })
+      )
+    },
+  })
+
   const removeBatchQueueItem = useCallback((id: string) => {
     setExpandedBatchItemId(prev => (prev === id ? null : prev))
     setBatchQueue(prev => prev.filter(item => item.id !== id))
@@ -756,45 +781,47 @@ export default function KbLibraryPage() {
     setBatchPanelVisible(true)
     let uploadedAny = false
     try {
-      for (const item of items) {
-        if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-        if (!batchQueueRef.current.some(queueItem => queueItem.id === item.id && queueItem.status === 'waiting')) continue
-        setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'uploading', uploadProgress: 0 } : i))
-        try {
-          const data = await kbLibraryApi.uploadFile(
-            {
-              file: item.file,
-              title: item.title || item.file.name.replace(/\.[^.]+$/, ''),
-              source_path: item.source_path ?? '',
-              category: item.category,
-              tags: item.tags ? item.tags.split(',').map((s: string) => s.trim()).filter(Boolean) : [],
-              summary: item.summary,
-              is_enabled: true,
-            },
-            pct => setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, uploadProgress: pct } : i)),
-          )
-          if (batchRunVersionRef.current !== runVersion) break
-          uploadedAny = true
-          setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'indexing', assetId: data.asset.id } : i))
-          const deadline = Date.now() + 300_000
-          while (Date.now() < deadline) {
-            if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-            await new Promise(r => setTimeout(r, 1500))
-            if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-            const detail = await kbLibraryApi.getAsset(data.asset.id)
-            if (detail.asset.sync_status === 'ready' || detail.asset.sync_status === 'failed') break
+      // 有限并发工作池：共享游标逐文件分配任务，最多 BATCH_UPLOAD_CONCURRENCY 个文件同时上传
+      let nextIndex = 0
+      const workerCount = Math.min(BATCH_UPLOAD_CONCURRENCY, items.length)
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (true) {
+          if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) return
+          const index = nextIndex
+          nextIndex += 1
+          if (index >= items.length) return
+          const item = items[index]
+          if (!batchQueueRef.current.some(queueItem => queueItem.id === item.id && queueItem.status === 'waiting')) continue
+          setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'uploading', uploadProgress: 0 } : i))
+          try {
+            const data = await kbLibraryApi.uploadFile(
+              {
+                file: item.file,
+                title: item.title || item.file.name.replace(/\.[^.]+$/, ''),
+                source_path: item.source_path ?? '',
+                category: item.category,
+                tags: item.tags ? item.tags.split(',').map((s: string) => s.trim()).filter(Boolean) : [],
+                summary: item.summary,
+                is_enabled: true,
+              },
+              pct => setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, uploadProgress: pct } : i)),
+            )
+            if (batchRunVersionRef.current !== runVersion) return
+            uploadedAny = true
+            // 上传成功即视为该文件处理完成，索引由后端后台任务异步执行，无需在此等待。
+            // 取消只拦住还没开始的文件：这一个已经在服务端建出来了，照实标成完成
+            setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'done', assetId: data.asset.id } : i))
+          } catch (err) {
+            if (batchRunVersionRef.current !== runVersion) return
+            setBatchQueue(prev => prev.map(i => i.id === item.id ? {
+              ...i,
+              status: 'error',
+              errorMessage: err instanceof Error ? err.message : String(err),
+            } : i))
           }
-          if (batchRunVersionRef.current !== runVersion || batchCancelRequestedRef.current) break
-          setBatchQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: 'done' } : i))
-        } catch (err) {
-          if (batchRunVersionRef.current !== runVersion) break
-          setBatchQueue(prev => prev.map(i => i.id === item.id ? {
-            ...i,
-            status: 'error',
-            errorMessage: err instanceof Error ? err.message : String(err),
-          } : i))
         }
-      }
+      })
+      await Promise.all(workers)
     } finally {
       const isCurrentRun = batchRunVersionRef.current === runVersion
       const cancelRequested = batchCancelRequestedRef.current
@@ -1722,8 +1749,19 @@ export default function KbLibraryPage() {
                 <ActionButton tone="secondary" startIcon={<ImportFolderIcon />} onClick={() => dirInputRef.current?.click()} disabled={withEmbeddingGuard()}>
                   {t('knowledge.actions.importFolder')}
                 </ActionButton>
+                <ActionButton
+                  tone="secondary"
+                  startIcon={zipImporting ? <CircularProgress size={16} /> : <ArchiveIcon />}
+                  onClick={() => zipInputRef.current?.click()}
+                  disabled={withEmbeddingGuard() || zipImporting}
+                >
+                  {t('knowledge.actions.importZip')}
+                </ActionButton>
                 <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'center' }}>
                   {t('knowledge.form.dirImportHint')}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'center' }}>
+                  {t('knowledge.form.zipImportHint')}
                 </Typography>
               </Stack>
             ) : (
@@ -1785,7 +1823,6 @@ export default function KbLibraryPage() {
                           </>
                         )}
                         {item.status === 'uploading' && <CircularProgress size={14} />}
-                        {item.status === 'indexing' && <CircularProgress size={14} color="warning" />}
                         {item.status === 'done' && <CheckCircleIcon sx={{ fontSize: 16, color: 'success.main' }} />}
                         {item.status === 'error' && <ErrorOutlineIcon sx={{ fontSize: 16, color: 'error.main' }} />}
                       </Stack>
@@ -1857,6 +1894,13 @@ export default function KbLibraryPage() {
               // @ts-expect-error webkitdirectory is non-standard but widely supported
               webkitdirectory=""
               onChange={handleDirFileChange}
+            />
+            <input
+              ref={zipInputRef}
+              type="file"
+              hidden
+              accept=".zip"
+              onChange={handleZipFileChange}
             />
           </Stack>
         </DialogContent>
@@ -1951,15 +1995,11 @@ export default function KbLibraryPage() {
                     </>
                   )}
                   {item.status === 'uploading' && <CircularProgress size={14} />}
-                  {item.status === 'indexing' && <CircularProgress size={14} color="warning" />}
                   {item.status === 'done' && <CheckCircleIcon sx={{ fontSize: 16, color: 'success.main' }} />}
                   {item.status === 'error' && <ErrorOutlineIcon sx={{ fontSize: 16, color: 'error.main' }} />}
                 </Stack>
                 {item.status === 'uploading' && (
                   <LinearProgress variant="determinate" value={item.uploadProgress} sx={{ height: 3, borderRadius: 999 }} />
-                )}
-                {item.status === 'indexing' && (
-                  <LinearProgress color="warning" sx={{ height: 3, borderRadius: 999 }} />
                 )}
                 {item.status === 'error' && item.errorMessage && (
                   <Typography variant="caption" color="error" noWrap title={item.errorMessage}>{item.errorMessage}</Typography>

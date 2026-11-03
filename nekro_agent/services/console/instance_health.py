@@ -46,7 +46,7 @@ NoneBot driver 的 `on_bot_connect` / `on_bot_disconnect` 只在 WebSocket 真�
 而它从来没上线过，这条告警从第一次起就是错的，且永远不会自愈。存量里那批
 「建了实例、还没绑账号」的空壳行由 `start()` 里的一次性改判摘进这个状态。
 
-落库只在**状态真的变化**时发生（经 `adapter_instance_service.set_status()`，它一并写审计
+落库只在**状态真的变化**时发生（经 `adapter_instance_service.set_runtime_status()`，它一并写审计
 事件与 SSE），否则每个探活周期都会产生一条 from==to 的噪声事件。
 
 ## 抖动抑制
@@ -551,7 +551,7 @@ class InstanceHealthService:
             state.alerted = False
 
             if previous_status != target_status:
-                await adapter_instance_service.set_status(instance, target_status, message=message)
+                await adapter_instance_service.set_runtime_status(instance, target_status, message=message)
 
             if was_alerted:
                 downtime = int((now - offline_since).total_seconds()) if offline_since else 0
@@ -575,7 +575,7 @@ class InstanceHealthService:
             state.offline_since = now
 
         if previous_status != target_status:
-            await adapter_instance_service.set_status(instance, target_status, message=message)
+            await adapter_instance_service.set_runtime_status(instance, target_status, message=message)
 
         if state.alerted:
             return

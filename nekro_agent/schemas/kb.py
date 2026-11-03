@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -10,6 +10,81 @@ KBSearchSourceKind = Literal["document", "asset"]
 class KBActionResponse(BaseModel):
     ok: bool = True
     message: Optional[str] = None
+
+
+class KBZipImportError(BaseModel):
+    """zip 导入单条目失败信息"""
+
+    source_path: str = Field(default="", description="失败条目在压缩包内的相对路径")
+    reason: str = Field(default="", description="失败原因（已清洗的用户可读消息）")
+
+
+class KBZipImportResponse(BaseModel):
+    """zip 批量导入结果统计"""
+
+    ok: bool = True
+    imported: int = 0
+    reused: int = 0
+    skipped: int = 0
+    failed: int = 0
+    errors: list[KBZipImportError] = Field(default_factory=list)
+
+
+# 请求体的硬上限：可配置的 KB_BATCH_MAX_SIZE 要等整份 JSON 解析完才校验，
+# 这里先把解析本身的规模挡住；元素限在数据库自增主键的范围内，越界 ID 不必逐条走到 DB 再报错
+_BATCH_IDS_HARD_LIMIT = 10000
+_BatchId = Annotated[int, Field(ge=1, le=2_147_483_647)]
+
+
+class KBBatchIdsBody(BaseModel):
+    """批量操作请求体（删除/解绑/重建索引通用的 id 列表）"""
+
+    ids: list[_BatchId] = Field(
+        default_factory=list, max_length=_BATCH_IDS_HARD_LIMIT, description="待操作的文档或资产 ID 列表"
+    )
+
+
+class KBAssetBatchUnbindBody(BaseModel):
+    """批量解绑全局资产与工作区"""
+
+    asset_ids: list[_BatchId] = Field(default_factory=list, max_length=_BATCH_IDS_HARD_LIMIT)
+    workspace_id: int = Field(..., description="目标工作区 ID")
+
+
+class KBBatchDeleteResponse(BaseModel):
+    """批量删除结果统计"""
+
+    ok: bool = True
+    deleted: int = 0
+    failed: int = 0
+    deleted_ids: list[int] = Field(default_factory=list, description="实际删除/解绑成功的 ID 列表")
+    failed_ids: list[int] = Field(default_factory=list, description="删除失败的 ID 列表")
+    warnings: list[str] = Field(default_factory=list, description="外部资源清理警告（best-effort 失败不中断）")
+    errors: list[str] = Field(default_factory=list)
+
+
+class KBBatchReindexResponse(BaseModel):
+    """批量重建索引结果统计"""
+
+    ok: bool = True
+    queued: int = 0
+    failed: int = 0
+    queued_ids: list[int] = Field(default_factory=list, description="已提交重建索引任务的 ID 列表")
+    failed_ids: list[int] = Field(default_factory=list, description="重建索引提交失败的 ID 列表")
+    warnings: list[str] = Field(default_factory=list, description="重建过程中产生的警告（当前为空）")
+    errors: list[str] = Field(default_factory=list)
+
+
+class KBBatchUnbindResponse(BaseModel):
+    """批量解绑资产与工作区结果统计"""
+
+    ok: bool = True
+    unbound: int = 0
+    failed: int = 0
+    unbound_ids: list[int] = Field(default_factory=list, description="实际解绑成功的资产 ID 列表")
+    failed_ids: list[int] = Field(default_factory=list, description="解绑失败的资产 ID 列表")
+    warnings: list[str] = Field(default_factory=list, description="外部资源清理警告（当前为空）")
+    errors: list[str] = Field(default_factory=list)
 
 
 class KBTagUpdate(BaseModel):

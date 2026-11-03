@@ -6,7 +6,7 @@ LICENSE（"Nekro Agent 开源协议 V1.1"）要求：
 - 所有图形界面必须以清晰可见、可访问的**超链接**保留项目来源；
 - 必须标明「基于 NekroAgent 项目构建」并提供项目地址，**字体不小于界面主文字的 80%**，颜色对比度可读。
 
-界面页脚此前只有 `© NekroAgent`，没有「基于……构建」字样。这里把修复钉住。`/info` 命令的作者行是所有者决定保留 fork 作者，不在此列。这份用例在每个分发版本里都必须通过：界面源码里不能依赖只在某一个版本里才有的东西。
+界面页脚此前只有 `© NekroAgent`，没有「基于……构建」字样。这里把修复钉住。`/info` 命令的作者行有意显示 fork 作者，不在此列。这份用例在每个分发版本里都必须通过：界面源码里不能依赖只在某一个版本里才有的东西。
 """
 
 import json
@@ -28,7 +28,7 @@ def _read(path: Path) -> str:
 class TestChatCommandsSayWhatTheyAreBasedOn:
     """`na_info` / `na_help` 的输出里各有一行“基于 NekroAgent”的说明。
 
-    作者行用 fork 作者是**所有者的决定**（见 DECISIONS.md「`/info` 署名由所有者决定」），这里不要求恢复上游作者与链接，
+    作者行用 fork 作者是**有意为之**，这里不要求恢复上游作者与链接，
     只钉住“基于 NekroAgent”这一行不被删掉。
     """
 
@@ -38,7 +38,7 @@ class TestChatCommandsSayWhatTheyAreBasedOn:
         from nekro_agent.models import db_chat_channel
         from nekro_agent.services.command.built_in import info
         from nekro_agent.services.command.schemas import CommandExecutionContext
-        from nekro_agent.tools.common_util import get_app_version
+        from nekro_agent.tools.common_util import get_app_version, get_upstream_base_version
 
         async def fake_preset() -> Any:
             return SimpleNamespace(name="示例人设")
@@ -57,16 +57,23 @@ class TestChatCommandsSayWhatTheyAreBasedOn:
 
         context = CommandExecutionContext(user_id="u", chat_key="onebot_v11-inst1-group_2000000001", username="t", adapter_key="onebot_v11")
         response = await info.NaInfoCommand().execute(context)
-        assert any("NekroAgent" in line and get_app_version() in line for line in str(response.message).splitlines())
+        # 「基于」一行同时给出上游基线与插件兼容版本：只写兼容版本会让人以为代码整体基于它
+        assert any(
+            f"NekroAgent {get_upstream_base_version()}" in line and get_app_version() in line
+            for line in str(response.message).splitlines()
+        )
 
     async def test_na_help_output(self) -> None:
         from nekro_agent.services.command.built_in import info
         from nekro_agent.services.command.schemas import CommandExecutionContext
-        from nekro_agent.tools.common_util import get_app_version
+        from nekro_agent.tools.common_util import get_app_version, get_upstream_base_version
 
         context = CommandExecutionContext(user_id="u", chat_key="onebot_v11-inst1-group_2000000001", username="t", adapter_key="onebot_v11")
         response = await info.NaHelpCommand().execute(context)
-        assert any("based on NekroAgent" in line and get_app_version() in line for line in str(response.message).splitlines())
+        assert any(
+            f"based on NekroAgent {get_upstream_base_version()}" in line and get_app_version() in line
+            for line in str(response.message).splitlines()
+        )
 
 
 FOOTERS = {

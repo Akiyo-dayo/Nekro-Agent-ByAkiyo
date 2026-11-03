@@ -11,7 +11,7 @@
       → 模块导入期 `config.dump_config(mask_model_group_secrets=False)`   （写回）
       → `bootstrap_model_groups()`            （导入数据库、重建视图、落盘）
 
-按这条序列走，旧实现有四处与文档不符（round-27 复核，已逐条复现）：
+按这条序列走，旧实现有四处与文档不符（已逐条复现）：
 
 1. `load_config` 把 `nkmask:1` 归一成 `""`，导入期那次 dump 又把 `""` 原样写回——
    **每次重启 YAML 里的占位符都变成 `API_KEY: ''`**，「有 Key」与「没配 Key」从此不可区分；
@@ -410,12 +410,12 @@ class TestUndecryptableRowsHoldBackThePersist:
 
 
 class TestHandEditedKeyAgainstAnExistingRowIsBackedUpBeforeItIsMasked:
-    """库里已有同名行，YAML 里手填了一把不同的 Key（round-27 复核 P2-3，第二轮复核 P2-6 改方案）
+    """库里已有同名行，YAML 里手填了一把不同的 Key
 
     导入以 `name` 是否已存在为准，同名行不会被覆盖——手填的 Key 没导入。上一版只跳过启动那一次落盘，
     可告警建议的「后台编辑该模型组」正会触发落盘、把这份明文掩码掉：保护是漏的，告警说的也不准。
 
-    现在的做法（取舍见 DECISIONS「手填 Key 与库内同名行分歧」）：首次掩码落盘**之前**，把分歧组手填的原值
+    现在的做法：首次掩码落盘**之前**，把分歧组手填的原值
     备份到 `<DATA_DIR>/configs/` 下一个 0600 权限的文件，然后照常掩码——YAML 里不再留明文，也不会反复告警。
     备份文件是一份新的明文副本，所以日志逐字点名路径并要求取出后删除；备份失败则退回旧做法（不落盘、
     明文留在 YAML 里），并如实说明后台编辑会抹掉它。
@@ -863,7 +863,7 @@ class TestTheImportTimeDumpIsStillWiredTheWayWeSimulateIt:
 
 
 # ============================================================
-# 5. 手填 Key 备份文件：平台口径如实、残留备份启动时告警（round-27 第三轮复核 P2-5）
+# 5. 手填 Key 备份文件：平台口径如实、残留备份启动时告警
 # ============================================================
 
 
@@ -1090,7 +1090,7 @@ class TestLaterSavesKeepTheYamlValueOfGroupsTheDatabaseCannotOpen:
     启动之后**任何一次**别的配置落盘（WebUI 保存任意系统配置、后台改任一模型组）都走 `dump_config`，而内存视图里
     解不开的组 Key 是 fail-closed 的空串，于是 YAML 里的明文被写成 `API_KEY: ''`，再也找不回来。
 
-    修法（最小可行，取舍见 DECISIONS）：启动时记下这些组 YAML 里原本的值（明文或占位符），落盘时对「内存里 Key 为空
+    修法（最小可行）：启动时记下这些组 YAML 里原本的值（明文或占位符），落盘时对「内存里 Key 为空
     且被记下」的组原样写回；其余组照常掩码。库接管之后（密钥恢复重启、或后台填入新 Key、或组被删）记账自然失效。
     """
 

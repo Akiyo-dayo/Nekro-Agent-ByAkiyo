@@ -1,4 +1,4 @@
-"""docker-guard：bind source 符号链接绕过（PROJECT_STATE §3 #73）的回归用例。
+"""docker-guard：bind source 符号链接绕过的回归用例。
 
 ## 被钉住的洞
 

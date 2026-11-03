@@ -1,0 +1,43 @@
+# qbob（QQ 官方机器人 → OneBot v11）附加文件：叠在任意一份基础 compose 之上
+#
+#   docker compose -f docker-compose.yml -f qbob/docker-compose.qbob.yml --env-file .env up -d
+#
+# ⚠️ 多份 compose 叠加时，相对路径一律以**第一份文件所在目录**为准，所以下面的 build.context 写 ./qbob。
+# 镜像在本机构建（从上游固定提交拉源码），不从任何仓库拉取，也不发布。
+# 设计、许可边界与升级方法见 docs/qbob-integration.md。
+
+services:
+  nekro_agent:
+    environment:
+      # NA 经容器网络访问 qbob 管理面；没有这一行 = 本部署未附带 qbob，后台里该协议端置灰
+      - NEKRO_QBOB_ADMIN_URL=http://${INSTANCE_NAME:-}nekro_qbob:17810
+      # 界面「所用提交」用：与实际构建 qbob 镜像的 QBOB_REF 是同一个值的默认
+      - NEKRO_QBOB_REF=${QBOB_REF:-9c36d577bae36f205c0ad04b88afe11588fe56aa}
+
+  nekro_qbob:
+    build:
+      context: ./qbob
+      args:
+        QBOB_REF: ${QBOB_REF:-9c36d577bae36f205c0ad04b88afe11588fe56aa}
+        WITH_CHROMIUM: ${QBOB_WITH_CHROMIUM:-false}
+        PIP_INDEX_URL: ${QBOB_PIP_INDEX_URL:-}
+    # 本地镜像名带上游提交：本机没有这个镜像时 `up` 才构建，平时 `up` 不会重新拉源码与依赖；
+    # 改了 QBOB_REF 镜像名跟着变，下次 `up` 自动按新提交构建。拉取时用 `pull --ignore-buildable` 跳过它
+    image: nekro-qbob:${QBOB_REF:-9c36d577bae36f205c0ad04b88afe11588fe56aa}
+    container_name: ${INSTANCE_NAME:-}nekro_qbob
+    environment:
+      # 与 NA 容器里的挂载路径一致：NA 要读这里的首启 admin 口令文件和 qbob 返回的本地媒体路径
+      - QBOB_DATA_DIR=${NEKRO_DATA_DIR}/qbob_data
+      # 用 webhook 收事件或「合并转发转网页」时才需要：指向本服务 17800 端口的 https 地址（需自备反代）
+      - QBOB_PUBLIC_BASE_URL=${QBOB_PUBLIC_BASE_URL:-}
+    volumes:
+      - ${NEKRO_DATA_DIR}/qbob_data:${NEKRO_DATA_DIR}/qbob_data:rw
+    ports:
+      # 管理台只绑宿主回环（远程用 SSH 隧道）；日常操作都在 NA 总后台完成，用不到它
+      - "127.0.0.1:${QBOB_ADMIN_EXPOSE_PORT:-17810}:17810"
+    networks:
+      - nekro_network
+    # 入口以 root 起步后降权；禁止通过 setuid 类二进制拿回权限
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

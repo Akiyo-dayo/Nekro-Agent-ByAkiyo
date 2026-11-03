@@ -14,9 +14,18 @@
 
 租户可以测试自己能用的组（含平台组），实现与脱敏全部在
 `services/model_group_test.py`，本模块只负责身份解析与出参组装。
+
+## 批量删除
+
+逐个组走与单个删除相同的判定（`model_group_service.delete_groups`），逐个结算并列出没删成的组与原因。
+
+## 删除前的引用提醒
+
+删除确认框先查一次"这些组被哪些配置引用"（`services/model_group_refs.py`），只提醒不拦截。
+作用域：租户只看到自己实例下的引用，且只对自己能删的组作答。
 """
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -27,11 +36,14 @@ from nekro_agent.models.db_model_group import ModelGroupVisibility
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.console import ActionOkResponse
 from nekro_agent.schemas.tenant import ModelGroupInfo, ModelGroupListResponse
+from nekro_agent.services.model_group_refs import ModelGroupRefScope, find_model_group_references
 from nekro_agent.services.model_group_service import (
+    DeleteRefusal,
     build_model_group_info,
     can_see_credential,
     create_group,
     delete_group,
+    delete_groups,
     get_editable_group,
     get_visible_group,
     list_visible_groups,
@@ -83,6 +95,72 @@ class ModelGroupCreateRequest(ModelGroupPayload):
     """新建模型组；租户创建的自动归属该租户"""
 
     name: str = Field(..., description="模型组名，全局唯一，创建后不可改")
+
+
+# 一次最多提交的组名数。界面一屏勾得到的远少于这个数，上限只是不让一次请求无界地连删
+MAX_BATCH_DELETE = 200
+
+
+class ModelGroupBatchDeleteRequest(BaseModel):
+    """批量删除模型组"""
+
+    names: List[str] = Field(..., min_length=1, max_length=MAX_BATCH_DELETE, description="要删除的模型组名")
+
+
+class ModelGroupBatchDeleteFailure(BaseModel):
+    """没删成的一个组"""
+
+    name: str = Field(...)
+    reason: DeleteRefusal = Field(
+        ...,
+        description=(
+            "not_found：不存在或当前身份不可见；forbidden：可见但无权删除；default_group：默认模型组不可删除；"
+            "error：删除时出错（详情见服务端日志）"
+        ),
+    )
+
+
+class ModelGroupBatchDeleteResponse(BaseModel):
+    """批量删除结果；逐个结算，`ok` 仅在全部删除成功时为 True"""
+
+    ok: bool = Field(...)
+    succeeded: List[str] = Field(default_factory=list, description="已删除的组名")
+    failed: List[ModelGroupBatchDeleteFailure] = Field(default_factory=list)
+    message: str = Field(default="")
+
+
+class ModelGroupReferencesRequest(BaseModel):
+    """查询模型组被哪些配置引用"""
+
+    names: List[str] = Field(..., min_length=1, max_length=MAX_BATCH_DELETE, description="要查询的模型组名")
+
+
+class ModelGroupReferenceInfo(BaseModel):
+    """一处引用"""
+
+    scope: ModelGroupRefScope = Field(..., description="引用所在的配置层")
+    target: str = Field(
+        default="",
+        description="system 为空；adapter 为适配器标识；instance 为 `<adapter>/<instance>`；channel 为 chat_key；插件两层为插件键",
+    )
+    field: str = Field(..., description="配置字段名")
+    title: str = Field(default="", description="配置字段标题")
+    instance_key: str = Field(default="", description="仅 plugin_instance：插件在哪个实例上的配置")
+    i18n_title: Optional[Dict[str, str]] = Field(default=None, description="字段标题的多语言版本")
+
+
+class ModelGroupReferenceItem(BaseModel):
+    """一个组的引用情况"""
+
+    name: str = Field(...)
+    total: int = Field(..., description="引用总数；references 可能被截断")
+    references: List[ModelGroupReferenceInfo] = Field(default_factory=list)
+
+
+class ModelGroupReferencesResponse(BaseModel):
+    """只含当前身份可删除的组；其余组名不出现"""
+
+    items: List[ModelGroupReferenceItem] = Field(default_factory=list)
 
 
 class ModelGroupTestResult(BaseModel):
@@ -176,6 +254,53 @@ async def delete_console_model_group(
     row = await get_editable_group(name, identity)
     await delete_group(row)
     return ActionOkResponse(ok=True, message=f"模型组 {name} 已删除")
+
+
+@router.post("/model-groups/actions/references", summary="查询模型组被哪些配置引用")
+@require_role(Role.Admin)
+async def get_console_model_group_references(
+    body: ModelGroupReferencesRequest,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ModelGroupReferencesResponse:
+    """删除确认框用：列出这些组被哪些配置项引用
+
+    只对当前身份可删除的组作答；租户只看到自己实例下的引用（实例 / 频道覆盖与插件实例配置）。
+    """
+    identity = resolve_console_identity(_current_user)
+    reports = await find_model_group_references(body.names, identity)
+    return ModelGroupReferencesResponse(
+        items=[
+            ModelGroupReferenceItem(
+                name=report.name,
+                total=report.total,
+                references=[ModelGroupReferenceInfo(**reference._asdict()) for reference in report.references],
+            )
+            for report in reports
+        ],
+    )
+
+
+@router.post("/model-groups/actions/batch-delete", summary="批量删除模型组")
+@require_role(Role.Admin)
+async def batch_delete_console_model_groups(
+    body: ModelGroupBatchDeleteRequest,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ModelGroupBatchDeleteResponse:
+    """批量删除模型组
+
+    每个组的判定与单个删除相同：租户只能删自己租户的组，平台组对租户只读，
+    不可见的组按不存在处理，默认模型组不可删除。
+    """
+    identity = resolve_console_identity(_current_user)
+    outcome = await delete_groups(body.names, identity)
+    failed = [ModelGroupBatchDeleteFailure(name=name, reason=reason) for name, reason in outcome.refused]
+    deleted_count = len(outcome.deleted)
+    return ModelGroupBatchDeleteResponse(
+        ok=not failed,
+        succeeded=outcome.deleted,
+        failed=failed,
+        message=f"已删除 {deleted_count} 个，失败 {len(failed)} 个" if failed else f"已删除 {deleted_count} 个模型组",
+    )
 
 
 @router.post("/model-groups/{name}/test", summary="模型组连通性测试")

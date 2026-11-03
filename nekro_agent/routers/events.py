@@ -12,7 +12,7 @@
 
 判据来自事件自带的归属字段：`workspace_id` 过 `accessible_workspace_ids`，
 `chat_key` 过本身份实例名下的频道集合（与 `routers/chat_channel.py:assert_channel_accessible`
-逐字同一套口径），`instance_key` 过 `accessible_instance_keys`。
+逐字同一套口径），实例状态事件按 `(adapter_key, instance_key)` 成对过 `accessible_instance_refs`。
 
 **频道归属不要改成 `{adapter_key}-{instance_key}-` 前缀匹配**：那只是
 `BaseAdapter.build_chat_key` 的默认实现，`wechat_ilink_multi` 与 `qqbot_openclaw` 都不遵守
@@ -45,7 +45,12 @@ from nekro_agent.services.system_broadcast import (
 )
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
-from nekro_agent.services.user.tenant_perm import accessible_instance_keys, get_tenant_scope
+from nekro_agent.services.user.tenant_perm import (
+    InstanceRef,
+    accessible_instance_refs,
+    get_tenant_scope,
+    instance_refs_filter,
+)
 from nekro_agent.services.workspace.tenant_scope import accessible_workspace_ids
 
 logger = get_sub_logger("events")
@@ -92,7 +97,7 @@ class TenantEventVisibility:
     def __init__(self, user: DBUser) -> None:
         self._user = user
         self._expires_at = 0.0
-        self._instance_keys: FrozenSet[str] = frozenset()
+        self._instances: FrozenSet[InstanceRef] = frozenset()
         self._chat_keys: FrozenSet[str] = frozenset()
         self._workspace_ids: FrozenSet[int] = frozenset()
 
@@ -146,7 +151,7 @@ class TenantEventVisibility:
         if kind in SHARED_LIBRARY_EVENTS:
             return True
         if kind in INSTANCE_SCOPED_EVENTS:
-            return entry.get("instance_key") in self._instance_keys
+            return (entry.get("adapter_key"), entry.get("instance_key")) in self._instances
         if kind in CHAT_SCOPED_EVENTS:
             return self._owns_chat_key(entry.get("chat_key"))
         if kind in WORKSPACE_SCOPED_EVENTS:
@@ -157,7 +162,7 @@ class TenantEventVisibility:
         return False
 
     def _owns_chat_key(self, chat_key: object) -> bool:
-        """频道归属按 `chat_key -> chat_channel.instance_key` 判定
+        """频道归属按 `chat_key -> chat_channel.(adapter_key, instance_key)` 判定
 
         与 `routers/chat_channel.py:assert_channel_accessible` 同一套口径。集合在刷新时一次取出，
         逐事件判定不再产生查询；没有频道行的 `chat_key`（历史残留、已删频道）一律不可见。
@@ -168,10 +173,10 @@ class TenantEventVisibility:
         if time.monotonic() < self._expires_at:
             return
         try:
-            instance_keys = await accessible_instance_keys(self._user)
+            instances = await accessible_instance_refs(self._user)
             chat_keys = (
-                await DBChatChannel.filter(instance_key__in=instance_keys).values_list("chat_key", flat=True)
-                if instance_keys
+                await DBChatChannel.filter(instance_refs_filter(instances)).values_list("chat_key", flat=True)
+                if instances
                 else []
             )
             workspace_ids = await accessible_workspace_ids(self._user)
@@ -180,7 +185,7 @@ class TenantEventVisibility:
             self._expires_at = time.monotonic() + self.RETRY_INTERVAL_SECONDS
             return
 
-        self._instance_keys = frozenset(instance_keys)
+        self._instances = frozenset(instances)
         self._chat_keys = frozenset(chat_keys)
         self._workspace_ids = frozenset(workspace_ids or ())
         self._expires_at = time.monotonic() + self.REFRESH_INTERVAL_SECONDS

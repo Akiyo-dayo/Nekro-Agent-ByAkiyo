@@ -42,7 +42,12 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.schemas.errors import NotFoundError
-from nekro_agent.services.user.tenant_perm import accessible_instance_keys, get_tenant_scope
+from nekro_agent.services.user.tenant_perm import (
+    InstanceRef,
+    accessible_instance_refs,
+    get_tenant_scope,
+    instance_refs_filter,
+)
 from nekro_agent.services.workspace.network_guard import (
     PLATFORM_GROUP,
     resolve_workspace_network_group,
@@ -83,30 +88,39 @@ async def resolve_workspace_owner_groups(workspace_ids: Sequence[int]) -> Dict[i
         return groups
 
     try:
-        rows = await DBChatChannel.filter(workspace_id__in=ids).values("workspace_id", "instance_key")
+        rows = await DBChatChannel.filter(workspace_id__in=ids).values("workspace_id", "adapter_key", "instance_key")
     except Exception as e:
         logger.warning(f"批量读取工作区的频道绑定失败，全部按平台方分组处理: {e}")
         return groups
 
-    keys_by_workspace: Dict[int, List[str]] = {}
+    refs_by_workspace: Dict[int, List[InstanceRef]] = {}
     for row in rows:
-        keys_by_workspace.setdefault(int(row["workspace_id"]), []).append(str(row["instance_key"] or ""))
-    if not keys_by_workspace:
+        refs_by_workspace.setdefault(int(row["workspace_id"]), []).append(
+            (str(row["adapter_key"] or ""), str(row["instance_key"] or "")),
+        )
+    if not refs_by_workspace:
         return groups
 
-    named = sorted({key for keys in keys_by_workspace.values() for key in keys if key})
-    tenant_by_key: Dict[str, Optional[int]] = {}
+    named = sorted({instance_key for refs in refs_by_workspace.values() for _, instance_key in refs if instance_key})
+    tenant_by_ref: Dict[InstanceRef, Optional[int]] = {}
     if named:
         try:
-            instance_rows = await DBAdapterInstance.filter(instance_key__in=named).values("instance_key", "tenant_id")
+            instance_rows = await DBAdapterInstance.filter(instance_key__in=named).values(
+                "adapter_key",
+                "instance_key",
+                "tenant_id",
+            )
         except Exception as e:
             logger.warning(f"批量读取工作区所属实例的租户归属失败，全部按平台方分组处理: {e}")
             return groups
-        tenant_by_key = {str(row["instance_key"]): row["tenant_id"] for row in instance_rows}
+        # 按 (适配器, 实例) 成对对上：另一个适配器下可以有归别的租户的同名实例
+        tenant_by_ref = {
+            (str(row["adapter_key"]), str(row["instance_key"])): row["tenant_id"] for row in instance_rows
+        }
 
     # 空 instance_key 是多账号化之前尚未被认领的历史频道，查不到实例行的同理，两者都按平台方计入
-    for workspace_id, keys in keys_by_workspace.items():
-        groups[workspace_id] = workspace_group_key([tenant_by_key.get(key) if key else None for key in keys])
+    for workspace_id, refs in refs_by_workspace.items():
+        groups[workspace_id] = workspace_group_key([tenant_by_ref.get(ref) if ref[1] else None for ref in refs])
     return groups
 
 
@@ -114,20 +128,20 @@ async def accessible_workspace_ids(user: DBUser) -> Optional[List[int]]:
     """列出该身份可见的工作区 ID
 
     Returns:
-        `None` 表示平台方、不受限（与 `accessible_instance_keys` 的空列表语义不同：
+        `None` 表示平台方、不受限（与 `accessible_instance_refs` 的空集合语义不同：
         租户一个工作区都看不到时返回的是空列表，那确实是「什么都看不到」）。
     """
     scope = get_tenant_scope(user)
     if scope is None:
         return None
 
-    instance_keys = await accessible_instance_keys(user)
-    if not instance_keys:
+    instances = await accessible_instance_refs(user)
+    if not instances:
         return []
     candidates = {
         int(workspace_id)
         for workspace_id in await DBChatChannel.filter(
-            instance_key__in=instance_keys,
+            instance_refs_filter(instances),
             workspace_id__isnull=False,
         ).values_list("workspace_id", flat=True)
         if workspace_id is not None

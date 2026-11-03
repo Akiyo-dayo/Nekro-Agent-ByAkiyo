@@ -33,10 +33,10 @@ class TokenRevokedError(AppError):
     同档）：前端 axios 拦截器对非登录接口的 401 会清空登录态跳回登录页，这正是
     令牌被吊销时期望的行为，不能沿用「未授权访问」这种让用户摸不着头脑的文案。
 
-    fail-closed 是有意取舍（项目所有者拍板）：本特性上线前签发的存量令牌都没有
+    fail-closed 是有意取舍：本特性上线前签发的存量令牌都没有
     `pwd_gen` 声明，一律走这里——部署后所有已登录会话失效、需重新登录。反过来
-    「缺声明就放行」会让吊销对存量令牌形同虚设（PROJECT_STATE §3 #54 的
-    「半做更糟」警告）。就地定义而不进 `schemas/errors.py` 的理由与
+    「缺声明就放行」会让吊销对存量令牌形同虚设，这种半做比不做更糟。
+    就地定义而不进 `schemas/errors.py` 的理由与
     `routers/user.py:IncorrectCurrentPasswordError` 相同：不与并行开发的其他模块
     争抢同一个共享文件。
     """

@@ -182,11 +182,29 @@ if _driver is not None:
 
         await run_db_migrations()
 
+        # 沙盒回调地址若还是早先按旧端口自动生成的默认值，按当前部署纠正。必须在下面两件事之前：
+        # `bootstrap_model_groups()` 会落盘配置（纠正值随之写回），沙盒隔离规则按回调端点放行
+        try:
+            from nekro_agent.services.sandbox.network_guard import reconcile_sandbox_chat_api_url
+
+            reconcile_sandbox_chat_api_url()
+        except Exception as e:
+            logger.warning(f"核对沙盒回调地址失败（非致命，沿用配置值）: {e}")
+
         # 把配置文件里的存量模型组导入数据库，并据此重建 config.MODEL_GROUPS 运行时视图。
         # 必须紧跟迁移之后：适配器与插件初始化都会同步读 config.MODEL_GROUPS
         from nekro_agent.services.model_group_service import bootstrap_model_groups
 
         await bootstrap_model_groups()
+
+        # 只读自检：跨适配器重名的实例标识会让只按标识存取的数据串用，提示管理员改名，不改数据。
+        # 放在迁移之后：此时表结构已是当前版本
+        from nekro_agent.services.console.instance_manager import warn_cross_adapter_instance_key_collisions
+
+        try:
+            await warn_cross_adapter_instance_key_collisions()
+        except Exception as e:
+            logger.warning(f"检查跨适配器重名的实例标识失败（非致命）: {e}")
 
         # 回收上次运行遗留的沙盒容器（必须在适配器接入消息之前完成，避免误杀新启动的沙盒）
         try:
@@ -220,6 +238,32 @@ if _driver is not None:
 
         register_built_in_commands()
         logger.info("Built-in commands registered")
+
+        # 存量命令权限覆盖里的 advanced 按升级前的实际效果改成 super_user，只做一次（见该方法说明）
+        try:
+            from nekro_agent.services.command.manager import command_manager
+
+            command_manager.migrate_legacy_advanced_overrides()
+        except Exception as e:
+            logger.warning(f"迁移存量命令权限覆盖失败（非致命，下次启动重试）: {e}")
+
+        # 超级用户只认平台方可信的来源：先把租户名下实例此刻生效的令牌记成「曾对租户可见」，
+        # 再说清楚哪些部署形态会让名单里的人在哪些实例上失去超级用户
+        from nekro_agent.services.unclaimed_dispatch import auto_claim_unclaimed_with_history
+        from nekro_agent.services.user.super_users import log_super_user_warnings
+        from nekro_agent.services.user.token_exposure import scan_tenant_token_exposure
+
+        # 未认领实例从此只在凭部署级令牌连上来时才分发：升级前就有聊天记录的存量未认领实例先就地认领一次，
+        # 否则它们会在升级后当场失声（一次性，见该函数说明）
+        try:
+            await auto_claim_unclaimed_with_history()
+        except Exception as e:
+            logger.error(f"升级时自动认领存量未认领实例失败（下次启动重试）: {e}")
+        try:
+            await scan_tenant_token_exposure()
+        except Exception as e:
+            logger.error(f"记录曾对租户可见的 OneBot 令牌失败（下次启动重试）: {e}")
+        await log_super_user_warnings()
 
         await init_plugins()
 
@@ -425,6 +469,14 @@ if _driver is not None:
     async def on_bot_connect(bot: Bot):
         adapter: str = bot.adapter.get_name()
         bot_id: str = bot.self_id
+        if adapter == "OneBot V11":
+            # 协议端识别与自检是附加信息：查询失败不能影响下面两条连接状态同步
+            try:
+                from nekro_agent.adapters.onebot_v11.core.endpoint_status import on_onebot_connect
+
+                await on_onebot_connect(bot)
+            except Exception as e:
+                logger.warning(f"初始化 OneBot 协议端自检失败: {e}")
         await send_bot_status_email(adapter, bot_id, True)
         await _report_onebot_instance_status(adapter, bot_id, is_online=True)
 

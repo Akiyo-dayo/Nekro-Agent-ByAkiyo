@@ -515,25 +515,27 @@ async def resolve_workspace_network_group(workspace: "DBWorkspace") -> str:
     from nekro_agent.models.db_chat_channel import DBChatChannel
 
     try:
-        instance_keys = await DBChatChannel.filter(workspace_id=workspace.id).values_list("instance_key", flat=True)
+        bound = await DBChatChannel.filter(workspace_id=workspace.id).values_list("adapter_key", "instance_key")
     except Exception as e:
         logger.warning(f"读取工作区 {workspace.id} 的频道绑定失败，按平台方分组处理: {e}")
         return PLATFORM_GROUP
-    if not instance_keys:
+    if not bound:
         return PLATFORM_GROUP
 
-    named = sorted({str(key) for key in instance_keys if key})
-    tenant_by_key: Dict[str, Optional[int]] = {}
+    refs = [(str(adapter_key or ""), str(instance_key or "")) for adapter_key, instance_key in bound]
+    named = sorted({instance_key for _, instance_key in refs if instance_key})
+    tenant_by_ref: Dict[Tuple[str, str], Optional[int]] = {}
     if named:
         try:
-            rows = await DBAdapterInstance.filter(instance_key__in=named).values("instance_key", "tenant_id")
+            rows = await DBAdapterInstance.filter(instance_key__in=named).values("adapter_key", "instance_key", "tenant_id")
         except Exception as e:
             logger.warning(f"读取工作区 {workspace.id} 所属实例的租户归属失败，按平台方分组处理: {e}")
             return PLATFORM_GROUP
-        tenant_by_key = {str(row["instance_key"]): row["tenant_id"] for row in rows}
+        # 按 (适配器, 实例) 成对对上：另一个适配器下可以有归别的租户的同名实例
+        tenant_by_ref = {(str(row["adapter_key"]), str(row["instance_key"])): row["tenant_id"] for row in rows}
 
     # 空 instance_key 是多账号化之前尚未被认领的历史频道，查不到实例行的同理，两者都按平台方计入
-    return workspace_group_key([tenant_by_key.get(str(key)) if key else None for key in instance_keys])
+    return workspace_group_key([tenant_by_ref.get(ref) if ref[1] else None for ref in refs])
 
 
 async def _ensure_network(docker: aiodocker.Docker, group: str) -> WorkspaceNetwork:

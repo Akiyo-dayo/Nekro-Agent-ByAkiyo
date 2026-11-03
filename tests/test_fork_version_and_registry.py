@@ -3,7 +3,8 @@
 两件事，都是「改一处忘了另一处就悄悄失效」的那种：
 
 1. **版本号**：展示版本只有一处真相 `nekro_agent/tools/common_util.py:FORK_VERSION`。`pyproject.toml` 的 `version` 是
-   **上游版本**，驱动云端插件兼容判定 / 更新检查 / 遥测，不能改成 fork 的 0.x（见 `FORK_VERSION` 上方的注释）。
+   **插件兼容版本**（插件可见接口与上游哪个版本一致），驱动云端插件兼容判定 / 更新检查 / 遥测，不能改成 fork 的 0.x
+   （见 `FORK_VERSION` 上方的注释）。署名用的上游基线是 `UPSTREAM_BASE_VERSION`，不能高于插件兼容版本。
    CHANGELOG 顶部的版本标题、`publish.yml` 的镜像 tag 都必须跟着 `FORK_VERSION` 走。
 2. **镜像**：CI、三份 compose、安装脚本、沙盒默认镜像都指向本 fork 的 GHCR（`ghcr.io/akiyo-dayo/...`），不再引用上游
    `kromiose/nekro-agent*` 镜像；工作流只用内置 `GITHUB_TOKEN`，不依赖 Docker Hub / PyPI 密钥（PyPI 任务被显式禁用）。
@@ -21,7 +22,14 @@ from typing import Any, Dict, List
 import pytest
 import yaml
 
-from nekro_agent.tools.common_util import FORK_VERSION, get_app_version, get_fork_version
+from nekro_agent.tools.common_util import (
+    FORK_VERSION,
+    UPSTREAM_BASE_VERSION,
+    compare_semver,
+    get_app_version,
+    get_fork_version,
+    get_upstream_base_version,
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
@@ -73,6 +81,20 @@ class TestForkVersion:
         major = int(get_app_version().split(".")[0])
         assert major >= 2, get_app_version()
 
+    def test_the_upstream_base_is_separate_and_not_ahead_of_plugin_compat(self) -> None:
+        """署名「基于 NekroAgent X」用基线版本：只追平插件接口时它落后于插件兼容版本，但绝不能超前"""
+        assert re.fullmatch(r"\d+\.\d+\.\d+", UPSTREAM_BASE_VERSION), UPSTREAM_BASE_VERSION
+        assert get_upstream_base_version() == UPSTREAM_BASE_VERSION
+        assert UPSTREAM_BASE_VERSION != FORK_VERSION
+        assert compare_semver(UPSTREAM_BASE_VERSION, get_app_version()) <= 0, (UPSTREAM_BASE_VERSION, get_app_version())
+
+    def test_the_lock_file_carries_the_same_plugin_compat_version(self) -> None:
+        """`uv.lock` 里本项目的版本要与 `pyproject.toml` 一致，否则 `uv sync --locked` 会报锁文件过期"""
+        lock = _read(REPO_ROOT / "uv.lock")
+        match = re.search(r'^name = "nekro-agent"\nversion = "([^"]+)"', lock, re.M)
+        assert match, "uv.lock 里找不到 nekro-agent 的版本"
+        assert match.group(1) == get_app_version()
+
     def test_the_changelog_has_a_heading_for_the_current_version_above_all_dated_sections(self) -> None:
         headings = re.findall(r"^## (.+)$", _read(REPO_ROOT / "CHANGELOG.md"), re.M)
         assert headings[0].startswith(f"v{FORK_VERSION} ("), f"CHANGELOG 顶部标题应是 v{FORK_VERSION}，实际是 {headings[0]!r}"
@@ -115,6 +137,11 @@ class TestForkVersion:
     def test_a_tag_that_differs_from_the_code_version_is_refused(self) -> None:
         text = _read(WORKFLOWS / "publish.yml")
         assert 'GITHUB_REF_NAME}" != "v${VERSION}"' in text
+
+    def test_only_the_release_tag_form_triggers_publishing(self) -> None:
+        # YAML 1.1 把键 `on` 读成 True
+        trigger = yaml.safe_load(_read(WORKFLOWS / "publish.yml"))[True]
+        assert trigger["push"]["tags"] == ["v*.*.*"]
 
 
 # ============================================================

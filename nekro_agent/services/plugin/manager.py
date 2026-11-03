@@ -10,6 +10,11 @@ from nekro_agent.core.config import CONFIG_PATH, config
 from nekro_agent.core.core_utils import ConfigBase
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.services.config_service import ConfigService
+from nekro_agent.services.plugin.call_priority import (
+    PluginCallPriority,
+    get_plugin_call_priority,
+    set_plugin_call_priority,
+)
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.isolation import PluginQuarantine, get_quarantine
 from nekro_agent.services.plugin.prompt_activation import (
@@ -56,6 +61,10 @@ def _build_activation_strategy_meta(plugin) -> dict:
         "sleepBrief": plugin.sleep_brief,
         "controller": _get_activation_controller_meta(),
     }
+
+
+def _build_call_priority_meta(plugin) -> dict:
+    return {"configured": get_plugin_call_priority(plugin.module_name)}
 
 
 def build_quarantine_meta(quarantine: Optional[PluginQuarantine]) -> Optional[dict]:
@@ -105,12 +114,15 @@ async def get_all_ext_meta_data() -> List[dict]:
             "author": plugin.author,
             "enabled": plugin.is_enabled,
             "hasConfig": hasattr(plugin, "_Configs") and plugin._Configs != ConfigBase,  # noqa: SLF001
+            "webuiPath": plugin.get_webui_url_path(),
+            "webuiType": plugin.get_webui_type(),
             "url": plugin.url or "",
             "isBuiltin": plugin.is_builtin,
             "isPackage": plugin.is_package,
             "i18n_name": plugin.i18n_name,
             "i18n_description": plugin.i18n_description,
             "activationStrategy": _build_activation_strategy_meta(plugin),
+            "callPriority": _build_call_priority_meta(plugin),
             "loadFailed": False,  # 标记加载状态
             "quarantine": build_quarantine_meta(get_quarantine(plugin.key)),  # 非 None 表示已被自动隔离
         }
@@ -128,12 +140,15 @@ async def get_all_ext_meta_data() -> List[dict]:
                 "author": "N/A",
                 "enabled": False,
                 "hasConfig": False,
+                "webuiPath": None,
+                "webuiType": None,
                 "url": "N/A",
                 "isBuiltin": failed_plugin.is_builtin,
                 "isPackage": failed_plugin.is_package,
                 "i18n_name": None,
                 "i18n_description": None,
                 "activationStrategy": None,
+                "callPriority": None,
                 "quarantine": None,  # 加载失败走 loadFailed，与自动隔离是两回事
                 "loadFailed": True,  # 标记加载失败，前端根据此字段隐藏开关并显示"加载失败"
                 "errorMessage": failed_plugin.error_message,  # 完整错误信息
@@ -166,12 +181,15 @@ async def get_plugin_detail(plugin_id: str) -> Optional[dict]:
                 "url": "N/A",
                 "enabled": False,
                 "hasConfig": False,
+                "webuiPath": None,
+                "webuiType": None,
                 "methods": [],
                 "webhooks": [],
                 "router": None,
                 "isBuiltin": failed_plugin.is_builtin,
                 "isPackage": failed_plugin.is_package,
                 "activationStrategy": None,
+                "callPriority": None,
                 "quarantine": None,  # 加载失败走 loadFailed，与自动隔离是两回事
                 "loadFailed": True,  # 前端根据此字段隐藏开关并显示"加载失败"
                 "errorMessage": failed_plugin.error_message,  # 完整错误信息
@@ -224,6 +242,8 @@ async def get_plugin_detail(plugin_id: str) -> Optional[dict]:
         "url": plugin.url or "",
         "enabled": plugin.is_enabled,
         "hasConfig": hasattr(plugin, "_Configs") and plugin._Configs != ConfigBase,  # noqa: SLF001
+        "webuiPath": plugin.get_webui_url_path(),
+        "webuiType": plugin.get_webui_type(),
         "methods": methods,
         "webhooks": webhooks,
         "router": router_info,  # 新增路由信息
@@ -231,6 +251,7 @@ async def get_plugin_detail(plugin_id: str) -> Optional[dict]:
         "isPackage": plugin.is_package,
         "quarantine": build_quarantine_meta(get_quarantine(plugin.key)),
         "activationStrategy": _build_activation_strategy_meta(plugin),
+        "callPriority": _build_call_priority_meta(plugin),
         "loadFailed": False,
     }
 
@@ -254,6 +275,17 @@ async def update_plugin_activation_strategy(
 
     set_plugin_activation_strategy(plugin.module_name, strategy)
     return True, None
+
+
+async def update_plugin_call_priority(
+    plugin_id: str,
+    priority: PluginCallPriority,
+) -> tuple[bool, Optional[str]]:
+    plugin = plugin_collector.get_plugin(plugin_id)
+    if not plugin:
+        return False, f"插件 {plugin_id} 不存在"
+
+    return set_plugin_call_priority(plugin.module_name, priority)
 
 
 async def get_all_plugin_router_info() -> Dict[str, Any]:

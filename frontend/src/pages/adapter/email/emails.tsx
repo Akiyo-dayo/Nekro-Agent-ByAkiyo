@@ -41,6 +41,38 @@ import {
 import { emailApi, type EmailAccount } from '../../../services/api/email'
 import { CARD_VARIANTS } from '../../../theme/variants'
 
+// 隔离渲染邮件 HTML 时套在正文外面的文档头。CSP 是 iframe sandbox 之外的第二层：
+// 即使 sandbox 属性被误删，脚本、插件、嵌套页面、表单提交仍然一律不允许；图片照常显示。
+const EMAIL_DOCUMENT_HEAD =
+  '<meta charset="utf-8">' +
+  '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data: https: http:; ' +
+  'style-src \'unsafe-inline\'; font-src data: https:; form-action \'none\'">' +
+  '<style>body{margin:12px;font-family:sans-serif;word-break:break-word;color:#222}' +
+  'img{max-width:100%;height:auto}</style>'
+
+// 邮件正文里要去掉的元素。sandbox 与 CSP 挡住了脚本，但挡不住「让 iframe 自己跳走」：
+// `<meta http-equiv="refresh">` 或 `<base>` 改写后的链接会把框里换成外部页面，在后台里框出一个钓鱼页。
+const EMAIL_STRIPPED_ELEMENTS = 'meta, base, link, script, noscript, iframe, frame, frameset, object, embed'
+
+function sanitizeEmailHtml(html: string): string {
+  // DOMParser 解析出来的文档是惰性的：不执行脚本、不加载资源
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  doc.querySelectorAll(EMAIL_STRIPPED_ELEMENTS).forEach(el => el.remove())
+  // 链接一律改成新窗口打开：sandbox 没有 allow-popups，点了不会发生任何事，iframe 也不会被带走
+  doc.querySelectorAll('a[href], area[href]').forEach(el => {
+    el.setAttribute('target', '_blank')
+    el.setAttribute('rel', 'noopener noreferrer')
+  })
+  const headStyles = Array.from(doc.head.querySelectorAll('style'))
+    .map(style => style.outerHTML)
+    .join('')
+  return headStyles + doc.body.innerHTML
+}
+
+function buildIsolatedEmailDocument(html: string): string {
+  return `<!doctype html><html><head>${EMAIL_DOCUMENT_HEAD}</head><body>${sanitizeEmailHtml(html)}</body></html>`
+}
+
 function formatDate(dateStr: string | null) {
   if (!dateStr) return '-'
   try {
@@ -220,18 +252,22 @@ function DetailContent({
           {rawLoading ? (
             <Skeleton variant="rounded" height={220} />
           ) : bodyView === 'html' && hasHtmlBody ? (
+            // 邮件正文来自任意发件人，不能注入后台页面：直接 innerHTML 时，正文里的脚本 / 事件属性会以
+            // 当前登录管理员的身份执行。这里放进 sandbox="" 的 iframe：不允许脚本、表单、弹窗，
+            // 文档是独立的不透明源，读不到后台的登录凭据；srcDoc 里再加一层 CSP 兜底。
             <Box
+              component="iframe"
+              title={t('emails.bodyHtmlFrameTitle')}
+              sandbox=""
+              referrerPolicy="no-referrer"
+              srcDoc={buildIsolatedEmailDocument(rawContent?.html_content || '')}
               sx={{
-                p: 1.5,
+                width: '100%',
+                height: 480,
                 borderRadius: 2,
                 border: theme => `1px solid ${theme.palette.divider}`,
-                backgroundColor: 'background.paper',
-                '& img': {
-                  maxWidth: '100%',
-                  height: 'auto',
-                },
+                backgroundColor: '#fff',
               }}
-              dangerouslySetInnerHTML={{ __html: rawContent?.html_content || '' }}
             />
           ) : (
             <Typography

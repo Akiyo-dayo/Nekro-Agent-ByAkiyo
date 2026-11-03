@@ -27,6 +27,7 @@ class InstanceProvider(str, Enum):
     BUILTIN_NAPCAT = "builtin_napcat"  # 本机 Docker 内托管的 NapCat 容器
     REMOTE_ONEBOT = "remote_onebot"  # 连接到外部已有的 OneBot 协议端
     NATIVE = "native"  # 原生适配器（qqbot_openclaw / email / minecraft 等）
+    BUILTIN_QBOB = "builtin_qbob"  # 附带的 qbob（QQ 官方机器人 → OneBot v11）里由 NA 托管的 bot
 
 
 class InstanceStatus(str, Enum):
@@ -97,6 +98,10 @@ class InstanceInfo(BaseModel):
     stats: InstanceStats = Field(default_factory=InstanceStats, description="运行统计")
     last_error: str = Field(default="", description="最近错误")
     offline_since: Optional[str] = Field(default=None, description="掉线起始时间")
+    qbob_appid: str = Field(
+        default="",
+        description="内置 qbob 实例已接入的 AppID；非空表示 qbob 里还挂着这个 bot（AppID 不是凭据）",
+    )
 
 
 class InstanceListResponse(BaseModel):
@@ -295,6 +300,11 @@ class UnclaimedInstanceItem(BaseModel):
     message_count_today: int = Field(default=0, description="今日消息数")
     last_active_at: Optional[str] = Field(default=None, description="最近活跃时间")
     first_seen_at: Optional[str] = Field(default=None, description="首次连入时间")
+    dispatch_paused: bool = Field(
+        default=False,
+        description="认领之前它的消息会不会被丢弃（部署级令牌为空、曾对租户可见、或曝光记录不可用时为真）",
+    )
+    dispatch_paused_reason: str = Field(default="", description="消息暂不处理的原因，dispatch_paused 为假时为空")
 
 
 class InstanceAdoptTarget(BaseModel):
@@ -414,7 +424,7 @@ class ActionOkResponse(BaseModel):
     message: str = Field(default="")
 
 
-# ==================== 实例配额（RK5 / RK6） ====================
+# ==================== 实例配额 ====================
 
 
 class InstanceConcurrencyInfo(BaseModel):

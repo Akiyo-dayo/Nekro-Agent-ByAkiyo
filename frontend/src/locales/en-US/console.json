@@ -59,6 +59,7 @@
     "containerNone": "This instance has no hosted container",
     "unboundTitle": "No account bound yet",
     "unboundHint": "This instance has no bot account bound, so it never establishes a connection and never receives a message — it is not offline. A protocol endpoint that connects first registers itself as an unclaimed instance; claim it below. If nothing has connected yet, use \"Bind account\" below to type the account in directly.",
+    "qbobUnboundHint": "No QQ official bot is connected to this instance yet. Open the Protocol tab to scan a QR code or enter the AppID / AppSecret. The account is bound automatically after connecting; you do not need to rebind it from the overview.",
     "migration": "History ownership",
     "migrationHint": "When a protocol endpoint connects before its instance exists, it registers itself as an unclaimed instance and claims the historical channels. You can explicitly move that instance's channels, messages and memories into this one.",
     "fields": {
@@ -124,7 +125,8 @@
   "provider": {
     "builtin_napcat": "Built-in NapCat",
     "remote_onebot": "External OneBot",
-    "native": "Native adapter"
+    "native": "Native adapter",
+    "builtin_qbob": "Built-in qbob (QQ official bot)"
   },
   "card": {
     "accountUnbound": "No account bound",
@@ -149,7 +151,8 @@
     "viewAll": "View all instances",
     "refresh": "Refresh",
     "bindAccount": "Bind account",
-    "rebindAccount": "Rebind"
+    "rebindAccount": "Rebind",
+    "goToProtocol": "Go to Protocol"
   },
   "migrationDialog": {
     "title": "Migrate history ownership",
@@ -197,7 +200,8 @@
     "descriptionWithChannels_one": "A protocol endpoint registers itself as an unclaimed instance when it connects, and messages and channels go to it. {{count}} channel currently sits under these unclaimed instances — if you cannot find your group in channel management, this is where it is.",
     "descriptionWithChannels_other": "A protocol endpoint registers itself as an unclaimed instance when it connects, and messages and channels go to it. {{count}} channels currently sit under these unclaimed instances — if you cannot find your group in channel management, this is where they are.",
     "accountLabel": "Account {{account}}",
-    "firstSeen": "first seen"
+    "firstSeen": "first seen",
+    "dispatchPaused": "Messages are not processed yet (claim it first; the deployment token is empty or was exposed)"
   },
   "claimDialog": {
     "title": "Claim protocol endpoint",
@@ -227,6 +231,7 @@
     "modePurge": "Purge",
     "archiveDescription": "Archiving stops the instance but keeps channels, messages and memories read-only for later handling.",
     "purgeDescription": "Purging cascades to every channel, message and memory of this instance and cannot be undone.",
+    "qbobAttached": "This instance is connected to a QQ official bot in qbob. Deleting the instance does not delete that bot; it keeps running and retrying the connection. Disconnect it first on the Protocol tab of the instance.",
     "confirmLabel": "Type the instance key to confirm",
     "confirmHelper": "Type {{instanceKey}} manually",
     "confirmMismatch": "The instance key does not match",
@@ -247,5 +252,27 @@
     "title": "Bind a bot account",
     "description": "Inbound messages are routed to an instance by account. Enter the account the protocol endpoint logs in with (e.g. the QQ number) so this instance receives its messages. Leave it empty to unbind.",
     "helper": "One account can only be bound to one instance; if another instance already holds it you will be told to claim or unbind that one"
+  },
+  "onebotEndpoint": {
+    "title": "OneBot endpoint",
+    "refresh": "Refresh",
+    "loadFailed": "Failed to load the endpoint status",
+    "protocol": "Endpoint",
+    "offline": "Not connected",
+    "unknown": "Unknown",
+    "selfReport": "Report self messages",
+    "selfReportState": {
+      "on": "On",
+      "off_suspected": "Probably off",
+      "unknown": "Not determined yet"
+    },
+    "hints": {
+      "snowluma": "In the SnowLuma WebUI, open this account's OneBot configuration, find the reverse WebSocket node that connects to NA, turn on \"Report self messages\" and save. It takes effect immediately without dropping the connection.",
+      "napcat": "In the NapCat WebUI, open \"Network Configuration\", find the reverse WebSocket that connects to NA, turn on \"Report self messages\" and save.",
+      "other": "Turn on \"Report self messages\" (reportSelfMessage) in the endpoint's OneBot network configuration.",
+      "suffix": "Without it, messages sent by other programs on the same account never reach the chat history, and the AI cannot see them."
+    },
+    "undetermined": "NA has not sent enough messages on this connection to tell yet. Send a few messages, then refresh.",
+    "counts": "On this connection: NA sent {{ownSends}} message(s), received {{echoes}} echo(es)"
   }
 }

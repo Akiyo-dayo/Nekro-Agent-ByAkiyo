@@ -10,7 +10,7 @@ import socket
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Tuple, Union
-from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 import aiofiles
 import httpx
@@ -30,6 +30,12 @@ _APP_VERSION: str = ""
 ALLOWED_DOWNLOAD_SCHEMES = frozenset({"http", "https"})
 DOWNLOAD_TIMEOUT_SECONDS = 20.0
 MAX_DOWNLOAD_SIZE_BYTES = 64 * 1024 * 1024
+# 跳转由 download_file 手动跟随、每一跳重新校验（httpx 自己跟跳转时不会再过校验），超过这个次数按失败处理
+MAX_DOWNLOAD_REDIRECTS = 3
+_DOWNLOAD_REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
+# 只收未压缩的正文：httpx 解压 gzip / deflate 时不限输出长度，`Content-Encoding: gzip, gzip` 的几十 KB
+# 一次读就能展开成几十 GB，等不到边读边计数就把进程撑爆。服务端不理 identity 照样压缩的，按失败处理
+_DOWNLOAD_REQUEST_HEADERS = {"Accept-Encoding": "identity"}
 _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
 
 
@@ -130,6 +136,29 @@ def _is_allowed_target_ip(ip: _IPAddress) -> bool:
     return any(ip.version == network.version and ip in network for network in parse_extra_allowed_networks(OsEnv.DOWNLOAD_EXTRA_ALLOWED_NETWORKS))
 
 
+def _split_outbound_url(url: str, subject: str) -> Tuple[str, str, int]:
+    """拆出协议、主机、端口，口径与 httpx 发起连接时一致
+
+    主机取 httpx 的 `raw_host`（ASCII），不能用 `urlparse(...).hostname`：后者是 Unicode，交给 getaddrinfo 时按
+    Python 自带的 IDNA 2003 编码，httpx 连接时按 IDNA 2008 编码，`ß` / `ς` 这类字符两边编出两个不同的域名
+    （`ss.example` 与 `xn--zca.example`）。攻击者让前者解析到公网、后者解析到内网，就能不靠任何时间窗口地绕过校验。
+
+    Raises:
+        UnsafeDownloadUrlError: 不是合法 URL、协议不被允许或缺少主机名
+    """
+    try:
+        target = httpx.URL(url)
+    except httpx.InvalidURL as e:
+        raise UnsafeDownloadUrlError(f"{subject}不是合法的 URL") from e
+    scheme = target.scheme
+    if scheme not in ALLOWED_DOWNLOAD_SCHEMES:
+        raise UnsafeDownloadUrlError(f"不支持的{subject}协议: {scheme or '(空)'}")
+    host = target.raw_host.decode("ascii")
+    if not host:
+        raise UnsafeDownloadUrlError(f"{subject}缺少主机名")
+    return scheme, host, target.port or _DEFAULT_SCHEME_PORTS[scheme]
+
+
 async def _assert_url_targets_public_network(url: str, subject: str) -> None:
     """校验 URL 的协议与解析结果，确保出站请求不会打进内网
 
@@ -144,19 +173,11 @@ async def _assert_url_targets_public_network(url: str, subject: str) -> None:
     Raises:
         UnsafeDownloadUrlError: 协议不被允许、主机无法解析或指向非公网地址
     """
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-    if scheme not in ALLOWED_DOWNLOAD_SCHEMES:
-        raise UnsafeDownloadUrlError(f"不支持的{subject}协议: {scheme or '(空)'}")
-
-    host = parsed.hostname
-    if not host:
-        raise UnsafeDownloadUrlError(f"{subject}缺少主机名")
-
-    port = parsed.port or _DEFAULT_SCHEME_PORTS[scheme]
+    _scheme, host, port = _split_outbound_url(url, subject)
     try:
         addr_infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror as e:
+    except (socket.gaierror, UnicodeError) as e:
+        # UnicodeError：httpx 放行、但 getaddrinfo 的 idna 编码拒绝的主机名（空标签 `a..b`、超过 63 字符的标签），没有发出查询
         raise UnresolvableDownloadHostError(f"{subject}主机名解析失败: {host}") from e
 
     for addr_info in addr_infos:
@@ -183,11 +204,7 @@ async def assert_download_url_safe(url: str) -> None:
     if OsEnv.ALLOW_PRIVATE_NETWORK_DOWNLOAD:
         # 该开关只放宽"下载素材"这一类出站，且仅由部署方设置。多租户下由租户填写的地址
         # 不走这里，见 assert_tenant_endpoint_url_safe
-        parsed = urlparse(url)
-        if parsed.scheme.lower() not in ALLOWED_DOWNLOAD_SCHEMES:
-            raise UnsafeDownloadUrlError(f"不支持的下载链接协议: {parsed.scheme.lower() or '(空)'}")
-        if not parsed.hostname:
-            raise UnsafeDownloadUrlError("下载链接缺少主机名")
+        _split_outbound_url(url, "下载链接")
         return
     await _assert_url_targets_public_network(url, "下载链接")
 
@@ -234,27 +251,40 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
 # 云端插件市场的兼容判定（`routers/cloud/plugins_market.py`）、更新检查
 # （`routers/deployment.py`）与遥测上报（`systems/cloud/collector.py`）。
 # 把它降成 0.x 会让所有声明了最低 NA 版本的云端插件被判为不兼容。
-# 因此上游版本继续驱动兼容逻辑，这里只是**面向用户展示**的分支版本。
+# 因此 `pyproject.toml` 的 `version` 是插件兼容版本、继续驱动兼容逻辑，这里只是**面向用户展示**的分支版本。
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
-# `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求 git tag 恰为 `v<版本号>`。
-FORK_VERSION = "0.3.0"
+# `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求触发发布的 git tag 与它一致（标签写法见 publish.yml）。
+FORK_VERSION = "0.4.2"
 FORK_AUTHOR = "Akiyo_dayo"
+
+# 本分支代码所基于的上游 NekroAgent 发布版，只用于署名「基于 NekroAgent 某版本」。
+#
+# 它和 `get_app_version()`（`pyproject.toml` 的 `version`，插件兼容版本）不是一回事：
+# 插件可见的接口追平上游某版本时，插件兼容版本就可以先提上去，让市场里按那个版本写的插件装得上；
+# 但只有上游那个版本的功能都已吸收（或明确不跟）之后，才能说本分支「基于」它。
+# 公开版 NOTICE 告诉读者「拿本树与上游这个版本比对就能看出改了哪些文件」，写早了会误导读者。
+UPSTREAM_BASE_VERSION = "2.3.3"
 
 
 def get_fork_version() -> str:
     """本二改分支的展示版本号
 
-    与 `get_app_version()`（上游版本，驱动兼容判定）是两个不同的量，别混用。
+    与 `get_app_version()`（插件兼容版本）、`get_upstream_base_version()`（署名用的上游基线）是三个不同的量，别混用。
     """
     return FORK_VERSION
 
 
-def get_app_version() -> str:
-    """获取上游 NekroAgent 的版本号
+def get_upstream_base_version() -> str:
+    """本分支代码所基于的上游 NekroAgent 发布版（署名用）"""
+    return UPSTREAM_BASE_VERSION
 
-    这是**兼容判定用**的版本：云端插件市场、更新检查、遥测都按它比较。
-    面向用户展示分支版本请用 `get_fork_version()`。
+
+def get_app_version() -> str:
+    """获取插件兼容版本（`pyproject.toml` 的 `version`）
+
+    这是**兼容判定用**的版本：云端插件市场、更新检查、遥测都按它比较，含义是「插件可见接口与上游这个版本一致」。
+    面向用户展示分支版本请用 `get_fork_version()`；署名「基于 NekroAgent 某版本」请用 `get_upstream_base_version()`。
 
     Returns:
         str: 应用版本号
@@ -311,6 +341,68 @@ def compare_semver(a: str, b: str) -> int:
     return 0
 
 
+async def _fetch_following_redirects(client: httpx.AsyncClient, url: str) -> bytes:
+    """GET 下载正文，手动跟随跳转
+
+    `url` 必须已经过 `assert_download_url_safe`（`download_file` 在重试逻辑之外校验首跳）。之后每一跳的目标
+    都在发请求之前重新校验：跳转目标由对方服务器决定，跟随而不校验等于让首跳的公网地址替内网地址背书。
+    跳转响应的正文不读；只有最终那一跳的正文按 `MAX_DOWNLOAD_SIZE_BYTES` 边读边计数。
+
+    时限：从首跳发出到最终响应头到达，整条链（含每一跳的校验解析）共用 `DOWNLOAD_TIMEOUT_SECONDS`，
+    跳转多了不会多拿时间。读正文沿用客户端每次读的超时加大小上限，不另设总时限——有意的取舍，
+    不改变大文件慢速下载的既有行为。
+
+    Raises:
+        UnsafeDownloadUrlError: 跳转目标被拒、跳转超过 `MAX_DOWNLOAD_REDIRECTS` 次、跳转没有目标地址、
+            链接或跳转目标不是合法 URL、正文带压缩编码、正文超过大小上限
+        httpx.HTTPStatusError: 最终响应不是 2xx（不跟随的 3xx 也走这里）
+        TimeoutError: 整条链在时限内没拿到最终响应头
+    """
+    deadline = asyncio.get_running_loop().time() + DOWNLOAD_TIMEOUT_SECONDS
+    current = url
+    for redirects_followed in range(MAX_DOWNLOAD_REDIRECTS + 1):
+        try:
+            async with asyncio.timeout_at(deadline):
+                if redirects_followed:
+                    await assert_download_url_safe(current)
+                response = await client.send(client.build_request("GET", current, headers=_DOWNLOAD_REQUEST_HEADERS), stream=True)
+        except httpx.InvalidURL as e:
+            # httpx 不跟跳转也会按 Location 预先构造下一跳（`response.next_request`，不发出去），`javascript:alert(1)`
+            # 这类目标在那里就抛 InvalidURL。确定性失败，不重试。Location 本身解析不了时 httpx 抛的是
+            # RemoteProtocolError，和真正的协议错误分不开，照普通失败处理（会重试，同样什么都没发出去）
+            raise UnsafeDownloadUrlError("下载链接或跳转目标不是合法的 URL") from e
+        try:
+            if response.status_code not in _DOWNLOAD_REDIRECT_STATUS:
+                response.raise_for_status()
+                if response.headers.get("content-encoding", "").strip().lower() not in ("", "identity"):
+                    raise UnsafeDownloadUrlError("下载内容带有压缩编码（请求的是 identity）")
+                declared_length = response.headers.get("content-length")
+                if declared_length and declared_length.isdigit() and int(declared_length) > MAX_DOWNLOAD_SIZE_BYTES:
+                    raise UnsafeDownloadUrlError(f"下载内容超过大小上限: {declared_length} bytes")
+                chunks: list[bytes] = []
+                downloaded = 0
+                # aiter_raw：不经 httpx 的解压，读进来多少就是多少
+                async for chunk in response.aiter_raw():
+                    downloaded += len(chunk)
+                    if downloaded > MAX_DOWNLOAD_SIZE_BYTES:
+                        raise UnsafeDownloadUrlError(f"下载内容超过大小上限: >{MAX_DOWNLOAD_SIZE_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            location = response.headers.get("location")
+        finally:
+            await response.aclose()
+        # 文案不带 URL：查询串里可能有签名，这些报错会进日志
+        if not location:
+            raise UnsafeDownloadUrlError("下载链接返回了跳转，但没有目标地址")
+        try:
+            current = urljoin(current, location)
+        except ValueError as e:
+            raise UnsafeDownloadUrlError("下载链接的跳转目标不是合法的 URL") from e
+    # 并不是所有调用方都会打印下载异常，这里自己留一条；只记主机名
+    logger.warning(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次，已放弃: {httpx.URL(url).host}")
+    raise UnsafeDownloadUrlError(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次")
+
+
 async def download_file(
     url: str,
     file_path: str = "",
@@ -329,24 +421,14 @@ async def download_file(
         Tuple[str, str]: 文件路径, 文件名
     """
 
-    # 校验失败属于确定性拒绝，重试不会有不同结果，因此放在重试逻辑之外直接抛出
+    # 校验失败属于确定性拒绝，重试不会有不同结果，因此放在重试逻辑之外直接抛出。
+    # 这里只校验首跳，跳转目标在 _fetch_following_redirects 里逐跳校验（同样抛 UnsafeDownloadUrlError，不重试）
     await assert_download_url_safe(url)
 
     try:
+        # follow_redirects=False：交给 httpx 跟跳转，跳转目标就不会再过上面的校验
         async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=False) as client:
-            async with client.stream("GET", url) as response:
-                response.raise_for_status()
-                declared_length = response.headers.get("content-length")
-                if declared_length and declared_length.isdigit() and int(declared_length) > MAX_DOWNLOAD_SIZE_BYTES:
-                    raise UnsafeDownloadUrlError(f"下载内容超过大小上限: {declared_length} bytes")
-                chunks: list[bytes] = []
-                downloaded = 0
-                async for chunk in response.aiter_bytes():
-                    downloaded += len(chunk)
-                    if downloaded > MAX_DOWNLOAD_SIZE_BYTES:
-                        raise UnsafeDownloadUrlError(f"下载内容超过大小上限: >{MAX_DOWNLOAD_SIZE_BYTES} bytes")
-                    chunks.append(chunk)
-            content = b"".join(chunks)
+            content = await _fetch_following_redirects(client, url)
             if not use_suffix:
                 mime = magic.from_buffer(content, mime=True)
                 use_suffix = f'.{mime.split("/")[1]}' if mime and len(mime.split("/")) > 1 else ""

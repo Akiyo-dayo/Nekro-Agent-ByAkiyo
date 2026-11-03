@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
+from nekro_agent.services.user.tenant_perm import require_platform_owner
 
 
 class QQBotOpenClawStatus(BaseModel):
@@ -42,29 +43,45 @@ def create_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/maintenance", tags=["QQBot OpenClaw Maintenance"])
 
+    # 五个端点都作用于整个部署（单账号适配器），租户管理员够得着就等于能重启平台方的网关
     @router.get("/status")
     @require_role(Role.User)
-    async def status(_current_user: DBUser = Depends(get_current_active_user)) -> QQBotOpenClawStatus:
+    async def status(
+        _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
+    ) -> QQBotOpenClawStatus:
         return QQBotOpenClawStatus.model_validate(await get_status())
 
     @router.post("/restart")
     @require_role(Role.Admin)
-    async def restart(_current_user: DBUser = Depends(get_current_active_user)) -> QQBotOpenClawActionResult:
+    async def restart(
+        _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
+    ) -> QQBotOpenClawActionResult:
         return QQBotOpenClawActionResult.model_validate(await restart_gateway())
 
     @router.post("/clear-ref-index")
     @require_role(Role.Admin)
-    async def clear_refs(_current_user: DBUser = Depends(get_current_active_user)) -> QQBotOpenClawActionResult:
+    async def clear_refs(
+        _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
+    ) -> QQBotOpenClawActionResult:
         return QQBotOpenClawActionResult.model_validate(await clear_ref_index())
 
     @router.post("/clear-session")
     @require_role(Role.Admin)
-    async def session_clear(_current_user: DBUser = Depends(get_current_active_user)) -> QQBotOpenClawActionResult:
+    async def session_clear(
+        _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
+    ) -> QQBotOpenClawActionResult:
         return QQBotOpenClawActionResult.model_validate(await clear_session())
 
     @router.post("/test-token")
     @require_role(Role.Admin)
-    async def token_test(_current_user: DBUser = Depends(get_current_active_user)) -> QQBotOpenClawActionResult:
+    async def token_test(
+        _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
+    ) -> QQBotOpenClawActionResult:
         return QQBotOpenClawActionResult.model_validate(await test_token())
 
     return router

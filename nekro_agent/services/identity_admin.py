@@ -13,7 +13,7 @@
 
 ## 账号合并为什么**一个数据行都不动**
 
-`DECISIONS.md` 的原话是"必须用别名指向，不能物理合并数据行；合错了要能拆开，删别名即撤销"。
+账号合并的设计约束是：必须用别名指向，不能物理合并数据行；合错了要能拆开，删别名即撤销。
 于是本模块的合并动作只做一件事：往 `identity_alias` 写一行 `(域, 副账号) → 主账号`。
 
 那"好感取高的"这条语义落在哪里？——落在**方向**上，而不是落在一次写入上。
@@ -25,8 +25,8 @@
 
 1. 那是一次**物理合并**——撤销之后主账号那行留着一个来路不明的高分，
    而"删别名即撤销"承诺的是回到合并前的状态；
-2. 好感的写入口 `services/affection/store.py` 的键形态本轮正在被另一组改，
-   在这里再写一份"建行 + 派生阶段 + 记流水"就是第二处实现，而隔离键是授权边界。
+2. 好感的写入口是 `services/affection/store.py`，在这里再写一份"建行 + 派生阶段 + 记流水"
+   就是第二处实现，两处的键形态迟早分叉，而隔离键是授权边界。
 
 ## 链式别名由合并动作维护，不由解析器兜
 
@@ -542,7 +542,7 @@ def _plan_alias_moves(
 ) -> _AliasMovePlan:
     """决定每一条源别名是迁、改写后迁、还是留下
 
-    **取舍（DECISIONS.md「实例入域并入存量好感」）**：
+    **取舍（实例入域时并入存量好感）**：
 
     - 源别名 `A→P` 撞上目标域 `P→Q`：**改写为 `A→Q`**，不留下。理由：A 是 P 的旧号（源域运营认定），
       P 是 Q 的副号（目标域运营认定），二者说的是同一条换号链上的前后两环；留下 A 的话，
@@ -664,7 +664,7 @@ def _plan_persons(
     """人档案的去向：目标域已有同 `person_uid` 的（或排在前面的源档案已占了位的）撞车，不随迁
 
     预览与执行**共用这一个判据**——预览数「随迁多少份」必须等于执行真搬的份数，
-    不能一边数全部、一边在执行时静默跳过撞车的（round-27 复核 P2-7）。
+    不能一边数全部、一边在执行时静默跳过撞车的。
     `source_persons` 须已按 ID 排序；返回 `(随迁的档案, 撞车的 person_uid)`。
     """
     taken = set(target_person_uids)
@@ -816,10 +816,10 @@ async def _compensate_held_alias_rows(
     只看 `held_scores`（别名落地**之前**目标域里就有的 A 的行，以及**折叠之前**的原分）：源域里 A 休眠的那一行
     当初已经按账号合并补偿过 P，这里不重算——否则 P 之后合法下跌的分数会被翻出来再补一遍。必须用快照而不是
     `target_rows` 里的当前分：源域那行 A 会折进目标域的 A 行并把它抬高（目标 A=50、源 A=95 → 95），读折叠后的分
-    就等于把休眠的 95 又补了一遍（round-27 第三轮复核 P2-1）。补偿走 `apply_delta`，记 `merge` 事件、
+    就等于把休眠的 95 又补了一遍。补偿走 `apply_delta`，记 `merge` 事件、
     来源账号是 A，与 `merge_accounts` 同一口径：撤销 A 时按流水扣回，落地多少扣多少。
 
-    取舍（DECISIONS.md「实例入域并入存量好感」）：不选「把这类别名列入冲突、留在源域」。那样每个在目标域
+    取舍（实例入域时并入存量好感）：不选「把这类别名列入冲突、留在源域」。那样每个在目标域
     有过发言的副号都要运营事后手工合并，且合并时走的恰好就是这段补偿逻辑；这里直接复用同一口径，
     结果等价于「运营入域后立刻合并了一次」，取高的语义不变（P ≥ A），不丢信息、也不多给。
     主号一侧读 `target_rows`：它已被行锁锁住且内存值与库一致（折叠与搬行都回写了），读它即主号当前分数。
@@ -895,8 +895,8 @@ async def _serialise_joins_into_group(connection: Any, group_id: int) -> None:
     """在当前事务里取「并入这个组」的互斥锁，事务结束（提交或回滚）自动释放
 
     行锁只能锁已存在的行；目标域里还没有这个人时无行可锁：两个实例同时并入同一个新人，各自读到「没有」、
-    各自把源行改键成目标键，后到的撞唯一约束；源行顺序相反的两个实例各占一个目标键再互相等对方，死锁
-    （round-27 第三轮复核 P2-2）。所以事务开头按 `group_id` 串行化同组并入——并入是低频的管理动作，
+    各自把源行改键成目标键，后到的撞唯一约束；源行顺序相反的两个实例各占一个目标键再互相等对方，死锁。
+    所以事务开头按 `group_id` 串行化同组并入——并入是低频的管理动作，
     排队的代价可以忽略；不同组互不影响。选咨询锁而不是锁组行：组行在测试里并不总是存在，且锁它会挡住
     同一事务里对组的其他写。SQLite 是单写者，写事务本来就串行，无需（也没有）这把锁。
     运行时写入（评估落分）不取这把锁，仍可能在锁读与搬行之间把目标行建出来——那一条由
@@ -960,7 +960,7 @@ async def _merge_self_domain_into_group(
     `defer_cache_invalidation`：调用方自己开着外层事务时传 True，并在**外层事务提交之后**
     调 `invalidate_cache()`（路由 `set_instance_domain` 就是这样）。本函数里的失效点在内层
     `in_transaction` 退出之后，但外层没提交时那仍在提交之前：并发读者在失效与提交之间读到
-    旧值又缓存起来，并入的好感就在 TTL 内读不到（round-27 复核 P2-6）。独立调用（默认 False）
+    旧值又缓存起来，并入的好感就在 TTL 内读不到。独立调用（默认 False）
     没有外层事务，本函数的 `in_transaction` 退出即提交，失效在其后。
 
     由 `set_instance_domain` 在**绑定行写入的同一事务里**调用（本函数内部也用
@@ -990,7 +990,7 @@ async def _merge_self_domain_into_group(
     alias_rows = person_rows = 0
 
     async with in_transaction() as connection:
-        # 同组并入串行：目标域里没有这个人时无行可锁，行锁挡不住并发新建目标行与死锁（P2-2）
+        # 同组并入串行：目标域里没有这个人时无行可锁，行锁挡不住并发新建目标行与死锁
         await _serialise_joins_into_group(connection, group.id)
         # 先把别名的去向定下来（读目标域**迁入前**的别名）：行的归一与别名的改写依据同一份
         # 目标域事实，之后才动任何数据。归一的语义见 `_plan_rows` / `_plan_alias_moves`。
@@ -1003,7 +1003,7 @@ async def _merge_self_domain_into_group(
         moved_accounts = {alias.platform_userid for alias, _final in alias_plan.moves}
         # 目标行带行锁读：同组其他实例此刻若正在写这些行（评估落分、另一个实例并入），
         # 无锁读到的是旧分，差额按旧分算、再叠加到别人刚提交的新分上，结果既不是「先并入再写」
-        # 也不是「先写再并入」（round-27 第二轮复核 P2-1）。锁到事务结束，读到的就是折叠时的真值。
+        # 也不是「先写再并入」。锁到事务结束，读到的就是折叠时的真值。
         # 锁的范围：源行归一后的人，加上随迁副号自己与它们指向的人（别名落地后的补偿要读这几行，见下）。
         target_rows = await _lock_target_rows(
             target_cols,
@@ -1012,8 +1012,8 @@ async def _merge_self_domain_into_group(
             | {final for _alias, final in alias_plan.moves},
         )
         # 随迁副号在目标域里**本来就有**的好感行（落地别名之前就在）：别名一落地，副号读到的就是主号那一行，
-        # 这些行自己的分数随之休眠——主号分数更低时副号的好感会当场掉分，见别名落地后的补偿（round-27 第二轮复核 P2-2）
-        # **快照原分**：之后折叠会把源域那行副号折进这些行并抬高它们，补偿只能按折叠之前的分算（P2-1）
+        # 这些行自己的分数随之休眠——主号分数更低时副号的好感会当场掉分，见别名落地后的补偿
+        # **快照原分**：之后折叠会把源域那行副号折进这些行并抬高它们，补偿只能按折叠之前的分算
         held_scores = {key: row.score for key, row in target_rows.items() if key[0] in moved_accounts}
         row_plans = _plan_rows(
             source_rows,
@@ -1062,7 +1062,7 @@ async def _merge_self_domain_into_group(
             # **只写叙事与计数字段，绝不写 score / stage**：分数的唯一写入口是 `apply_delta`
             # （它在库里行锁内读改写），而 `twin` 是循环外读出来的内存对象——前一条源行折叠时
             # `apply_delta` 已把库里的分数涨上去，这里若整行 save，下一条折叠到同一 twin 的源行
-            # 会把旧分数写回，分数被打回去而叙事已经换成了低分一侧（round-27 复核 P0）。
+            # 会把旧分数写回，分数被打回去而叙事已经换成了低分一侧。
             await twin.save(update_fields=_FOLD_NARRATIVE_FIELDS)
 
             if gap > 0:
@@ -1100,9 +1100,9 @@ async def _merge_self_domain_into_group(
             event_target_uid = _normalised_uid(uid, secondary_accounts, target_alias_map)
             if event_target_uid != uid:
                 # 空串 = 「触发账号与 platform_userid 相同」。改挂到 Q 之后空串会变成「是 Q 自己干的」，
-                # 原来是 P 的来源信息就丢了（P2-5）：先把空串落成原 uid（P 现在是 Q 的副号，正是
+                # 原来是 P 的来源信息就丢了：先把空串落成原 uid（P 现在是 Q 的副号，正是
                 # 「副号干的」该有的样子）。只动空串的事件——补偿事件的来源账号本来就非空，
-                # 撤销求和又只认补偿来源，这一步与 P1-2 的撤销语义互不相干。
+                # 撤销求和又只认补偿来源，这一步与下面补偿事件的撤销语义互不相干。
                 await DBAffectionEvent.filter(
                     **source.as_columns(),
                     platform_userid=uid,
@@ -1117,7 +1117,7 @@ async def _merge_self_domain_into_group(
                 )
         event_rows += int(await DBAffectionEvent.filter(**source.as_columns()).update(**target_cols) or 0)
 
-        # 账号合并补偿事件的可撤销性（round-27 复核 P1-2，第二轮复核 P1 补全）：`A→P` 的 `merge` 补偿
+        # 账号合并补偿事件的可撤销性：`A→P` 的 `merge` 补偿
         # 记在 P 的行上（`source_platform_userid=A`），`unmerge_account` 按这个标记求和后从人那一行扣回。
         # 一个 (人, 人设) 发生折叠之后，分数是「取高」的结果，行上任何一笔补偿是否还在分数里都无法逐笔对账：
         # 源域补偿被更高的目标分吃掉（Q=90、源 P=20+50 → 撤销 A 把 Q 扣成 40），目标域自己的补偿被更高的源分
@@ -1486,11 +1486,13 @@ async def _live_preset_ids(preset_ids: Sequence[int]) -> Set[int]:
     return {int(preset_id) for preset_id in await DBPreset.filter(id__in=wanted).values_list("id", flat=True)}
 
 
-async def list_orphan_buckets(instance_keys: Optional[Sequence[str]]) -> List[OrphanPresetBucket]:
+async def list_orphan_buckets(instances: Optional[Sequence[Tuple[str, str]]]) -> List[OrphanPresetBucket]:
     """列出挂在**已删除人设**下的好感数据，按 (域, 人设) 分桶
 
     Args:
-        instance_keys: `None` 表示不施加实例过滤（平台方全局视图）；否则只看这些实例的行。
+        instances: `None` 表示不施加实例过滤（平台方全局视图）；否则只看这些实例
+            （`(adapter_key, instance_key)`）的行。成对过滤是因为另一个适配器下可以有
+            归别的租户的同名实例，只按标识会把它的孤儿数据列进来、进而被这里清掉。
             注意好感行在属于实例组时 `instance_key` 是空串，域的身份落在 `domain_group_id`
             上——因此按实例过滤时必须**同时**放行"本作用域相关的组"的行，见下面的实现。
 
@@ -1500,18 +1502,21 @@ async def list_orphan_buckets(instance_keys: Optional[Sequence[str]]) -> List[Or
     """
     query = DBAffection.filter(preset_id__gt=PRESET_NONE)
     group_ids: Set[int] = set()
-    if instance_keys is not None:
-        wanted = [key for key in instance_keys]
+    if instances is not None:
+        from tortoise.expressions import Q
+
+        from nekro_agent.services.user.tenant_perm import instance_refs_filter
+
+        wanted = instance_refs_filter(instances)
         # 作用域内的实例可能自成一域（行落在 instance_key 上），也可能在某个组里
         # （行落在 domain_group_id 上、instance_key 为空串）。两种形态都要收进来，
         # 只收前者会让"进组之后孤儿数据在后台整体消失"。
-        for row in await DBInstanceDomainBinding.filter(instance_key__in=wanted):
+        for row in await DBInstanceDomainBinding.filter(wanted):
             for candidate in (row.memory_group_id, row.affection_group_id):
                 if candidate and candidate > SELF_DOMAIN_GROUP_ID:
                     group_ids.add(int(candidate))
-        from tortoise.expressions import Q
 
-        condition = Q(instance_key__in=wanted)
+        condition = wanted
         if group_ids:
             condition = condition | Q(domain_group_id__in=sorted(group_ids))
         query = query.filter(condition)

@@ -123,7 +123,7 @@ export default function ChatAnnouncementPage() {
    * react-query 不会因为查询被 disable 就把 `isError` 抹掉：在频道范围里失败一次之后
    * 切到实例范围，那条查询已经不发了，`isChannelsError` 却仍然为真 —— 整页会被一次
    * **与当前范围无关**的失败盖住。`retryAll` 那一行已经写了 `scopeType === 'channels'`，
-   * 这里是同一个判据的第二处实现，漏了一处（PROJECT_STATE §2.7 的形态）。
+   * 这里是同一个判据的第二处实现，漏了一处。
    */
   const isChannelsScope = scopeType === 'channels'
   const isChannelsFailed = isChannelsError && isChannelsScope

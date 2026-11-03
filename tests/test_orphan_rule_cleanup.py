@@ -3,9 +3,9 @@
 ## 这组测试要钉住的是什么
 
 链上的隔离规则标记是**宿主全局**的。升级换作用域之后旧标记的规则成了孤儿，新代码永远不会
-去清它们；而运维手上从前只有「自己去 iptables 上敲」这一条路，上一轮已经因此出过事
+去清它们；而运维手上从前只有「自己去 iptables 上敲」这一条路，之前已经因此出过事
 （`--comment "nekro-cc:x"` 的引号被 shell 吃掉，`-D` 全部失败 —— 半成功的话被删掉的
-就可能是还在生效的那一组，PROJECT_STATE §2.20）。
+就可能是还在生效的那一组）。
 
 本模块给出的判据只有一个目标：**绝不删掉还有人在用的那一组**。所以测试的重心不在
 「能删」，而在「该拦的每一种形态都真的拦住了」：
@@ -76,7 +76,7 @@ PREFIXES = [family.prefix for family in FAMILIES]
 # ——由数据目录派生的话，同一份测试在两台机器上判的就不是同一件事（§2.13）。
 CURRENT_SCOPE = "r16fork-"
 
-# 上一轮实测留在测试部署上的三个孤儿标记（PROJECT_STATE §9.2）
+# 之前实测留在测试部署上的三个孤儿标记
 LEGACY_SANDBOX_MARKER = isolation_marker("")
 LEGACY_CC_MARKER = workspace_isolation_marker("")
 LEGACY_CC_TENANT_MARKER = workspace_isolation_marker("", "t1")
@@ -511,7 +511,7 @@ class TestOrphanVerdicts:
         blocker = "".join(candidate.blockers)
         assert "还有 2 个容器" in blocker
         assert "nekro-cc-aabb" in blocker
-        # §3 #45：CC 工作区容器是长命的，删掉兜底 DROP 之后隔离静默消失
+        # CC 工作区容器是长命的，删掉兜底 DROP 之后隔离静默消失
         assert "不报错也不留日志" in blocker
         assert "重建" in blocker
 
@@ -712,7 +712,7 @@ class TestHostContainerFacts:
             containers=[
                 container_summary("cc", labels={"nekro.owner.scope": "default"}),
                 container_summary("sbx", labels={"nekro.sandbox.instance": "r16fork-"}),
-                # NapCat 的归属标签是另一套命名契约（§3 #46），不能算进作用域
+                # NapCat 的归属标签是另一套命名契约，不能算进作用域
                 container_summary("napcat", labels={"nekro.napcat.owner": "default"}),
             ],
         )
@@ -1660,7 +1660,7 @@ class TestTheRefusalReasonIsNotSelfContradictory:
 class TestTheCleanupOrderTrap:
     """#50 的端到端形态：先清沙盒、再清 CC，两步都要真的成功
 
-    实测复现（PROJECT_STATE §3 #50）就是这个顺序：清掉 `nekro-sandbox:default` 之后，
+    实测复现就是这个顺序：清掉 `nekro-sandbox:default` 之后，
     同一个预览接口把 `nekro-cc:default` 与 `nekro-cc:default.t1` 从 `orphan` 翻成了
     `blocked`，理由是「链上没有与之同作用域的沙盒隔离规则」。这不是别的条件变了 ——
     网桥上的容器数前后都是 0。

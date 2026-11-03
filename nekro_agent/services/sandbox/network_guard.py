@@ -637,6 +637,58 @@ def diff_marked_rules(expected: MarkedRuleSummary, actual: MarkedRuleSummary) ->
     return ""
 
 
+# `SANDBOX_CHAT_API_URL` 自动生成的形态（`core/config.py` 的字段默认值）。只认这一种逐字形态：
+# 其他主机、https、尾斜杠或别的路径都不是 NA 替用户生成的，一律视为手填
+_AUTO_CHAT_API_URL_PATTERN = re.compile(r"http://host\.docker\.internal:\d+/api")
+
+
+def default_sandbox_chat_api_url() -> str:
+    """沙盒回调 NA 的地址按当前部署该是什么
+
+    沙盒不在 NA 的容器网络里，只能经宿主网关回连（`host.docker.internal` -> 宿主 -> NA），
+    所以端口取**宿主侧**那个：Docker 部署是 compose 发布到宿主的 `EXPOSE_PORT`，裸机部署是
+    进程自己 bind 的端口。与 CC 中继兜底路径同一个判据（`cc_credential.relay_host_port`），
+    不能换成容器内的监听端口。
+    """
+    # 依赖方向是「工作区 -> 沙盒」，这里只能延迟引入
+    from nekro_agent.services.workspace.cc_credential import relay_host_port
+
+    return f"http://host.docker.internal:{relay_host_port()}/api"
+
+
+def reconcile_sandbox_chat_api_url() -> bool:
+    """把冻结在配置文件里的自动生成地址按当前部署纠正
+
+    字段默认值在首次启动就被落盘进配置文件（导入期每次都 dump），之后再改 `NEKRO_EXPOSE_PORT`，
+    沙盒仍按旧端口回连：宿主旧端口上若是同机另一套部署，RPC 打到邻居（密钥不同被拒，沙盒工具
+    调用全部失败），隔离规则也按旧端口放行到邻居。裸机部署的默认值按 `EXPOSE_PORT` 生成而不是
+    监听端口，`PORT` 与之不一致时同样连不上。
+
+    只纠正逐字等于自动生成形态 `http://host.docker.internal:<端口>/api` 的值，其他地址原样保留。
+    裸机下 `relay_host_port()` 要问 nonebot 驱动，所以只能在启动钩子里调用，不能放在导入期。
+
+    只改内存里的值、不自己落盘：配置落盘牵涉模型组 Key 的掩码时机，交给随后
+    `bootstrap_model_groups()` 那次落盘一并写回；那次落盘被跳过时，下次启动会再纠正一次。
+
+    Returns:
+        是否改动了配置
+    """
+    current = config.SANDBOX_CHAT_API_URL
+    if not _AUTO_CHAT_API_URL_PATTERN.fullmatch(current):
+        return False
+    expected = default_sandbox_chat_api_url()
+    if current == expected:
+        return False
+    config.SANDBOX_CHAT_API_URL = expected
+    logger.warning(
+        f"SANDBOX_CHAT_API_URL={current!r} 是早先自动生成的默认地址，端口与当前部署不符，"
+        f"已纠正为 {expected!r}（沙盒经宿主网关回连 NA，端口取宿主侧那个）。"
+        "改过 NEKRO_EXPOSE_PORT 或裸机监听端口之后出现这条属预期；若原端口是有意指向宿主上的其他服务"
+        "（如反向代理），请改填宿主网关 IP 或其他主机名，自动纠正只认默认生成的这一种形态",
+    )
+    return True
+
+
 def resolve_rpc_endpoints(api_url: str, host_addresses: Sequence[str]) -> Tuple[Tuple[str, int], ...]:
     """解析出沙盒回连 NA 时的目的地址与端口
 
@@ -1064,7 +1116,7 @@ async def purge_marked_rules_on_chain(
 
     命令一律以 **argv 数组**交给执行通道，不经过 shell：`iptables -S` 的输出里
     `--comment "nekro-sandbox:xxx"` 是**带引号**的，在 shell 里重新分词会把引号丢掉，
-    规则从此匹配不上（PROJECT_STATE §2.20：手写 `sed 's/^-A /-D /'` 两条命令全部失败）。
+    规则从此匹配不上（手写 `sed 's/^-A /-D /'` 重放时就这样两条命令全部失败过）。
 
     Args:
         executor: iptables 执行通道
@@ -1376,7 +1428,7 @@ async def report_legacy_marker_orphans(
 #
 # `report_legacy_marker_orphans` 只会打一条 WARNING，运维拿到的是一句「自己去 iptables 上删」。
 # 那条路已经出过事：手写 `iptables -S | sed 's/^-A /-D /'` 逐条重放时，`--comment "nekro-cc:x"`
-# 的引号被 shell 吃掉，两条命令全部 `Bad rule`（PROJECT_STATE §2.20）。半成功的话被删掉的
+# 的引号被 shell 吃掉，两条命令全部 `Bad rule`。半成功的话被删掉的
 # 就可能是**还在生效**的那一组。所以这里给出一个产品自己的出口：预览 -> 二次确认 -> 走
 # `build_cleanup_commands` 执行，全程 argv 数组，不拼裸命令字符串。
 #
@@ -1393,8 +1445,8 @@ async def report_legacy_marker_orphans(
 #
 #    | 判据 | 为什么它安全 |
 #    |---|---|
-#    | 规则里 `-i` 指向的网桥上**没有任何容器**（含已停止但 `NetworkMode` 钉在这张网上的） | 这是 §3 #45 那条教训的落点：沙盒容器是一次性的，**CC 工作区容器是长命的**且网络在创建时定死、重启不换网。删掉规则里的兜底 DROP，这些容器就能直接访问宿主内网，**不报错不留日志** |
-#    | 宿主上**没有任何容器**带着这个作用域的归属标签（`nekro.sandbox.instance` / `nekro.owner.scope`） | 这两个标签的取值就是 `deployment_scope()`，一个带着该值的容器意味着确实有部署在用这个作用域。（内置 NapCat 的 `nekro.napcat.owner` **不在此列**：round-16 起它写的也是 `deployment_scope()`（#46 已改），但**存量容器身上仍是升级前的 `INSTANCE_NAME or "default"`**，而这里要清的正是升级前留下的 `…:default` 那批标记——算进来会让它们永远清不掉；何况 NapCat 容器从不落在这些网桥上。理由完整版见 `OWNERSHIP_SCOPE_LABELS` 上方） |
+#    | 规则里 `-i` 指向的网桥上**没有任何容器**（含已停止但 `NetworkMode` 钉在这张网上的） | 这是容器生命周期差异那条教训的落点：沙盒容器是一次性的，**CC 工作区容器是长命的**且网络在创建时定死、重启不换网。删掉规则里的兜底 DROP，这些容器就能直接访问宿主内网，**不报错不留日志** |
+#    | 宿主上**没有任何容器**带着这个作用域的归属标签（`nekro.sandbox.instance` / `nekro.owner.scope`） | 这两个标签的取值就是 `deployment_scope()`，一个带着该值的容器意味着确实有部署在用这个作用域。（内置 NapCat 的 `nekro.napcat.owner` **不在此列**：它现在写的也是 `deployment_scope()`，但**存量容器身上仍是升级前的 `INSTANCE_NAME or "default"`**，而这里要清的正是升级前留下的 `…:default` 那批标记——算进来会让它们永远清不掉；何况 NapCat 容器从不落在这些网桥上。理由完整版见 `OWNERSHIP_SCOPE_LABELS` 上方） |
 #    | 该标记的放行 `(地址, 端口)` 上**没有进程在监听** | 这组规则存在的唯一理由，就是让容器能回连该端口上的那个 NA。所有者只要还活着就必然在监听它；反过来，端点明确 `ECONNREFUSED` 就说明所有者已经不在了。证据源优先取**同作用域的沙盒**规则（它放行的按构造就是宿主上的回调端点），取不到时回落到这个标记**自己**的放行端点——见 `resolve_liveness_evidence` 与下面的 #50 |
 #    | 以上任何一项**读不出来 / 探测不确定**（Docker 清单读失败、探测超时或不可达、两个证据源都拿不出可探端点） | 判不准就不给删，宁可少删 |
 #
@@ -1406,7 +1458,7 @@ async def report_legacy_marker_orphans(
 # 原判据把「这个标记的所有者还活着吗」的**唯一**证据源钉死在同作用域的沙盒规则上，
 # 找不到就直接拦住。但 `nekro-sandbox:<作用域>` 与 `nekro-cc:<作用域>[.tN]` 是**两个独立的
 # 标记、要分两次清**——于是只要运维先点了沙盒那一个，同作用域剩下的 CC 标记就**再也清不掉了**，
-# 而这个出口存在的全部理由就是把它们清掉（round-18 在真部署上实测复现）。
+# 而这个出口存在的全部理由就是把它们清掉（在真部署上实测复现过）。
 # fail-closed 本身没问题，错的是把两个可以各自消失的对象绑成了一个。
 # 现在找不到沙盒兄弟时回落去探这个标记自己的放行端点，判据强度不变：
 # 仍要拿到明确的 `closed` 才放行，`open` / `unknown` 照旧拦住。
@@ -1452,8 +1504,8 @@ async def report_legacy_marker_orphans(
 SANDBOX_MARKER_PREFIX = "nekro-sandbox"
 
 # 取值就是 `deployment_scope()` 的容器归属标签。带着某个作用域的容器 = 确实有部署在用它。
-# ⚠️ 不要把 `nekro.napcat.owner` 加进来。round-16 起它写的**也是** `deployment_scope()`
-# （#46 已改），但**存量容器身上仍然是升级前那套 `INSTANCE_NAME or "default"`**，而本模块
+# ⚠️ 不要把 `nekro.napcat.owner` 加进来。它现在写的**也是** `deployment_scope()`，
+# 但**存量容器身上仍然是升级前那套 `INSTANCE_NAME or "default"`**，而本模块
 # 要清的恰恰是升级前留下的 `nekro-sandbox:default` 这类旧标记：一个还带着 `default` 的存量
 # NapCat 容器会被当成「有部署在用 `default` 这个作用域」，于是那批孤儿永远清不掉。
 # 何况 NapCat 容器从不挂在沙盒/工作区网桥上，算进来也提供不了额外的存活证据。
@@ -2155,7 +2207,7 @@ def resolve_liveness_evidence(marker: str, inventory: Dict[str, MarkerInventory]
     sibling = next((item for item in candidates if inventory.get(item) and inventory[item].endpoints), "")
     if sibling:
         endpoints = inventory[sibling].endpoints
-        # 沙盒规则集的放行端点按构造就是宿主地址，整组都可豁免（round-16 的判据，逐字保留）
+        # 沙盒规则集的放行端点按构造就是宿主地址，整组都可豁免（沿用原有判据，逐字保留）
         return LivenessEvidence(sibling, endpoints, frozenset(endpoints), False, "")
 
     own = inventory.get(marker)
@@ -2536,7 +2588,7 @@ async def prepare_sandbox_network(docker: aiodocker.Docker) -> SandboxNetworkPla
                             f"无法从 SANDBOX_CHAT_API_URL={config.SANDBOX_CHAT_API_URL!r} 解析出**宿主可达**的回调端点。"
                             "沙盒容器与 NA 不在同一张 Docker 网络上，compose 里的服务别名（如 http://nekro_agent:8021/api）"
                             "在宿主与沙盒网络里都解析不到；"
-                            f"请改回 http://host.docker.internal:{OsEnv.EXPOSE_PORT}/api（两种部署形态都自动指向宿主网关），"
+                            f"请改回 {default_sandbox_chat_api_url()}（两种部署形态都自动指向宿主网关），"
                             "或直接填宿主上可解析的 IP",
                         )
                     spec = SandboxNetworkSpec(

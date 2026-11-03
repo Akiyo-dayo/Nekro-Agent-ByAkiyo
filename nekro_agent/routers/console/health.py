@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from nekro_agent.models.db_user import DBUser
-from nekro_agent.schemas.errors import ValidationError
+from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.services.console.instance_health import (
     InstanceHealthEventListResponse,
     InstanceHealthListResponse,
@@ -136,13 +136,18 @@ async def send_test_notification(
     scoped = get_tenant_scope(_current_user) is not None
     adapter_key = body.adapter_key
     if body.instance_key:
-        instance = await assert_instance_accessible(_current_user, body.instance_key)
-        # `adapter_key` 是调用方自由填的字段，而归属只校验到 `instance_key` 这一维。
-        # 不比对的话，租户可以拿自己的实例配另一个适配器的标识，让解析退到**那个适配器层**
-        # 的告警配置上去（适配器层是跨租户共享、只有平台方写得进的作用域）。
-        # 对不上就拒绝，不静默改写：那是一次调用方自己搞错了的请求。
-        if adapter_key and adapter_key != instance.adapter_key:
-            raise ValidationError(reason=f"适配器标识 '{adapter_key}' 与实例 '{body.instance_key}' 不匹配")
+        instance_key = body.instance_key
+        # 成对交给守卫：同一个租户在两个适配器下各有一个同名实例时，只按标识取回的是
+        # id 较小的那一行，配第二个实例会被误判成 400。带上适配器才能钉死本次要试发的那一行。
+        try:
+            instance = await assert_instance_accessible(_current_user, instance_key, adapter_key=body.adapter_key)
+        except NotFoundError:
+            # 填了适配器却对不上，是调用方自己搞错了：能看见这个实例就按 400 说清楚，
+            # 真正的越权 / 不存在继续走 404，不暴露存在性。
+            if not adapter_key:
+                raise
+            await assert_instance_accessible(_current_user, instance_key)
+            raise ValidationError(reason=f"适配器标识 '{adapter_key}' 与实例 '{instance_key}' 不匹配") from None
         adapter_key = instance.adapter_key
     elif scoped:
         raise ValidationError(reason="请指定要试发的实例")

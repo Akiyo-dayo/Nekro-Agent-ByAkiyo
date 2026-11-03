@@ -6,7 +6,9 @@ class DBAdapterInstanceSession(Model):
     """适配器实例会话模型，用于存储运行态凭据与同步状态。"""
 
     id = fields.IntField(pk=True, generated=True, description="ID")
-    instance_id = fields.IntField(index=True, description="适配器实例 ID")
+    # 一个实例只允许有一条会话。缺少唯一约束时，并发绑定/续期会各插一条，
+    # 之后按 instance_id 取单行的地方（get_or_none）每次都抛 MultipleObjectsReturned，实例起不来。
+    instance_id = fields.IntField(unique=True, description="适配器实例 ID")
     session_state = fields.CharField(max_length=64, default="", description="会话子状态")
     credentials_json = fields.TextField(default="", description="凭据数据(JSON)")
     sync_state_json = fields.TextField(default="", description="同步状态(JSON)")

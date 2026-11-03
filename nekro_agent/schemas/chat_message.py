@@ -1,6 +1,6 @@
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,20 @@ class ChatType(Enum):
 # 工具结果行的身份。不是 "-1"（Bot，会占回复配额）也不是 SYSTEM（提示词要求模型信任它）
 TOOL_RESULT_SENDER_ID = "-2"
 TOOL_RESULT_SENDER_NAME = "UNTRUSTED_TOOL_RESULT"
+
+# 同一账号由其他程序发出的消息（OneBot 的 `message_sent`，比如接在同一协议端上的另一个框架）。
+# 不是 "-1"：那会占回复配额，Bot 自己的历史也会被它污染；也不是真人：不算好感，不进参与者名单。
+# `platform_userid` 仍记 Bot 账号的号码，与 Bot 自己的消息同一个约定
+SELF_SENT_SENDER_ID = "-3"
+# 这个后缀跟着昵称走，WebUI、提示词、记忆整理读到的都是它，不用每处各写一遍判断
+SELF_SENT_NICKNAME_SUFFIX = "（同账号其他程序）"
+# `ext_data.self_sent_source` 的取值
+SELF_SENT_SOURCE_EXTERNAL = "external"
+
+# 只用字符串判断开关，核心与适配器都不 import 插件
+VIDEO_ANALYSIS_PLUGIN_KEY = "Akiyo_dayo.video_analysis"
+# 视频插件关着时跟在占位后面。固定文案：文件名由发送方决定，不能进提示词
+VIDEO_UNAVAILABLE_NOTE = "（这里有一个视频，但视频分析功能没有开启，你看不到它的内容。如实告诉用户，不要说没看到视频）"
 
 
 class ChatMessageSegmentType(Enum):
@@ -205,6 +219,40 @@ class ChatMessageSegmentFile(ChatMessageSegment):
         )
 
 
+class ChatMessageSegmentVideo(ChatMessageSegment):
+    """OneBot 视频占位：没有落盘文件，也绝不存链接
+
+    QQ 的视频链接带 `rkey`，有时效，不该进日志、聊天记录和提示词，所以 `text` 恒为
+    `[Video: message:<编号>]`，要看内容时按编号向协议端现取。`video_name` 由发送方决定，
+    只给 WebUI 显示，不进提示词。
+
+    别的适配器的视频段带 `file_name`、是真落盘的文件，走 `ChatMessageSegmentFile`，与这里无关。
+    """
+
+    video_name: str = ""
+    file_size: int = 0
+    # 这段是引用回复带出来的：`text` 里的编号指向被引用的那条消息，不是这一行自己
+    quoted: bool = False
+    quoted_sender_id: str = ""
+
+    @staticmethod
+    def placeholder_text(message_id: str) -> str:
+        return f"[Video: message:{message_id}]"
+
+
+def merge_video_placeholders(content_text: str, segments: Iterable[ChatMessageSegment]) -> str:
+    """把 OneBot 视频占位补进要落库的 `content_text`
+
+    判定（伪造检查、命令、忽略前缀、关键词、禁词、喊名字）一律用不带占位的原文：占位里有“message”，
+    用户正文里再出现“(id:”就会被伪造检查整条丢掉；占位还会被 `message`、`Video` 这类关键词与禁词命中。
+    只在落库（以及随之广播、记忆整理）时补上，别处按 `content_text` 检索仍看得到视频。
+    """
+    missing = [
+        seg.text for seg in segments if isinstance(seg, ChatMessageSegmentVideo) and seg.text and seg.text not in content_text
+    ]
+    return "".join([content_text, *missing]) if missing else content_text
+
+
 class ChatMessageSegmentImage(ChatMessageSegmentFile):
     """聊天消息段图片"""
 
@@ -270,9 +318,9 @@ def segment_from_dict(data: Dict) -> ChatMessageSegment:
         return ChatMessageSegment.model_validate(data)
     if segment_type == ChatMessageSegmentType.IMAGE:
         return ChatMessageSegmentImage.model_validate(data)
-    # OneBot 的视频段只有占位文本，没有落盘文件
+    # OneBot 的视频段只有占位，没有落盘文件
     if segment_type == ChatMessageSegmentType.VIDEO and not data.get("file_name"):
-        return ChatMessageSegment.model_validate(data)
+        return ChatMessageSegmentVideo.model_validate(data)
     if segment_type in {
         ChatMessageSegmentType.FILE,
         ChatMessageSegmentType.VOICE,

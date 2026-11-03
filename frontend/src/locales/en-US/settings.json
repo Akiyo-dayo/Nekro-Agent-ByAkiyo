@@ -74,7 +74,7 @@
       "expandAdvanced": "Expand Advanced Options ▶",
       "collapseAdvanced": "Collapse Advanced Options ▼",
       "nameCopy": "Set a new name for the copied group",
-      "nameChar": "Name cannot contain URL special chars (/ ? & # = %). Cannot change after creation.",
+      "nameChar": "Chinese, letters, digits, spaces and common punctuation (e.g. - _ . ( ) : （ ） 【 】 、 ·); up to 64 characters. Cannot change after creation.",
       "fetchPrecondition": "Fill API Address and Key first",
       "modelCapabilities": "Model Capabilities",
       "temperature": "Controls randomness of output (0-2)",
@@ -96,13 +96,14 @@
       "searchPlaceholder": "Search by name, model or endpoint",
       "selectAllTestable": "Select all testable ({{count}})",
       "clearSelection": "Clear selection",
+      "batchDelete": "Delete selected ({{count}})",
       "batchTest": "Batch model test ({{count}})",
       "test": "Speed Test",
       "createPlatformBtn": "New Platform Model Group"
     },
     "validation": {
       "nameRequired": "Group name is required",
-      "nameInvalid": "Name contains invalid characters (/ ? & # = %)",
+      "nameInvalid": "Use Chinese (plus Japanese kana and Korean), ASCII letters, digits, spaces and _ . - ( ) + : @ · （ ） 【 】 、 ：; start with a character, letter, digit or opening bracket; no double spaces and no / ? # % & =; up to 64 characters",
       "nameExists": "Basic model group name \"{{name}}\" already exists",
       "fetchSuccess": "Fetched {{count}} models",
       "fetchEmpty": "No models found, please enter manually",
@@ -193,12 +194,52 @@
       "testCompleted": "Model test completed. Check the result.",
       "testFailed": "Model test failed",
       "testPassed": "Model connectivity test passed",
-      "testError": "Speed test request failed"
+      "testError": "Speed test request failed",
+      "batchDeleteSuccess_one": "Deleted {{count}} model group",
+      "batchDeleteSuccess_other": "Deleted {{count}} model groups",
+      "batchDeletePartial": "Deleted {{succeeded}}; {{failed}} not deleted: {{details}}"
     },
     "deleteDialog": {
       "title": "Confirm Delete",
       "content": "Are you sure you want to delete basic model group \"{{name}}\"? Irreversible!",
       "confirm": "Delete"
+    },
+    "batchDelete": {
+      "title": "Delete Model Groups",
+      "content_one": "Delete the following model group? This cannot be undone!",
+      "content_other": "Delete the following {{count}} model groups? This cannot be undone!",
+      "confirm": "Delete",
+      "selectAllAria": "Select all deletable model groups in the current list",
+      "selectRowAria": "Select model group {{name}}",
+      "failureItem": "{{name}} ({{reason}})",
+      "failureSeparator": "; ",
+      "failureMore": " …and {{count}} more",
+      "tenantOwned": "(created by tenant #{{id}})",
+      "reasons": {
+        "not_found": "does not exist or is not visible to you",
+        "forbidden": "no permission to delete",
+        "default_group": "the default group cannot be deleted",
+        "error": "failed with an internal error; see server logs"
+      }
+    },
+    "references": {
+      "checking": "Checking whether any configuration uses these model groups…",
+      "none": "No configuration references the model groups being deleted",
+      "noneInScope": "No configuration you manage references the model groups being deleted",
+      "failed": "Could not check configuration references ({{error}}). You can still delete.",
+      "title": "These configurations still reference the model groups being deleted",
+      "hint": "After deletion they will point to a missing model group: a primary model group reference makes chats fail outright; fallback, plugin and other references fall back to the primary group or error. Consider switching them to another group first.",
+      "more": "…and {{count}} more",
+      "entry": "{{where}} · {{field}}",
+      "fieldWithTitle": "{{title}} ({{field}})",
+      "scopes": {
+        "system": "System configuration",
+        "adapter": "Overrides for adapter {{target}}",
+        "instance": "Overrides for instance {{target}}",
+        "channel": "Overrides for channel {{target}}",
+        "plugin": "Configuration of plugin {{target}}",
+        "plugin_instance": "Configuration of plugin {{target}} on instance {{instance}}"
+      }
     },
     "visibility": {
       "shared": "Shared with tenants",
@@ -442,7 +483,7 @@
     "permissions": {
       "public": "Public",
       "user": "User",
-      "advanced": "Advanced",
+      "advanced": "Channel admin",
       "super_user": "Super User"
     },
     "messages": {

@@ -75,7 +75,7 @@ class WorkspaceResourceSummary(BaseModel):
     bound_workspaces: List[BoundWorkspaceInfo] = Field(default_factory=list)
     # 指向已不存在的工作区的绑定条数。与 `bound_workspace_count` 分开数是有意的：
     # 合在一起时资源卡片会显示"已绑定 1 个工作区"而下面的工作区清单是空的，
-    # 用户看到一个自相矛盾的界面，且没有任何入口能处理它（PROJECT_STATE §3 #41）。
+    # 用户看到一个自相矛盾的界面，且没有任何入口能处理它。
     orphan_binding_count: int = 0
     create_time: str
     update_time: str

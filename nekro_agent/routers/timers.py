@@ -34,7 +34,7 @@ from nekro_agent.schemas.timer import (
 from nekro_agent.services.timer import timer_service
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
-from nekro_agent.services.user.tenant_perm import accessible_instance_keys, get_tenant_scope
+from nekro_agent.services.user.tenant_perm import accessible_instance_refs, get_tenant_scope
 from nekro_agent.services.workspace.manager import WorkspaceService
 
 router = APIRouter(prefix="/timers", tags=["Timers"])
@@ -195,13 +195,13 @@ async def _accessible_items(user: DBUser) -> List[TimerTaskItem]:
     items = await _build_all_items()
     if get_tenant_scope(user) is None:
         return items
-    keys = set(await accessible_instance_keys(user))
-    if not keys:
+    instances = await accessible_instance_refs(user)
+    if not instances:
         return []
     visible: List[TimerTaskItem] = []
     for item in items:
         channel = await DBChatChannel.filter(chat_key=item.chat_key).first()
-        if channel is not None and channel.instance_key in keys:
+        if channel is not None and (channel.adapter_key, channel.instance_key) in instances:
             visible.append(item)
     return visible
 

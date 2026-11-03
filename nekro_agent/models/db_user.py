@@ -23,7 +23,7 @@ class DBUser(Model):
 
     # 口令世代：自助改密与管理员重置口令成功时 +1。令牌里带着签发那一刻的世代
     # （`services/user/auth.py:build_pwd_gen_claim` 的 `pwd_gen`），get_current_user
-    # 比对不一致即拒绝——这就是「改密吊销已签发令牌」的机制（PROJECT_STATE §3 #54）。
+    # 比对不一致即拒绝——这就是「改密吊销已签发令牌」的机制。
     # 与上游那条已铺进测试库的同名列（迁移 23_20260829235235）语义相同，列由迁移 25 补齐。
     password_generation = fields.IntField(default=0, description="口令世代：改密/重置时 +1，令牌内世代与其不一致即视为已吊销")
 

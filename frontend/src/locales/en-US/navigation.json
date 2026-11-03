@@ -1,4 +1,7 @@
 {
+  "versionTag": {
+    "compat": "Plugin-compatible with NekroAgent {{version}}"
+  },
   "menu": {
     "cloud": "Nekro Cloud",
     "telemetry": "Community Insights",
@@ -51,7 +54,6 @@
     "consoleUsage": "Usage & Cost"
   },
   "footer": {
-    "copyright": "All rights reserved",
     "builtOnPrefix": "Built on the ",
     "builtOnSuffix": " project",
     "logout": "Logout"

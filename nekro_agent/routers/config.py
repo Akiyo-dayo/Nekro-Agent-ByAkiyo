@@ -52,12 +52,13 @@ from nekro_agent.services.quota_service import assert_tenant_quota_within_ceilin
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import (
-    accessible_instance_keys,
+    accessible_instance_refs,
     assert_instance_accessible,
     get_tenant_scope,
+    instance_refs_filter,
     require_platform_owner,
 )
-from nekro_agent.tools.common_util import get_app_version
+from nekro_agent.tools.common_util import get_app_version, get_fork_version, get_upstream_base_version
 from nekro_agent.tools.redaction import is_credential_mask, redact_text
 
 
@@ -407,10 +408,48 @@ def _current_config_value(config_key: str, item_key: str) -> Any:
 # 就拿到了平台方的运维通道，而通道背后是宿主级的实例与容器操作。
 PLATFORM_ONLY_SYSTEM_CONFIG_PREFIXES = ("OPS_BOT_",)
 
+# 按整键登记的同类项。超级用户名单决定谁能在聊天里执行 `sh`：租户读得到它，冒充所需的情报就是现成的
+PLATFORM_ONLY_SYSTEM_CONFIG_KEYS = frozenset({"SUPER_USERS"})
+
+# 平台方一侧也只有 `Role.Super` 能改的项：写进超级用户名单就能在聊天里 `sh`，
+# 与 `/commands/webui-execute` 同档（那一条也是 `Role.Super`）
+SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS = frozenset({"SUPER_USERS"})
+
 
 def _is_platform_only_config(config_key: str, item_key: str) -> bool:
-    """该配置项是否只允许平台方修改"""
-    return config_key == "system" and item_key.startswith(PLATFORM_ONLY_SYSTEM_CONFIG_PREFIXES)
+    """该配置项是否只允许平台方读写"""
+    return config_key == "system" and (
+        item_key.startswith(PLATFORM_ONLY_SYSTEM_CONFIG_PREFIXES) or item_key in PLATFORM_ONLY_SYSTEM_CONFIG_KEYS
+    )
+
+
+def _normalized_list_value(value: Any) -> Optional[List[str]]:
+    """把配置项的当前值或提交值规整成字符串列表，规整不了返回 None"""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if not isinstance(value, list):
+        return None
+    return [str(item).strip() for item in value]
+
+
+def _assert_super_role_items_unchanged(user: DBUser, config_key: str, configs: Dict[str, str]) -> None:
+    """平台方非 Super 的管理员不能改 `SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS` 里的项
+
+    只拦「值真的变了」：配置页保存时会把整页的值一起提交，名单原样带回来不算修改，
+    否则非 Super 的管理员连别的系统设置都存不了。规整不了的提交值按「变了」处理。
+    """
+    if config_key != "system" or user.perm_level >= Role.Super:
+        return
+    for item_key, raw_value in configs.items():
+        if item_key not in SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS:
+            continue
+        submitted = _normalized_list_value(raw_value)
+        current = _normalized_list_value(_current_config_value(config_key, item_key))
+        if submitted is None or submitted != current:
+            raise PermissionDeniedError(detail=f"配置项 {config_key}.{item_key} 只有超级管理员可以修改")
 
 
 # 覆盖层的配置键前缀。写在这些层上的取值只对该作用域生效，因此"这份值归谁"
@@ -594,7 +633,7 @@ async def _assert_config_key_accessible(user: DBUser, config_key: str, *, for_wr
         )
         if not adapter_key or not instance_key:
             raise NotFoundError(resource=f"配置 '{config_key}'")
-        await assert_instance_accessible(user, instance_key)
+        await assert_instance_accessible(user, instance_key, adapter_key=adapter_key)
         return
     if config_key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
         await _assert_chat_key_accessible(user, config_key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :])
@@ -615,7 +654,7 @@ async def _assert_chat_key_accessible(user: DBUser, chat_key: str) -> None:
     channel = await DBChatChannel.filter(chat_key=chat_key).first()
     if channel is None:
         raise NotFoundError(resource=f"频道 '{chat_key}'")
-    await assert_instance_accessible(user, channel.instance_key)
+    await assert_instance_accessible(user, channel.instance_key, adapter_key=channel.adapter_key)
 
 
 def _raise_config_error(
@@ -666,10 +705,10 @@ async def get_config_keys(_current_user: DBUser = Depends(get_current_active_use
     if not _is_tenant_view(_current_user):
         return keys
 
-    accessible = set(await accessible_instance_keys(_current_user))
+    accessible = await accessible_instance_refs(_current_user)
     channel_keys = [key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :] for key in keys if key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX)]
     accessible_chat_keys = set(
-        await DBChatChannel.filter(chat_key__in=channel_keys, instance_key__in=accessible).values_list(
+        await DBChatChannel.filter(instance_refs_filter(accessible), chat_key__in=channel_keys).values_list(
             "chat_key",
             flat=True,
         ),
@@ -678,7 +717,8 @@ async def get_config_keys(_current_user: DBUser = Depends(get_current_active_use
     visible: List[str] = []
     for key in keys:
         if key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
-            if key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(INSTANCE_OVERRIDE_KEY_SEP)[2] in accessible:
+            adapter_key, _, instance_key = key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(INSTANCE_OVERRIDE_KEY_SEP)
+            if (adapter_key, instance_key) in accessible:
                 visible.append(key)
         elif key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
             if key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :] in accessible_chat_keys:
@@ -786,6 +826,7 @@ async def set_config_value(
     if _is_tenant_view(_current_user):
         await _assert_config_key_accessible(_current_user, config_key)
         await _assert_tenant_may_write(_current_user, config_key, {item_key: value})
+    _assert_super_role_items_unchanged(_current_user, config_key, {item_key: value})
 
     sanitized = _sanitize_config_updates(config_key, {item_key: value})
     if item_key not in sanitized:
@@ -816,6 +857,7 @@ async def batch_update_config(
     if _is_tenant_view(_current_user):
         await _assert_config_key_accessible(_current_user, config_key)
         await _assert_tenant_may_write(_current_user, config_key, body.configs)
+    _assert_super_role_items_unchanged(_current_user, config_key, body.configs)
 
     success, error_msg = UnifiedConfigService.batch_update_config(config_key, _sanitize_config_updates(config_key, body.configs))
     if not success:
@@ -879,8 +921,14 @@ async def reload_config_api(
 
     "重置"是把磁盘上的配置重新读回内存并重新灌进 env，对 `system` 这类共享作用域来说
     等于替所有租户回滚一次配置，因此与写入用同一条判据。
+
+    `system` 另外只许 `Role.Super`：回滚会一并改动 `SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS`
+    里的项（超级管理员刚从名单里移走、还没落盘的人会被读回来），而重置是整份配置一起读，
+    没法像写入那样只拦「值真的变了」的那一项。
     """
     await _assert_config_key_accessible(_current_user, config_key)
+    if config_key == "system" and _current_user.perm_level < Role.Super:
+        raise PermissionDeniedError(detail="重置系统配置会改动超级用户名单，只有超级管理员可以执行")
 
     success, error_msg = UnifiedConfigService.reload_config(config_key)
     if not success:
@@ -923,7 +971,7 @@ async def get_instance_config(
     租户身份只能读自己名下的实例（他人实例一律 404），且凭据一律为掩码。
     """
     if _is_tenant_view(_current_user):
-        await assert_instance_accessible(_current_user, instance_key)
+        await assert_instance_accessible(_current_user, instance_key, adapter_key=adapter_key)
 
     config_key = _instance_override_config_key(adapter_key, instance_key)
     try:
@@ -951,7 +999,7 @@ async def update_instance_config(
     config_key = _instance_override_config_key(adapter_key, instance_key)
 
     if _is_tenant_view(_current_user):
-        await assert_instance_accessible(_current_user, instance_key)
+        await assert_instance_accessible(_current_user, instance_key, adapter_key=adapter_key)
         await _assert_tenant_may_write(_current_user, config_key, body.configs)
 
     success, error_msg = UnifiedConfigService.batch_update_config(config_key, _sanitize_config_updates(config_key, body.configs))
@@ -991,6 +1039,9 @@ async def get_effective_config_trace(
     if not _is_tenant_view(_current_user):
         return trace
 
+    # 溯源逐字段遍历整个 `CoreConfig`，平台方专属项（运维 Bot、超级用户名单）要与
+    # `/config/list/system` 一样整项拿掉，掩码挡不住它们：号码本身就是冒充所需的情报
+    trace.items = [item for item in trace.items if not _is_platform_only_config("system", item.key)]
     visible_groups = await _visible_model_groups(_current_user)
     for item in trace.items:
         if item.key == MODEL_GROUPS_CONFIG_ITEM_KEY:
@@ -1292,5 +1343,28 @@ async def test_model_group_inline(
 @router.get("/version", summary="获取应用版本", response_model=str)
 @require_role(Role.User)
 async def get_version(_current_user: DBUser = Depends(get_current_active_user)) -> str:
-    """获取应用版本"""
+    """获取插件兼容版本
+
+    返回 `pyproject.toml` 的 `version`。插件市场页面按它判断插件的 `minNaVersion` / `maxNaVersion`，
+    含义不能改；界面上展示产品版本请用 `/version-info` 里的 `fork_version`。
+    """
     return get_app_version()
+
+
+class VersionInfo(BaseModel):
+    """本分支的三个版本号，含义见 `nekro_agent/tools/common_util.py`"""
+
+    fork_version: str
+    compat_version: str
+    upstream_base_version: str
+
+
+@router.get("/version-info", summary="获取分支版本、插件兼容版本与上游基线版本", response_model=VersionInfo)
+@require_role(Role.User)
+async def get_version_info(_current_user: DBUser = Depends(get_current_active_user)) -> VersionInfo:
+    """侧栏的版本标签展示分支版本，悬停提示插件兼容版本"""
+    return VersionInfo(
+        fork_version=get_fork_version(),
+        compat_version=get_app_version(),
+        upstream_base_version=get_upstream_base_version(),
+    )

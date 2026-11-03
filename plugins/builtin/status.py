@@ -35,6 +35,7 @@ from nekro_agent.api.plugin import (
 )
 from nekro_agent.core.logger import logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.services.plugin.scope_guard import require_own_chat_key
 
 plugin = NekroPlugin(
     name="状态控制插件",
@@ -286,6 +287,9 @@ async def update_preset_status(_ctx: schemas.AgentCtx, chat_key: str, setting_na
         update_preset_status(chat_key, f"正在认真看书的{character_name}", f'由于 ... " ... {character_name} 开始认真看书且仍然戴着帽子')
         ```
     """
+    # `chat_key` 是模型自由填写的参数：角色状态会进入该频道的提示词，只认当前会话
+    chat_key = require_own_chat_key(_ctx, chat_key)
+
     # 从存储中获取频道数据
     data = await store.get(chat_key=chat_key, store_key="status")
     if not data:
@@ -322,6 +326,8 @@ async def clear_status(_ctx: schemas.AgentCtx, chat_key: str):
     Returns:
         str: Result message
     """
+    chat_key = require_own_chat_key(_ctx, chat_key)
+
     # 从存储中获取频道数据
     data = await store.get(chat_key=chat_key, store_key="status")
     if not data:

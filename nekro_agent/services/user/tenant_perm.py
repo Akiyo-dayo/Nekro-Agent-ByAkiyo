@@ -20,9 +20,12 @@
 行为与引入多租户之前完全一致。
 """
 
-from typing import Any, Callable, ClassVar, List, Optional
+import operator
+from functools import reduce
+from typing import Any, Callable, ClassVar, Iterable, List, Optional, Set, Tuple
 
 from fastapi import Depends
+from tortoise.expressions import Q
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
@@ -39,6 +42,9 @@ logger = get_sub_logger("tenant.perm")
 # 租户成员在旧权限体系里的硬上限。
 # Console 的实例增删与容器操作要求 Role.Super（宿主级），租户成员绝不能达到该等级。
 TENANT_MAX_PERM_LEVEL = Role.Admin
+
+# 一个实例的完整标识。`instance_key` 只在同一适配器内唯一。
+InstanceRef = Tuple[str, str]
 
 
 class TenantSuspendedError(AppError):
@@ -123,6 +129,10 @@ async def accessible_instance_keys(user: DBUser) -> List[str]:
 
     平台方返回空列表，语义是"不受限"（见 `CurrentIdentity.accessible_instance_keys` 的契约），
     不要把它理解成"一个实例都看不到"。
+
+    **只用于展示，不要拿去过滤数据。** `instance_key` 的唯一性只到
+    `(adapter_key, instance_key)`，另一个适配器下可以有同名实例归别的租户；按取值做
+    `instance_key__in` 会把那一行的数据一并放进来。过滤用 `accessible_instance_refs`。
     """
     scope = get_tenant_scope(user)
     if scope is None:
@@ -130,15 +140,49 @@ async def accessible_instance_keys(user: DBUser) -> List[str]:
     return list(await DBAdapterInstance.filter(tenant_id=scope).order_by("id").values_list("instance_key", flat=True))
 
 
-async def assert_instance_accessible(user: DBUser, instance_key: str) -> DBAdapterInstance:
+async def accessible_instance_refs(user: DBUser) -> Set[InstanceRef]:
+    """列出该身份可访问的实例，按 `(adapter_key, instance_key)` 成对给出
+
+    平台方返回空集合，语义同 `accessible_instance_keys`：不受限，调用方须先判 `get_tenant_scope`。
+    与频道、消息这类同样带两列的数据比对归属时，必须成对比较，见 `instance_refs_filter`。
+    """
+    scope = get_tenant_scope(user)
+    if scope is None:
+        return set()
+    rows = await DBAdapterInstance.filter(tenant_id=scope).values_list("adapter_key", "instance_key")
+    return {(str(adapter_key), str(instance_key)) for adapter_key, instance_key in rows}
+
+
+def instance_refs_filter(refs: Iterable[InstanceRef]) -> Q:
+    """把一组实例编成过滤条件，用于同时带 `adapter_key` 与 `instance_key` 两列的表
+
+    空集合编成恒假条件，而不是"不加条件"——一个实例都没有的租户什么都看不到。
+    """
+    conditions = [Q(adapter_key=adapter_key, instance_key=instance_key) for adapter_key, instance_key in refs]
+    if not conditions:
+        return Q(id__in=[])
+    return reduce(operator.or_, conditions)
+
+
+async def assert_instance_accessible(user: DBUser, instance_key: str, adapter_key: str = "") -> DBAdapterInstance:
     """校验当前身份能否访问某个实例，并返回该实例
 
     越权访问抛 **404 而不是 403**：403 会告诉租户"这个 instance_key 确实存在"，
     等于把平台方的实例清单变成可枚举的。不存在与无权访问对外必须不可区分。
+
+    调用方手上有 `adapter_key` 时必须一起传：同一个 `instance_key` 在不同适配器下可以是
+    两行、分属两个租户。只按标识查时，归属条件下推进查询，租户拿到的只可能是自己那一行，
+    而不是"随便取一行再比租户"——那样会把别人的同名实例判给自己的请求，或者反过来把
+    自己的实例误判成不存在。
     """
-    instance = await DBAdapterInstance.filter(instance_key=instance_key).first()
+    query = DBAdapterInstance.filter(instance_key=instance_key)
+    if adapter_key:
+        query = query.filter(adapter_key=adapter_key)
     scope = get_tenant_scope(user)
-    if instance is None or (scope is not None and instance.tenant_id != scope):
+    if scope is not None:
+        query = query.filter(tenant_id=scope)
+    instance = await query.order_by("id").first()
+    if instance is None:
         raise NotFoundError(resource=f"实例 '{instance_key}'")
     return instance
 

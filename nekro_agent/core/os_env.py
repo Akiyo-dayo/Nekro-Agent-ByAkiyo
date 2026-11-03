@@ -22,8 +22,8 @@ from .core_utils import OsEnvTypes
 # 也就是说：它一旦没换又泄漏了，不会有任何告警提示你。这正是启动期要单独告警一次的理由。
 FACTORY_DEFAULT_POSTGRES_PASSWORD = "nekro_agent"
 
-# 仓库 `.env.example` 历史上写过的两个「看起来能用」的 JWT 签名密钥示例值（round-28 起示例文件已改成占位符）。
-# 不少部署是手抄那份示例起家的（测试部署就是），所以启动审计仍要认得它们；判据与被判值共用这一处字面量（§2.10）。
+# 仓库 `.env.example` 历史上写过的两个「看起来能用」的 JWT 签名密钥示例值（示例文件现已改成占位符）。
+# 不少部署是手抄那份示例起家的，所以启动审计仍要认得它们；判据与被判值共用这一处字面量。
 LEGACY_EXAMPLE_JWT_SECRETS: FrozenSet[str] = frozenset(
     {"dev-secret-key-for-development", "dev-refresh-key-for-development"},
 )
@@ -172,6 +172,19 @@ class OsEnv:
     """暴露端口"""
     EXPOSE_PORT: int = OsEnvTypes.Int("EXPOSE_PORT", default=8021)
 
+    """附带的 qbob（QQ 官方机器人 → OneBot v11），见 docs/qbob-integration.md
+
+    `QBOB_ADMIN_URL` 是 qbob 管理面的根地址（容器网络内，如 `http://nekro_qbob:17810`），
+    由 compose 附加文件 `docker/qbob/docker-compose.qbob.yml` 传入。**为空 = 本部署没有附带 qbob**，
+    总后台里「内置 qbob」协议端置灰。`QBOB_DATA_DIR` 留空时取 `{DATA_DIR}/qbob_data`
+    （compose 把它按同一路径挂进两个容器），NA 只从这里读 qbob 首启写下的 admin 口令文件。
+    """
+    QBOB_ADMIN_URL: str = OsEnvTypes.Str("QBOB_ADMIN_URL", default="")
+    QBOB_DATA_DIR: str = OsEnvTypes.Str("QBOB_DATA_DIR", default="")
+    # 本机 qbob 镜像构建所用的上游提交，由 compose 附加文件从 QBOB_REF 传进来；只用于界面
+    # 标注「所用提交」，NA 不用它做任何事
+    QBOB_REF: str = OsEnvTypes.Str("QBOB_REF", default="")
+
     """前端资源目录"""
     STATIC_DIR: str = OsEnvTypes.Str("STATIC_DIR", default="./static")
 
@@ -223,7 +236,7 @@ class OsEnv:
 # 一眼就能看见；而 iptables 标记撞了是**静默**的——`install_marked_rules` 的语义是
 # 「先按标记全删、再装自己那套」，后启动的一方会把先启动一方的沙盒回调放行规则整组换掉，
 # 表现只有「每一次沙盒执行都恰好卡到运行超时」，NA 侧一条错误日志都没有
-# （真实事故，见 PROJECT_STATE §2.6，排查花了九个多小时）。
+# （这种故障很难从现象倒推到原因）。
 #
 # 所以这里给出一个**结构上不可能相撞**的作用域：显式设了 `NEKRO_INSTANCE_NAME` 就用它，
 # 没设就从部署身份派生一个稳定后缀。
@@ -456,6 +469,10 @@ COMMAND_SYSTEM_STATE_FILE: str = COMMAND_STATE_DIR + "/system.json"
 COMMAND_CHANNEL_STATE_DIR: str = COMMAND_STATE_DIR + "/channels"
 COMMAND_SYSTEM_PERMISSION_FILE: str = COMMAND_STATE_DIR + "/system_permissions.json"
 COMMAND_CHANNEL_PERMISSION_DIR: str = COMMAND_STATE_DIR + "/channel_permissions"
+COMMAND_USER_PERMISSION_FILE: str = COMMAND_STATE_DIR + "/user_permissions.json"
+# 按频道的用户命令授权（本分支多租户用，上游没有）。按完整 chat_key 分桶放在一个文件里，
+# 不走 `channel_state_file` 的文件名清洗：两个 chat_key 清洗后可能撞名，而这份数据的边界就是租户边界
+COMMAND_CHANNEL_USER_PERMISSION_FILE: str = COMMAND_STATE_DIR + "/channel_user_permissions.json"
 
 
 # 设置上传目录及其子目录权限

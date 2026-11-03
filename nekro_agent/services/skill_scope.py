@@ -7,7 +7,7 @@
 正好就是 `Role.Admin`（`TENANT_MAX_PERM_LEVEL`）—— `GET /skills/tree` 拿目录、
 `GET /skills/content` 拿正文，两跳就能把平台方整座技能库读走。
 反过来写端点全是 `Role.Super`，租户一个字都写不了，
-`需求文档 §R8`「可以自己制作并使用 skills」对定制版客户根本不成立。
+也就根本没法自己制作并使用 skills。
 
 两件事同一个根因：**技能库只有一份，而且没有归属概念**。
 
@@ -36,7 +36,7 @@
 `SHARED` / `PRIVATE` 与 `models/db_model_group.ModelGroupVisibility` 同名同值
 （`tests/test_skills_tenant_scope.py` 钉住两者不会分叉），语义也照抄：
 
-- **平台方技能默认 `PRIVATE`**。这是本轮的安全默认值 —— 默认 `shared` 等于把原来的洞
+- **平台方技能默认 `PRIVATE`**。这是安全默认值 —— 默认 `shared` 等于把原来的洞
   原样留着，只是换了个名字。平台方要共享哪一条，就显式点一次。
 - **租户自建技能恒为私有**，与「租户自建模型组恒为私有」同源：它承载的是这个租户自己的
   东西，没有「共享给别的租户」这一说。所以可见性登记表里**只允许出现平台方的条目**，
@@ -452,7 +452,13 @@ async def channel_skill_scope(chat_key: str) -> Optional[int]:
     channel = await DBChatChannel.get_or_none(chat_key=chat_key)
     if channel is None or not channel.instance_key:
         return None
-    instance = await DBAdapterInstance.filter(instance_key=channel.instance_key).first()
+    # 带上适配器：另一个适配器下可以有归别的租户（或平台方）的同名实例，只按标识取会把
+    # 这个频道判给那一边——判成平台方就是 None，也就是"不受限"
+    instance = (
+        await DBAdapterInstance.filter(adapter_key=channel.adapter_key, instance_key=channel.instance_key)
+        .order_by("id")
+        .first()
+    )
     return instance.tenant_id if instance is not None else None
 
 

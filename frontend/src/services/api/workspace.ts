@@ -331,6 +331,55 @@ export interface KBReindexResponse {
   failed: number
 }
 
+export interface KBZipImportError {
+  source_path: string
+  reason: string
+}
+
+export interface KBZipImportResponse {
+  ok: boolean
+  imported: number
+  reused: number
+  skipped: number
+  failed: number
+  errors: KBZipImportError[]
+}
+
+export interface KBBatchDeleteResponse {
+  ok: boolean
+  deleted: number
+  failed: number
+  deleted_ids: number[]
+  failed_ids: number[]
+  warnings: string[]
+  errors: string[]
+}
+
+export interface KBBatchReindexResponse {
+  ok: boolean
+  queued: number
+  failed: number
+  queued_ids: number[]
+  failed_ids: number[]
+  warnings: string[]
+  errors: string[]
+}
+
+export interface KBBatchUnbindResponse {
+  ok: boolean
+  unbound: number
+  failed: number
+  unbound_ids: number[]
+  failed_ids: number[]
+  warnings: string[]
+  errors: string[]
+}
+
+/** 空批次占位响应：无操作成功，供前端批量 mutation 的"未选中该类型"分支复用 */
+export const EMPTY_BATCH_DELETE: KBBatchDeleteResponse = { ok: true, deleted: 0, failed: 0, deleted_ids: [], failed_ids: [], warnings: [], errors: [] }
+export const EMPTY_BATCH_UNBIND: KBBatchUnbindResponse = { ok: true, unbound: 0, failed: 0, unbound_ids: [], failed_ids: [], warnings: [], errors: [] }
+export const EMPTY_BATCH_REINDEX: KBBatchReindexResponse = { ok: true, queued: 0, failed: 0, queued_ids: [], failed_ids: [], warnings: [], errors: [] }
+
 export interface KBUploadFilePayload {
   file: File
   title?: string
@@ -523,7 +572,7 @@ export interface WorkspaceResourceSummary {
    * 指向已不存在的工作区（或已不存在的资源）的绑定条数。
    *
    * 与 `bound_workspace_count` 分开数：合在一起时卡片会显示「已绑定 1 个工作区」
-   * 而 `bound_workspaces` 是空的，用户看到一个自相矛盾的界面（PROJECT_STATE §3 #41）。
+   * 而 `bound_workspaces` 是空的，用户看到一个自相矛盾的界面。
    * 租户身份下后端恒为 0——它描述的是别的工作区。
    */
   orphan_binding_count: number
@@ -906,6 +955,79 @@ export const workspaceApi = {
   },
 }
 
+/**
+ * 知识库上传请求的超时。实例默认的 30 秒包含上传时间：大文件、zip 包，或批量上传几路并发分摊带宽时，
+ * 文件还没传完就会被判超时，而服务端其实照常建出了文档，用户重试只会撞上"目标路径已存在"。
+ */
+const KB_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000
+
+/** 批量接口每次请求的 ID 数：取后端单请求上限的建议下限，选中更多时分片顺序提交、合并结果 */
+const KB_BATCH_CHUNK_SIZE = 100
+
+const sendIdsInChunks = async <T>(ids: number[], send: (chunk: number[]) => Promise<T>): Promise<T[]> => {
+  const results: T[] = []
+  for (let start = 0; start < ids.length; start += KB_BATCH_CHUNK_SIZE) {
+    results.push(await send(ids.slice(start, start + KB_BATCH_CHUNK_SIZE)))
+  }
+  return results
+}
+
+const mergeBatchDelete = (results: KBBatchDeleteResponse[]): KBBatchDeleteResponse =>
+  results.reduce<KBBatchDeleteResponse>(
+    (acc, next) => ({
+      ok: acc.ok && next.ok,
+      deleted: acc.deleted + next.deleted,
+      failed: acc.failed + next.failed,
+      deleted_ids: [...acc.deleted_ids, ...next.deleted_ids],
+      failed_ids: [...acc.failed_ids, ...next.failed_ids],
+      warnings: [...acc.warnings, ...next.warnings],
+      errors: [...acc.errors, ...next.errors],
+    }),
+    EMPTY_BATCH_DELETE
+  )
+
+const mergeBatchReindex = (results: KBBatchReindexResponse[]): KBBatchReindexResponse =>
+  results.reduce<KBBatchReindexResponse>(
+    (acc, next) => ({
+      ok: acc.ok && next.ok,
+      queued: acc.queued + next.queued,
+      failed: acc.failed + next.failed,
+      queued_ids: [...acc.queued_ids, ...next.queued_ids],
+      failed_ids: [...acc.failed_ids, ...next.failed_ids],
+      warnings: [...acc.warnings, ...next.warnings],
+      errors: [...acc.errors, ...next.errors],
+    }),
+    EMPTY_BATCH_REINDEX
+  )
+
+const mergeBatchUnbind = (results: KBBatchUnbindResponse[]): KBBatchUnbindResponse =>
+  results.reduce<KBBatchUnbindResponse>(
+    (acc, next) => ({
+      ok: acc.ok && next.ok,
+      unbound: acc.unbound + next.unbound,
+      failed: acc.failed + next.failed,
+      unbound_ids: [...acc.unbound_ids, ...next.unbound_ids],
+      failed_ids: [...acc.failed_ids, ...next.failed_ids],
+      warnings: [...acc.warnings, ...next.warnings],
+      errors: [...acc.errors, ...next.errors],
+    }),
+    EMPTY_BATCH_UNBIND
+  )
+
+/** zip 批量导入上传（工作区与全局库共用） */
+const postZipImport = async (url: string, file: File): Promise<KBZipImportResponse> => {
+  const formData = new FormData()
+  formData.append('file', file)
+  const response = await axios.post<KBZipImportResponse>(url, formData, {
+    // 必须显式指定 multipart：axios 实例默认 Content-Type 为 application/json，
+    // axios 1.15 会因此把 FormData 序列化成 JSON（File 被转成空对象 {}）导致后端 422
+    headers: { 'Content-Type': 'multipart/form-data' },
+    // 上传之后服务端还要逐条解压导入，整段都算在这个请求里
+    timeout: KB_UPLOAD_TIMEOUT_MS,
+  })
+  return response.data
+}
+
 export const knowledgeBaseApi = {
   list: async (workspaceId: number): Promise<KBDocumentListItem[]> => {
     const response = await axios.get<KBDocumentListResponse>(`/workspaces/${workspaceId}/kb/documents`)
@@ -937,12 +1059,17 @@ export const knowledgeBaseApi = {
     formData.append('is_enabled', String(payload.is_enabled ?? true))
     const response = await axios.post<KBDocumentDetailResponse>(`/workspaces/${workspaceId}/kb/files`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: KB_UPLOAD_TIMEOUT_MS,
       onUploadProgress: event => {
         if (!onProgress || !event.total) return
         onProgress(Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100))))
       },
     })
     return response.data
+  },
+
+  uploadZip: async (workspaceId: number, file: File): Promise<KBZipImportResponse> => {
+    return postZipImport(`/workspaces/${workspaceId}/kb/zip`, file)
   },
 
   updateDocument: async (
@@ -956,6 +1083,26 @@ export const knowledgeBaseApi = {
 
   deleteDocument: async (workspaceId: number, documentId: number): Promise<void> => {
     await axios.delete(`/workspaces/${workspaceId}/kb/documents/${documentId}`)
+  },
+
+  batchDeleteDocuments: async (workspaceId: number, documentIds: number[]): Promise<KBBatchDeleteResponse> => {
+    const results = await sendIdsInChunks(documentIds, async ids => {
+      const response = await axios.post<KBBatchDeleteResponse>(`/workspaces/${workspaceId}/kb/documents/batch-delete`, {
+        ids,
+      })
+      return response.data
+    })
+    return mergeBatchDelete(results)
+  },
+
+  batchReindexDocuments: async (workspaceId: number, documentIds: number[]): Promise<KBBatchReindexResponse> => {
+    const results = await sendIdsInChunks(documentIds, async ids => {
+      const response = await axios.post<KBBatchReindexResponse>(`/workspaces/${workspaceId}/kb/documents/batch-reindex`, {
+        ids,
+      })
+      return response.data
+    })
+    return mergeBatchReindex(results)
   },
 
   getFulltext: async (workspaceId: number, documentId: number, maxChars = 20000): Promise<KBFullTextResponse> => {
@@ -1077,12 +1224,17 @@ export const kbLibraryApi = {
 
     const response = await axios.post<KBAssetUploadResponse>('/kb-library/assets/files', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: KB_UPLOAD_TIMEOUT_MS,
       onUploadProgress: event => {
         if (!onProgress || !event.total) return
         onProgress(Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100))))
       },
     })
     return response.data
+  },
+
+  uploadZip: async (file: File): Promise<KBZipImportResponse> => {
+    return postZipImport('/kb-library/assets/zip', file)
   },
 
   deleteAsset: async (assetId: number): Promise<void> => {
@@ -1113,6 +1265,33 @@ export const kbLibraryApi = {
   unbindWorkspace: async (assetId: number, workspaceId: number): Promise<KBAssetBindingsResponse> => {
     const response = await axios.delete<KBAssetBindingsResponse>(`/kb-library/assets/${assetId}/bindings/${workspaceId}`)
     return response.data
+  },
+
+  batchDeleteAssets: async (assetIds: number[]): Promise<KBBatchDeleteResponse> => {
+    const results = await sendIdsInChunks(assetIds, async ids => {
+      const response = await axios.post<KBBatchDeleteResponse>('/kb-library/assets/batch-delete', { ids })
+      return response.data
+    })
+    return mergeBatchDelete(results)
+  },
+
+  batchReindexAssets: async (assetIds: number[]): Promise<KBBatchReindexResponse> => {
+    const results = await sendIdsInChunks(assetIds, async ids => {
+      const response = await axios.post<KBBatchReindexResponse>('/kb-library/assets/batch-reindex', { ids })
+      return response.data
+    })
+    return mergeBatchReindex(results)
+  },
+
+  batchUnbindWorkspace: async (assetIds: number[], workspaceId: number): Promise<KBBatchUnbindResponse> => {
+    const results = await sendIdsInChunks(assetIds, async ids => {
+      const response = await axios.post<KBBatchUnbindResponse>('/kb-library/assets/batch-unbind', {
+        asset_ids: ids,
+        workspace_id: workspaceId,
+      })
+      return response.data
+    })
+    return mergeBatchUnbind(results)
   },
 
   downloadRawFile: async (assetId: number): Promise<{ blob: Blob; filename: string | null; contentType: string | null }> => {

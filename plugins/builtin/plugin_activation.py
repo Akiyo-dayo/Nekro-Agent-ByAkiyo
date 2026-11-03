@@ -14,6 +14,7 @@ from nekro_agent.services.plugin.prompt_activation import (
     is_sleep_effective,
     render_plugin_prompt_for_agent,
 )
+from nekro_agent.tools.untrusted_content import echo_inline
 
 plugin = NekroPlugin(
     name="插件激活调度器",
@@ -79,28 +80,29 @@ async def activate_plugin(_ctx: AgentCtx, module_name: str, rounds: int = 5) -> 
         module_name (str): Target plugin module_name.
         rounds (int): Visible runs to keep after activation. Default is 5.
     """
+    # 返回值会落成 SYSTEM 消息，`module_name` 是模型传入的：一律压成单行再回显（找不到插件时它可以是任意文字）
     target = _get_sleepable_plugin(module_name)
     if not target:
         existing = _get_existing_plugin(module_name)
         if existing:
             return (
-                f"Plugin `{module_name}` is always visible and does not need activation. "
+                f"Plugin {echo_inline(module_name)} is always visible and does not need activation. "
                 "You can use its predefined methods directly."
             )
-        return f"Plugin `{module_name}` is missing or disabled."
+        return f"Plugin {echo_inline(module_name)} is missing or disabled."
 
     state = await get_activation_state(_ctx.chat_key)
     current_rounds = max(0, state.module_rounds.get(module_name, 0))
     if current_rounds > 0:
         return (
-            f"Plugin `{module_name}` is already active with {current_rounds} runs remaining. "
+            f"Plugin {echo_inline(module_name)} is already active with {current_rounds} runs remaining. "
             "Use `extend_plugin_activation(module_name, rounds)` if you need to keep it visible longer."
         )
 
     final_rounds = await activate_module_for_chat(_ctx.chat_key, module_name, rounds)
     plugin_block = await render_plugin_prompt_for_agent(target, _ctx, rounds_left=final_rounds)
     return (
-        f"Plugin `{module_name}` is now activated for the next {final_rounds} runs. "
+        f"Plugin {echo_inline(module_name)} is now activated for the next {final_rounds} runs. "
         "The full plugin block is returned below and is now the source of truth for this capability. "
         "Stop here and continue in the next agent step.\n\n"
         f"{plugin_block}"
@@ -119,18 +121,19 @@ async def extend_plugin_activation(_ctx: AgentCtx, module_name: str, rounds: int
         module_name (str): Target plugin module_name.
         rounds (int): Additional visible runs to append. Default is 3.
     """
+    # BEHAVIOR 方法的返回值同样落成 SYSTEM 消息：`module_name` 压成单行再回显
     target = _get_sleepable_plugin(module_name)
     if not target:
         existing = _get_existing_plugin(module_name)
         if existing:
             return (
-                f"Plugin `{module_name}` is always visible and does not need to be extended. "
+                f"Plugin {echo_inline(module_name)} is always visible and does not need to be extended. "
                 "You can use its predefined methods directly."
             )
-        return f"Plugin `{module_name}` is missing or disabled."
+        return f"Plugin {echo_inline(module_name)} is missing or disabled."
 
     final_rounds = await extend_module_for_chat(_ctx.chat_key, module_name, rounds)
-    return f"Plugin `{module_name}` visibility extended. {final_rounds} runs remain."
+    return f"Plugin {echo_inline(module_name)} visibility extended. {final_rounds} runs remain."
 
 
 @plugin.mount_cleanup_method()

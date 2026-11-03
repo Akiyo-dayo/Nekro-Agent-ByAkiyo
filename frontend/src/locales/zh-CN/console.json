@@ -59,6 +59,7 @@
     "containerNone": "该实例没有托管容器",
     "unboundTitle": "尚未绑定账号",
     "unboundHint": "本实例没有绑定任何 Bot 账号，因此不会建立连接、也不会收到任何消息——它不是掉线了。协议端连上来时会先自行登记成一个待认领实例，在下方把它认领过来即可；协议端还没连上来时，用下面的「绑定账号」直接填上要绑定的账号。",
+    "qbobUnboundHint": "本实例还没有接入 QQ 官方机器人。请到「协议端」页签扫码或填写 AppID / AppSecret 接入；接入成功后账号会自动绑定，不需要在概览页手工改绑。",
     "migration": "历史归属",
     "migrationHint": "协议端在建实例之前先连上时会自行登记一个待认领实例并认领历史会话。可以把那个实例名下的会话、消息与记忆显式迁到本实例。",
     "fields": {
@@ -124,7 +125,8 @@
   "provider": {
     "builtin_napcat": "内置 NapCat",
     "remote_onebot": "外部 OneBot",
-    "native": "原生适配器"
+    "native": "原生适配器",
+    "builtin_qbob": "内置 qbob（QQ 官方机器人）"
   },
   "card": {
     "accountUnbound": "未绑定账号",
@@ -149,7 +151,8 @@
     "viewAll": "查看全部实例",
     "refresh": "刷新",
     "bindAccount": "绑定账号",
-    "rebindAccount": "改绑"
+    "rebindAccount": "改绑",
+    "goToProtocol": "前往协议端"
   },
   "migrationDialog": {
     "title": "迁移历史归属",
@@ -197,7 +200,8 @@
     "descriptionWithChannels_one": "协议端连上时会先把自己登记成一个待认领实例，消息与会话都归它。目前已有 {{count}} 个会话挂在这些待认领实例名下——如果频道管理里找不到你的群，多半就在这里。",
     "descriptionWithChannels_other": "协议端连上时会先把自己登记成一个待认领实例，消息与会话都归它。目前已有 {{count}} 个会话挂在这些待认领实例名下——如果频道管理里找不到你的群，多半就在这里。",
     "accountLabel": "账号 {{account}}",
-    "firstSeen": "首次连入"
+    "firstSeen": "首次连入",
+    "dispatchPaused": "消息暂不处理（需认领；部署令牌为空或已暴露）"
   },
   "claimDialog": {
     "title": "认领协议端",
@@ -227,6 +231,7 @@
     "modePurge": "彻底删除",
     "archiveDescription": "归档后实例停止工作，会话、消息与记忆等数据只读保留，后续可再处理。",
     "purgeDescription": "彻底删除会级联清除该实例的全部会话、消息与记忆数据，且无法恢复。",
+    "qbobAttached": "该实例接着 qbob 里的一个 QQ 官方机器人。删除实例不会删除那个 bot，它会继续运行并反复尝试连接。请先在实例详情的「协议端」页解绑。",
     "confirmLabel": "输入实例标识以确认",
     "confirmHelper": "请手工输入 {{instanceKey}}",
     "confirmMismatch": "输入的实例标识不匹配",
@@ -247,5 +252,27 @@
     "title": "绑定 Bot 账号",
     "description": "入站消息按账号定位实例：填上协议端登录的那个账号（如 QQ 号），这个实例才会收到它的消息。留空表示解绑。",
     "helper": "一个账号只能绑一个实例；已被别的实例占用时会提示去认领或解绑"
+  },
+  "onebotEndpoint": {
+    "title": "OneBot 协议端",
+    "refresh": "刷新",
+    "loadFailed": "读取协议端状态失败",
+    "protocol": "协议端",
+    "offline": "未连接",
+    "unknown": "未知",
+    "selfReport": "上报自身消息",
+    "selfReportState": {
+      "on": "已开启",
+      "off_suspected": "疑似未开启",
+      "unknown": "暂未确定"
+    },
+    "hints": {
+      "snowluma": "在 SnowLuma 的 WebUI 里打开这个账号的 OneBot 配置，找到连到 NA 的反向 WebSocket 节点，打开「上报自身消息」并保存。保存后立即生效，不会断线。",
+      "napcat": "在 NapCat 的 WebUI「网络配置」里，找到连到 NA 的反向 WebSocket，打开「上报自身消息」并保存。",
+      "other": "在协议端的 OneBot 网络配置里开启「上报自身消息」（reportSelfMessage）。",
+      "suffix": "不开的话，同账号其他程序发的消息不会进聊天记录，AI 也看不到。"
+    },
+    "undetermined": "NA 在这次连接里还没发出几条消息，暂时判断不了；发过几条消息后再刷新。",
+    "counts": "本次连接以来：NA 发出 {{ownSends}} 条，收到回传 {{echoes}} 条"
   }
 }

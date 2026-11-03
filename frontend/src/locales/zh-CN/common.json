@@ -215,6 +215,7 @@
     "restartSent": "系统重启请求已发送，请稍候...",
     "restartFailed": "重启系统失败，请检查网络连接",
     "currentModelGroupMissing": "当前选择的模型组已不存在",
+    "tenantOwnedModelGroup": "租户 #{{id}} 自建",
     "currentEmailAccountMissing": "当前选中的邮箱账户不存在或未启用发信",
     "goToModelGroup": "跳转到模型组配置页面",
     "ModelGroup": "{{label}}模型组",

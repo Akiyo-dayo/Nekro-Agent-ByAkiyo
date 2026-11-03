@@ -1,6 +1,6 @@
 """记忆向量库 payload 索引的回归。
 
-`R5-M3`（「Qdrant 缺 payload 索引」）那一轮补了 7 个字段索引，并让 `ensure_collection`
+之前补 Qdrant 缺的 payload 索引时加了 7 个字段索引，并让 `ensure_collection`
 对**已存在**的 collection 也补建。但 `rebuild_collection` 是另一条路径：它
 `delete_collection` + `create_collection` 从头重来，**没有**补索引。
 
@@ -221,7 +221,7 @@ class TestIndexFieldListMatchesFilterUsage:
 
     @pytest.mark.asyncio
     async def test_instance_key_is_indexed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """实例隔离是 `DECISIONS.md` 的不变式，它的过滤字段单独钉一条。"""
+        """记忆按实例隔离是一条不变式，它的过滤字段单独钉一条。"""
         client = FakeQdrantClient(existing=[])
 
         async def get_client() -> FakeQdrantClient:

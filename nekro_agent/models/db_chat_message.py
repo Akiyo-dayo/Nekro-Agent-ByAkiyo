@@ -1,5 +1,5 @@
 import datetime
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import json5
 from tortoise import fields
@@ -8,13 +8,17 @@ from tortoise.models import Model
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
 from nekro_agent.core.config import CoreConfig
 from nekro_agent.schemas.chat_message import (
+    VIDEO_ANALYSIS_PLUGIN_KEY,
+    VIDEO_UNAVAILABLE_NOTE,
     ChatMessageSegment,
     ChatMessageSegmentAt,
     ChatMessageSegmentFile,
     ChatMessageSegmentForward,
     ChatMessageSegmentImage,
     ChatMessageSegmentJsonCard,
+    ChatMessageSegmentType,
     ChatMessageSegmentUntrusted,
+    ChatMessageSegmentVideo,
     segments_from_list,
 )
 from nekro_agent.tools.common_util import limited_text_output
@@ -28,6 +32,9 @@ from nekro_agent.tools.untrusted_content import (
 
 # 合并转发内容完全由发送方构造，渲染进提示词时的长度上限
 MAX_FORWARD_PROMPT_LENGTH = 2048
+
+# 不可信正文被单条消息长度上限截断时留下的记号
+UNTRUSTED_BODY_TRUNCATION_PLACEHOLDER = "\n(content too long, omitted)\n"
 
 
 class DBChatMessage(Model):
@@ -77,8 +84,19 @@ class DBChatMessage(Model):
             travel_mode: 漫游记录用的渲染（调用方没有本轮令牌，传空串），资源段不带令牌；
                 不可信内容的边界在任何模式下都保留。
         """
-        content = convert_raw_msg_data_json_to_msg_prompt(self.content_data, one_time_code, config, travel_mode)
-        content = limited_text_output(content, config.AI_CONTEXT_LENGTH_PER_MESSAGE, placeholder="(content too long, omitted)")
+        # 长度上限必须**先限正文再包裹**：整条消息渲染完再做首尾截断，会把开标签（含 `trust:untrusted`）
+        # 与闭标签切掉，正文尾部就以裸文的形态留在提示词里（合并转发、工具结果、视频分析都中招）。
+        # 所以不可信块只限自己的正文，标签永远完整；块以外的文本仍按原来的首尾截断。
+        limit = config.AI_CONTEXT_LENGTH_PER_MESSAGE
+        pieces = _render_segment_pieces(
+            self.content_data,
+            one_time_code,
+            config,
+            travel_mode,
+            body_limit=limit,
+            video_note=self._video_note(),
+        )
+        content = _join_with_limit(pieces, limit, placeholder="(content too long, omitted)")
         time_str = datetime.datetime.fromtimestamp(self.send_timestamp).strftime("%m-%d %H:%M:%S")
 
         # 消息引用前缀生成
@@ -98,6 +116,18 @@ class DBChatMessage(Model):
         prefix_str: str = f"({', '.join(parts)})" if parts else ""
 
         return f'{prefix_str}[{time_str} id:{self.platform_userid}] "{self.sender_nickname}" 说: {content or self.content_text}'
+
+    def _video_note(self) -> str:
+        """视频插件关着时给 AI 的说明
+
+        按渲染时的开关判，不落库：开关随时会变，存进记录的话开了插件之后 AI 还在说看不到。
+        """
+        if ChatMessageSegmentType.VIDEO.value not in self.content_data:
+            return ""
+        from nekro_agent.services.plugin.scope import is_plugin_active
+
+        active = is_plugin_active(VIDEO_ANALYSIS_PLUGIN_KEY, self.instance_key or "", self.chat_key or "")
+        return "" if active else VIDEO_UNAVAILABLE_NOTE
 
     def parse_content_data(self) -> List[ChatMessageSegment]:
         """解析内容数据"""
@@ -119,16 +149,71 @@ class DBChatMessage(Model):
             return PlatformMessageExt()
 
 
-def convert_raw_msg_data_json_to_msg_prompt(json_data: str, one_time_code: str, config: "CoreConfig", travel_mode: bool = False) -> str:
+def _join_with_limit(pieces: List[Tuple[str, bool]], limit: int, placeholder: str) -> str:
+    """拼接渲染片段并套上单条消息长度上限
+
+    `pieces` 是 `(文本, 是否不可信块)`。没有不可信块时与旧行为逐字相同（整体首尾截断）；
+    有不可信块时，块原样保留（它们的正文在渲染时已按上限截过，标签完整），块与块之间连续的普通文本
+    各自按上限截断——不能把带标签的整段喂给首尾截断，那会切掉边界。
+    """
+    if not any(is_block for _, is_block in pieces):
+        return limited_text_output("".join(text for text, _ in pieces), limit, placeholder=placeholder)
+    out: List[str] = []
+    run: List[str] = []
+    for text, is_block in pieces:
+        if is_block:
+            if run:
+                out.append(limited_text_output("".join(run), limit, placeholder=placeholder))
+                run = []
+            out.append(text)
+        else:
+            run.append(text)
+    if run:
+        out.append(limited_text_output("".join(run), limit, placeholder=placeholder))
+    return "".join(out)
+
+
+def convert_raw_msg_data_json_to_msg_prompt(
+    json_data: str,
+    one_time_code: str,
+    config: "CoreConfig",
+    travel_mode: bool = False,
+    video_note: str = "",
+) -> str:
     """将数据库保存的原始消息数据 JSON 转换为提示词字符串
 
     Args:
         json_data (str): 数据库保存的原始消息数据 JSON
+        video_note (str): 跟在 OneBot 视频占位后面的说明，见 `DBChatMessage._video_note`
 
     Returns:
         str: 提示词字符串
     """
+    return "".join(
+        text for text, _ in _render_segment_pieces(json_data, one_time_code, config, travel_mode, video_note=video_note)
+    )
 
+
+def _render_segment_pieces(
+    json_data: str,
+    one_time_code: str,
+    config: "CoreConfig",
+    travel_mode: bool = False,
+    body_limit: Optional[int] = None,
+    video_note: str = "",
+) -> List[Tuple[str, bool]]:
+    """逐段渲染，返回 `(文本, 是否不可信块)`
+
+    `body_limit` 给定时，不可信块的正文与工具结果的可信摘要各自按它截断，标签不受影响。
+    所以带不可信块的一条消息最长约为「摘要 + 正文 + 标签」，不再是单个上限；换来的是边界永远完整。
+    """
+
+    def _limit_body(body: str) -> str:
+        if body_limit is None:
+            return body
+        return limited_text_output(body, body_limit, placeholder=UNTRUSTED_BODY_TRUNCATION_PLACEHOLDER)
+
+    pieces: List[Tuple[str, bool]] = []
     prompt_str = ""
 
     for seg in segments_from_list(cast(List[Dict[str, Any]], json5.loads(json_data))):
@@ -162,23 +247,33 @@ def convert_raw_msg_data_json_to_msg_prompt(json_data: str, one_time_code: str, 
         elif isinstance(seg, ChatMessageSegmentForward):
             # 合并转发的昵称与正文均由发送方任意构造，与真实群聊消息格式同构。
             # 必须包裹在带会话令牌的边界内并标注为不可信，否则可伪造他人发言。
-            forward_body = sanitize_block_text(seg.text, MAX_FORWARD_PROMPT_LENGTH)
-            prompt_str += (
-                forward_body
-                if travel_mode
-                else wrap_untrusted_block(
-                    one_time_code,
-                    "Forward",
-                    forward_body,
-                    nodes=len(seg.forward_content),
+            forward_body = _limit_body(sanitize_block_text(seg.text, MAX_FORWARD_PROMPT_LENGTH))
+            if travel_mode:
+                prompt_str += forward_body
+            else:
+                pieces.append((prompt_str, False))
+                prompt_str = ""
+                pieces.append(
+                    (wrap_untrusted_block(one_time_code, "Forward", forward_body, nodes=len(seg.forward_content)), True),
                 )
-            )
         elif isinstance(seg, ChatMessageSegmentUntrusted):
-            result = UntrustedToolResult(kind=seg.kind, body=seg.text, summary=seg.summary, attrs=seg.attrs)
+            # 可信摘要在标签外、紧挨着开标签：它也要单独限长。整体截断的旧写法里，过长的摘要正好把开标签挤出保留区
+            result = UntrustedToolResult(
+                kind=seg.kind,
+                body=_limit_body(seg.text),
+                summary=_limit_body(seg.summary),
+                attrs=seg.attrs,
+            )
             # 工具结果的正文来自外部（模型看过视频之后写的话、抓来的网页），任何渲染模式下都要有不可信边界；
             # 漫游模式拿不到本轮令牌，边界里的令牌是空的，但 `trust:untrusted` 标注仍在
-            prompt_str += render_untrusted_result(one_time_code, result)
+            pieces.append((prompt_str, False))
+            prompt_str = ""
+            pieces.append((render_untrusted_result(one_time_code, result), True))
+        elif isinstance(seg, ChatMessageSegmentVideo):
+            # 只用占位与固定说明：`video_name` 由发送方决定，不进提示词
+            prompt_str += f"{seg.text}{video_note}"
         elif isinstance(seg, ChatMessageSegment):
             prompt_str += seg.text
 
-    return prompt_str
+    pieces.append((prompt_str, False))
+    return [(text, is_block) for text, is_block in pieces if text]

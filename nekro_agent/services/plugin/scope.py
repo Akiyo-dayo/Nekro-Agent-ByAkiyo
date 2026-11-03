@@ -38,9 +38,11 @@ chat_key 覆盖均为空，解析结果恒等于全局开关，行为与改造�
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Type
 
 import yaml
 from pydantic import BaseModel
@@ -93,17 +95,39 @@ class PluginScopeState(BaseModel):
 _instance_context_getter: Optional[Callable[[], Optional["InstanceContext"]]] = None
 _instance_context_probed: bool = False
 
+# 不依赖任何适配器的实例上下文：沙盒回调、定时器等不经过适配器入站的链路由调用方显式设置
+_scoped_instance_key: ContextVar[Optional[str]] = ContextVar("plugin_scope_instance_key", default=None)
+
+
+@contextmanager
+def instance_scope(instance_key: str) -> Iterator[None]:
+    """在这段代码里把当前实例固定为 `instance_key`（空串表示单实例 / 无实例，读全局值）
+
+    在这段代码里用 `asyncio.create_task` 拉起的任务会继承这个实例上下文（contextvar 在创建任务时拷贝）；
+    全局常驻服务若在这里惰性启动，应自己包一层 `instance_scope("")`，避免长期停在某个实例上。
+    """
+    token = _scoped_instance_key.set(instance_key or "")
+    try:
+        yield
+    finally:
+        _scoped_instance_key.reset(token)
+
 
 def current_instance_key() -> str:
     """解析当前处理链路所属的实例标识
 
     Returns:
-        实例标识；单实例部署、沙盒 RPC 回调等无上下文场景返回空串。
+        实例标识；都没有上下文时返回空串。
 
-    无上下文时**必须**优雅回落到全局值而不是抛异常：沙盒回调是独立的 HTTP 请求，
-    contextvar 不会传播，插件在其中读配置是完全正常的用法。
+    优先返回 `instance_scope()` 显式设置的实例（空串也是显式设置，表示单实例 / 无实例）；
+    其次才是适配器入站写入的上下文。都没有时**必须**优雅回落到全局值而不是抛异常：
+    插件在任意链路里读配置都是正常用法，不能因为拿不到实例而失败。
     """
     global _instance_context_getter, _instance_context_probed  # noqa: PLW0603
+
+    scoped = _scoped_instance_key.get()
+    if scoped is not None:
+        return scoped
 
     if not _instance_context_probed:
         _instance_context_probed = True

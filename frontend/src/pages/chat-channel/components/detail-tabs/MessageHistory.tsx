@@ -39,6 +39,7 @@ import IconActionButton from '../../../../components/common/IconActionButton'
 import { useNotification } from '../../../../hooks/useNotification'
 import { useUploadAccessToken } from '../../../../hooks/useUploadAccessToken'
 import { buildSignedUploadUrl, type UploadAccessToken } from '../../../../services/api/common'
+import MessageVideoPlayer from './MessageVideoPlayer'
 
 // 防抖函数
 function debounce<T extends (...args: unknown[]) => unknown>(
@@ -683,6 +684,19 @@ function MessageContent({
               src={src}
               alt={seg.file_name || 'image'}
               onClick={() => setPreviewSrc(src)}
+            />
+          )
+        }
+
+        // 有 `file_name` 的视频是别的适配器落盘的文件，仍是文件卡片；没有的是 OneBot 占位
+        if (seg.type === 'video' && !seg.file_name) {
+          return (
+            <MessageVideoPlayer
+              key={i}
+              chatKey={message.chat_key}
+              segment={seg}
+              fallbackMessageId={message.message_id}
+              isDark={theme.palette.mode === 'dark'}
             />
           )
         }

@@ -10,7 +10,7 @@
     GET /api/skills/file?path=ops-runbook/x.md-> 200，同上
 
 反过来 13 个写端点全是 `Role.Super`，租户一个字也写不了 ——
-`需求文档 §R8`「可以自己制作并使用 skills」对定制版客户不成立。
+改前租户根本没法自己制作并使用技能。
 
 而且**读接口不是最短的那条路**：`PUT /workspaces/{id}/skills` 是 `Role.Admin`，
 选中列表是一串任意字符串，改前 `sync_skills` 拿它直接去全局库找目录 ——
@@ -829,7 +829,7 @@ class TestWorkspaceSyncIsTheLastGate:
 
 
 class TestPromotionLandsInTheCallersLibrary:
-    """把沙盒里 CC 自己写的技能收进技能库 —— `需求文档 §R8` 的主路径
+    """把沙盒里 CC 自己写的技能收进技能库 —— 租户自制技能的主路径
 
     这条端点此前是 `Role.Super`，判据是"晋升 == 往全局库写服务端可信代码"。
     技能库有了归属之后落点是 `writable_root(调用方作用域)`，租户写进的是自己那一层，
@@ -1309,7 +1309,7 @@ class TestTheAgentSidePlumbingIsReallyWiredIn:
     `list_all_skills(scope)` 这两个零件。把 `skill_loader` 里
     `_session_skill_scope` 的函数体换成 `return None`（也就是改回"不带作用域"），
     那两条照样全绿 —— 因为它们压根没走这个插件。
-    见 `PROJECT_STATE §2.7`：接线用例要按调用点一个一个数。
+    接线用例要按调用点一个一个数。
 
     这里覆盖三个调用点：提示词索引、`list_skills()`、`load_skill()`。
     """
@@ -1345,7 +1345,7 @@ class TestTheAgentSidePlumbingIsReallyWiredIn:
     async def test_list_skills_method_is_scoped(self, workspaces) -> None:
         from plugins.builtin.skill_loader.main import list_skills as agent_list_skills
 
-        listed = await agent_list_skills(self._ctx(self.ACME_CHAT_KEY))
+        listed = (await agent_list_skills(self._ctx(self.ACME_CHAT_KEY))).body
         assert "acme-notes" in listed
         assert "ops-runbook" not in listed
 
@@ -1354,8 +1354,8 @@ class TestTheAgentSidePlumbingIsReallyWiredIn:
         from plugins.builtin.skill_loader.main import load_skill
 
         # 正向对照：自己作用域里的那条读得到正文
-        body = await load_skill(self._ctx(self.ACME_CHAT_KEY), "acme-notes")
-        assert "ACME-BODY" in body
+        loaded = await load_skill(self._ctx(self.ACME_CHAT_KEY), "acme-notes")
+        assert "ACME-BODY" in loaded.body
 
         with pytest.raises(ValueError):
             await load_skill(self._ctx(self.ACME_CHAT_KEY), "ops-runbook")
@@ -1363,13 +1363,16 @@ class TestTheAgentSidePlumbingIsReallyWiredIn:
             await load_skill(self._ctx(self.ACME_CHAT_KEY), "rival-notes")
 
     @pytest.mark.asyncio
-    async def test_a_new_workspace_created_by_the_bot_gets_the_channels_own_defaults(self, workspaces) -> None:
+    async def test_a_new_workspace_created_by_the_bot_gets_the_channels_own_defaults(self, workspaces, monkeypatch) -> None:
         """`cc_workspace.create_and_bind_workspace` 是自动注入清单的第二个消费点
 
         它按**发起频道**建工作区，却在改前取平台方那份清单 ——
         平台方私有技能就这样被预装进租户的沙盒目录。
         """
-        from plugins.builtin.cc_workspace.main import create_and_bind_workspace
+        from plugins.builtin.cc_workspace.main import cc_config, create_and_bind_workspace
+
+        # 创建授权默认关闭，函数体会直接拒绝；本用例只验证技能作用域，先显式打开
+        monkeypatch.setattr(cc_config, "ALLOW_AUTO_CREATE_WORKSPACE", True)
 
         # 两份清单必须**不同**：都用「平台方那份裁剪后的子集」的话，下游那次
         # `list_all_skills(scope)` 过滤会把两条路径的结果重新拉平，
@@ -1395,9 +1398,12 @@ class TestTheAgentSidePlumbingIsReallyWiredIn:
         assert ws.metadata.get("skills") == ["acme-notes"]
 
     @pytest.mark.asyncio
-    async def test_a_platform_channel_positive_control_for_workspace_creation(self, workspaces) -> None:
+    async def test_a_platform_channel_positive_control_for_workspace_creation(self, workspaces, monkeypatch) -> None:
         """同一个函数、只换频道：平台方频道照旧拿到平台方那份，逐字不变"""
-        from plugins.builtin.cc_workspace.main import create_and_bind_workspace
+        from plugins.builtin.cc_workspace.main import cc_config, create_and_bind_workspace
+
+        # 创建授权默认关闭，函数体会直接拒绝；本用例只验证技能作用域，先显式打开
+        monkeypatch.setattr(cc_config, "ALLOW_AUTO_CREATE_WORKSPACE", True)
 
         await update_auto_inject_skills(
             AutoInjectSkillsUpdate(skills=["ops-runbook", "shared-guide"]), _current_user=platform_owner()

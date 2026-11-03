@@ -22,8 +22,9 @@ from nekro_agent.services.agent.provider_refusal import (
 )
 from nekro_agent.services.agent.session_token import attach_untrusted_result, register_session_token
 from nekro_agent.services.model_group_service import enforce_channel_model_group_scope
+from nekro_agent.services.plugin.call_priority import build_plugin_call_priority_rules
 from nekro_agent.services.plugin.prompt_activation import build_plugin_activation_rules
-from nekro_agent.services.plugin.scope import resolve_active_plugins
+from nekro_agent.services.plugin.scope import instance_scope, resolve_active_plugins
 from nekro_agent.services.sandbox.runner import build_container_key, limited_run_code
 from nekro_agent.services.usage import (
     LLMUsageContext,
@@ -213,7 +214,7 @@ _SIGNATURE_MAX_LEN = 200
 # 「先看看再动手」会在第二轮被判成无进展、直接掐断。
 # 收益则是零：本轮 7 天的证据里烧满迭代的样本**没有一条**是 MANUAL。
 #
-# ## `SECURITY` 与零输出 `TIMEOUT` 的签名是**结构性退化**的，这是有意保留的（§3 #60）
+# ## `SECURITY` 与零输出 `TIMEOUT` 的签名是**结构性退化**的，这是有意保留的
 #
 # `SECURITY` 分支根本不进沙盒（`one_time_code in code_content` 即就地判定），`sandbox_output`
 # 恒为空串，于是签名**永远**是 `SECURITY|<empty>`：触发提前收尾的不是「同一个错重复」，
@@ -472,6 +473,23 @@ async def run_agent(
         db_chat_channel = await DBChatChannel.get(chat_key=chat_key)
         ctx = AgentCtx.create_by_db_chat_channel(db_chat_channel=db_chat_channel)
 
+    with instance_scope(db_chat_channel.instance_key):
+        return await _run_agent_in_instance_scope(
+            chat_key=chat_key,
+            chat_message=chat_message,
+            ctx=ctx,
+            db_chat_channel=db_chat_channel,
+            one_time_code=one_time_code,
+        )
+
+
+async def _run_agent_in_instance_scope(
+    chat_key: str,
+    chat_message: Optional[ChatMessage],
+    ctx: AgentCtx,
+    db_chat_channel: DBChatChannel,
+    one_time_code: str,
+) -> None:
     # 登记本轮令牌，供插件的沙盒方法用 `ctx.one_time_code` 包裹外部内容。
     # 沙盒方法经 RPC 回调进来时会新建 AgentCtx，拿不到这里的局部变量，
     # 只能靠服务端按 container_key 存查——令牌绝不下发进容器，否则模型生成的代码能读到并伪造可信标签。
@@ -486,6 +504,7 @@ async def run_agent(
     await enforce_channel_model_group_scope(
         config,
         instance_key=db_chat_channel.instance_key,
+        adapter_key=db_chat_channel.adapter_key,
         chat_key=chat_key,
     )
     preset = await db_chat_channel.get_preset()
@@ -574,6 +593,7 @@ async def run_agent(
         plugins_prompt=rendered_plugins.system_prompt,
         plugins_runtime_prompt=runtime_prompt,
         plugin_activation_rules=build_plugin_activation_rules() if activation_enabled else "",
+        plugin_call_priority_rules=build_plugin_call_priority_rules(),
         enable_cot=used_model_group.ENABLE_COT,
         chat_key_rules="\n".join(f"- {r}" for r in db_chat_channel.adapter.chat_key_rules),
         enable_at=db_chat_channel.adapter.config.SESSION_ENABLE_AT,
@@ -794,7 +814,7 @@ async def run_agent(
                         repeats=repeats,
                     )
 
-        # 这一趟已经是最后一趟：**不要再为下一趟发请求了**（§3 #58）
+        # 这一趟已经是最后一趟：**不要再为下一趟发请求了**
         #
         # 循环体每一趟消费的是**上一趟末尾**请求回来的 `parsed_code_data`。最后一趟末尾那次
         # 请求发完、解析完，循环就结束了，它的结果**无人消费**——改造前照样发，含全量上下文，

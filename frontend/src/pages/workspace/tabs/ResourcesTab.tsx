@@ -1237,7 +1237,7 @@ export default function ResourcesTab({ workspace }: { workspace?: WorkspaceDetai
   ) : null
 
   // 悬空绑定的唯一可见入口。没有这一块，「删工作区留下的绑定」在后台上不存在，
-  // 只能直连数据库才看得到（PROJECT_STATE §3 #41）。
+  // 只能直连数据库才看得到。
   const bindingHealthAlert = bindingHealth && !bindingHealth.ok ? (
     <Alert
       severity="warning"

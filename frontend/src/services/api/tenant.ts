@@ -11,6 +11,7 @@
  */
 
 import axios, { ApiError } from './axios'
+import type { I18nDict } from './types'
 import type { ModelGroupConfig } from '../../components/common/ConfigTable'
 
 /** 租户体系下的角色，权限从高到低 */
@@ -140,6 +141,62 @@ export interface ModelGroupInfo {
 export interface ModelGroupListResponse {
   items: ModelGroupInfo[]
   total: number
+}
+
+/**
+ * 批量删除里某个组没删成的原因（与后端 `DeleteRefusal` 一一对应）
+ *
+ * - `not_found`：不存在，或当前身份看不见（两者刻意不区分）
+ * - `forbidden`：看得见但无权删除，如租户眼里的平台组
+ * - `default_group`：默认模型组不可删除
+ * - `error`：删除时出错（详情只在服务端日志里）
+ */
+export const MODEL_GROUP_DELETE_REFUSALS = [
+  'not_found',
+  'forbidden',
+  'default_group',
+  'error',
+] as const
+export type ModelGroupDeleteRefusal = (typeof MODEL_GROUP_DELETE_REFUSALS)[number]
+
+/** 引用所在的配置层（与后端 `ModelGroupRefScope` 一一对应） */
+export type ModelGroupRefScope =
+  | 'system'
+  | 'adapter'
+  | 'instance'
+  | 'channel'
+  | 'plugin'
+  | 'plugin_instance'
+
+/** 一处配置引用 */
+export interface ModelGroupReferenceInfo {
+  scope: ModelGroupRefScope
+  /** system 为空；adapter 为适配器标识；instance 为 `<adapter>/<instance>`；channel 为 chat_key；插件两层为插件键 */
+  target: string
+  field: string
+  title: string
+  /** 仅 plugin_instance：插件在哪个实例上的配置 */
+  instance_key: string
+  /** 字段标题的多语言版本；有值时界面按语言取 */
+  i18n_title?: I18nDict | null
+}
+
+/**
+ * 一个组被哪些配置引用。后端只对当前身份可删除的组作答；
+ * 租户只看得到自己实例下的引用。`references` 可能被截断，`total` 是总数
+ */
+export interface ModelGroupReferenceItem {
+  name: string
+  total: number
+  references: ModelGroupReferenceInfo[]
+}
+
+/** 批量删除结果；后端逐个结算，`ok` 仅在全部删除成功时为 true */
+export interface ModelGroupBatchDeleteResponse {
+  ok: boolean
+  succeeded: string[]
+  failed: { name: string; reason: ModelGroupDeleteRefusal }[]
+  message: string
 }
 
 /**
@@ -374,6 +431,24 @@ export const tenantApi = {
     await axios.delete(`${CONSOLE_BASE}/model-groups/${encode(name)}`)
   },
 
+  /** 查询模型组被哪些配置引用（删除确认框的提醒用） */
+  async getModelGroupReferences(names: string[]): Promise<ModelGroupReferenceItem[]> {
+    const response = await axios.post<{ items: ModelGroupReferenceItem[] }>(
+      `${CONSOLE_BASE}/model-groups/actions/references`,
+      { names }
+    )
+    return response.data.items
+  },
+
+  /** 批量删除模型组（组名在请求体里，不进路径） */
+  async batchDeleteModelGroups(names: string[]): Promise<ModelGroupBatchDeleteResponse> {
+    const response = await axios.post<ModelGroupBatchDeleteResponse>(
+      `${CONSOLE_BASE}/model-groups/actions/batch-delete`,
+      { names }
+    )
+    return response.data
+  },
+
   /** 模型组连通性测试 */
   async testModelGroup(name: string): Promise<ModelGroupTestResponse> {
     const response = await axios.post<ModelGroupTestResponse>(
@@ -391,7 +466,7 @@ export const tenantApi = {
  */
 export function isTenantEndpointUnavailable(error: unknown): boolean {
   if (error instanceof ApiError) {
-    // ⚠️ `NotFoundError` 是**后端自己抛的越权语义**（PROJECT_STATE §1.4：越权一律 404，
+    // ⚠️ `NotFoundError` 是**后端自己抛的越权语义**（越权一律 404，
     // 见 `assert_tenant_accessible` / `assert_instance_accessible`），它恰恰证明接口**在**。
     // 把它算成「接口尚未就绪」就是「把越权 404 说成接口没上线」——`pages/settings/system.tsx`
     // 顶部已经把这句话点名成一条错误，这里是它的第二处实现。
@@ -437,6 +512,9 @@ export const TENANT_QUERY_KEYS = {
   tenant: (tenantId: number) => ['tenant', 'detail', tenantId] as const,
   members: (tenantId: number) => ['tenant', 'members', tenantId] as const,
   modelGroups: ['tenant', 'model-groups'] as const,
+  /** 删除确认框的引用检查；组名排序后入键，同一组集合只查一次 */
+  modelGroupReferences: (names: string[]) =>
+    ['tenant', 'model-group-references', [...names].sort()] as const,
   /** 实例列表与 Console 侧共用同一份缓存，划归后两边同时失效 */
   instances: ['console-instances'] as const,
 }

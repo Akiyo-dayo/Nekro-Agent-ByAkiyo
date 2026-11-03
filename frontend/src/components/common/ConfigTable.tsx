@@ -57,6 +57,9 @@ import { useRestartCapability } from '../../hooks/useRestartCapability'
 import { unifiedConfigApi } from '../../services/api/unified-config'
 import { ThemedTooltip } from './ThemedTooltip'
 import { presetsApi, Preset } from '../../services/api/presets'
+import { TENANT_QUERY_KEYS, tenantApi } from '../../services/api/tenant'
+import { useIdentity } from '../../hooks/useIdentity'
+import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { I18nDict, getLocalizedText } from '../../services/api/types'
@@ -969,6 +972,30 @@ export default function ConfigTable({
   const [emptyRequiredFields, setEmptyRequiredFields] = useState<string[]>([])
   const [modelGroups, setModelGroups] = useState<Record<string, ModelGroupConfig>>({})
   const [modelTypes, setModelTypes] = useState<ModelTypeOption[]>([])
+
+  /**
+   * 平台方在模型组下拉框里要分得清哪些是租户自建的组：组名全局唯一，但可以长得很像
+   * （片假名 カ 与汉字 力、英文 I 与 l），选错一次，平台的对话就发到了租户配置的端点上。
+   * `/config/model-groups` 只给组名与配置，归属取自 `/console/model-groups`（与模型组管理页共用缓存）。
+   * 只对平台方查：租户只看得到自己的组与平台开放的组，不存在被别的租户冒充的问题。
+   */
+  const { isPlatformOwner } = useIdentity()
+  const ownershipQuery = useQuery({
+    queryKey: TENANT_QUERY_KEYS.modelGroups,
+    queryFn: () => tenantApi.listModelGroups(),
+    enabled: isPlatformOwner && Boolean(configService.getModelGroups),
+    staleTime: 30_000,
+    retry: false,
+  })
+  const tenantOwnedGroups = useMemo(
+    () =>
+      new Map(
+        (ownershipQuery.data?.items ?? [])
+          .filter(group => group.ownership === 'tenant')
+          .map(group => [group.name, group.owner_tenant_id] as const)
+      ),
+    [ownershipQuery.data]
+  )
   const [emailSendAccounts, setEmailSendAccounts] = useState<EmailSendAccountOption[]>([])
 
   const [presets, setPresets] = useState<Preset[]>([])
@@ -1325,6 +1352,17 @@ export default function ConfigTable({
             {modelGroupNames.map(name => (
               <MenuItem key={name} value={name}>
                 {name}
+                {tenantOwnedGroups.has(name) && (
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    color="warning"
+                    label={t('configTable.tenantOwnedModelGroup', {
+                      id: tenantOwnedGroups.get(name) ?? '?',
+                    })}
+                    sx={{ ml: 1 }}
+                  />
+                )}
               </MenuItem>
             ))}
           </TextField>

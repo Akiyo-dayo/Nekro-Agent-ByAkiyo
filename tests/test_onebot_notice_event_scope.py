@@ -134,6 +134,11 @@ def _notice_handler():
     return notice_module, handlers[0].call
 
 
+async def _dispatch_allowed(_adapter_key: str, _instance_key: str) -> bool:
+    """这两条测的是通知解析，不是实例闸门（闸门要查实例表，见 `test_unclaimed_dispatch_onebot.py`）"""
+    return True
+
+
 @pytest.mark.asyncio
 async def test_input_status_notice_is_skipped_without_touching_the_db(monkeypatch) -> None:
     notice_module, handler = _notice_handler()
@@ -155,6 +160,7 @@ async def test_input_status_notice_is_skipped_without_touching_the_db(monkeypatc
 
     monkeypatch.setattr(notice_module, "resolve_instance_key", _resolve_instance_key)
     monkeypatch.setattr(notice_module, "set_current_instance", lambda *a, **k: None)
+    monkeypatch.setattr(notice_module, "is_inbound_dispatch_allowed", _dispatch_allowed)
     monkeypatch.setattr(notice_module.DBChatChannel, "get_channel", classmethod(lambda cls, chat_key: _get_channel(chat_key)))
     monkeypatch.setattr(notice_module.notice_manager, "handle", _handle)
 
@@ -197,6 +203,7 @@ async def test_real_group_notice_still_reaches_the_handlers(monkeypatch) -> None
     monkeypatch.setattr(notice_module, "resolve_instance_key", _resolve_instance_key)
     monkeypatch.setattr(onebot_util, "resolve_instance_key", _resolve_instance_key)
     monkeypatch.setattr(notice_module, "set_current_instance", lambda *a, **k: None)
+    monkeypatch.setattr(notice_module, "is_inbound_dispatch_allowed", _dispatch_allowed)
     monkeypatch.setattr(notice_module.DBChatChannel, "get_channel", classmethod(lambda cls, chat_key: _get_channel(chat_key)))
     monkeypatch.setattr(notice_module.notice_manager, "handle", _handle)
 

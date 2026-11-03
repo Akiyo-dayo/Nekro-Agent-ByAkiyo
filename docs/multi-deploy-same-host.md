@@ -82,7 +82,7 @@
 | NapCat WebUI 宿主端口 | 36000–36999 随机，只与**自己库里**已用端口去重 | 两套部署可能选中同一个端口 → 容器启动失败（响，但报错指向 Docker 而不是这条原因） | 同上，且失败是响的 |
 | CC 工作区宿主端口 | 40000–49999 随机，只与**自己库里**已用端口去重 | 同上 | 同上 |
 | docker-guard 的容器归属判据（仅硬化部署） | 认标签键前缀 `nekro.`，目前不区分具体是哪套部署 | 同宿主跑多套硬化部署时，归属判断只到“是不是本系统的容器”这一级 | 细化到“按部署作用域精确匹配”需要先让各类容器的标签都带上作用域值，并处理存量容器的迁移，计划中。建议给每套部署设置不同的 `NEKRO_INSTANCE_NAME`，边界与建议配置见 `docs/docker-guard.md` |
-| ~~`NEKRO_INSTANCE_NAME` 被当作 DNS 主机名~~（#47，**已修**） | `ws://{主机名}:{端口}/onebot/v11/ws` | 曾经：用 `docker-compose.yml` 且设了 `INSTANCE_NAME=foo` 时，NA 的容器名是 `foonekro_agent` 而不是 `foo`，内置 NapCat 反连不上 | round-26 把主机名拆成独立的 `NEKRO_SELF_HOSTNAME`（应用层三级回落）；round-27 补上 compose 这一半——三份 compose 都把它传进容器、默认值就是容器名，**运维零配置**，见 §2.1 |
+| ~~`NEKRO_INSTANCE_NAME` 被当作 DNS 主机名~~（**已修**） | `ws://{主机名}:{端口}/onebot/v11/ws` | 曾经：用 `docker-compose.yml` 且设了 `INSTANCE_NAME=foo` 时，NA 的容器名是 `foonekro_agent` 而不是 `foo`，内置 NapCat 反连不上 | 先把主机名拆成独立的 `NEKRO_SELF_HOSTNAME`（应用层三级回落），再补上 compose 这一半——三份 compose 都把它传进容器、默认值就是容器名，**运维零配置**，见 §2.1 |
 
 ---
 
@@ -108,19 +108,19 @@ NEKRO_EXPOSE_PORT=8022
 `NEKRO_SELF_HOSTNAME=${NEKRO_SELF_HOSTNAME:-${INSTANCE_NAME:-}nekro_agent}`
 这两行三份 compose（含 `-x-napcat.yml`）里都有，会把它们传到应用层。
 
-> ✅ **内置 NapCat 的反连地址（#47，compose 下零配置）**：应用层不把
+> ✅ **内置 NapCat 的反连地址（compose 下零配置）**：应用层不把
 > `NEKRO_INSTANCE_NAME` 直接当 DNS 主机名——反连 host 统一走 `resolve_self_hostname()`
 > 三级回落（`NEKRO_SELF_HOSTNAME` → `NEKRO_INSTANCE_NAME` → `nekro_agent`）。
-> round-26 做了应用层，但**当时 compose 没把 `NEKRO_SELF_HOSTNAME` 传进容器**
+> 最初只做了应用层，但**当时 compose 没把 `NEKRO_SELF_HOSTNAME` 传进容器**
 > （`environment:` 是显式白名单、也没有 `env_file`），文档却让运维写进 `.env`，
-> 于是那个值进不了容器、#47 在 Docker 下形同没修（round-27 发现并补上）。
+> 于是那个值进不了容器、这个问题在 Docker 下形同没修（后来补上了 compose 这一半）。
 > 现在每份 compose 都带这一行，**默认值就是该文件里 NA 的容器名**：设了
 > `INSTANCE_NAME=na_a_` 之后容器名是 `na_a_nekro_agent`，反连主机名也是它，
 > 加前缀与容器网络解析同时成立，**什么都不用再配**。想显式覆盖才在 `docker/.env` 里写
 > `NEKRO_SELF_HOSTNAME=...`（空值等于没设）。
 > ⚠️ **不要**把它写进仓库的 `.env.prod`：那份文件被打进镜像，`run_bot.py` 会把其中
 > `NEKRO_` 前缀的键无条件覆盖进环境，抹掉 compose 传进来的值。
-> 之前升级过 round-26 并手工在 `.env` 里写了 `NEKRO_SELF_HOSTNAME=${INSTANCE_NAME}nekro_agent`
+> 之前升级到只修了应用层的版本、并手工在 `.env` 里写了 `NEKRO_SELF_HOSTNAME=${INSTANCE_NAME}nekro_agent`
 > 的部署，这行写法与默认值逐字等价，可留可删。
 > 钉住这件事的用例：`tests/test_compose_self_hostname.py`（每份定义 NA 服务的 compose 都含该行，
 > 默认值在 Compose 插值之后逐场景等于该文件的 `container_name`）。
@@ -210,7 +210,7 @@ NEKRO_EXPOSE_PORT=8022
 **不要手写 `iptables` 命令。** 这条路已经真的翻过车：`iptables -S` 输出里的
 `--comment "nekro-cc:default"` **带引号**，`iptables-save | sed 's/^-A /-D /' | while read` 那种写法
 经 shell 重新分词后引号会丢掉，`-D` 一条都匹配不上；而**半成功比全失败更糟** ——
-被删掉的那半完全可能是还在生效的兜底 DROP（PROJECT_STATE §2.20）。
+被删掉的那半完全可能是还在生效的兜底 DROP。
 
 页面做三件事：
 

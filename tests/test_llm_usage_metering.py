@@ -2,7 +2,7 @@
 
 ## 这份测试要防的是什么
 
-上线阻塞 #3 的核心是「算不出每个客户烧了多少」。修法是一张流水表 + 三个记账点 +
+要解决的是「算不出每个客户烧了多少」。修法是一张流水表 + 三个记账点 +
 一个带租户作用域的查询出口。这三件事各有各的失效形态，本文件逐条钉：
 
 | 失效形态 | 表现 | 钉在哪 |
@@ -15,7 +15,7 @@
 | 模型组名原样吐给租户 | 绕开 `can_view_group`「看不到的组根本不出现」 | `TestUsageQueryIsTenantScoped` |
 | 记账失败把回复也带崩 | 数据库抖一下，Bot 就不说话了 | `TestBillingNeverBreaksTheMainPath` |
 
-## §3 #57：`gen_openai_chat_stream` 的两条判据
+## `gen_openai_chat_stream` 的两条判据
 
 `TestSimpleStreamHasTheSameGates` 是 #57 的行为侧。它与 `gen_openai_chat_response`
 的那两条分支共用同一套判据（同一个常量集合、同一个救回函数、同一组异常类），
@@ -23,8 +23,7 @@
 
 ## 变异表（把每一处判据改回旧行为 / 改坏，看用例会不会红）
 
-驱动器在 scratchpad 的 `usage_mutate.py`（逐处字符串替换 + 逐处还原，不做整文件写回，
-见 PROJECT_STATE §2.26 / §2.30）。
+驱动器在 scratchpad 的 `usage_mutate.py`（逐处字符串替换 + 逐处还原，不做整文件写回）。
 
 | # | 变异 | 结果 |
 |---|---|---|
@@ -514,7 +513,7 @@ class TestEveryUsageReadPointIsBilled:
     ① `gen_openai_chat_response` 非流式（`res.usage`）
     ② `gen_openai_chat_response` 流式（`chunk.usage` 累加）
     ③ `gen_openai_chat_stream`（本轮才接上，此前连 `include_usage` 都没要）
-    ④ `gen_openai_embeddings`（round-23 复核补的，见 `TestEmbeddingsAreBilledToo`）
+    ④ `gen_openai_embeddings`（见 `TestEmbeddingsAreBilledToo`）
     """
 
     async def test_non_stream_success_is_billed(self, db, monkeypatch) -> None:
@@ -981,7 +980,7 @@ class TestModelGroupNamesAreMaskedForTenants:
 
         平台方配两个组（主 + fallback 是常态）时，租户的账单上会出现两行
         一模一样的「(未公开的模型组)」：数字不同、标签相同，"这两行差在哪"无解；
-        前端拿 `key` 当 React 列表键还会撞。这与 round-22 修的 `display_name`
+        前端拿 `key` 当 React 列表键还会撞。这与之前修过的 `display_name`
         撞名是同一形态，只是解法必须相反 —— 那边可以退回唯一的 `name` 把两行分开，
         这边"分开"恰恰是掩码禁止的（能数出平台方有几个组就已经泄露了清单规模）。
         """
@@ -1207,7 +1206,7 @@ class TestEveryModelHasAMigration:
 
 
 # ---------------------------------------------------------------------------
-# 8. §3 #57：`gen_openai_chat_stream` 的两条判据
+# 8. `gen_openai_chat_stream` 的两条判据
 # ---------------------------------------------------------------------------
 
 
@@ -1654,7 +1653,7 @@ class TestEmbeddingsAreBilledToo:
     async def test_the_embedding_test_branch_declares_attribution(self, db, monkeypatch) -> None:
         """`run_model_group_test` 有**两支**：chat 与 embedding
 
-        round-22 只给 chat 那一支接了归属。嵌入组的连通性测试同样是租户自己点出来的花销，
+        最初只给 chat 那一支接了归属。嵌入组的连通性测试同样是租户自己点出来的花销，
         落进 `unattributed` 的话他在自己的用量页上看不到自己刚烧的钱。
         """
         from nekro_agent.services import model_group_test as mgt
@@ -1800,7 +1799,7 @@ class TestShutdownFlushesTheLedger:
         # 判据必须是**真的调了**，不能只是"这个名字在函数体里出现过"：
         # 收尾块里那行 `from ... import flush_llm_usage` 本身就带着这个名字，
         # 只判名字的话，把 `await flush_llm_usage()` 换成 `0` 这条变异会**存活**
-        # （复核第一轮实测如此）。
+        # （变异实测如此）。
         assert "await flush_llm_usage(" in body, "用量流水没有在进程收尾时冲干净，队列里的账会静默消失"
         # 顺序也要对：必须排在 HTTP 连接池关闭**之前**
         assert body.index("await flush_llm_usage(") < body.index("reset_http_clients")
@@ -1810,10 +1809,10 @@ class TestShutdownFlushesTheLedger:
     def test_the_ledger_summary_line_survives_the_default_log_level(self) -> None:
         """收尾那行必须是 **INFO**，因为 `APP_LOG_LEVEL` 默认就是 INFO
 
-        `PRELAUNCH_CHECKLIST §3.6` 拿 `grep "llm usage ledger flushed"` 当
-        "账本收尾过、这次运行一条都没丢"的唯一凭据。写成 `logger.debug` 的话
+        运维拿 `grep "llm usage ledger flushed"` 当"账本收尾过、这次运行一条都没丢"的
+        唯一凭据（docs/operations.md §2.3）。写成 `logger.debug` 的话
         它在**健康部署上恒为 0 命中**——而真的丢账时同样是 0 命中，两者分不开，
-        于是这条上线前判据既报假警又漏真警。周围那些收尾步骤是 DEBUG，这一条故意不是。
+        于是这条运维判据既报假警又漏真警。周围那些收尾步骤是 DEBUG，这一条故意不是。
         """
         import pathlib
         import re
@@ -1826,7 +1825,7 @@ class TestShutdownFlushesTheLedger:
         source = pathlib.Path("nekro_agent/__init__.py").read_text(encoding="utf-8")
         _head, _, body = source.partition("async def on_shutdown()")
         match = re.search(r"logger\.(\w+)\(\s*\n?\s*f?\"\[shutdown\] llm usage ledger flushed", body)
-        assert match, "找不到收尾汇总那一行——`PRELAUNCH_CHECKLIST §3.6` 的判据锚在它上面"
+        assert match, "找不到收尾汇总那一行——运维排查用 grep 这一行做判据"
         assert match.group(1) == "info", f"它是 logger.{match.group(1)}，生产上不落盘"
         # §2.11 对照：同一段里那条 DEBUG 必须被这个正则判成**不是** info
         debug_line = re.search(r"logger\.(\w+)\(\"\[shutdown\] flushing llm usage ledger\"\)", body)
@@ -1997,7 +1996,7 @@ class TestTheUsageEntryIsHiddenForTheRightReason:
     标记与 URL 兜底清单）。交接时那条支路正在被整文件改写，因此本族当时只更新了前两份，
     "后端确实是 Role.Admin"这句话对本族端点**没被检查过**。
 
-    **round-23 复核已把 `("/console/usage", "console.usage", "GET", "/usage/summary")`
+    **后来已把 `("/console/usage", "console.usage", "GET", "/usage/summary")`
     并进那张表**（它顺带把「URL 兜底清单真的挡住只读成员」也钉上了，那一维本文件测不到）。
     本类保留，因为它覆盖的是**四条**读端点而不是一条代表：`/usage/trend`、`/usage/records`、
     `/usage/enums` 任意一条被降级，那张表都不会红。

@@ -13,7 +13,7 @@
 | 宿主资源分配 | `create` / `start` / `stop` / `delete` / `network-config` 读写 | `Role.Super` |
 | 协议端自助运维 | `container` 读 / `restart` / `qrcode` / `quick-login` | `Role.Admin` + 归属校验 |
 
-第二档是 R19「与其他需求的耦合」明写过的那一条：租户**最多能「重启我的 NapCat」**，
+第二档的边界：租户**最多能「重启自己的 NapCat」**，
 且必须由后端校验该容器确实属于该租户。此前整族 11 个端点全是 `Role.Super`，于是
 QQ 掉线 / 需要重新扫码 —— 最高频的那类运营事件 —— 对定制版客户是一个红点加零个按钮。
 

@@ -196,11 +196,13 @@ async def person_account_ids(key: AffectionKey) -> List[str]:
     return accounts
 
 
-async def affection_domain_of_instance(instance_key: str) -> Optional[ScopeDomain]:
+async def affection_domain_of_instance(instance_key: str, adapter_key: str = "") -> Optional[ScopeDomain]:
     """按实例标识解析好感域，供只拿得到 `instance_key` 的调用方（后台作用域）使用
 
     Args:
         instance_key: 实例标识；空串表示"没有作用域"，本函数不接受
+        adapter_key: 调用方知道实例属于哪个适配器时必须传。不传时在同名的几行里取最早那行，
+            而另一个适配器下的同名实例可以归别的租户——换算出来的就是别人的域。
 
     Returns:
         该实例的好感域；实例行查不到时返回 `None`。
@@ -220,7 +222,10 @@ async def affection_domain_of_instance(instance_key: str) -> Optional[ScopeDomai
     # （`console/instance_manager.py` 的全局重名校验），库里的唯一键是
     # `(adapter_key, instance_key)`，允许重名。与 `DBAdapterInstance.get_by_bound_account`
     # 同一取舍——脏行下确定性地取一行，而不是让后台整页 500。
-    instance = await DBAdapterInstance.filter(instance_key=instance_key).order_by("id").first()
+    query = DBAdapterInstance.filter(instance_key=instance_key)
+    if adapter_key:
+        query = query.filter(adapter_key=adapter_key)
+    instance = await query.order_by("id").first()
     if instance is None:
         return None
     return await resolve_affection_domain(instance.adapter_key, instance_key)

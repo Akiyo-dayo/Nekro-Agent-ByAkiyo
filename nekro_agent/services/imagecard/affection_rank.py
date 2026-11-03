@@ -64,7 +64,7 @@ from PIL import Image, ImageChops, ImageDraw
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_affection import DBAffection
 from nekro_agent.models.db_chat_message import DBChatMessage
-from nekro_agent.schemas.chat_message import TOOL_RESULT_SENDER_ID
+from nekro_agent.schemas.chat_message import SELF_SENT_SENDER_ID, TOOL_RESULT_SENDER_ID
 from nekro_agent.services.affection.key import AffectionKey
 from nekro_agent.services.identity_scope import (
     ChannelLike,
@@ -96,7 +96,7 @@ DEFAULT_SCAN_LIMIT = 20000
 
 # Bot 自身发言在消息表里以 sender_id "-1" 记录，不该出现在榜上
 BOT_SENDER_ID = "-1"
-NON_HUMAN_SENDER_IDS = (BOT_SENDER_ID, TOOL_RESULT_SENDER_ID)
+NON_HUMAN_SENDER_IDS = (BOT_SENDER_ID, TOOL_RESULT_SENDER_ID, SELF_SENT_SENDER_ID)
 
 
 class RankChannel(ChannelLike, Protocol):

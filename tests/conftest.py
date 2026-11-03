@@ -40,3 +40,11 @@ def _warm_up_memory_tokenizer() -> None:
     from nekro_agent.services.memory.text_terms import warm_up_tokenizer
 
     warm_up_tokenizer()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rpc_decode_budget() -> None:
+    """沙盒 RPC 的解码时间预算按容器键记账；各用例共用同几个容器键，上一条用例的欠账不该让下一条被拒"""
+    from nekro_agent.services.rpc_service import decode_budget
+
+    decode_budget.reset()

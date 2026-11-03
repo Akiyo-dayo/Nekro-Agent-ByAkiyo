@@ -1,4 +1,4 @@
-"""模型组 `api_key` 的静态加密（上线阻塞 #4 / 需求 R19 §3 数据模型 `api_key(加密存储)`）
+"""模型组 `api_key` 的静态加密（数据模型要求 `api_key` 加密存储）
 
 ## 这里钉的是什么
 
@@ -8,7 +8,7 @@ Python 属性恒为明文。
 
 ## 每条断言都必须能因"修复缺失"而变红
 
-本文件不做空断言（PROJECT_STATE §2.11：掩码空串还是空串，断言恒成立）。做法统一是
+本文件不做空断言（掩码空串还是空串，断言恒成立）。做法统一是
 **先写哨兵值造出差异**：
 
 - 每个模型组都带一个 `sk-...` 形态的哨兵 Key；
@@ -80,7 +80,7 @@ ROUND_TRIP_SAMPLES: List[str] = [
 
 # "明文不出现在密文里"只对足够长的样例有意义：单个字符（"x"）会以约 1/64 的概率
 # 出现在任意一段 base64 里，拿它断言等于给自己埋一条随机变红的用例 ——
-# 那是假红，不是信号（PROJECT_STATE §6：不要随机输入的伪 fuzz）。
+# 那是假红，不是信号（不要用随机输入做伪 fuzz）。
 NON_LEAK_SAMPLES: List[str] = [value for value in ROUND_TRIP_SAMPLES if len(value) >= 8]
 
 
@@ -145,7 +145,7 @@ def _real_config_file() -> Path:
     掐不掉的后果不是"测试脏"，是**把开发机的配置文件真的改掉**：
     第一版没掐，跑完之后 `MODEL_GROUPS` 只剩本文件的哨兵组，`USE_MODEL_GROUP: default`
     从此指空，全量跑出来 17 条 `KeyError: 模型组 'default' 不存在`（全在 `test_affection_*`，
-    因为它们按字母序排在前面、先读到被改坏的那份配置）。见 PROJECT_STATE §2.29。
+    因为它们按字母序排在前面、先读到被改坏的那份配置）。
 
     ⚠️ 路径取 `core.config.CONFIG_PATH` 本人，不自己按 `OsEnv.DATA_DIR` 拼一遍：
     那个常量是**导入期**就从 `OsEnv.DATA_DIR` 算好的，测试把 `OsEnv.DATA_DIR`
@@ -278,7 +278,7 @@ class TestStoredFormatIsAContractWithDataAlreadyOnDisk:
 
     上面 `TestCipherRoundTrip` 全是"本进程加密 → 本进程解密"。把
     `ENVELOPE_PREFIX` / `_KDF_SALT` / `_KDF_CONTEXT` / `_AAD` 任意一个改掉之后，
-    新参数照样自洽，**76 条用例一条都不红** —— 正是 PROJECT_STATE §2.11 那个
+    新参数照样自洽，**76 条用例一条都不红** —— 正是典型的
     `a = f(x); b = f(x); assert a == b` 的形态：对照组和被测项一起变了，什么都没测到。
 
     而这四个常量每一个都是**跨版本的持久化契约**，改动的真实后果是：
@@ -301,7 +301,7 @@ class TestStoredFormatIsAContractWithDataAlreadyOnDisk:
     # 密钥材料是自己编的（§2.13），且**只**用于这条向量
     GOLDEN_KEY_MATERIAL = "golden-vector-key-material-do-not-use-in-production"
     GOLDEN_PLAINTEXT = "sk-golden-vector-SENTINEL-0f3a"
-    # 由 round-22 的实现产出、此后**不允许再变**的一条密文。
+    # 由当时的实现产出、此后**不允许再变**的一条密文。
     # 它同时钉住了：`nkenc1:` 前缀、base64url 去 padding、nonce|tag|ct 的排列、
     # AES-256-GCM、AAD 的取值、以及 HKDF 的 salt / context / 摘要 / 输出长度。
     GOLDEN_ENVELOPE = (
@@ -712,7 +712,7 @@ class TestKeySources:
 
 
 class TestTheCipherIsActuallyWiredIn:
-    """接线用例（PROJECT_STATE §2.7：零件全对、调用点没了 = 测试全绿）
+    """接线用例（零件全对、调用点没了 = 测试全绿）
 
     上面所有行为用例都建立在"`api_key` 这个字段真的是加密字段"之上。把字段换回
     `TextField` 之后，行为用例确实会红 —— 这一组是为**另外两个调用点**准备的：
@@ -784,7 +784,7 @@ class TestTheCipherIsActuallyWiredIn:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 运维要配的那个环境变量名。它出现在 `.env.example`、`docker/.env.example`、三份 compose、
-# `PRELAUNCH_CHECKLIST §1.8`、以及三条运行期日志文案里 —— 一处写错就是「运维配了、
+# `docs/operations.md §1.5`、以及三条运行期日志文案里 —— 一处写错就是「运维配了、
 # 应用没读到，日志还在劝他去配他刚配过的那一项」
 ENV_VAR_NAME = "NEKRO_CREDENTIAL_SECRET_KEY"
 

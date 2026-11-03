@@ -1,7 +1,7 @@
 # NekroAgent 硬化部署（opt-in）：NA 容器不再直接持有宿主 docker.sock，
 # 改由一个独立的 docker-guard 边车按「NA 实际用到的动作 + 安全形状」放行。
 #
-# 背景（RK3 / PROJECT_STATE.md §3 #19，详细边界见 docs/docker-guard.md）：
+# 背景（详细边界见 docs/docker-guard.md）：
 #   直接把 /var/run/docker.sock 挂进 NA = 给 NA 进程宿主 root。任何能在 NA 内执行代码的路径
 #   一旦被突破，攻击者就能 `POST /containers/create` 起一个 Privileged + 挂载宿主 / 的容器，
 #   直接读走宿主 /etc/shadow、写宿主 /root。tecnativa/docker-socket-proxy 的 `CONTAINERS=1`

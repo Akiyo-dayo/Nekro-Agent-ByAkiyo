@@ -9,6 +9,7 @@ from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.services.config_service import ConfigService
 from nekro_agent.services.plugin.base import NekroPlugin
+from nekro_agent.services.plugin.call_priority import get_plugin_call_priority
 
 _STORE_PLUGIN_KEY = "__prompt_activation__"
 _STORE_KEY = "module_rounds"
@@ -151,6 +152,7 @@ async def render_plugin_prompt_for_agent(plugin: NekroPlugin, ctx: AgentCtx, rou
         PluginPromptRenderUnit(
             plugin_name=plugin.name,
             module_name=plugin.module_name,
+            call_priority=get_plugin_call_priority(plugin.module_name),
             state="active",
             rounds_left=rounds_left,
             plugin_brief=get_plugin_brief(plugin),
@@ -189,6 +191,7 @@ async def build_prompt_disclosure_view(plugins: List[NekroPlugin], ctx: AgentCtx
                     PluginPromptRenderUnit(
                         plugin_name=plugin.name,
                         module_name=plugin.module_name,
+                        call_priority=get_plugin_call_priority(plugin.module_name),
                         state="sleeping",
                         rounds_left=0,
                         plugin_brief=brief,
@@ -200,6 +203,7 @@ async def build_prompt_disclosure_view(plugins: List[NekroPlugin], ctx: AgentCtx
                 PluginPromptRenderUnit(
                     plugin_name=plugin.name,
                     module_name=plugin.module_name,
+                    call_priority=get_plugin_call_priority(plugin.module_name),
                     state="active",
                     rounds_left=rounds_snapshot.get(plugin.module_name, 0),
                     plugin_brief=brief,
@@ -231,6 +235,7 @@ async def build_prompt_disclosure_view(plugins: List[NekroPlugin], ctx: AgentCtx
             PluginPromptRenderUnit(
                 plugin_name=plugin.name,
                 module_name=plugin.module_name,
+                call_priority=get_plugin_call_priority(plugin.module_name),
                 state="always_awake",
                 plugin_brief=brief,
                 plugin_method_prompt=method_prompt,

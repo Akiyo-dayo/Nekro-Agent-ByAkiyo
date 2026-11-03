@@ -1,6 +1,6 @@
 """OneBot V11 协议端接入令牌：按实例校验
 
-盘点发现的死局（上线阻塞 #1 / R12a）：总后台每建一个实例都生成一枚 access token 并下发进
+盘点发现的死局：总后台每建一个实例都生成一枚 access token 并下发进
 NapCat 配置，而 NA 这一侧的校验只有部署级的一个值。于是「留空 = 谁都能冒充协议端连进来」，
 「填上 = 总后台建的实例全部握手 403」。
 
@@ -831,7 +831,7 @@ class TestNoStaleModuleConstant:
         assert not hasattr(os_env, "ONEBOT_ACCESS_TOKEN")
 
     def test_nobody_imports_it_anymore(self) -> None:
-        """扫描的覆盖面本身也要立得住（§2 #38 那次"0 命中"就是扫窄了扫出来的）
+        """扫描的覆盖面本身也要立得住（以前有一次"0 命中"就是扫窄了扫出来的）
 
         - **括号跨行的 import 必须能命中**：改造前 `adapters/onebot_v11/routers.py`
           写的正是 `from ... import (\\n    ONEBOT_ACCESS_TOKEN,\\n ...)`，

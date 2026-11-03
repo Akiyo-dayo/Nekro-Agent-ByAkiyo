@@ -1,15 +1,26 @@
 import json
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Any
+
+from tortoise import timezone
+from tortoise.exceptions import IntegrityError
+from tortoise.transactions import in_transaction
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import TOMBSTONE_STATUS, DBAdapterInstance
 from nekro_agent.models.db_adapter_instance_event import DBAdapterInstanceEvent
 from nekro_agent.models.db_adapter_instance_session import DBAdapterInstanceSession
+from nekro_agent.schemas.errors import ConflictError
 from nekro_agent.services.system_broadcast import publish_adapter_instance_status
 
 logger = get_sub_logger("adapter_instance")
+
+# 管理员对实例的处置：停用、归档、软删。只有管理员动作（经 `set_status`）能写入或离开它们；
+# 连接、续期、探活这些自动来源经 `set_runtime_status`，碰到它们就不写。
+# 与 console 层的 `STATUS_DISABLED` / `STATUS_ARCHIVED` 同值（服务层不依赖 console 模块，用例钉住两边一致）。
+ADMIN_INTENT_STATUSES: frozenset[str] = frozenset({"disabled", "archived", TOMBSTONE_STATUS})
 
 
 class AdapterInstanceService:
@@ -37,8 +48,8 @@ class AdapterInstanceService:
         内置 NapCat 回写四条路都会放行）。
 
         于是「复活」变成了一次隐蔽的账号写入：把墓碑重新变成活行，它记着的那个陈旧账号就
-        重新进入唯一性判据的取值范围，库里立刻出现两行活着的实例绑同一个账号 —— 正是 §3 #31
-        要消灭的状态。更难看的是 `get_by_bound_account` 取的是**最早那行**，而墓碑的 id 通常
+        重新进入唯一性判据的取值范围，库里立刻出现两行活着的实例绑同一个账号 ——
+        正是唯一性判据要防止的状态。更难看的是 `get_by_bound_account` 取的是**最早那行**，而墓碑的 id 通常
         更小：入站消息会从那个一直在收发的实例，静默改判给刚复活的空壳。
 
         ## 为什么是解绑而不是拒绝复活
@@ -111,6 +122,9 @@ class AdapterInstanceService:
 
         Returns:
             DBAdapterInstance: 创建或更新后的实例对象
+
+        Raises:
+            ConflictError: 新建时该 `instance_key` 已被**另一个适配器**的实例占用
         """
         metadata_json: str = json.dumps(metadata, ensure_ascii=False) if metadata else ""
 
@@ -123,6 +137,8 @@ class AdapterInstanceService:
             existing.display_name = display_name
             existing.provider = provider
             existing.metadata_json = metadata_json
+            # 只写本分支改的列：读出之后（例如下面的账号核对期间）别处改的租户归属等列不能被写回
+            changed = ["display_name", "provider", "metadata_json", "update_time"]
             revived = existing.status == "deleted"
             released = ""
             if revived:
@@ -133,7 +149,8 @@ class AdapterInstanceService:
                 existing.status = "pending"
                 existing.enabled = True
                 existing.last_error = released
-            await existing.save()
+                changed += ["status", "enabled", "last_error"]
+            await existing.save(update_fields=changed)
             if revived:
                 await self.record_event(
                     instance=existing,
@@ -147,6 +164,12 @@ class AdapterInstanceService:
                 f"instance={instance_key}, id={existing.id}",
             )
             return existing
+
+        # 数据库的唯一约束只到 (adapter_key, instance_key)，但人设、插件开关、好感与记忆、协议端
+        # 容器名都只按 `instance_key` 存取，同名的两个实例会在这些地方共用一份数据；两行再分属
+        # 两个租户，就是跨租户的读写。总后台建实例时查的是全表重名，这里与它保持同一条判据。
+        if await DBAdapterInstance.filter(instance_key=instance_key).exclude(adapter_key=adapter_key).exists():
+            raise ConflictError(resource=f"实例 '{instance_key}'")
 
         instance: DBAdapterInstance = await DBAdapterInstance.create(
             adapter_key=adapter_key,
@@ -200,8 +223,18 @@ class AdapterInstanceService:
         new_status: str,
         message: str = "",
         payload: dict[str, Any] | None = None,
+        *,
+        extra_fields: Iterable[str] = (),
     ) -> DBAdapterInstance:
         """设置实例主生命周期状态并记录审计事件。
+
+        ## 只写状态那几列
+
+        落库只写 `status`、`last_error`（加 `update_time`），外加调用方在 `extra_fields` 里**显式声明**它改过的列。
+        传进来的对象常常是一段时间以前读出来的：微信 iLink 的连接拿着建立时读出的实例跑几个小时，掉线监测拿着本轮
+        开头读出的对象去探活。整行写回会把这期间别处改的列冲回旧值——平台方刚改划给别的租户的 `tenant_id`、
+        刚停用的 `enabled`、刚改的账号与名称。调用方若在对象上改了别的列、想借这一次写入落库（启停改 `enabled`、
+        认领改名称），就把那几列放进 `extra_fields`，不要指望整行保存顺带写进去。
 
         ## 离开墓碑态时要先核对账号绑定
 
@@ -216,6 +249,7 @@ class AdapterInstanceService:
             new_status: 新状态值
             message: 状态变更说明
             payload: 附加载荷字典，序列化为 JSON 字符串存储
+            extra_fields: 调用方改过、要随本次一起落库的其他列
 
         Returns:
             DBAdapterInstance: 更新后的实例对象
@@ -230,8 +264,64 @@ class AdapterInstanceService:
             # 复活后落到 offline/unbound 时 `last_error` 本会被清空，而"我启用的实例
             # 怎么没了账号"必须在总后台看得见——这条说明是唯一的现场线索
             instance.last_error = released
-        await instance.save()
+        # 去重：PostgreSQL 对同一列赋值两次直接报错（调用方在 extra_fields 里多写了 status 之类）
+        await instance.save(update_fields=list(dict.fromkeys(["status", "last_error", "update_time", *extra_fields])))
+        await self._announce_status_change(instance, old_status, new_status, message, payload)
+        return instance
 
+    async def set_runtime_status(
+        self,
+        instance: DBAdapterInstance,
+        new_status: str,
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> DBAdapterInstance:
+        """自动来源（连接、续期、绑定流程、探活、掉线监测、账号回写）写实例的运行态
+
+        与 `set_status` 的区别：自动来源永远不覆盖管理员的处置（`ADMIN_INTENT_STATUSES`：停用、归档、软删）。
+        写入是一条条件更新——实例此刻仍启用、且不在这三种状态——判据落在写入那一刻，而不是调用方手里那份
+        可能早已过时的对象：连接拿着建立时读出的实例跑几个小时，掉线监测拿着探活之前读出的对象，按旧对象的状态
+        判断再写，会把刚停用的实例写回在线、把刚软删的墓碑写回活态（墓碑的账号核对也随之被绕开）。
+
+        条件不满足时什么都不写：不记审计事件、不广播，只记 debug 日志。离开墓碑态只走管理员恢复。
+
+        内存对象的 `status` / `last_error` 无论写没写都更新成调用方要的值：微信 iLink 的连接靠它记「这条连接
+        自己的运行态」（续期循环据此判断凭据是否已过期、要不要停止重试），库里写没写由条件更新决定，两者互不干扰。
+
+        `new_status` 若本身是管理员意图状态（调用方由旧状态推导出来的，例如续期「恢复原状态」时原状态正是停用），
+        同样不写、不改内存，只记一条告警：抛错会把这种边角变成接口 500 或续期循环里的一次假失败。
+        """
+        if new_status in ADMIN_INTENT_STATUSES:
+            logger.warning(
+                f"[AdapterInstanceService] 自动来源想把实例写成管理员意图状态，已忽略: id={instance.id}, 想写 {new_status}",
+            )
+            return instance
+        old_status = instance.status
+        last_error = message if new_status == "error" else ""
+        written = (
+            await DBAdapterInstance.filter(id=instance.id, enabled=True)
+            .exclude(status__in=list(ADMIN_INTENT_STATUSES))
+            .update(status=new_status, last_error=last_error, update_time=timezone.now())
+        )
+        instance.status = new_status
+        instance.last_error = last_error
+        if not written:
+            logger.debug(
+                f"[AdapterInstanceService] 实例已停用、归档或软删，自动来源不改写状态: id={instance.id}, 想写 {new_status}",
+            )
+            return instance
+        await self._announce_status_change(instance, old_status, new_status, message, payload)
+        return instance
+
+    async def _announce_status_change(
+        self,
+        instance: DBAdapterInstance,
+        old_status: str,
+        new_status: str,
+        message: str,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        """状态已经落库之后：记审计事件、广播给 SSE 订阅者"""
         await self.record_event(
             instance=instance,
             event_type="status_change",
@@ -255,48 +345,33 @@ class AdapterInstanceService:
             f"[AdapterInstanceService] 实例状态变更: id={instance.id}, "
             f"{old_status} -> {new_status}",
         )
-        return instance
 
     async def set_session_state(
         self,
         instance: DBAdapterInstance,
         session_state: str,
-        payload: dict[str, Any] | None = None,
     ) -> DBAdapterInstanceSession:
         """设置实例会话子状态（如 bind_status）。
 
         若实例尚无关联会话，则自动创建一条空会话记录。
 
+        本方法只写 `session_state`，**不碰 `sync_state_json`**：那个字段是同步游标 `SyncState` 的
+        序列化载体，读取方按 `extra="forbid"` 严格解析。以前这里收一个 `payload` 并整体覆盖它，
+        扫码绑定时传进来的 `{bind_session_id, qr_url}` 于是在绑定成功后让实例每次启动都解析失败、
+        监控起不来、收不到消息。绑定过程的附加信息记在 `record_event` 的 `payload_json` 里。
+
         Args:
             instance: 目标实例对象
             session_state: 会话子状态值
-            payload: 附加同步状态字典，覆盖 sync_state_json
 
         Returns:
             DBAdapterInstanceSession: 更新后的会话对象
         """
-        session: DBAdapterInstanceSession | None = await DBAdapterInstanceSession.get_or_none(
-            instance_id=instance.id,
-        )
-
-        sync_state_json: str = json.dumps(payload, ensure_ascii=False) if payload else ""
-
-        if session is None:
-            created = await DBAdapterInstanceSession.create(
-                instance_id=instance.id,
-                session_state=session_state,
-                sync_state_json=sync_state_json,
-            )
-            logger.info(
-                f"[AdapterInstanceService] 会话状态创建: instance_id={instance.id}, "
-                f"state={session_state}",
-            )
-            return created
-
-        session.session_state = session_state
-        if payload is not None:
-            session.sync_state_json = sync_state_json
-        await session.save()
+        await self._ensure_session_row(instance.id)
+        async with in_transaction() as conn:
+            session = await DBAdapterInstanceSession.select_for_update().using_db(conn).get(instance_id=instance.id)
+            session.session_state = session_state
+            await session.save(using_db=conn, update_fields=["session_state", "update_time"])
 
         # 不在此处广播 SSE：会话子状态(bind_status)是绑定内部细节，且其 status==previous_status
         # 会产生 from==to 的无意义“状态转换”事件。主生命周期状态变更已由 set_status 正确广播；
@@ -312,6 +387,24 @@ class AdapterInstanceService:
     # Session Management
     # ------------------------------------------------------------------
 
+    @staticmethod
+    async def _ensure_session_row(instance_id: int) -> None:
+        """确保该实例的会话行存在，供随后加锁更新。
+
+        并发保证靠 `instance_id` 的唯一约束：两个调用同时判断为「不存在」时，落败的那次插入撞约束，
+        这里吞掉 `IntegrityError` 即可，最终只有一行。
+
+        故意放在事务之外，调用方也不能在事务里调它：PostgreSQL 里事务内一旦出现 `IntegrityError`，
+        整个事务进入 aborted 状态，后面的语句全部失败；在事务外，失败的只是这一次插入。
+        """
+        if await DBAdapterInstanceSession.exists(instance_id=instance_id):
+            return
+        try:
+            await DBAdapterInstanceSession.create(instance_id=instance_id)
+            logger.info(f"[AdapterInstanceService] 会话创建: instance_id={instance_id}")
+        except IntegrityError:
+            logger.debug(f"[AdapterInstanceService] 会话已由并发请求创建: instance_id={instance_id}")
+
     async def upsert_session(
         self,
         instance: DBAdapterInstance,
@@ -321,6 +414,8 @@ class AdapterInstanceService:
         last_cursor: str = "",
     ) -> DBAdapterInstanceSession:
         """创建或更新实例会话。
+
+        只写凭据、同步状态、过期时间、游标这几列，不碰 `session_state`（绑定子状态由 `set_session_state` 管）。
 
         Args:
             instance: 目标实例对象
@@ -332,29 +427,17 @@ class AdapterInstanceService:
         Returns:
             DBAdapterInstanceSession: 创建或更新后的会话对象
         """
-        session: DBAdapterInstanceSession | None = await DBAdapterInstanceSession.get_or_none(
-            instance_id=instance.id,
-        )
-
-        if session is None:
-            created = await DBAdapterInstanceSession.create(
-                instance_id=instance.id,
-                credentials_json=credentials_json,
-                sync_state_json=sync_state_json,
-                expires_at=expires_at,
-                last_cursor=last_cursor,
+        await self._ensure_session_row(instance.id)
+        async with in_transaction() as conn:
+            session = await DBAdapterInstanceSession.select_for_update().using_db(conn).get(instance_id=instance.id)
+            session.credentials_json = credentials_json
+            session.sync_state_json = sync_state_json
+            session.expires_at = expires_at
+            session.last_cursor = last_cursor
+            await session.save(
+                using_db=conn,
+                update_fields=["credentials_json", "sync_state_json", "expires_at", "last_cursor", "update_time"],
             )
-            logger.info(
-                f"[AdapterInstanceService] 会话创建: instance_id={instance.id}, "
-                f"session_id={created.id}",
-            )
-            return created
-
-        session.credentials_json = credentials_json
-        session.sync_state_json = sync_state_json
-        session.expires_at = expires_at
-        session.last_cursor = last_cursor
-        await session.save()
 
         logger.info(
             f"[AdapterInstanceService] 会话更新: instance_id={instance.id}, "
@@ -394,7 +477,8 @@ class AdapterInstanceService:
         next_renew_at: datetime = expires_at - timedelta(minutes=renew_before_minutes)
         instance.next_renew_at = next_renew_at
         instance.renew_before_minutes = renew_before_minutes
-        await instance.save()
+        # 只写续期计划：调用方（微信 iLink 的连接）拿着的是连接建立时读出的对象，理由同 `set_status`
+        await instance.save(update_fields=["next_renew_at", "renew_before_minutes", "update_time"])
 
         logger.info(
             f"[AdapterInstanceService] 续期计划: instance_id={instance.id}, "
@@ -455,10 +539,10 @@ class AdapterInstanceService:
         Returns:
             DBAdapterInstance: 更新后的实例对象
         """
-        # 先置 enabled=False，再交由 set_status 落库 + 广播：set_status 内部的
-        # instance.save() 会一并持久化 enabled，避免直改状态导致 SSE 消费者漏掉删除事件。
+        # 先置 enabled=False，再交由 set_status 落库 + 广播：`enabled` 经 `extra_fields` 随状态一次写入，
+        # 避免直改状态导致 SSE 消费者漏掉删除事件。
         instance.enabled = False
-        instance = await self.set_status(instance, "deleted", message="实例已软删除")
+        instance = await self.set_status(instance, "deleted", message="实例已软删除", extra_fields=["enabled"])
         logger.info(f"[AdapterInstanceService] 实例软删除: id={instance.id}")
         return instance
 

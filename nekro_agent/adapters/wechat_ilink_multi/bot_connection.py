@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiofiles
+from pydantic import ValidationError
 
 from nekro_agent.adapters.interface.collector import collect_message
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 from nekro_agent.models.db_adapter_instance_session import DBAdapterInstanceSession
-from nekro_agent.services.adapter_instance_service import adapter_instance_service
+from nekro_agent.services.adapter_instance_service import ADMIN_INTENT_STATUSES, adapter_instance_service
 
 from .client import OpenILinkMonitorCallbacks, OpenILinkMultiClient
 from .config import WeChatILinkMultiConfig
@@ -164,7 +165,7 @@ class BotConnection:
 
     async def renew_once(self) -> None:
         previous_status = self.instance.status
-        self.instance = await adapter_instance_service.set_status(
+        self.instance = await adapter_instance_service.set_runtime_status(
             self.instance,
             "renewing",
             "实例会话续期中",
@@ -185,15 +186,21 @@ class BotConnection:
             last_cursor=result.sync_state.cursor or "",
         )
         self.session.renewed_at = datetime.now(timezone.utc)
-        await self.session.save()
+        await self.session.save(update_fields=["renewed_at", "update_time"])
         if result.credentials.expires_at is not None:
+            # 提前量现读：`self.instance` 是连接建立时读出的，管理员在续期策略接口改过的值不能被它写回去
+            await self.instance.refresh_from_db(fields=["renew_before_minutes"])
             self.instance = await adapter_instance_service.schedule_renew(
                 instance=self.instance,
                 expires_at=result.credentials.expires_at,
                 renew_before_minutes=self.instance.renew_before_minutes or self.config.DEFAULT_RENEW_BEFORE_MINUTES,
             )
-        restored_status = previous_status if previous_status not in ("renewing", "error") else "online"
-        self.instance = await adapter_instance_service.set_status(
+        # 原状态是停用 / 归档 / 软删（管理员手动拉起后立刻续期时，内存里还是库里读出的那个状态）也按 online 恢复：
+        # 这些状态不归连接写，库里是否真的落成 online 由条件写入决定
+        restored_status = (
+            previous_status if previous_status not in ("renewing", "error", *ADMIN_INTENT_STATUSES) else "online"
+        )
+        self.instance = await adapter_instance_service.set_runtime_status(
             self.instance,
             restored_status,
             "实例会话续期完成",
@@ -214,7 +221,7 @@ class BotConnection:
             # 必须先持久化 online 状态并发出 SSE 事件，再放行 wait_until_online，
             # 否则等待方可能在 DB 仍为 binding、online 事件尚未广播时就返回（竞态）。
             self._online = True
-            self.instance = await adapter_instance_service.set_status(
+            self.instance = await adapter_instance_service.set_runtime_status(
                 self.instance,
                 "online",
                 "实例监控已启动",
@@ -227,7 +234,7 @@ class BotConnection:
             self._online = False
             self._startup_error = str(e)
             self._online_started.set()
-            self.instance = await adapter_instance_service.set_status(
+            self.instance = await adapter_instance_service.set_runtime_status(
                 self.instance,
                 "error",
                 str(e),
@@ -287,6 +294,14 @@ class BotConnection:
             logger.debug(f"重复 OpenILink 消息已过滤: instance={self.instance_key}, message_id={message.message_id}")
             return
 
+        # 停止 / 删除与长轮询之间有时间窗，期间到达的在途消息不再往下送
+        if not await self._instance_still_active():
+            logger.info(
+                f"实例已停止或已删除，丢弃入站 OpenILink 消息: instance={self.instance_key}, "
+                f"message_id={message.message_id}",
+            )
+            return
+
         try:
             parsed = await self.processor.parse(await self._message_to_processor_payload(message))
         except Exception as e:
@@ -305,17 +320,38 @@ class BotConnection:
         )
         await self._persist_message_cursor(message)
 
+    async def _instance_still_active(self) -> bool:
+        """实例当前是否仍应接收消息
+
+        先看本连接是否已在停止中：`stop()` 第一件事就是置位 `_stopped`，而数据库状态要等停止流程走完
+        才落盘，只查库会在这段窗口里把在途消息误判为可接收。再读库（不用 `self.instance` 缓存，
+        删除动作发生在别的请求上下文里）：
+
+        - 实例不在或已软删：拒绝，并让残留连接自行退出；
+        - 实例被停用：只拒绝这条消息，**不停连接**。停用的语义是「连着但不理」（见 `set_instance_enabled`），
+          重新启用后要立刻恢复收消息；在这里停掉连接，启用之后就没有人再把它拉起来。
+        """
+        if self._stopped.is_set():
+            return False
+        instance = await adapter_instance_service.get_instance(self.adapter.key, self.instance_key)
+        if instance is None or instance.status == "deleted":
+            self._stopped.set()
+            return False
+        return bool(instance.enabled)
+
     async def _handle_sync_state(self, sync_state: SyncState) -> None:
+        # `self.session` 是连接建立时读出来的对象；只写本方法负责的列，整行写回会把别的入口
+        # 在这之间写的凭据、绑定子状态冲回旧值。下面两处同理。
         self.session.sync_state_json = sync_state.model_dump_json()
         self.session.last_cursor = sync_state.cursor or ""
-        await self.session.save()
+        await self.session.save(update_fields=["sync_state_json", "last_cursor", "update_time"])
 
     async def _handle_monitor_error(self, error: Exception) -> None:
         logger.warning(f"OpenILink 多实例监控回调错误: instance={self.instance_key}, error={error}")
 
     async def _mark_renew_failure(self, error: Exception) -> None:
         status = "session_expired" if self._credentials_expired() else "error"
-        self.instance = await adapter_instance_service.set_status(
+        self.instance = await adapter_instance_service.set_runtime_status(
             self.instance,
             status,
             f"实例会话续期失败: {error}",
@@ -348,7 +384,22 @@ class BotConnection:
     def _load_sync_state(self) -> SyncState:
         if not self.session.sync_state_json:
             return SyncState()
-        return SyncState.model_validate_json(self.session.sync_state_json)
+        try:
+            return SyncState.model_validate_json(self.session.sync_state_json)
+        except ValidationError as e:
+            # 兼容存量脏数据：修复前 set_session_state 会把绑定态（bind_session_id / qr_url）写进这个字段，
+            # 而 SyncState 是 extra="forbid"。同步游标只是增量拉取的优化，读不出来按空游标继续，不能让监控起不来。
+            #
+            # 只记字段名与错误类型，不打印原始内容，也不直接打印 ValidationError（它的消息会回显 input_value）：
+            # 脏数据里正是扫码绑定凭据，落进日志就是泄露。
+            problems = ", ".join(
+                f"{'.'.join(str(item) for item in err['loc']) or '<root>'}:{err['type']}" for err in e.errors()
+            )
+            logger.warning(
+                f"同步状态解析失败，按空游标继续: instance={self.instance_key}, "
+                f"length={len(self.session.sync_state_json)}, problems=[{problems}]",
+            )
+            return SyncState()
 
     def _seconds_until_next_renew(self) -> float:
         renew_at = self.instance.next_renew_at
@@ -452,10 +503,13 @@ class BotConnection:
 
     async def _persist_message_cursor(self, message: OpenILinkMessage) -> None:
         sync_cursor = message.context_token.sync_cursor
+        # 消息没带游标时不写 last_cursor：内存里那个值可能早已被别的入口在库里改过
+        update_fields = ["last_message_remote_id", "update_time"]
         if sync_cursor:
             self.session.last_cursor = sync_cursor
+            update_fields.append("last_cursor")
         self.session.last_message_remote_id = message.message_id
-        await self.session.save()
+        await self.session.save(update_fields=update_fields)
         # 记录实例最近活跃时间（轻量 update，避免重载整行）
         await DBAdapterInstance.filter(id=self.instance.id).update(last_active_at=datetime.now(timezone.utc))
 

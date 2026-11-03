@@ -65,6 +65,9 @@ const UserDetail: React.FC<UserDetailProps> = ({ userId, open, onClose }) => {
     }
   }
 
+  const getCommandPermissionLabel = (permission: string) =>
+    t(`commandPermissions.${permission}`, permission)
+
   return (
     <Drawer
       anchor="right"
@@ -209,6 +212,19 @@ const UserDetail: React.FC<UserDetailProps> = ({ userId, open, onClose }) => {
                     label={getRoleLabel(user.perm_level)}
                     size="small"
                     sx={CHIP_VARIANTS.getRoleChip(user.perm_level, isSmall)}
+                  />
+                </Grid>
+
+                <Grid item xs={4}>
+                  <Typography variant={isSmall ? 'caption' : 'body2'} color="text.secondary">
+                    {t('table.commandPermission')}
+                  </Typography>
+                </Grid>
+                <Grid item xs={8}>
+                  <Chip
+                    label={getCommandPermissionLabel(user.command_permission)}
+                    size="small"
+                    sx={CHIP_VARIANTS.getCommandPermissionChip(user.command_permission, isSmall)}
                   />
                 </Grid>
               </Grid>

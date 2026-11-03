@@ -304,15 +304,22 @@ class TestOpsConfigIsPlatformOnly:
         ("config_key", "item_key"),
         [
             ("system", "AI_CHAT_PRESET_NAME"),
-            ("system", "SUPER_USERS"),
+            ("system", "SUPER_USERS_EXTRA"),
             ("plugin_basic", "OPS_BOT_ENABLED"),
+            ("plugin_basic", "SUPER_USERS"),
         ],
     )
     def test_unrelated_config_stays_writable(self, config_key: str, item_key: str) -> None:
-        """守护范围要精确：只锁 system 配置里的运维项，不误伤插件/适配器同名项"""
+        """守护范围要精确：只锁 system 配置里的运维项与超级用户名单，不误伤插件/适配器同名项、不按前缀误伤"""
         from nekro_agent.routers.config import _is_platform_only_config
 
         assert not _is_platform_only_config(config_key, item_key)
+
+    def test_super_user_list_is_platform_only(self) -> None:
+        """超级用户名单与运维人员名单同一档：它是在聊天里冒充超级用户（能执行 `sh`）所需的全部情报"""
+        from nekro_agent.routers.config import _is_platform_only_config
+
+        assert _is_platform_only_config("system", "SUPER_USERS")
 
     def test_ops_config_is_not_overridable(self) -> None:
         """运维配置不得进入覆盖模型

@@ -9,6 +9,7 @@ import {
   CircularProgress,
   Divider,
   SxProps,
+  Stack,
   Table,
   TableBody,
   TableCell,
@@ -49,6 +50,8 @@ import UnclaimedProtocolPanel from './components/UnclaimedProtocolPanel'
 
 // 协议端面板由 NapCat 面板路实现，按需加载避免阻塞详情页首屏
 const NapCatPanel = lazy(() => import('./components/NapCatPanel'))
+const QbobPanel = lazy(() => import('./components/QbobPanel'))
+const OnebotEndpointCard = lazy(() => import('./components/OnebotEndpointCard'))
 
 function formatDateTime(value: string | null, fallback: string): string {
   if (!value) return fallback
@@ -180,12 +183,15 @@ function OverviewTab({ instance }: { instance: InstanceInfo }) {
   const { t } = useTranslation('console')
   const { t: tCommon } = useTranslation('common')
   const { isPlatformOwner } = useIdentity()
+  const navigate = useNavigate()
   const [migrationOpen, setMigrationOpen] = useState(false)
   const [accountOpen, setAccountOpen] = useState(false)
 
   // 账号绑定是平台方能力（后端 `PATCH /instances/{key}` 要求 Role.Super），
-  // 原生适配器没有账号这一说，两处都不给入口
-  const canBindAccount = isPlatformOwner && instance.provider !== 'native'
+  // 原生适配器没有账号这一说；内置 qbob 的账号由接入流程按 bot 的 self_id 写入，
+  // 通用改绑 / 解绑会让 bot 重连时落到未认领实例，必须走协议端页的解绑
+  const canBindAccount =
+    isPlatformOwner && instance.provider !== 'native' && instance.provider !== 'builtin_qbob'
 
   return (
     <Box
@@ -203,10 +209,24 @@ function OverviewTab({ instance }: { instance: InstanceInfo }) {
         <Box sx={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', gap: 1 }}>
           <Alert severity="warning" variant="outlined">
             <AlertTitle sx={{ fontWeight: 700 }}>{t('detail.unboundTitle')}</AlertTitle>
-            {t('detail.unboundHint')}
-            {/* 「或者手工填上账号」这条出路必须在这里就能点到。协议端还没连上来时
-                下面那个面板整块不渲染，此时它是唯一可走的一条 */}
-            {canBindAccount && (
+            {instance.provider === 'builtin_qbob'
+              ? t('detail.qbobUnboundHint')
+              : t('detail.unboundHint')}
+            {/* qbob 实例的下一步是到协议端页扫码 / 填凭据接入，不走认领或手工改绑 */}
+            {instance.provider === 'builtin_qbob' ? (
+              <Box sx={{ mt: 1.5 }}>
+                <ActionButton
+                  tone="primary"
+                  size="small"
+                  startIcon={<LinkRoundedIcon fontSize="small" />}
+                  onClick={() =>
+                    navigate(consolePaths.instanceDetail(instance.instance_key, 'protocol'))
+                  }
+                >
+                  {t('actions.goToProtocol')}
+                </ActionButton>
+              </Box>
+            ) : canBindAccount ? (
               <Box sx={{ mt: 1.5 }}>
                 <ActionButton
                   tone="primary"
@@ -217,9 +237,12 @@ function OverviewTab({ instance }: { instance: InstanceInfo }) {
                   {t('actions.bindAccount')}
                 </ActionButton>
               </Box>
-            )}
+            ) : null}
           </Alert>
-          <UnclaimedProtocolPanel preferredTargetKey={instance.instance_key} />
+          {/* qbob 的 bot 由接入流程绑定，不会以未认领实例的形式出现在这里 */}
+          {instance.provider === 'builtin_qbob' ? null : (
+            <UnclaimedProtocolPanel preferredTargetKey={instance.instance_key} />
+          )}
         </Box>
       )}
 
@@ -617,7 +640,7 @@ export default function InstanceDetailPage() {
             <CircularProgress />
           </Box>
         ) : isNotFoundError(instanceQuery.error) ? (
-          /* 404 必须继续说「不存在」：越权在本项目里就是 404（PROJECT_STATE §1.4），
+          /* 404 必须继续说「不存在」：越权在本项目里就是 404，
              改口说「你无权查看」等于把后端刻意藏起来的"这个实例存在"讲了出来 */
           <Alert severity="warning">{t('detail.notFound')}</Alert>
         ) : instanceQuery.isError ? (
@@ -646,7 +669,16 @@ export default function InstanceDetailPage() {
               </Box>
             }
           >
-            <NapCatPanel instanceKey={instance.instance_key} />
+            <Stack spacing={2}>
+              {instance.adapter_key === 'onebot_v11' && canOperateProtocol ? (
+                <OnebotEndpointCard instanceKey={instance.instance_key} />
+              ) : null}
+              {instance.provider === 'builtin_qbob' ? (
+                <QbobPanel instanceKey={instance.instance_key} />
+              ) : (
+                <NapCatPanel instanceKey={instance.instance_key} />
+              )}
+            </Stack>
           </Suspense>
         ) : (
           <EventsTab instanceKey={instance.instance_key} />

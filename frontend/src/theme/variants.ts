@@ -823,6 +823,25 @@ export const CHIP_VARIANTS = {
     }
   },
 
+  // 命令权限Chip样式
+  getCommandPermissionChip: (permission: string, isSmall: boolean = false): SxProps<Theme> => {
+    const permissionColors = {
+      public: '#607d8b',
+      user: '#1976d2',
+      advanced: '#9c27b0',
+      super_user: '#f44336',
+    }
+
+    const color = permissionColors[permission as keyof typeof permissionColors] || '#9e9e9e'
+
+    return {
+      ...CHIP_VARIANTS.base(isSmall),
+      backgroundColor: alpha(color, 0.12),
+      color: color,
+      borderColor: alpha(color, 0.2),
+    }
+  },
+
   // 用户状态Chip样式
   getUserStatusChip: (status: string, isSmall: boolean = false): SxProps<Theme> => {
     // 状态颜色映射
@@ -1005,10 +1024,16 @@ export const UNIFIED_TABLE_STYLES = {
   get tableLayoutContainer(): SxProps<Theme> {
     return {
       height: '100%',
+      minHeight: 0,
       display: 'flex',
       flexDirection: 'column',
       overflow: 'hidden',
       gap: '6px',
+      '@media (max-width: 899.95px)': {
+        height: 'auto',
+        minHeight: '100%',
+        overflow: 'visible',
+      },
     }
   },
 
@@ -1018,6 +1043,7 @@ export const UNIFIED_TABLE_STYLES = {
     const palette = getCurrentExtendedPalette()
     return {
       flex: 1,
+      minHeight: 0,
       display: 'flex',
       flexDirection: 'column',
       overflow: 'hidden',
@@ -1025,6 +1051,11 @@ export const UNIFIED_TABLE_STYLES = {
       boxShadow: UI_STYLES.getShadow('light'),
       borderRadius: BORDER_RADIUS.DEFAULT,
       border: `1px solid ${alpha(palette.primary.main, mode === 'light' ? 0.06 : 0.1)}`,
+      '@media (max-width: 899.95px)': {
+        flex: '0 0 auto',
+        height: 'max(360px, 62dvh)',
+        maxHeight: '680px',
+      },
     } as SxProps<Theme>
   },
 
@@ -1033,8 +1064,11 @@ export const UNIFIED_TABLE_STYLES = {
     const mode = getCurrentThemeMode()
     return {
       flex: 1,
+      minHeight: 0,
       overflow: 'auto',
       maxHeight: '100%',
+      WebkitOverflowScrolling: 'touch',
+      overscrollBehavior: 'contain',
       '&::-webkit-scrollbar': {
         width: '8px',
         height: '8px',

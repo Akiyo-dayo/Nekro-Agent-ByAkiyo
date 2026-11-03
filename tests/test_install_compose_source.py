@@ -1,4 +1,4 @@
-"""安装脚本取 compose 文件的来源（round-28 复核 P2-3）
+"""安装脚本取 compose 文件的来源
 
 三份安装脚本（`install.sh` / `install_i18n.sh` / `wrtinstall.sh`）原先**无条件**从上游 main 下载
 compose 文件覆盖本地。上游那份没有 `NEKRO_JWT_SECRET_KEY` / `NEKRO_JWT_REFRESH_SECRET_KEY` /

@@ -38,6 +38,7 @@ from nekro_agent.services.ops_bot.policy import (
     loaded_im_adapter_keys,
 )
 from nekro_agent.services.ops_bot.reports import READ_RENDERERS
+from nekro_agent.services.user.super_users import is_trusted_super_user_source
 
 logger = get_sub_logger("ops_bot.command")
 
@@ -47,6 +48,7 @@ DENY_MESSAGES = {
     OpsAccessDecision.NON_IM_ORIGIN: "运维指令只能从运维频道的真实消息发起",
     OpsAccessDecision.WRONG_CHANNEL: "当前频道不是运维频道",
     OpsAccessDecision.NOT_OPERATOR: "你不在运维人员白名单中",
+    OpsAccessDecision.UNTRUSTED_SOURCE: "运维频道所在的实例不是平台方可信的来源（见启动日志里的超级用户来源告警）",
 }
 
 CONSOLE_CONFIRM_PATH = "/console/ops-confirm"
@@ -109,6 +111,12 @@ class OpsBotCommand(BaseCommand):
             user_id=context.user_id,
             im_adapter_keys=loaded_im_adapter_keys(),
         )
+        # 第五道闸门：白名单只比用户 ID，运维频道所在实例上报的身份还得是平台方能担保的
+        if decision is OpsAccessDecision.ALLOWED and not await is_trusted_super_user_source(
+            policy.adapter_key,
+            policy.instance_key,
+        ):
+            decision = OpsAccessDecision.UNTRUSTED_SOURCE
         if decision is OpsAccessDecision.ALLOWED:
             return True, None
 

@@ -407,7 +407,7 @@ class TestPlatformSideIsUnfiltered:
     @pytest.mark.parametrize("identity", [platform_owner, single_tenant_admin], ids=["platform-owner", "single-tenant"])
     async def test_scope_is_unrestricted(self, db, identity) -> None:  # noqa: ARG002
         scope = await resolve_dashboard_scope(identity())
-        assert scope.instance_keys is None
+        assert scope.instances is None
         assert await scope.exec_codes().count() == ALL_EXECS
         assert await scope.messages().count() == ALL_MESSAGES
 

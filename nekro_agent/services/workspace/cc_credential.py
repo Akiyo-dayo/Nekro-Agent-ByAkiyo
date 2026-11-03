@@ -62,7 +62,7 @@ CC 仍然能读到中继令牌（它就在 `settings.json` 与子进程环境里
 
 两个开关刻意放在环境变量而不是 WebUI 配置里，与 `OsEnv.ALLOW_PRIVATE_NETWORK_DOWNLOAD`
 同一个理由：这是平台方与租户之间的安全边界，不该出现在租户能改的那一层
-（四层配置里承载凭据的项一律不标 `overridable`，见 PROJECT_STATE §1.2）。
+（四层配置里承载凭据的项一律不标 `overridable`）。
 
 - `NEKRO_CC_CREDENTIAL_MODE`：`relay`（默认）或 `direct`（改造前的行为，真 Key 进容器）。
   部署确实无法让工作区容器回连 NA 时才用 `direct`。

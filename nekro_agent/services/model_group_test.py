@@ -405,7 +405,7 @@ async def run_model_group_test(
             # 与下面 chat 那一支同一条理由：连通性测试真的打了上游、真的计费，
             # 而这是租户唯一能自己点出来的非对话花销。**两支都要声明** ——
             # 只给 chat 那一支的话，嵌入组的测试会整条落进 `unattributed`，
-            # 租户在自己的用量页上看不到自己刚烧的钱（round-22 对 chat 支修过一次的同款）
+            # 租户在自己的用量页上看不到自己刚烧的钱（chat 那一支修过同样的问题）
             with usage_scope(
                 LLMUsageContext(scene=LLMUsageScene.EMBEDDING, tenant_id=tenant_id).with_model_group(
                     group_name or group.GROUP_NAME,

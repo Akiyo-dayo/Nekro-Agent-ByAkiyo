@@ -30,6 +30,7 @@ from tortoise import Tortoise
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 from nekro_agent.models.db_affection import DBAffection
 from nekro_agent.models.db_chat_channel import INSTANCE_METADATA_DEFAULT_PRESET_ID, DBChatChannel
+from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_identity import DBIdentityAlias
 from nekro_agent.models.db_instance_group import (
     SELF_DOMAIN_GROUP_ID,
@@ -39,6 +40,7 @@ from nekro_agent.models.db_instance_group import (
 from nekro_agent.models.db_preset import DBPreset
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.chat_message import ChatType
+from nekro_agent.schemas.errors import ConflictError
 from nekro_agent.services.identity_scope import (
     PRESET_NONE,
     IdentityScope,
@@ -824,6 +826,59 @@ class TestOwnershipChangeReleasesTheDomain:
         scope = await resolve_identity_scope(_StubChannel(INSTANCE_A), USER_MAIN)
         assert scope.domain == ScopeDomain.of_instance(ADAPTER, INSTANCE_A)
         assert await DBAffection.filter(**scope.affection_columns()).count() == 0
+
+    async def test_purge_refuses_when_another_adapter_has_the_same_instance_key(self, scope_db: None) -> None:
+        """记忆和向量只按标识存：另一个适配器下的同名实例会被连带删掉，必须先拒绝"""
+        from nekro_agent.services.console import instance_manager
+
+        other_adapter = "wechat_ilink_multi"
+        target = await DBAdapterInstance.create(adapter_key=ADAPTER, instance_key="dup")
+        # 墓碑行同样算同名：它的数据还在，也照样会被按标识删掉
+        await DBAdapterInstance.create(adapter_key=other_adapter, instance_key="dup", status="deleted")
+
+        for adapter_key in (ADAPTER, other_adapter):
+            chat_key = f"{adapter_key}-dup-group_1"
+            await DBChatChannel.create(
+                adapter_key=adapter_key,
+                instance_key="dup",
+                channel_id="group_1",
+                chat_key=chat_key,
+                channel_type=ChatType.GROUP.value,
+                data="{}",
+            )
+            await DBChatMessage.create(
+                sender_id="1",
+                sender_name="sender",
+                sender_nickname="sender",
+                is_tome=0,
+                is_recalled=False,
+                adapter_key=adapter_key,
+                instance_key="dup",
+                message_id=f"{adapter_key}-msg-1",
+                chat_key=chat_key,
+                chat_type=ChatType.GROUP,
+                platform_userid="1",
+                content_text="hi",
+                content_data="[]",
+                raw_cq_code="",
+                ext_data="",
+                send_timestamp=0,
+            )
+
+        async def _no_vectors(_instance_key: str) -> None:
+            """向量库不在本用例的契约里"""
+
+        original = instance_manager.purge_instance_vectors
+        instance_manager.purge_instance_vectors = _no_vectors  # type: ignore[assignment]
+        try:
+            with pytest.raises(ConflictError):
+                await instance_manager.purge_instance(target)
+        finally:
+            instance_manager.purge_instance_vectors = original  # type: ignore[assignment]
+
+        assert await DBChatChannel.filter(instance_key="dup").count() == 2
+        assert await DBChatMessage.filter(instance_key="dup").count() == 2
+        assert await DBAdapterInstance.filter(instance_key="dup").count() == 2
 
 
 class TestDirtyGroupColumnsDoNotKillTheHotPath:

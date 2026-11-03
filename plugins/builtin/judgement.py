@@ -27,6 +27,7 @@ from nekro_agent.api.plugin import (
     SandboxMethodType,
 )
 from nekro_agent.api.schemas import AgentCtx
+from nekro_agent.services.plugin.scope_guard import require_own_chat_key
 from nekro_agent.core.config import config
 from nekro_agent.schemas.chat_message import ChatType
 
@@ -130,6 +131,11 @@ async def mute_user(_ctx: AgentCtx, chat_key: str, user_qq: str, duration: int, 
         duration (int): 禁言时长，单位为秒，设置为 0 则解除禁言
         report (str): 禁言完整理由，附上充分证据说明，将被记录并自动转发至管理频道 (lang: zh-CN)
     """
+    # 禁言的实际动作恒作用于**当前会话**所在的群（下面用的是 `_ctx.channel_id` 与 `_ctx.chat_key`），
+    # `chat_key` 只进日志与管理员报告。允许它是别的值，等于让模型在管理频道里伪造"这条禁言发生在哪个频道"，
+    # 所以只认当前会话
+    chat_key = require_own_chat_key(_ctx, chat_key)
+
     # channel_id 形如 `group_{group_id}`。原先的 `_ctx.chat_key.split("_")` 兜底分支已删除：
     # chat_key 前缀 `onebot_v11` 自身含下划线，会切出 3 段并直接 ValueError，
     # 它从来就不是一条可用的回退路径。

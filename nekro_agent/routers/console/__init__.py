@@ -90,3 +90,17 @@ except ImportError:
     logger.debug("Console NapCat 残留回收路由尚未就绪，跳过挂载")
 else:
     router.include_router(napcat_orphans_router)
+
+try:
+    from .qbob import router as qbob_router
+except ImportError:
+    logger.debug("Console qbob 托管路由尚未就绪，跳过挂载")
+else:
+    router.include_router(qbob_router)
+
+try:
+    from .onebot_endpoint import router as onebot_endpoint_router
+except ImportError:
+    logger.debug("Console OneBot 协议端状态路由尚未就绪，跳过挂载")
+else:
+    router.include_router(onebot_endpoint_router)

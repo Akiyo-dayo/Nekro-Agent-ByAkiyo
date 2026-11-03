@@ -5,7 +5,7 @@
 > **这是一个非官方的二次开发版本。** 它基于 [KroMiose/nekro-agent](https://github.com/KroMiose/nekro-agent)（NekroAgent）修改而来，
 > 与 NekroAgent 项目维护方没有任何隶属或背书关系。**基于 NekroAgent 项目构建**——上游项目地址：<https://github.com/KroMiose/nekro-agent>。
 >
-> - 当前版本：**0.3.0**（本版本自己的版本号；所基于的上游版本是 `2.3.3`）
+> - 当前版本：**0.4.2**（本版本自己的版本号；所基于的上游版本是 `2.3.3`，插件兼容到上游 `2.4.0`：按 2.4.0 编写的插件可以直接安装使用）
 > - 许可证：沿用上游的 [Nekro Agent 开源协议 V1.1](./LICENSE)（基于 Apache License 2.0 修改），详见下方「许可证」与 [`NOTICE`](./NOTICE)
 > - 变更记录：[`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -61,7 +61,7 @@ sudo -E bash -c "$(curl -fsSL https://raw.githubusercontent.com/Akiyo-dayo/Nekro
 
 标签：
 
-- **版本号**（如 `0.3.0`）与 `latest`：打 `v*.*.*` 标签时构建，适用于生产；
+- **版本号**（如 `0.4.2`）与 `latest`：打 `v*.*.*` 标签时构建，适用于生产；
 - `preview` / `preview-<提交短 SHA>`：`main` 分支更新时构建，包含最新改动，适用于测试。
 
 ```bash
@@ -94,7 +94,7 @@ docker pull ghcr.io/akiyo-dayo/nekro-agent-byakiyo-sandbox:latest
 沿用上游的行为，**本版本没有改动**：配置项 `ENABLE_NEKRO_CLOUD`（界面里叫“启用 NekroAI 云服务”）**默认是 `true`**。开启时：
 
 - 应用会**每小时**向 NekroAI 云服务 `https://cloud.nekro.ai` 上报一次使用统计。该服务由上游项目运营，不是本二次开发版运营的；后台的“检查更新”也会请求同一个域名；
-- 上报的内容（见 `nekro_agent/systems/cloud/` 与 `nekro_agent/tools/telemetry_util.py`）：实例 ID（由主机名、平台、机器 ID、CPU 数、内存总量、环境变量名清单等做 SHA-256 得到）、上游版本号、是否在 Docker 里运行、系统信息（含**主机名**、平台、Python 版本、CPU 架构）、以及数据库**全库合计**（多实例 / 多租户部署下是所有实例的总和）与上一小时的统计数字：用户数、频道数、消息数（含群聊 / 私聊）、沙盒执行次数与停止类型分布、执行耗时的平均与最大值、活跃用户 / 频道数。**不包含**聊天内容、代码内容和凭据；
+- 上报的内容（见 `nekro_agent/systems/cloud/` 与 `nekro_agent/tools/telemetry_util.py`）：实例 ID（由主机名、平台、机器 ID、CPU 数、内存总量、环境变量名清单等做 SHA-256 得到）、插件兼容版本号（`pyproject.toml` 的 `version`）、是否在 Docker 里运行、系统信息（含**主机名**、平台、Python 版本、CPU 架构）、以及数据库**全库合计**（多实例 / 多租户部署下是所有实例的总和）与上一小时的统计数字：用户数、频道数、消息数（含群聊 / 私聊）、沙盒执行次数与停止类型分布、执行耗时的平均与最大值、活跃用户 / 频道数。**不包含**聊天内容、代码内容和凭据；
 - 填了 NekroAI 云服务 API Key 后，还可以使用云端的插件、人设共享等能力。
 
 **如何关闭：**

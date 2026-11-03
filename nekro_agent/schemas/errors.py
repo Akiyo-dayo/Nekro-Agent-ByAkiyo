@@ -193,6 +193,36 @@ class InstanceDisabledError(AppError):
         super().__init__(instance_key=instance_key, **kwargs)
 
 
+class MessageVideoGoneError(AppError):
+    """视频已被撤回或链接已失效，不会再恢复"""
+
+    http_status: ClassVar[int] = 410
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="这个视频已无法播放",
+        en_US="This video can no longer be played",
+    )
+
+
+class MessageVideoUnavailableError(AppError):
+    """暂时取不到视频（协议端离线、上游失败），稍后可能恢复"""
+
+    http_status: ClassVar[int] = 503
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="视频暂时无法播放",
+        en_US="The video is temporarily unavailable",
+    )
+
+
+class MessageVideoBusyError(AppError):
+    """同时在转发的视频太多（按用户或全局），关掉几个再试"""
+
+    http_status: ClassVar[int] = 429
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="同时播放的视频太多，请关掉一些再试",
+        en_US="Too many videos are playing at once; close some and try again",
+    )
+
+
 class AdapterUnavailableError(AppError):
     """适配器不可用"""
 

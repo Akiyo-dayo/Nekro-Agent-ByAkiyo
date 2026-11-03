@@ -32,6 +32,7 @@ from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.services.command.base import CommandPermission
 from nekro_agent.services.command.ctl import CmdCtl
 from nekro_agent.services.command.schemas import Arg, CommandExecutionContext, CommandResponse
+from nekro_agent.tools.untrusted_content import echo_inline
 
 plugin = NekroPlugin(
     name="掷骰姬",
@@ -209,7 +210,9 @@ async def dice_roll(_ctx: AgentCtx, event_name: str, description: str, difficult
         difficulty (int): 事件难度 - 分析场景，给出一个客观合理的预期的难度值 (范围: 1-20)
     """
 
-    assert 1 <= difficulty <= 20, "Difficulty should be between 1 and 20"
+    # 不用 assert（`python -O` 下会被删掉）：难度要进返回值，返回值会落成 SYSTEM 消息，必须先确认它是 1~20 的数
+    if isinstance(difficulty, bool) or not isinstance(difficulty, (int, float)) or not 1 <= difficulty <= 20:
+        raise ValueError("Difficulty should be a number between 1 and 20")
 
     # 由于 LLM 倾向指定难度值偏高，因此在指定高难度时随机降低难度
     if difficulty >= 19 and random.randint(1, 20) < 12:
@@ -253,8 +256,9 @@ async def dice_roll(_ctx: AgentCtx, event_name: str, description: str, difficult
         _ctx,
         record=False,  # 掷骰结果不需要记录到上下文
     )
+    # 返回值会落成 SYSTEM 消息：事件名是模型传入的，压成单行再回显，否则带个换行就能接出一行伪造的系统消息
     return (
-        f"[{event_name}] ({difficulty}/20) {fix_str_en} roll result: {roll_result}{fix_diff_show}【{result_str}】\n"
+        f"[{echo_inline(event_name)}] ({difficulty}/20) {fix_str_en} roll result: {roll_result}{fix_diff_show}【{result_str}】\n"
         "Note: This is only an effect check for the action, not a substitute for the action itself. You still need to actually perform (and be able to perform) the corresponding reaction.\n"
         "Please continue to generate responses and reactions based on the results"
     )
@@ -347,11 +351,12 @@ async def probability_wheel(
 
     selected_percentage = (final_probabilities.get(selected_choice, 0) / total_probability) * 100
 
+    # 事件名、选项名、兜底事件名都是模型传入的：压成单行再回显（返回值会落成 SYSTEM 消息）
     return (
-        f"[Probability Wheel: {event_name}]\n"
-        f"Selected: {selected_choice}\n"
+        f"[Probability Wheel: {echo_inline(event_name)}]\n"
+        f"Selected: {echo_inline(selected_choice)}\n"
         f"Probability: {final_probabilities.get(selected_choice, 0):.1f}/{total_probability} ({selected_percentage:.1f}%)\n"
-        f"Fallback '{actual_fallback}' had: {fallback_prob:.1f}/{total_probability} ({fallback_percentage:.1f}%)\n"
+        f"Fallback {echo_inline(actual_fallback)} had: {fallback_prob:.1f}/{total_probability} ({fallback_percentage:.1f}%)\n"
         f"Total distributed: {total_probability}\n"
         "Continue your response based on the selected outcome."
     )

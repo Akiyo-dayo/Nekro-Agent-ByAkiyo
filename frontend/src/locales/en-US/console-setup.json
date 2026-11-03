@@ -38,6 +38,11 @@
     "native": {
       "description": "Use a native adapter such as qqbot_openclaw, email, or minecraft to talk to the platform directly, bypassing OneBot.",
       "cost": "No container, zero extra resource cost"
+    },
+    "builtin_qbob": {
+      "description": "Connect a QQ official bot through the qbob service bundled with this deployment, which bridges it to OneBot. Scan a QR code or enter the AppID / AppSecret; NA wires it up for you.",
+      "cost": "All bots share one qbob container, roughly 100-200MB RAM",
+      "unavailable": "qbob is not bundled with this deployment (install with --with-qbob)"
     }
   },
   "basic": {
@@ -191,5 +196,61 @@
     "waiting": "Fetching QR code...",
     "scanHint": "Scan the QR code with your mobile client. It refreshes automatically.",
     "pollingStopped": "Auto refresh stopped. Click \"Refresh QR code\" to continue."
+  },
+  "qbob": {
+    "intro": "Connect a QQ official bot to this instance. NA creates the bot in the bundled qbob, binds the account and wires up the reverse WebSocket; you never need to open qbob's own console.",
+    "serviceUnavailable": "The bundled qbob is not available. Check that the qbob container is running.",
+    "attachedHint": "Bot {{appid}} is connected, and OneBot account {{selfId}} is bound to this instance.",
+    "groupHint": "For the bot to work in a group, the group owner must turn on \"proactive messages\" and \"receive all messages\" for it. QQ official bots can only reply within a limited time and number of messages, so proactive messages such as scheduled tasks may fail.",
+    "license": "qbob is a separate project licensed under AGPL-3.0, not under this project's license. The image is built locally from the upstream source:",
+    "licenseCommit": "Commit in use:",
+    "credential": {
+      "title": "Provide a qbob service account",
+      "intro": "NA needs a qbob admin account to manage bots. If qbob's initial password is no longer available, create an admin account in qbob's console and enter it here.",
+      "username": "qbob username",
+      "password": "Password",
+      "passwordHint": "Write-only; stored encrypted in the NA data directory",
+      "save": "Save",
+      "saved": "qbob service account saved"
+    },
+    "connect": {
+      "scanTab": "Scan QR code",
+      "manualTab": "Enter AppID",
+      "scanIntro": "Generate a QR code and have the bot owner scan and confirm it in mobile QQ. The bot is connected automatically afterwards.",
+      "generate": "Generate QR code",
+      "regenerate": "Regenerate",
+      "waitingScan": "Waiting for the scan to be confirmed...",
+      "pollStopped": "Polling stopped after 5 consecutive failures. Regenerate the QR code or try again later.",
+      "manualIntro": "After creating the bot on the QQ open platform, enter its AppID and AppSecret. The AppSecret is stored only in qbob, never in NA.",
+      "appid": "AppID",
+      "appidInvalid": "The AppID must be digits only",
+      "secret": "AppSecret",
+      "secretHint": "Write-only; it will not be shown again",
+      "attach": "Connect"
+    },
+    "panel": {
+      "readOnly": "Read-only members cannot view the protocol status.",
+      "notAttached": "No QQ official bot is connected to this instance yet.",
+      "askProvider": "Ask your service provider to connect a bot to this instance.",
+      "ids": "AppID {{appid}} · OneBot account {{selfId}}",
+      "reload": "Reload",
+      "reloaded": "Bot reloaded",
+      "rewire": "Rewire",
+      "rewired": "Reverse WebSocket rewired",
+      "detach": "Disconnect",
+      "detached": "Disconnected",
+      "running": "Running",
+      "stopped": "Not running",
+      "qqConnected": "Connected to QQ",
+      "onebotConnected": "Connected to this NA",
+      "endpointMismatch": "Endpoint changed",
+      "lastError": "Last error recorded by qbob: {{error}}",
+      "enabled": "Enable bot",
+      "markdown": "Enable markdown (needed for real @ in groups)",
+      "reportSelf": "Report the bot's own messages",
+      "advancedHint": "Advanced features (plugins, groups, message history) live in qbob's own console. It only listens on the host's 127.0.0.1 (port set by QBOB_ADMIN_EXPOSE_PORT in .env, 17810 by default); use an SSH tunnel to reach it remotely.",
+      "detachConfirmTitle": "Disconnect bot",
+      "detachConfirmBody": "This deletes bot {{appid}} from qbob and unbinds the account from this instance. The instance itself is kept and can be connected again."
+    }
   }
 }

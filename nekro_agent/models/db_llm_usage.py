@@ -31,10 +31,10 @@ token 数此前**只在单次请求里存在**（`services/agent/openai.py` 读�
 | 人 | `person_uid` | `identity_scope.resolve_person_uid` 的输出；空串 = 本次请求与具体的人无关 |
 | 人设 | `preset_id` | 0 = 无人设档 |
 
-⚠️ **`person_uid` 目前没有任何生产者**（`LLMUsageContext.with_identity` 全仓零调用方，
-round-23 复核核对）。它不是被忘掉的，而是**计费单元不是「人」**：一次 Agent 回合的 prompt
+⚠️ **`person_uid` 目前没有任何生产者**（`LLMUsageContext.with_identity` 全仓零调用方）。
+它不是被忘掉的，而是**计费单元不是「人」**：一次 Agent 回合的 prompt
 装的是整个频道的上下文，把这笔钱记在"最后说话的那个人"头上是错的归因，不是缺失的归因。
-真正按人计费要先有产品口径（PROJECT_STATE §8 第 20 条那四条待拍板之一），所以这一列
+按人归因没有站得住的口径，所以这一列
 先留着不填，而**不要**在读侧假装它有值。`preset_id` 只有记忆整合那一档在填（那条链路的
 隔离键本来就带人设），其余场景恒 0，同理。
 

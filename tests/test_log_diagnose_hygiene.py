@@ -1,4 +1,4 @@
-"""loguru `diagnose` 开关与出厂默认凭据告警（§3 #39 残留②／待用户决策 8）。
+"""loguru `diagnose` 开关与出厂默认凭据告警。
 
 ## 这条缺陷是什么
 
@@ -554,7 +554,7 @@ class TestShippedExampleIsSafe:
     DRIVER/HOST/PORT/ONEBOT_ACCESS_TOKEN 四行、会被 `dockerfile:89` 打进镜像），
     而 compose 形态压根不读 env 文件——`docker-compose.yml` 的 `environment:` 是一张
     **显式白名单**，没登记的键传不进容器。所以 `NEKRO_LOG_DIAGNOSE` 在 compose 上
-    结构上恒为关；要在那里打开必须先往白名单里加一行（判据见 PRELAUNCH_CHECKLIST §4.2.1）。
+    结构上恒为关；要在那里打开必须先往白名单里加一行（自查方式见 docs/operations.md §2.2）。
     """
 
     def test_env_example_declares_it_off(self) -> None:

@@ -6,8 +6,8 @@
 `api_key` 的原始列，写的是 `WHERE "id" = ?`。SQLite 驱动认 `?`，**asyncpg 不转换占位符**
 （它只认 `$1`），Postgres 直接报语法错误。后果是：任何「内存 `api_key` 为空串的已有行」的
 保存都失败——包括内置 `default` 组，以及密钥丢了之后解不开的行（它的属性恰是空串）。
-而本仓库的测试一律跑 SQLite，所以这个守卫上线时 5400 多条用例全绿（PROJECT_STATE §2 新增
-教训「SQLite 测试掩盖 Postgres 行为」）。
+而本仓库的测试一律跑 SQLite，所以这个守卫上线时 5400 多条用例全绿（SQLite 测试掩盖了
+Postgres 行为）。
 
 ## 本文件钉的三件事
 

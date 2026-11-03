@@ -56,7 +56,7 @@ def _extract_extra_fields(field_json_schema_extra: dict) -> dict:
             extra_data[extra_field] = field_json_schema_extra[dump_key]
         elif dump_key != extra_field and extra_field in field_json_schema_extra:
             # 回退读原键：第三方插件手写的 `json_schema_extra={"required": True}` 没经过 `ExtraField.model_dump()`，
-            # 键还叫原名。只认换名后的键会把它丢掉，前端就不再做必填校验（round-27 第三轮复核 P2-4）
+            # 键还叫原名。只认换名后的键会把它丢掉，前端就不再做必填校验
             extra_data[extra_field] = field_json_schema_extra[extra_field]
     return extra_data
 
@@ -476,9 +476,9 @@ class UnifiedConfigService:
             if not reload_path:
                 return False, f"重载失败: 配置文件路径未知: {config_key}"
 
-            # CoreConfig 不能换实例：运行时视图里的模型组明文只在活对象上（YAML 里是占位符，#61），
+            # CoreConfig 不能换实例：运行时视图里的模型组明文只在活对象上（YAML 里是占位符），
             # 注册表项一旦换成读盘得到的新实例，`collect_platform_secrets()` 就收不到平台 Key，
-            # 沙盒与 cc_relay 的出口脱敏失效（round-27 复核 P1-1）。走 `core.config.reload_config()`：
+            # 沙盒与 cc_relay 的出口脱敏失效。走 `core.config.reload_config()`：
             # 它就地更新活对象、跳过 MODEL_GROUPS、不动注册表。它只认默认路径，所以显式指定
             # 其他路径时拒绝而不是退回通用路径（那会再次换掉注册表项；也没有调用方这样用）。
             if isinstance(config_obj, CoreConfig):

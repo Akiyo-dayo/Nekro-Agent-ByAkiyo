@@ -1,4 +1,4 @@
-"""实例入域并入存量好感（§3 #67）的行为契约
+"""实例入域并入存量好感的行为契约
 
 ## 这条测试要防的是什么
 
@@ -508,7 +508,7 @@ class TestSourceRowsAreNormalisedByTargetAliases:
     ) -> None:
         """P、Q、R 三条源行都归一到 Q：分数取最高、叙事跟分数、流水账对得上，且与源行顺序无关
 
-        回归（round-27 复核 P0）：折叠循环里 `twin` 是循环外读出来的内存对象，`apply_delta`
+        回归：折叠循环里 `twin` 是循环外读出来的内存对象，`apply_delta`
         在库里把分数涨上去之后它仍是旧值，下一条折叠到同一 twin 的源行 `twin.save()` 把旧分写回，
         分数被打回去、叙事却已经换成了低分一侧、事件的 `score_after` 与最终分数对不上。
         """
@@ -620,7 +620,7 @@ async def score_of(group_id: int, person: str) -> int:
 
 
 class TestSourceMergeCompensationSurvivesTheJoinOnlyIfItLanded:
-    """源域里 A→P 的 `merge` 补偿（P 行 +50）并入后，撤销 A 不能扣掉别人挣的分（round-27 复核 P1-2）
+    """源域里 A→P 的 `merge` 补偿（P 行 +50）并入后，撤销 A 不能扣掉别人挣的分
 
     `unmerge` 按 `(source ∈ {merge, unmerge}, source_platform_userid=A)` 把流水求和扣回。
     源域 P 行折叠进目标域一行**更高**的分数时，这 50 点根本没落进目标行（取高吃掉了），
@@ -780,9 +780,9 @@ async def join_second_instance(group: DBInstanceGroup) -> None:
 
 
 class TestTargetSideCompensationIsNeutralisedToo:
-    """目标域行上已有的账号合并补偿，在该 (人, 人设) 发生折叠后同样不可撤销（round-27 第二轮复核 P1）
+    """目标域行上已有的账号合并补偿，在该 (人, 人设) 发生折叠后同样不可撤销
 
-    上一轮只把**源域**事件改记成 `domain_merge`；目标域那一行自己身上的 `merge` 补偿仍可撤销。
+    只把**源域**事件改记成 `domain_merge` 是不够的：目标域那一行自己身上的 `merge` 补偿仍可撤销。
     折叠把分数改成「取高」之后，这笔补偿是否还在分数里已无法逐笔对账，撤销会扣掉别处挣的分——
     「宁可少扣，不能多扣」不成立。统一口径：落在发生过折叠的 (目标人, 人设) 上的补偿事件，
     不论来自源域还是目标域，一律改记为 `domain_merge`。
@@ -880,10 +880,10 @@ async def unmerge_events(group_id: int, account: str) -> list:
 
 
 class TestMovedAliasNeverLowersTheAccountsOwnTargetScore:
-    """随迁别名 `A→P`：目标域里 A 本来有活跃好感时，别名落地后 A 读到的是 P 的行（round-27 第二轮复核 P2-2）
+    """随迁别名 `A→P`：目标域里 A 本来有活跃好感时，别名落地后 A 读到的是 P 的行
 
     目标 A=90、源域 P 补到 70，别名随迁之后 A 读到 70——一次悄悄的降分。
-    取舍（DECISIONS）：把 P 补到不低于 A，补偿记 `merge` 事件、来源账号 A，撤销 A 即扣回，
+    取舍：把 P 补到不低于 A，补偿记 `merge` 事件、来源账号 A，撤销 A 即扣回，
     与账号合并同一口径；不选「列入冲突」（那样每个在目标域有过发言的副号都要运营事后手工合并）。
     """
 
@@ -1014,7 +1014,7 @@ class TestMovedAliasNeverLowersTheAccountsOwnTargetScore:
 
 
 class TestFoldReadsTargetRowsUnderLock:
-    """折叠前对目标行加行锁读（round-27 第二轮复核 P2-1）
+    """折叠前对目标行加行锁读
 
     SQLite 没有行锁（Tortoise 在该方言下忽略它），这里只能证明「调用点在、锁的是对的行、且能跑」；
     真正的互斥见 `test_domain_join_concurrency_pg.py`（真 PG）。
@@ -1101,7 +1101,7 @@ class TestFoldReadsTargetRowsUnderLock:
 class TestMovedAliasesNeverFormChains:
     """搬进目标域的别名不能与目标域已有别名接成链（解析只跟一跳）
 
-    取舍（DECISIONS.md「实例入域并入存量好感」）：源别名 A→P 撞上目标域 P→Q 时**改写为 A→Q**
+    取舍：源别名 A→P 撞上目标域 P→Q 时**改写为 A→Q**
     （跟到终点，备注留痕、响应里逐个点名）；其余会成链的形态——目标域已有别名指向 A、
     或改写后指回 A 自己——不改目标域既有的任何一行，把源别名列入冲突、留在原地。
     """
@@ -1468,11 +1468,11 @@ class TestPreviewMatchesExecution:
 
 
 class TestEventsKeepTheirOriginWhenRekeyed:
-    """流水改挂到最终的人名下时，空的来源账号（= 与 platform_userid 相同）不能丢（round-27 复核 P2-5）
+    """流水改挂到最终的人名下时，空的来源账号（= 与 platform_userid 相同）不能丢
 
     生产里没合并过的人，事件的 `source_platform_userid` 是空串。P 的事件改挂到 Q 之后，
     空串就会读成「是 Q 自己干的」——原来是 P 的信息丢了。改挂时把空串落成原 uid。
-    与 P1-2 的撤销语义不冲突：撤销求和只认补偿来源，而空串事件都不是补偿事件。
+    与 `TestSourceMergeCompensationSurvivesTheJoinOnlyIfItLanded` 的撤销语义不冲突：撤销求和只认补偿来源，而空串事件都不是补偿事件。
     """
 
     async def _seed_plain_events(self, uid: str, score: int) -> None:
@@ -1521,7 +1521,7 @@ class TestEventsKeepTheirOriginWhenRekeyed:
 
 
 class TestCacheIsInvalidatedOnlyAfterCommit:
-    """并入的快照缓存失效必须在外层事务提交之后（round-27 复核 P2-6）
+    """并入的快照缓存失效必须在外层事务提交之后
 
     提交之前失效，并发读者在失效与提交之间读到旧值又缓存起来，并入的好感在 TTL 内读不到。
     用记录器包住两处 `invalidate_cache`，在调用瞬间看当前连接是不是事务连接。
@@ -1571,7 +1571,7 @@ class TestCacheIsInvalidatedOnlyAfterCommit:
 
 
 class TestPreviewPersonCountMatchesExecution:
-    """预览的「人档案随迁」数必须用与执行相同的撞车判据（round-27 复核 P2-7）"""
+    """预览的「人档案随迁」数必须用与执行相同的撞车判据"""
 
     async def test_colliding_person_is_counted_the_same_way_in_both(self, db) -> None:
         group = await make_group("acme-family", ACME_TENANT_ID)
@@ -1616,7 +1616,7 @@ class TestPreviewPersonCountMatchesExecution:
 
 
 class TestDormantScoreFoldedIntoTheHeldRowIsNotCompensatedAgain:
-    """补偿只看别名落地**之前**目标域里副号的行分（round-27 第三轮复核 P2-1）
+    """补偿只看别名落地**之前**目标域里副号的行分
 
     目标 A=50，源域 A=95（休眠）、P 当初被补到 95 后合法跌到 70。并入时源域那行 A 折进目标域的 A（50→95），
     若补偿读折叠后的副号分 95，会把 P 又补回 95；该有的是 70（目标域原来的 A=50 低于 70，无需补）。
@@ -1651,7 +1651,7 @@ class TestDormantScoreFoldedIntoTheHeldRowIsNotCompensatedAgain:
 
 
 class TestCompensationOnlyJoinStillInvalidatesTheCache:
-    """只有补偿、没有搬行也没有折叠的并入，同样要失效快照缓存（round-27 第三轮复核 P2-3）"""
+    """只有补偿、没有搬行也没有折叠的并入，同样要失效快照缓存"""
 
     @pytest.fixture
     def calls(self, monkeypatch: pytest.MonkeyPatch) -> List[bool]:

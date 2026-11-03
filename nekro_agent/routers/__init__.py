@@ -8,6 +8,8 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from nekro_agent.adapters import load_adapters_api
 from nekro_agent.adapters.email.routers import router as email_adapter_config_router
@@ -62,6 +64,66 @@ from .workspaces import router as workspaces_router
 # 不再使用静态路由挂载方式
 
 
+def _elapsed_color(elapsed_ms: float) -> str:
+    if elapsed_ms >= 3000:
+        return "red"
+    if elapsed_ms >= 1000:
+        return "yellow"
+    if elapsed_ms >= 300:
+        return "blue"
+    return "green"
+
+
+class RequestTimingMiddleware:
+    """记录 HTTP 请求耗时，并回写 `X-Process-Time` 响应头
+
+    - 普通请求记录的是完整处理耗时
+    - 流式响应记录的是开始返回响应前的耗时，不包含整个流结束时间
+
+    纯 ASGI，只包一层 `send`，不碰响应体。以前是 `@app.middleware("http")`（`BaseHTTPMiddleware`）：
+    它把内层的响应体搬进内存流、再由自己补发结束帧，于是内层流式响应被中途切断时（视频转发的发送超时、
+    时长上限），外层照样补 `more_body: False`，分块传输下浏览器会把截短的内容当成完整的。
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started_at = time.perf_counter()
+        started = False
+
+        def log(status_code: int, elapsed_ms: float) -> None:
+            color = _elapsed_color(elapsed_ms)
+            client = scope.get("client")
+            client_host = client[0] if client else "unknown"
+            # 颜色标记只写在模板里（取值来自固定的几种颜色），请求方能控制的方法、路径、地址一律作参数传入：
+            # loguru 只解析模板里的标记。直接拼进去的话，匿名请求 `/x%3C/y%3E` 解码出的 `</y>`
+            # 会被当成颜色标签，有 DEBUG 级别的输出时抛 ValueError，变成一个 500
+            template = "[HTTP] {} {} status={} elapsed=<" + color + ">{:.2f}ms</" + color + "> client={}"
+            logger.opt(colors=True).debug(template, scope.get("method", ""), scope.get("path", ""), status_code, elapsed_ms, client_host)
+
+        async def send_with_timing(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start" and not started:
+                started = True
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                # ASGI 规定 `headers` 可以省略
+                message.setdefault("headers", [])
+                MutableHeaders(scope=message)["X-Process-Time"] = f"{elapsed_ms:.2f}ms"
+                log(message.get("status", 200), elapsed_ms)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_timing)
+        except Exception:
+            if not started:
+                log(500, (time.perf_counter() - started_at) * 1000)
+            raise
+
+
 def mount_middlewares(app: FastAPI):
     """挂载中间件和全局处理器"""
     # OneBot V11 协议端接入令牌的**按实例**校验。必须挂在这里而不是适配器初始化里：
@@ -78,53 +140,7 @@ def mount_middlewares(app: FastAPI):
         allow_headers=["*"],
     )
 
-    @app.middleware("http")
-    async def request_timing_middleware(request: Request, call_next):
-        """记录 HTTP 请求耗时，并回写响应头。
-
-        说明：
-        - 普通请求记录的是完整处理耗时
-        - 流式响应记录的是开始返回响应前的耗时，不包含整个流结束时间
-        """
-        def get_elapsed_color(elapsed_ms: float) -> str:
-            if elapsed_ms >= 3000:
-                return "red"
-            if elapsed_ms >= 1000:
-                return "yellow"
-            if elapsed_ms >= 300:
-                return "blue"
-            return "green"
-
-        started_at = time.perf_counter()
-        status_code = 500
-
-        try:
-            response = await call_next(request)
-            status_code = response.status_code
-        except Exception:
-            elapsed_ms = (time.perf_counter() - started_at) * 1000
-            elapsed_color = get_elapsed_color(elapsed_ms)
-            client_host = request.client.host if request.client else "unknown"
-            logger.opt(colors=True).debug(
-                f"[HTTP] {request.method} {request.url.path} "
-                f"status={status_code} "
-                f"elapsed=<{elapsed_color}>{elapsed_ms:.2f}ms</{elapsed_color}> "
-                f"client={client_host}"
-            )
-            raise
-
-        elapsed_ms = (time.perf_counter() - started_at) * 1000
-        response.headers["X-Process-Time"] = f"{elapsed_ms:.2f}ms"
-
-        elapsed_color = get_elapsed_color(elapsed_ms)
-        client_host = request.client.host if request.client else "unknown"
-        logger.opt(colors=True).debug(
-            f"[HTTP] {request.method} {request.url.path} "
-            f"status={status_code} "
-            f"elapsed=<{elapsed_color}>{elapsed_ms:.2f}ms</{elapsed_color}> "
-            f"client={client_host}"
-        )
-        return response
+    app.add_middleware(RequestTimingMiddleware)
 
     # 注册统一的全局异常处理器
     # 支持 AppError 业务错误、验证错误、HTTPException 及通用异常

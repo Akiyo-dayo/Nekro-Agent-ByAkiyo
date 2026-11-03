@@ -168,6 +168,10 @@ export interface ChatMessageSegment {
   file_name?: string
   local_path?: string
   remote_url?: string
+  // OneBot 视频占位：没有落盘文件，`text` 是给 AI 看的 `[Video: message:<编号>]`，不展示给人
+  video_name?: string
+  file_size?: number
+  quoted?: boolean
   // at
   target_platform_userid?: string
   target_nickname?: string
@@ -186,6 +190,17 @@ export interface ChatMessageSegment {
   poke_style?: string
   poke_style_suffix?: string
   target_id?: string
+}
+
+/**
+ * 视频预览的探测结果。`<video>` 的 onError 读不到响应体，放不了的原因靠这里的 `status` 说清楚
+ */
+export interface MessageVideoAccess {
+  status: 'ok' | 'recalled' | 'offline' | 'expired' | 'unavailable' | 'not_found'
+  url: string
+  expires_at: number
+  file_name: string
+  file_size: number
 }
 
 export interface ForwardMessageItem {
@@ -222,6 +237,10 @@ export interface ChatMessageListResponse {
 export interface ChatChannelUser {
   platform_userid: string
   nickname: string
+  command_permission: 'user' | 'advanced' | 'super_user'
+  // 平台方看得到 super_users / global；租户看到的这两类统一是 platform
+  command_permission_source: 'super_users' | 'global' | 'platform' | 'channel' | 'group_role' | null
+  channel_granted: boolean
 }
 
 export interface ChatChannelUsersResponse {
@@ -453,8 +472,27 @@ export const chatChannelApi = {
     })
   },
 
+  getMessageVideoAccess: async (chatKey: string, messageId: string): Promise<MessageVideoAccess> => {
+    const response = await axios.get<MessageVideoAccess>(
+      `/chat-channel/${encodeURIComponent(chatKey)}/messages/${messageId}/video-access`
+    )
+    return response.data
+  },
+
   getUsers: async (chatKey: string): Promise<ChatChannelUsersResponse> => {
     const response = await axios.get<ChatChannelUsersResponse>(`/chat-channel/${chatKey}/users`)
+    return response.data
+  },
+
+  setUserCommandPermission: async (
+    chatKey: string,
+    platformUserId: string,
+    permission: 'advanced' | 'user'
+  ): Promise<ActionResponse> => {
+    const response = await axios.put<ActionResponse>(
+      `/chat-channel/${encodeURIComponent(chatKey)}/users/${encodeURIComponent(platformUserId)}/command-permission`,
+      { permission }
+    )
     return response.data
   },
 

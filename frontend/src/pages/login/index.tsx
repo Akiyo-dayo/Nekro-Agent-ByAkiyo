@@ -665,49 +665,13 @@ export default function LoginPage() {
                   )}
                 </ActionButton>
 
-                <Box
-                  sx={{
-                    display: 'flex',
-                    justifyContent: 'center',
-                    mt: 2,
-                    opacity: 0.8,
-                    fontSize: isMobile ? '0.7rem' : '0.8rem',
-                  }}
-                >
-                  <Typography
-                    variant="caption"
-                    color="text.secondary"
-                    sx={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 0.5,
-                    }}
-                  >
-                    © {new Date().getFullYear()}
-                    <Link
-                      href="https://github.com/KroMiose/nekro-agent"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      sx={{
-                        color: theme.palette.primary.main,
-                        textDecoration: 'none',
-                        '&:hover': {
-                          textDecoration: 'underline',
-                        },
-                      }}
-                    >
-                      Nekro Agent
-                    </Link>
-                    . {t('footer.copyright')}.
-                  </Typography>
-                </Box>
-                {/* LICENSE 要求：界面里以可点击超链接标明「基于 NekroAgent 项目构建」，字号不小于主文字的 80%，对比度可读。任何分发版本都必须保留。 */}
+                {/* LICENSE 要求：界面里以可点击超链接标明「基于 NekroAgent 项目构建」，版权年份并在同一行，字号不小于主文字的 80%，对比度可读。任何分发版本都必须保留。 */}
                 <Typography
                   component="div"
                   color="text.secondary"
-                  sx={{ fontSize: '0.875rem', lineHeight: 1.5, mt: 0.5, textAlign: 'center' }}
+                  sx={{ fontSize: '0.875rem', lineHeight: 1.5, mt: 2, textAlign: 'center' }}
                 >
-                  {t('footer.builtOnPrefix')}
+                  © {new Date().getFullYear()} · {t('footer.builtOnPrefix')}
                   <Link
                     href="https://github.com/KroMiose/nekro-agent"
                     target="_blank"

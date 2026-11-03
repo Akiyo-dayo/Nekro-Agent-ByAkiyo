@@ -17,7 +17,7 @@
    去读别人的协议端日志；
 4. **`get_container()` 不再改写调用方的异常**：旧写法把 `yield` 也包在 `except Exception`
    里，端点自己抛的业务错误会被统统改写成"获取容器失败"。
-5. **模板名那一支要过归属校验**（round-16 补，§3 #46）：模板名是**宿主全局**的且不带部署
+5. **模板名那一支要过归属校验**：模板名是**宿主全局**的且不带部署
    前缀，同宿主上另一套部署里同名的 `instance_key` 会解析到同一个容器，于是这批端点会成为
    「读走邻居的 WebUI 令牌 / 重启邻居的协议端」的第二个出口。判据与总后台同一份
    （`container_manager.assert_container_owned`）。**遗留名那一支不校验**——那个容器没有标签，
@@ -54,7 +54,7 @@ def scoped_container() -> str:
 
 
 def bare_template_container() -> str:
-    """升级前的裸模板容器名（round-26 之前建的容器顶着它）"""
+    """升级前的裸模板容器名（容器名带上部署前缀之前建的容器顶着它）"""
     return container_manager.build_legacy_container_name(INSTANCE_KEY)
 
 
@@ -109,12 +109,12 @@ def _labels_a_real_container_would_carry(name: str) -> Dict[str, str]:
     模板名的容器**只可能**是 `container_manager.create_container()` 建的，而它每次都写
     `nekro.napcat.instance` / `nekro.napcat.owner`；遗留名那个由 compose / 运维建，
     身上一个标签都没有。fake 照抄这条事实，否则 `get_container()` 的归属校验
-    （round-16 起，见模块 docstring 第 5 条）会在一个现实中不存在的形态上被测。
+    （见模块 docstring 第 5 条）会在一个现实中不存在的形态上被测。
 
     模板段 `nekro_napcat_` 之后的尾段就是 `instance_key`，带前缀的新名与升级前的裸名
     都满足这一形态；遗留配置名不满足，返回空标签。
 
-    归属标签的取值**调产品自己的函数现算**，不写默认环境下的字面量（PROJECT_STATE §2.9）。
+    归属标签的取值**调产品自己的函数现算**，不写默认环境下的字面量。
     """
     prefix = container_manager.CONTAINER_NAME_TEMPLATE.format(instance_key="")
     _deployment_prefix, sep, tail = name.rpartition(prefix)
@@ -228,7 +228,7 @@ class TestContainerNameCandidates:
         assert await routers.container_name_candidates("   ") == [LEGACY_CONTAINER]
 
     async def test_instance_key_prefers_template_then_legacy(self, db, legacy_name) -> None:  # noqa: ARG002
-        """三段候选按升级路径排序：新名、round-26 前的裸模板名、单实例遗留名"""
+        """三段候选按升级路径排序：新名、加部署前缀之前的裸模板名、单实例遗留名"""
         assert await routers.container_name_candidates(INSTANCE_KEY) == [
             scoped_container(),
             bare_template_container(),
@@ -296,7 +296,7 @@ class TestGetContainerFallback:
         assert docker["attempts"] == [scoped_container()]
 
     async def test_falls_back_to_the_bare_template_name(self, db, legacy_name, docker) -> None:  # noqa: ARG002
-        """round-26 升级路径：升级前建的容器顶着裸模板名，新名 404 后第二个候选兜住
+        """容器名加部署前缀之后的升级路径：升级前建的容器顶着裸模板名，新名 404 后第二个候选兜住
 
         漏掉这一档的话，`/logs`（含 WebUI 令牌）与 `/restart` 在升级当天对存量容器集体 404。
         """

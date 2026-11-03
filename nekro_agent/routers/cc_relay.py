@@ -15,7 +15,7 @@
 2. **路径白名单**（`ALLOWED_UPSTREAM_PATHS`）：只放行 `claude` CLI 真正会打的那两条。
    否则这把令牌就是一个通往上游中转站全部接口的开放代理；
 3. **出口脱敏**：非 2xx 的响应体会被读出来过一遍凭据替换再回传——中转站的报错文案里
-   回显 Authorization 头是真实发生过的形态（PROJECT_STATE §5「异常原文回显凭据」）。
+   回显 Authorization 头是真实发生过的形态（异常原文会把凭据带出来）。
    2xx 的流式响应不做替换：按块替换会在块边界上漏掉，而且会把首字延迟变成缓冲整包。
 
 ## 为什么响应必须流式
@@ -78,7 +78,7 @@ _DROPPED_RESPONSE_HEADERS = frozenset(
 _MAX_ERROR_BODY_BYTES = 64 * 1024
 
 # 进程生命期共用的上游客户端。每请求新建一个的代价是每次 LLM 调用都要重做 TCP + TLS 握手
-# ——`services/openai_utils`/`anthropic.py` 已经因为同一个毛病改过一次（PROJECT_STATE §3 #9），
+# ——`services/openai_utils`/`anthropic.py` 已经因为同一个毛病改过一次，
 # 这里从一开始就用共享池。**不要套 `async with`**：那会连池一起关掉。
 # 超时按预设逐请求给（`build_request(timeout=...)`），所以共享一个客户端不会把超时钉死。
 _upstream_client: Optional[httpx.AsyncClient] = None

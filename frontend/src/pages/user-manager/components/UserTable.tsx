@@ -254,6 +254,9 @@ const UserTable: React.FC<UserTableProps> = ({
     }
   }
 
+  const getCommandPermissionLabel = (permission: string) =>
+    t(`commandPermissions.${permission}`, permission)
+
   const DurationSelector = ({
     duration,
     setDuration,
@@ -591,6 +594,15 @@ const UserTable: React.FC<UserTableProps> = ({
                 ...(UNIFIED_TABLE_STYLES.header as SxProps<Theme>),
               }}
             >
+              {t('table.commandPermission')}
+            </TableCell>
+            <TableCell
+              sx={{
+                width: '10%',
+                py: isSmall ? 1 : 1.5,
+                ...(UNIFIED_TABLE_STYLES.header as SxProps<Theme>),
+              }}
+            >
               {t('table.status')}
             </TableCell>
             {!isMobile && (
@@ -630,13 +642,13 @@ const UserTable: React.FC<UserTableProps> = ({
         <TableBody>
           {loading ? (
             <TableRow>
-              <TableCell colSpan={isMobile ? 7 : 8} align="center" sx={{ py: 4 }}>
+              <TableCell colSpan={isMobile ? 8 : 9} align="center" sx={{ py: 4 }}>
                 <CircularProgress size={24} />
               </TableCell>
             </TableRow>
           ) : users.length === 0 ? (
             <TableRow>
-              <TableCell colSpan={isMobile ? 7 : 8} align="center" sx={{ py: 4 }}>
+              <TableCell colSpan={isMobile ? 8 : 9} align="center" sx={{ py: 4 }}>
                 {t('list.noData')}
               </TableCell>
             </TableRow>
@@ -686,6 +698,13 @@ const UserTable: React.FC<UserTableProps> = ({
                       label={getRoleLabel(user.perm_level)}
                       size="small"
                       sx={CHIP_VARIANTS.getRoleChip(user.perm_level, isSmall)}
+                    />
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                    <Chip
+                      label={getCommandPermissionLabel(user.command_permission)}
+                      size="small"
+                      sx={CHIP_VARIANTS.getCommandPermissionChip(user.command_permission, isSmall)}
                     />
                   </TableCell>
                   <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>

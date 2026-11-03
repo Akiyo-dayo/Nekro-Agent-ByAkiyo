@@ -104,6 +104,32 @@ const EMPTY_CONFIG: ModelGroupConfig = {
  */
 const DEFAULT_VISIBILITY: ModelGroupVisibility = 'private'
 
+/**
+ * 组名规则：中日韩文字、半角字母数字，文字之间可用空格与常见标点，首字符须是文字或左括号，
+ * 不许连续空格，最长 64 字符。
+ *
+ * ⚠️ **与后端 `services/model_group_service._NAME_RE` 是同一条规则**，以后端为准；这里只是让错误
+ * 在输入时就出现，而不是提交后弹一条 toast。中日韩文字用显式码段而不是 `\p{L}`：后者把西里尔同形字、
+ * 全角字母和不可见的韩文填充符都算作字母；显式码段也不受浏览器与后端 Unicode 版本差异影响。
+ * 防止平台方选错组的主手段是配置下拉框里标出租户自建的组（`ConfigTable.tsx`），字符集只挡最廉价的几类。
+ * `tests/test_model_group_name_and_batch_delete.py` 读本文件逐码点比对两侧。
+ */
+const GROUP_NAME_LETTERS =
+  'A-Za-z0-9' +
+  '\\u3400-\\u4DBF\\u4E00-\\u9FFF' + // 汉字：扩展 A、基本区
+  '\\u{20000}-\\u{2A6DF}\\u{2A700}-\\u{2EE5F}\\u{30000}-\\u{323AF}' + // 汉字：扩展 B–I
+  '\\u3041-\\u3096\\u309D-\\u309F' + // 平假名
+  '\\u30A1-\\u30FA\\u30FC-\\u30FF' + // 片假名（含长音符 ー，不含中点 ・）
+  '\\uAC00-\\uD7A3' // 韩文音节（不含填充符与单独字母）
+/** 可出现在文字之间的标点（含空格）：_ . - ( ) + : @ · （ ） 【 】 、 ： */
+const GROUP_NAME_PUNCT = '_.\\-()+:@ \\u00B7\\uFF08\\uFF09\\u3010\\u3011\\u3001\\uFF1A'
+/** 可以打头的标点只有左括号：( （ 【 */
+const GROUP_NAME_OPENERS = '(\\uFF08\\u3010'
+const GROUP_NAME_PATTERN = new RegExp(
+  `^(?!.*  )[${GROUP_NAME_LETTERS}${GROUP_NAME_OPENERS}][${GROUP_NAME_LETTERS}${GROUP_NAME_PUNCT}]{0,63}$`,
+  'u'
+)
+
 const MODEL_TYPE_ICONS: Record<string, React.ReactElement> = {
   Chat: <ChatIcon fontSize="small" />,
   Code: <CodeIcon fontSize="small" />,
@@ -289,8 +315,7 @@ export default function ModelGroupFormDialog({
   const canSetVisibility =
     isPlatformOwner && (mode === 'edit' ? source?.ownership === 'platform' : true)
 
-  // 只排除会影响 URL 解析的特殊字符，包括百分号
-  const isValidGroupName = (name: string) => name.trim().length > 0 && !/[/\\?&#=%]/.test(name)
+  const isValidGroupName = (name: string) => GROUP_NAME_PATTERN.test(name.trim())
 
   const handleGroupNameChange = (name: string) => {
     setGroupName(name)
@@ -315,7 +340,10 @@ export default function ModelGroupFormDialog({
       setGroupNameError(t('modelGroup.validation.nameRequired'))
       return
     }
-    if (!isValidGroupName(trimmedName)) {
+    // 只校验新建 / 复制：编辑时组名不可改，而存量组名可能来自上游更宽松的规则
+    // （配置文件导入不走组名校验，`DeepSeek V3`、`qwen2.5:7b` 都可能存在），按新规则挡住
+    // 就再也保存不了——连轮换 API Key 都做不到。后端更新接口本来也不校验组名
+    if (isCreate && !isValidGroupName(trimmedName)) {
       setGroupNameError(t('modelGroup.validation.nameInvalid'))
       return
     }
@@ -372,7 +400,8 @@ export default function ModelGroupFormDialog({
     setSubmitting(true)
     setError('')
     try {
-      await onSubmit(trimmedName, payload, isCreate)
+      // 编辑时用源组名原样作路径：存量组名可能带首尾空白，trim 之后就找不到那一行了
+      await onSubmit(isCreate ? trimmedName : (source?.name ?? trimmedName), payload, isCreate)
       onClose()
     } catch (err) {
       setError(err instanceof Error ? err.message : t('modelGroup.actions.saveFailed'))

@@ -1,8 +1,8 @@
-"""内置 NapCat 容器名带上部署前缀：`deployment_scope()` 派生 + 过渡期双识别（§3 #46 名字这一半）
+"""内置 NapCat 容器名带上部署前缀：`deployment_scope()` 派生 + 过渡期双识别（名字这一半）
 
 ## 这份测试在守什么
 
-round-16 把**归属标签**切到了 `deployment_scope()`；round-26 把**容器名**也切过去：
+此前已经把**归属标签**切到了 `deployment_scope()`；这里把**容器名**也切过去：
 `build_container_name()` 从裸模板名 `nekro_napcat_{instance_key}` 换成
 `{deployment_scope()}nekro_napcat_{instance_key}`。名字是 Docker 的**宿主全局**命名空间，
 两套部署上同名 `instance_key` 时裸模板名逐字相同——后建的一方 `create_container` 抛 409，

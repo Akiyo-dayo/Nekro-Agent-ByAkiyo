@@ -27,6 +27,7 @@ from nekro_agent.api.plugin import (
 )
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
 from nekro_agent.schemas.chat_message import ChatType
 
 plugin = NekroPlugin(
@@ -107,6 +108,9 @@ async def set_user_special_title(_ctx: AgentCtx, chat_key: str, user_qq: str, sp
     Returns:
         bool: 操作是否成功
     """
+    # 同一租户内允许跨频道，跨租户一律拒绝：下面用的是**目标频道**的 Bot 连接，
+    # 不校验的话 A 的模型能借 B 的 Bot 在 B 的群里授予、撤销头衔
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
     db_chat_channel: DBChatChannel = await DBChatChannel.get_channel(chat_key=chat_key)
     chat_type = db_chat_channel.chat_type
     chat_id = db_chat_channel.channel_id

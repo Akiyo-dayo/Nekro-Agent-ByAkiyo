@@ -641,7 +641,7 @@ class TestOverRealHttp:
     """真发一次 HTTP 请求，确认端点在 FastAPI 里是**接通的**
 
     直接 `await` 端点函数验不了这一层：依赖注入、请求体解析、`response_model`、
-    以及"业务错误怎么变成状态码"全在 FastAPI 的栈里。PROJECT_STATE §2 里那条
+    以及"业务错误怎么变成状态码"全在 FastAPI 的栈里。之前那条
     `@require_role` 参数名写错就 500 的坑，就是只有真发请求才看得见。
     本端点没用那个装饰器，但同一条规矩照跑：**任何一档都不能是 5xx**。
     """

@@ -97,7 +97,8 @@
       "basicInfo": "频道详情",
       "overrideSettings": "覆盖配置",
       "messageHistory": "实时消息",
-      "pluginData": "插件数据"
+      "pluginData": "插件数据",
+      "commandPermissions": "命令权限"
     },
     "resetDialog": {
       "title": "确认重置聊天？",
@@ -107,6 +108,20 @@
     }
   },
   "messageHistory": {
+    "video": {
+      "title": "视频",
+      "quoted": "引用的视频",
+      "play": "播放视频",
+      "retry": "重试",
+      "error": {
+        "recalled": "这个视频已被撤回",
+        "offline": "协议端不在线，暂时无法播放",
+        "expired": "视频链接已失效，或协议端已经取不到这条消息",
+        "unavailable": "这个视频暂时无法播放",
+        "not_found": "找不到这个视频",
+        "playback": "浏览器无法播放这个视频"
+      }
+    },
     "noMessages": "暂无消息记录",
     "noContent": "[无文本内容]",
     "scrollToBottom": "回到底部",
@@ -177,5 +192,17 @@
     "globalScope": "全局",
     "jsonFormatError": "JSON 格式错误，将以纯文本保存",
     "selectItem": "选择左侧列表项查看数据"
+  },
+  "commandPermissions": {
+    "hint": "频道管理员可以在本频道使用 reset、stop、na_on、na_off、na_observe 等命令，只能操作本频道。这里的授权只对本频道生效；超级用户由平台方配置。如需让群主和群管理员自动成为频道管理员，请在实例或本频道的覆盖配置里开启「群主与群管理员自动成为频道管理员」。",
+    "unknownNickname": "（未在本频道发言）",
+    "columns": { "user": "用户", "permission": "命令权限", "source": "来源", "channelGrant": "本频道授权" },
+    "permissions": { "user": "普通用户", "advanced": "频道管理员", "super_user": "超级用户" },
+    "sources": { "super_users": "平台方超级用户", "channel": "本频道授权", "global": "平台方全局授权", "platform": "平台方设置", "group_role": "群主 / 群管理员" },
+    "superUserLocked": "超级用户由平台方配置，无法在这里修改",
+    "grantById": { "placeholder": "平台用户 ID", "button": "授予频道管理员" },
+    "messages": { "updated": "命令权限已更新", "updateFailed": "命令权限更新失败" },
+    "empty": "这个频道还没有用户",
+    "loadError": "加载用户列表失败"
   }
 }

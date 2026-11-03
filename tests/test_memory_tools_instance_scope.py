@@ -1,6 +1,6 @@
 """`memory_tools` 插件的实例作用域回归。
 
-`DECISIONS.md` 定的是「记忆默认按实例隔离，允许配置共享（共享组模式）」。这条不变式在
+记忆默认按实例隔离，允许配置共享（共享组模式）。这条不变式在
 **自动注入**那一侧由 `_inject_memory_context` 执行：它拿 `instance_scope.resolve_memory_scope`
 把当前频道换算成 `(域, 人设)` 的可见范围，再传给检索器。
 
@@ -35,7 +35,29 @@ from nekro_agent.models.db_mem_paragraph import (
     OriginKind,
 )
 from nekro_agent.services.memory import retriever as retriever_module
-from plugins.builtin.memory_tools import main as memory_tools
+from nekro_agent.tools.untrusted_content import UntrustedToolResult
+from plugins.builtin.memory_tools import main as _memory_tools_module
+
+
+class _BodyOnly:
+    """三个工具现在返回 `UntrustedToolResult`（记忆是从群聊里提炼的，写的人是群里的任何人）。
+
+    本文件关心的是**作用域**（返回里有没有别的实例的记忆），所以这里把结果拆回正文 JSON，
+    原有断言一条不动；"结果必须是不可信包裹"由 `test_agent_results_untrusted.py` 钉。
+    """
+
+    def __getattr__(self, name: str):
+        tool = getattr(_memory_tools_module, name)
+
+        async def call(*args, **kwargs):
+            result = await tool(*args, **kwargs)
+            assert isinstance(result, UntrustedToolResult)
+            return result.body
+
+        return call
+
+
+memory_tools = _BodyOnly()
 
 WORKSPACE_ID = 7701
 MEMORY_MODELS = [

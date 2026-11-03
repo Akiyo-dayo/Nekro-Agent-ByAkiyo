@@ -1,8 +1,9 @@
-"""视频分析插件（R20）复核之后的六处小修
+"""视频分析插件复核之后的六处小修
 
-逐条对应 `PROJECT_STATE.md` §9.17「小修」一节：
+逐条如下：
 
-1. 插件关着时，私聊里单发视频只剩一个合成的 @ 段，旧行为会白烧一轮空文本 Agent（主 Agent + 好感度评估各一次模型请求）。
+1. 私聊里单发视频不该白烧一轮空文本 Agent（主 Agent + 好感度评估各一次模型请求）。视频现在始终进记录，
+   不再靠适配器标记，由 `push_human_message` 的“私聊纯媒体不触发”兜住。
    这里**驱动真实的 OneBot 消息匹配器**，一路走到 `collect_message` -> `push_human_message`，断言落在“有没有排上 Agent 任务”上。
 2. `ref_mode`（要不要带消息编号）被当成了 `travel_mode`（要不要省掉令牌），引用到的消息里的工具结果渲染成了无令牌裸文。
 3. `FRAMES_PER_BATCH` 的实例覆盖方向写反；转写与场景检测在全局关着时实例不能自己打开。
@@ -229,9 +230,9 @@ class TestPrivateLoneVideoDoesNotTrigger:
         plugin_switch(False)
         await pipeline(_private_event(MessageSegment("video", VIDEO_DATA)))
         rows = await DBChatMessage.filter(chat_key=private_key)
-        assert len(rows) == 1, "记录行为保持现状：合成的 @ 段照旧落库"
-        assert [seg.type for seg in rows[0].parse_content_data()] == ["at"]
-        assert private_key not in message_service.pending_messages, "跳过视频之后消息里什么都没有，不该白烧一轮 Agent"
+        assert len(rows) == 1
+        assert [seg.type for seg in rows[0].parse_content_data()] == ["at", "video"], "视频始终进记录"
+        assert private_key not in message_service.pending_messages, "只发视频没有可回应的文字，不该白烧一轮 Agent"
 
     async def test_plugin_off_the_same_lone_video_in_a_group_still_triggers(self, db: None, pipeline: Callable[..., Any], plugin_switch: Callable[[bool], None]) -> None:  # noqa: F811
         """群里有人明确叫了 Bot：这是对 Bot 说话，与改造前一样处理"""
@@ -258,21 +259,6 @@ class TestPrivateLoneVideoDoesNotTrigger:
         row = await DBChatMessage.get(chat_key=private_key)
         assert [seg.type for seg in row.parse_content_data()] == ["at", "video"]
         assert private_key not in message_service.pending_messages
-
-    def test_the_matcher_hands_the_decision_to_the_collector(self) -> None:
-        """调用点：匹配器算出来的决定要经 PlatformMessage 交到 push_human_message"""
-        from nekro_agent.adapters.interface import collector
-
-        def keyword_names(path: str, callee: str) -> List[List[str]]:
-            tree = ast.parse(Path(path).read_text(encoding="utf-8"))
-            return [
-                [kw.arg or "" for kw in node.keywords]
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) == callee
-            ]
-
-        assert any("suppress_trigger" in names for names in keyword_names(message_matcher_module.__file__, "PlatformMessage"))
-        assert any("suppress_trigger" in names for names in keyword_names(collector.__file__, "push_human_message"))
 
 
 # ---------------------------------------------------------------------------

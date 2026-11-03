@@ -1,4 +1,4 @@
-"""#54 ②：轮换 `ADMIN_PASSWORD` 之后，旧的 admin 令牌必须失效（round-28 任务 3 / A2）
+"""#54 ②：轮换 `ADMIN_PASSWORD` 之后，旧的 admin 令牌必须失效
 
 ## 缺口
 
@@ -199,7 +199,7 @@ class TestRotatingTheAdminPasswordRevokesTheOldTokens:
 
     async def test_rotating_back_makes_the_old_token_valid_again(self, db, admin_password) -> None:  # noqa: ARG002
         """指纹只取决于（JWT 密钥, 当前口令, 库内世代）：换回原口令，原票自然又对得上。
-        这是「没有口令世代表」的必然（不新增迁移）；要真的吊销就走 user-manager 自重置（世代 +1），见 DECISIONS。"""
+        这是「没有口令世代表」的必然（不新增迁移）；要真的吊销就走 user-manager 自重置（世代 +1）。"""
         await seed_users()
         token = await admin_login()
 

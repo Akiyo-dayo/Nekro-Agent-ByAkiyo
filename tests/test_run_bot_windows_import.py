@@ -1,4 +1,4 @@
-"""`run_bot.py` 在 Windows 上 import 即崩（裸机部署验收发现，round-27 第二轮）
+"""`run_bot.py` 在 Windows 上 import 即崩（裸机部署验收发现）
 
 `run_bot.py` 顶层的卡死诊断在 Windows 上不成立：`faulthandler.register` 与 `signal.SIGUSR1` / `SIGUSR2`
 都只在 POSIX 上存在，原先无条件调用，`bot` 入口一 import 就 AttributeError。诊断只是辅助手段，

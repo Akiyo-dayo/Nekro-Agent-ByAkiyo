@@ -434,6 +434,7 @@ class _Harness:
             channel_name="测试群",
             channel_type="group",
             instance_key="onebot_v11-inst4",
+            adapter_key="onebot_v11",
             adapter=adapter,
             get_effective_config=_async_value(config),
             get_preset=_async_value(preset),
@@ -641,7 +642,7 @@ class TestNoStallWhenErrorsDiffer:
             asyncio.run(harness.run())
 
         assert harness.sandbox_calls == harness.max_retry == 3
-        # §3 #58：跑满迭代的回合恰好发 `max_retry` 次请求。改造前是 `max_retry + 1` ——
+        # 跑满迭代的回合恰好发 `max_retry` 次请求。改造前是 `max_retry + 1` ——
         # 最后一趟末尾还会再发一次含全量上下文的请求，而它的结果无人消费。
         assert harness.llm_calls == harness.max_retry
         assert harness.parse_calls == harness.llm_calls, "有响应被解析了却没有对应的请求（或反过来）"

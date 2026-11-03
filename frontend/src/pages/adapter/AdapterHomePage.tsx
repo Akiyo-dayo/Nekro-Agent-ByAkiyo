@@ -64,7 +64,8 @@ export default function AdapterHomePage() {
                 {t('home.adapterDocs')}
               </Typography>
             </Box>
-            <MarkdownRenderer>{docs.content}</MarkdownRenderer>
+            {/* 适配器目录里随本项目发布的 README.md，内容可信，保留其中的 HTML 排版 */}
+            <MarkdownRenderer enableHtml>{docs.content}</MarkdownRenderer>
           </CardContent>
         </Card>
       ) : (

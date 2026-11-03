@@ -4,7 +4,7 @@
 而且是整个进程一份、跨租户混写的，没有可用的过滤维度。
 `/logs/download` 更是直接把日志文件交出去。
 
-这与 PROJECT_STATE §3 #16 把 NapCat `/logs` 提到 `Role.Super` 是同一条判据：
+这与 NapCat `/logs` 被提到 `Role.Super`（`adapters/onebot_v11/routers.py`）是同一条判据：
 **日志里就带着令牌**（前端当时正是从日志里抠 WebUI 令牌）。
 改前 4 个端点都是 `Role.Admin`，而租户管理员就是 `Role.Admin`。
 """

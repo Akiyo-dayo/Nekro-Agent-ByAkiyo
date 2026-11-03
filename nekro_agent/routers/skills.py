@@ -8,8 +8,8 @@
 
 改前这两件事各错了一半：
 
-- 全部写操作 `Role.Super` —— 租户一个字也写不了，`需求文档 §R8`
-  「可以自己制作并使用 skills」对定制版客户不成立。
+- 全部写操作 `Role.Super` —— 租户一个字也写不了，
+  也就没法自己制作并使用 skills。
 - 全部读操作 `Role.Admin` 且**不带任何过滤** —— 而租户管理员正好就是 `Role.Admin`
   （`TENANT_MAX_PERM_LEVEL`）。`GET /skills/tree` 拿目录、`GET /skills/content` 拿正文，
   两跳读走平台方整座库。

@@ -28,7 +28,7 @@
 
 判据按**前端源码文本**做：这个仓库没有前端测试设施，Python 侧解析源码是既有做法
 （见 `tests/test_console_platform_only_paths.py`）。每一条结构性断言都配一个
-「把那一行改掉之后它必须变红」的对照组（PROJECT_STATE §2.11）。
+「把那一行改掉之后它必须变红」的对照组。
 """
 
 import importlib
@@ -283,7 +283,7 @@ ADMIN_ONLY_READ_ENDPOINTS: Tuple[Tuple[str, str, str, str], ...] = (
     ("/console", "console.overview", "GET", "/overview"),
     ("/console/instances", "console.instances", "GET", "/instances"),
     ("/console/quota", "console.quota", "GET", "/quota/instances"),
-    # 用量与费用（round-23 复核并入）：它与 `/console/quota` 同档 —— 定制版客户要看得到
+    # 用量与费用：它与 `/console/quota` 同档 —— 定制版客户要看得到
     # 自己的账，所以**不是** platformOnly，但整族端点都是 `Role.Admin`。
     # 这是这条依据的**第三份**手维护清单，前两份是菜单的 `visibility` 与 `TENANT_ADMIN_ONLY_PATHS`
     ("/console/usage", "console.usage", "GET", "/usage/summary"),
@@ -588,7 +588,7 @@ class TestForbiddenIsDetectedByStatusNotByName:
         assert any(args[-1] != "status" for args in _api_error_calls(broken))
 
     def test_not_found_stays_not_found(self) -> None:
-        """404 是**越权语义**（PROJECT_STATE §1.4），不能被改口成「你无权查看」
+        """404 是**越权语义**，不能被改口成「你无权查看」
 
         改口等于把后端刻意藏起来的「这个资源存在」又讲了出来。
         """
@@ -741,7 +741,7 @@ class TestNoPageOffersAWriteItCannotDo:
         assert "useIdentity" in source
 
     def test_enable_disable_stays_platform_only(self) -> None:
-        """详情页顶栏那个「启用 / 停用」（round-19 修的，别被改回去）"""
+        """详情页顶栏那个「启用 / 停用」（之前修过的，别被改回去）"""
         assert _min_role("console.instances", "POST", "/instances/{instance_key}/enable") is Role.Super
         assert _min_role("console.instances", "POST", "/instances/{instance_key}/disable") is Role.Super
         source = _read(INSTANCE_DETAIL)
@@ -893,7 +893,7 @@ class TestBothLocalesCarryTheNewStrings:
 # 上面那一批用例是「零件」判据：清单里有没有这一条、键声明了没有、文件里出现过
 # `QueryErrorState` 没有。复核对本轮改动跑了 38 条**接线**变异（每一条把某个
 # **调用点**改回旧行为），**9 条存活**——全部是同一个形态：值声明得好好的，
-# 但没有任何断言盯着它被谁用、用在哪。§2.7 的原话是「零件全对、调用点没了 —— 测试会全绿」。
+# 但没有任何断言盯着它被谁用、用在哪：零件全对、调用点没了 —— 测试会全绿。
 #
 # 存活的九条，逐条对应下面一个用例：
 #
@@ -1177,7 +1177,7 @@ class TestGroupLevelHidingIsAlignedToo:
 
 
 # --------------------------------------------------------------------------------------
-# D. 适配器配置子页（round-28，PROJECT_STATE #52e ①）
+# D. 适配器配置子页
 #
 # `AdapterConfigPage.tsx` 的 `useQuery` 此前没有任何失败分支：`GET /config/list/adapter_*` 是
 # `Role.Admin`，只读租户成员得 403，页面落成「空配置表 + 『暂无 XX 配置项』」——与 #52c 要消灭的
@@ -1193,7 +1193,7 @@ ADAPTER_CONFIG = FRONTEND / "pages/adapter/AdapterConfigPage.tsx"
 
 #: 失败分支的开口、404 支、通用支、表格支（逐字含缩进）
 #: 闸门用 `isLoadingError`（失败且手里没有数据），**不是** `isError`：后者在「已有数据、之后某次 refetch 失败」时
-#: 也为真，会把整张表卸载，用户未保存的编辑随组件一起丢掉（round-28 复核 P2）。
+#: 也为真，会把整张表卸载，用户未保存的编辑随组件一起丢掉。
 ADAPTER_FAILURE_GATE = "      {isLoadingError ? (\n"
 ADAPTER_NOT_FOUND_BRANCH = "        isNotFoundError(error) ? (\n"
 ADAPTER_GENERIC_BRANCH = "        ) : (\n"

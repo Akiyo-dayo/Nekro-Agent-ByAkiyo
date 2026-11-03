@@ -4,25 +4,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
-from pydantic import BaseModel, ValidationError
-
 from nonebot.adapters.onebot.v11 import (
-
     Bot,
     GroupMessageEvent,
     GroupUploadNoticeEvent,
     Message,
     MessageEvent,
 )
+from pydantic import BaseModel, ValidationError
 
 from nekro_agent.adapters.interface.base import BaseAdapter
+from nekro_agent.adapters.onebot_v11.core.message_id import parse_message_id
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import get_user_group_card_name
+from nekro_agent.adapters.onebot_v11.tools.segment_placeholder import describe_segment
+from nekro_agent.adapters.onebot_v11.tools.video import build_video_segment
 from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import NAPCAT_TEMPFILE_DIR
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.schemas.chat_message import (
-
     ChatMessageSegment,
     ChatMessageSegmentAt,
     ChatMessageSegmentFile,
@@ -32,7 +32,6 @@ from nekro_agent.schemas.chat_message import (
     ChatMessageSegmentType,
     ChatType,
 )
-from nekro_agent.services.plugin.scope import is_plugin_active
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 # JSON卡片处理常量
@@ -41,14 +40,16 @@ logger = get_sub_logger("adapter.onebot_v11")
 JSON_CARD_FALLBACK_TEXT = "[JSON卡片]"  # i18n: JSON Card fallback placeholder
 FORWARD_FALLBACK_TEXT = "[合并转发消息]"  # i18n: Forward message fallback placeholder
 VOICE_FALLBACK_TEXT = "[语音]"  # i18n: Voice fallback placeholder
-# 只用字符串判断开关，适配器不 import 插件
-VIDEO_ANALYSIS_PLUGIN_KEY = "Akiyo_dayo.video_analysis"
+FILE_TOO_LARGE_TEXT = "[File: unavailable, exceeds size limit]"  # i18n: File size limit placeholder
+MAX_MARKDOWN_LENGTH = 4000  # Markdown 原文会直接进提示词，限长避免单段挤占上下文
 MAX_FORWARD_DEPTH = 3  # 合并转发最大递归深度
 # 合并转发的内容完全由发送方构造，以下上限用于抑制解析阶段的 CPU/网络/磁盘放大，
 # 以及避免单条消息挤占上下文。深度已有限制，但广度此前是无界的。
 MAX_FORWARD_NODES = 50  # 单层合并转发最多解析的节点数
 MAX_FORWARD_NICKNAME_LENGTH = 32  # 转发节点昵称最大长度
 MAX_FORWARD_LINE_LENGTH = 512  # 转发节点单条正文最大长度
+MAX_PRIVATE_AT_NAME_LENGTH = 64  # 私聊 @ 的名字由发送方填写，清洗后的上限
+MAX_PRIVATE_AT_ID_LENGTH = 32  # 私聊 @ 的号码不是纯数字时同样清洗
 MAX_FORWARD_IMAGES_PER_NODE = 5  # 单个转发节点最多下载的图片数
 FORWARD_TRUNCATED_TEXT = "[部分转发内容因数量超限被省略]"  # i18n: Forward truncation notice
 VOICE_SEGMENT_TYPES = {"record", "voice", "audio", "ptt"}
@@ -87,6 +88,29 @@ def _extract_http_url(data: object) -> str:
             return url
 
     return _extract_http_url(data.get("data"))
+
+
+def _segment_size_bytes(data: object) -> Optional[int]:
+    """取段里声明的字节数：NapCat 用字符串 file_size，标准实现用整数 size
+
+    两个字段都解析并取较大值：同一段里 `size` 可能是 0（或另一个小值），而 `file_size`
+    才是真实大小；优先认前者会让超限文件照样进入下载。
+    """
+    if not isinstance(data, dict):
+        return None
+    sizes: List[int] = []
+    for key in ("size", "file_size"):
+        value = data.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            sizes.append(value)
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.isascii() and stripped.isdigit():
+                sizes.append(int(stripped))
+    return max(sizes) if sizes else None
 
 
 def _extract_file_busid(*sources: object) -> Optional[Union[int, str]]:
@@ -164,7 +188,8 @@ async def _fetch_voice_transcript(bot: Bot, message_id: str) -> str:
     if _FETCH_PTT_TEXT_UNSUPPORTED:
         return ""
 
-    payload: object = int(message_id) if message_id.isdigit() else message_id
+    parsed = parse_message_id(message_id)
+    payload: object = parsed if parsed is not None else message_id
 
     try:
         result = await asyncio.wait_for(
@@ -206,6 +231,25 @@ async def _fetch_voice_transcript(bot: Bot, message_id: str) -> str:
         return ""
 
     return ""
+
+
+def _forward_segment_text(seg_type: str, data: dict) -> Optional[str]:
+    """转发节点里现有分支之外的段：留占位，别让它们静默消失"""
+    if seg_type == "video":
+        # 转发里的视频没法按消息编号回取，只能说明这里有一个视频
+        return "[视频]"
+    if seg_type in VOICE_SEGMENT_TYPES:
+        return VOICE_FALLBACK_TEXT
+    if seg_type == "file":
+        return "[文件]"
+    if seg_type == "json":
+        return JSON_CARD_FALLBACK_TEXT
+    if seg_type == "markdown":
+        content = data.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        return "[Markdown消息]"
+    return describe_segment(seg_type, data)
 
 
 async def _parse_forward_nodes(
@@ -250,7 +294,9 @@ async def _parse_forward_nodes(
         for seg in content:
             seg_data = seg if isinstance(seg, dict) else {}
             seg_type = seg_data.get("type", "")
-            data = seg_data.get("data", {}) or {}
+            # 上游只保证 data 存在、不保证是字典；非字典按空字典处理，别让一个坏段整条退化成占位
+            data = seg_data.get("data")
+            data = data if isinstance(data, dict) else {}
 
             if seg_type == "text":
                 text_parts.append(data.get("text", ""))
@@ -288,8 +334,10 @@ async def _parse_forward_nodes(
                 text_parts.append("[合并转发消息]")
             elif seg_type == "at":
                 text_parts.append(f"@{data.get('qq', '')}")
-            elif seg_type == "face":
-                text_parts.append("[表情]")
+            else:
+                placeholder = _forward_segment_text(seg_type, data)
+                if placeholder is not None:
+                    text_parts.append(placeholder)
 
         # 正文同样由发送方构造，折叠换行以保证「一节点一行」的结构不可被打破
         line_text = sanitize_inline_text("".join(text_parts), MAX_FORWARD_LINE_LENGTH)
@@ -365,7 +413,9 @@ async def _parse_forward_message(
         for seg in content:
             seg_data = seg if isinstance(seg, dict) else (seg.dict() if hasattr(seg, "dict") else {})
             seg_type = seg_data.get("type", "")
-            data = seg_data.get("data", {}) or {}
+            # 与 `_parse_forward_nodes` 同一套规整：data 不是字典就当空字典
+            data = seg_data.get("data")
+            data = data if isinstance(data, dict) else {}
 
             if seg_type == "text":
                 text_parts.append(data.get("text", ""))
@@ -421,11 +471,15 @@ async def _parse_forward_message(
                         "images": [],
                         "forward_content": nested_content,
                     })
+                else:
+                    text_parts.append(FORWARD_FALLBACK_TEXT)
             elif seg_type == "at":
                 qq = data.get("qq", "")
                 text_parts.append(f"@{qq}")
-            elif seg_type == "face":
-                text_parts.append("[表情]")
+            else:
+                placeholder = _forward_segment_text(seg_type, data)
+                if placeholder is not None:
+                    text_parts.append(placeholder)
 
         # 正文同样由发送方构造，折叠换行以保证「一节点一行」的结构不可被打破
         line_text = sanitize_inline_text("".join(text_parts), MAX_FORWARD_LINE_LENGTH)
@@ -802,20 +856,6 @@ def _extract_detail_from_meta(json_data: dict) -> dict | None:
     return None
 
 
-def is_skipped_video_only(ob_event: object, content_data: List[ChatMessageSegment]) -> bool:
-    """私聊里的消息是否只剩合成的 @ 段，而原消息带着一个被跳过的视频段
-
-    视频插件关着时 `convert_chat_message` 会跳过视频段；私聊没有真正的 @，`msg_to_me` 补上的
-    @ 段就成了整条消息的全部内容，下游把它当成一条“叫了 Bot”的消息，白烧一轮空文本 Agent。
-    只管这一种：别的认不出的段类型、群聊里明确 @ 了 Bot 的消息，行为都与改造前一致。
-    """
-    if getattr(ob_event, "message_type", "") != "private":
-        return False
-    if not content_data or not all(isinstance(seg, ChatMessageSegmentAt) for seg in content_data):
-        return False
-    return any(seg.type == "video" for seg in (getattr(ob_event, "message", None) or []))
-
-
 async def convert_chat_message(
     ob_event: Union[MessageEvent, GroupMessageEvent, GroupUploadNoticeEvent],
     msg_to_me: bool,
@@ -957,22 +997,29 @@ async def convert_chat_message(
                 )
             else:
                 logger.warning(f"OneBot image message without url: {seg}")
-                continue
+                ret_list.append(
+                    ChatMessageSegmentImage.create_unavailable_placeholder(reason="no url or file"),
+                )
 
         elif seg.type == "at":
-            assert isinstance(ob_event, GroupMessageEvent)
             at_qq = str(seg.data["qq"])
             bot_qq = (await adapter.get_self_info(db_chat_channel.chat_key)).user_id
             if at_qq == bot_qq:
                 at_qq = bot_qq
                 is_tome = True
                 nick_name = (await db_chat_channel.get_preset()).name
-            else:
+            elif isinstance(ob_event, GroupMessageEvent):
                 nick_name = await get_user_group_card_name(
                     group_id=ob_event.group_id,
                     user_id=at_qq,
                     db_chat_channel=db_chat_channel,
                 )
+            else:
+                # 私聊的 @ 没有群名片可查，名字和号码都是发送方自己填的（普通用户的私聊也走这里），
+                # 原样进 `<令牌 | At:[@id:…;nickname:…@]>` 就能换行伪造一条消息，所以和别处的昵称一样清洗、限长
+                if not (at_qq.isascii() and at_qq.isdigit()):
+                    at_qq = sanitize_inline_text(at_qq, MAX_PRIVATE_AT_ID_LENGTH)
+                nick_name = sanitize_inline_text(str(seg.data.get("name") or at_qq), MAX_PRIVATE_AT_NAME_LENGTH)
             logger.info(f"OneBot at message: {at_qq=} {nick_name=}")
             if not adapter.config.SESSION_ENABLE_AT:
                 ret_list.append(
@@ -993,42 +1040,50 @@ async def convert_chat_message(
                 )
 
         elif seg.type == "file":
-            if "size" in seg.data and seg.data["size"] > config.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+            file_size = _segment_size_bytes(seg.data)
+            if file_size is not None and file_size > config.MAX_UPLOAD_SIZE_MB * 1024 * 1024:
                 file_name = seg.data.get("name", "unknown")
-                logger.warning(f"文件过大，跳过处理: {file_name}")
-                continue
-            file_url = _extract_http_url(seg.data)
-            if file_url:
+                logger.warning(f"文件过大，不下载，只留占位: {file_name}")
                 ret_list.append(
-                    await ChatMessageSegmentFile.create_from_url_or_placeholder(
-                        url=file_url,
-                        from_chat_key=db_chat_channel.chat_key,
+                    ChatMessageSegment(
+                        type=ChatMessageSegmentType.TEXT,
+                        text=FILE_TOO_LARGE_TEXT,
                     ),
                 )
-            elif "file" in seg.data or "file_id" in seg.data:
-                file_seg = await _build_file_segment_from_onebot_file(
-                    seg=seg,
-                    bot=bot,
-                    from_chat_key=db_chat_channel.chat_key,
-                    group_id=ob_event.group_id if isinstance(ob_event, GroupMessageEvent) else None,
-                )
-                if file_seg:
-                    ret_list.append(file_seg)
-                else:
-                    logger.warning(f"无法转换文件消息，已跳过: {seg}")
             else:
-                logger.warning(f"OneBot file message without url or file: {seg}")
-                continue
+                file_url = _extract_http_url(seg.data)
+                if file_url:
+                    ret_list.append(
+                        await ChatMessageSegmentFile.create_from_url_or_placeholder(
+                            url=file_url,
+                            from_chat_key=db_chat_channel.chat_key,
+                        ),
+                    )
+                elif "file" in seg.data or "file_id" in seg.data:
+                    file_seg = await _build_file_segment_from_onebot_file(
+                        seg=seg,
+                        bot=bot,
+                        from_chat_key=db_chat_channel.chat_key,
+                        group_id=ob_event.group_id if isinstance(ob_event, GroupMessageEvent) else None,
+                    )
+                    if file_seg:
+                        ret_list.append(file_seg)
+                    else:
+                        logger.warning(f"无法获取文件内容，只留占位: {seg}")
+                        ret_list.append(
+                            ChatMessageSegmentFile.create_unavailable_placeholder(reason="no download url"),
+                        )
+                else:
+                    logger.warning(f"OneBot file message without url or file: {seg}")
+                    ret_list.append(
+                        ChatMessageSegmentFile.create_unavailable_placeholder(reason="no url or file"),
+                    )
 
         elif seg.type == "video":
-            # 插件关着时跳过这一段，与改造前（这里没有 video 分支，和别的认不出的段类型同一条路）一样：
-            # - 群里单发视频，转换结果为空，被匹配器丢弃；
-            # - 私聊里单发视频，下面会补一个合成的 @ 段，消息照旧落库；但整条消息已经没有任何内容，
-            #   不该再触发一轮空文本的 Agent，由 `is_skipped_video_only` 判出来、经 `suppress_trigger` 交给收集器。
-            # 开着时只留占位：不下载（群里的视频动辄几十 MB，会拖住消息链路），也不留链接
-            # （带 rkey，不该进日志、聊天记录和提示词），分析时由插件用 message_id 取新链接。
-            if is_plugin_active(VIDEO_ANALYSIS_PLUGIN_KEY, db_chat_channel.instance_key, db_chat_channel.chat_key):
-                ret_list.append(ChatMessageSegment(type=ChatMessageSegmentType.VIDEO, text=f"[Video: message:{message_id}]"))
+            # 无论视频插件开没开都留占位：视频消失的话，AI 会说“你是不是忘了发”，WebUI 上也只剩一个 @。
+            # 只留占位不下载（群里的视频动辄几十 MB，会拖住消息链路），也不留链接
+            # （带 rkey，不该进日志、聊天记录和提示词），用的时候按 message_id 现取。
+            ret_list.append(build_video_segment(message_id, seg.data))
 
         elif seg.type in VOICE_SEGMENT_TYPES:
             if voice_transcript_text is None:
@@ -1073,6 +1128,13 @@ async def convert_chat_message(
                             text=FORWARD_FALLBACK_TEXT,
                         ),
                     )
+            else:
+                ret_list.append(
+                    ChatMessageSegment(
+                        type=ChatMessageSegmentType.TEXT,
+                        text=FORWARD_FALLBACK_TEXT,
+                    ),
+                )
 
         elif seg.type == "json":
             try:
@@ -1107,6 +1169,35 @@ async def convert_chat_message(
                     ChatMessageSegment(
                         type=ChatMessageSegmentType.TEXT,
                         text=JSON_CARD_FALLBACK_TEXT,
+                    ),
+                )
+
+        elif seg.type == "markdown":
+            content = seg.data.get("content")
+            if isinstance(content, str) and content.strip():
+                ret_list.append(
+                    ChatMessageSegment(
+                        type=ChatMessageSegmentType.TEXT,
+                        text=content[:MAX_MARKDOWN_LENGTH],
+                    ),
+                )
+            else:
+                placeholder = describe_segment("markdown", seg.data)
+                if placeholder is not None:
+                    ret_list.append(
+                        ChatMessageSegment(
+                            type=ChatMessageSegmentType.TEXT,
+                            text=placeholder,
+                        ),
+                    )
+
+        else:
+            placeholder = describe_segment(seg.type, seg.data)
+            if placeholder is not None:
+                ret_list.append(
+                    ChatMessageSegment(
+                        type=ChatMessageSegmentType.TEXT,
+                        text=placeholder,
                     ),
                 )
 

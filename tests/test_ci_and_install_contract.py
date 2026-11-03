@@ -1,4 +1,4 @@
-"""CI 工作流与安装脚本的静态契约（round-27 复核 P2-8 / P2-9）
+"""CI 工作流与安装脚本的静态契约
 
 两件事都是「改错了没有任何运行时信号」的类型，只能用静态用例钉住。
 
@@ -257,7 +257,7 @@ def _compose_probe_function() -> str:
 
 
 class TestComposeV2DetectionRunsAgainstFakeBinaries:
-    """独立二进制 `docker-compose` v2 也是 Compose v2（round-27 第二轮复核 P2-3）
+    """独立二进制 `docker-compose` v2 也是 Compose v2
 
     只认 `docker compose` 时，用 `docker-compose` v2 独立二进制的机器会被误判成 V1、默认进入安装，
     apt 机器还会走「卸载 docker-compose」那条分支。判定改成：`docker compose version` 成功，
@@ -330,8 +330,8 @@ def _open_permissions_function() -> str:
 
 
 class TestInstallScriptDoesNotOpenUpTheHandwrittenKeyBackup:
-    """`chmod -R 777` 会把含明文 API Key 的手填备份文件（应用创建时是仅属主可读写）改成全员可读
-    （round-27 第三轮复核 P2-5）。放开目录权限的动作排除该文件。"""
+    """`chmod -R 777` 会把含明文 API Key 的手填备份文件（应用创建时是仅属主可读写）改成全员可读。
+    放开目录权限的动作排除该文件。"""
 
     @staticmethod
     def _run(tmp_path: Path) -> List[str]:

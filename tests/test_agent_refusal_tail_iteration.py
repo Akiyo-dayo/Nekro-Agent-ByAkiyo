@@ -23,7 +23,7 @@
 修复把判定挂到**每一次 `parse_chat_response` 之后**（`run_agent.raise_if_provider_refusal`），
 两处解析点因此都被覆盖。
 
-## §3 #58 落地之后，「末轮」指的是哪一次请求（本文件的口径已随之改过）
+## 回合不再多发最后一次请求之后，「末轮」指的是哪一次请求（本文件的口径已随之改过）
 
 那次「结果无人消费」的请求现在**根本不发了**（`run_agent` 在最后一趟开头就 `break`，
 理由见该处注释）。于是回合总共只发 `AI_SCRIPT_MAX_RETRY_TIMES` 次请求，
@@ -201,7 +201,7 @@ class TestRefusalOnTheLastIterationResponse:
         `AI_SCRIPT_MAX_RETRY_TIMES` 是频道可覆盖的配置项，线上真实取值分布在 1~8。
         只测一个取值挡不住「off-by-one：判定晚一轮才生效」这类变异。
 
-        §3 #58 之后回合总共只发 `max_retry` 次请求，所以拒绝页放在第 `max_retry` 条，
+        不再多发最后一次请求之后，回合总共只发 `max_retry` 次请求，所以拒绝页放在第 `max_retry` 条，
         前面 `max_retry - 1` 条正常代码各自消费一趟沙盒。
         """
         responses = _ERROR_CODE[: max_retry - 1] + [REAL_PROVIDER_REFUSAL]
@@ -251,7 +251,7 @@ class TestEveryParseSiteIsGuarded:
         """拒答无论落在第几次请求上，都必须以 `AgentProviderRefusalError` 收尾且立刻停手
 
         `refusal_at=1` 是循环外那次请求（上一棒已覆盖，这里连带回归）；
-        `refusal_at=3` 在 `max_retry=3` 下正是末轮那条——§3 #58 之后回合最多只发
+        `refusal_at=3` 在 `max_retry=3` 下正是末轮那条——不再多发最后一次请求之后，回合最多只发
         `max_retry` 次请求，所以取值到 3 为止（原先的 `refusal_at=4` 对应的是那次
         「结果无人消费」的请求，它已经不存在了）。
         """
@@ -273,7 +273,7 @@ class TestEveryParseSiteIsGuarded:
         )
         # `raise_if_provider_refusal` 是被**两处**手算下标喂的闭包（循环外传 1、循环内传 `i + 2`），
         # 而那个下标只在这一行日志里露过面。逐字断言剩余次数 = `max_retry - iteration_index`，
-        # 任一调用点算错一格都会红——原先这里只断言「日志里没有负号」，而 §3 #58 之后
+        # 任一调用点算错一格都会红——原先这里只断言「日志里没有负号」，而不再多发最后一次请求之后
         # `iteration_index` 再也不可能超预算，那条断言已经恒真、什么都不测了。
         errors = "\n".join(harness.logger.texts("ERROR"))
         assert f"剩余 {max_retry - refusal_at} 次迭代未使用" in errors, (
@@ -388,7 +388,7 @@ class TestExistingExitPathsAreUnchanged:
         with pytest.raises(AgentRoundUnfinishedError):
             await harness.run()
 
-        # §3 #58：三趟迭代只发三次请求（改造前是 4 次，最后那次的结果无人消费）
+        # 不再多发最后一次请求之后：三趟迭代只发三次请求（改造前是 4 次，最后那次的结果无人消费）
         assert harness.llm_calls == 3
         assert harness.sandbox_calls == 3
 
@@ -508,5 +508,5 @@ class TestTailRefusalDoesNotLeakUpstreamText:
         assert "命中标志" in errors
         assert "policies.google.com" not in errors, "供应商链接被整段抄进了运维日志"
         # `max_retry=2` 且拒答落在第 2 次（=本回合最后一次）请求上 → 剩余恰好 0 次。
-        # 这里不再写「日志里没有负号」：§3 #58 之后 `iteration_index` 恒 <= 预算，那条断言恒真。
+        # 这里不再写「日志里没有负号」：不再多发最后一次请求之后 `iteration_index` 恒 <= 预算，那条断言恒真。
         assert "剩余 0 次迭代未使用" in errors, f"末轮拒答报的剩余迭代次数不是 0 ｜ {errors}"

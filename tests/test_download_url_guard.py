@@ -12,11 +12,17 @@
 全部用例使用 IP 字面量，`getaddrinfo` 不会发起 DNS 查询，测试可离线运行。
 """
 
+import asyncio
+import socket
+from typing import Any, Dict, List
+
+import httpx
 import pytest
 
 from nekro_agent.core.os_env import OsEnv
 from nekro_agent.tools.common_util import (
     DEFAULT_EXTRA_ALLOWED_NETWORKS,
+    UnresolvableDownloadHostError,
     UnsafeDownloadUrlError,
     assert_download_url_safe,
     assert_tenant_endpoint_url_safe,
@@ -135,6 +141,66 @@ class TestProxyFakeIpNetworks:
             await assert_download_url_safe("http://10.0.0.5:6099/image.png")
             with pytest.raises(UnsafeDownloadUrlError):
                 await assert_download_url_safe("http://10.0.0.6:6099/image.png")
+
+
+def _fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> List[str]:
+    """让当前事件循环的 getaddrinfo 按 zone 回答，记下被查的主机名；不在 zone 里的一律解析失败（不发真实 DNS 查询）"""
+    looked_up: List[str] = []
+
+    async def fake(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+        name = host.decode("ascii") if isinstance(host, bytes) else host
+        looked_up.append(name)
+        if name not in zone:
+            raise socket.gaierror(socket.EAI_NONAME, "not in fake zone")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (zone[name], port))]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake)
+    return looked_up
+
+
+class TestResolvesTheHostHttpxConnectsTo:
+    """校验解析的主机名必须就是 httpx 连接时用的那个
+
+    `urlparse(...).hostname` 是 Unicode，交给 getaddrinfo 时按 Python 自带的 IDNA 2003 编码，httpx 按 IDNA 2008：
+    `ß` 一边是 `ss`、一边是 `xn--zca`。攻击者让前者解析到公网、后者解析到内网，就能确定性地绕过校验。
+    """
+
+    @pytest.mark.parametrize("label", ["ß", "ς"])
+    async def test_the_idna_2008_spelling_is_resolved(self, monkeypatch: pytest.MonkeyPatch, label: str) -> None:
+        monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
+        monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", DEFAULT_EXTRA_ALLOWED_NETWORKS)
+        url = f"http://{label}.attacker.example/latest/meta-data/"
+        stdlib_spelling = f"{label.encode('idna').decode('ascii')}.attacker.example"
+        httpx_spelling = httpx.URL(url).raw_host.decode("ascii")
+        assert stdlib_spelling != httpx_spelling
+        looked_up = _fake_dns(monkeypatch, {stdlib_spelling: "8.8.8.8", httpx_spelling: "127.0.0.1"})
+        with pytest.raises(UnsafeDownloadUrlError):
+            await assert_download_url_safe(url)
+        with pytest.raises(UnsafeDownloadUrlError):
+            await assert_tenant_endpoint_url_safe(url)
+        assert looked_up == [httpx_spelling, httpx_spelling]
+
+    async def test_a_public_idna_2008_spelling_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
+        url = "http://ß.attacker.example/x"
+        _fake_dns(monkeypatch, {"ss.attacker.example": "127.0.0.1", httpx.URL(url).raw_host.decode("ascii"): "8.8.8.8"})
+        await assert_download_url_safe(url)
+
+    @pytest.mark.parametrize("url", ["http://a..b.example/x", f"http://{'a' * 64}.example/x"])
+    async def test_a_host_the_resolver_cannot_encode_is_a_guard_error(self, url: str) -> None:
+        """httpx 放行、getaddrinfo 编码时抛 UnicodeError（不会发出查询）：要落成守卫的异常，而不是一个调用方没预料到的 UnicodeError"""
+        with pytest.raises(UnresolvableDownloadHostError):
+            await assert_download_url_safe(url)
+        with pytest.raises(UnresolvableDownloadHostError):
+            await assert_tenant_endpoint_url_safe(url)
+
+    @pytest.mark.parametrize("url", ["http://[::1", "http://8.8.8.8/\x00", " file:///etc/passwd"])
+    async def test_a_url_httpx_cannot_use_is_refused(self, url: str) -> None:
+        with pytest.raises(UnsafeDownloadUrlError):
+            await assert_download_url_safe(url)
+        with pytest.raises(UnsafeDownloadUrlError), pytest.MonkeyPatch.context() as mp:
+            mp.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", True)
+            await assert_download_url_safe(url)
 
 
 class TestExtraAllowedNetworksParsing:

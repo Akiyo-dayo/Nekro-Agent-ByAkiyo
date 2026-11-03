@@ -97,7 +97,8 @@
       "basicInfo": "Channel Details",
       "overrideSettings": "Override Settings",
       "messageHistory": "Live Messages",
-      "pluginData": "Plugin Data"
+      "pluginData": "Plugin Data",
+      "commandPermissions": "Command permissions"
     },
     "resetDialog": {
       "title": "Confirm Reset Chat?",
@@ -107,6 +108,20 @@
     }
   },
   "messageHistory": {
+    "video": {
+      "title": "Video",
+      "quoted": "Quoted video",
+      "play": "Play video",
+      "retry": "Retry",
+      "error": {
+        "recalled": "This video was recalled",
+        "offline": "The protocol endpoint is offline, the video cannot be played right now",
+        "expired": "The video link has expired, or the protocol endpoint can no longer find this message",
+        "unavailable": "This video cannot be played right now",
+        "not_found": "Video not found",
+        "playback": "The browser cannot play this video"
+      }
+    },
     "noMessages": "No message history",
     "noContent": "[No text content]",
     "scrollToBottom": "Scroll to bottom",
@@ -177,5 +192,17 @@
     "globalScope": "Global",
     "jsonFormatError": "Invalid JSON format, will save as plain text",
     "selectItem": "Select an item from the list to view data"
+  },
+  "commandPermissions": {
+    "hint": "Channel admins can use reset, stop, na_on, na_off, na_observe and similar commands in this channel only. Grants here apply to this channel only; super users are configured by the platform. To make group owners and admins channel admins automatically, enable \"Group Owners and Admins Become Channel Admins\" in the instance or channel override settings.",
+    "unknownNickname": "(has not spoken here)",
+    "columns": { "user": "User", "permission": "Command permission", "source": "Source", "channelGrant": "Grant in this channel" },
+    "permissions": { "user": "User", "advanced": "Channel admin", "super_user": "Super user" },
+    "sources": { "super_users": "Platform super user", "channel": "Granted in this channel", "global": "Platform-wide grant", "platform": "Set by the platform", "group_role": "Group owner / admin" },
+    "superUserLocked": "Super users are configured by the platform and cannot be changed here",
+    "grantById": { "placeholder": "Platform user ID", "button": "Grant channel admin" },
+    "messages": { "updated": "Command permission updated", "updateFailed": "Failed to update command permission" },
+    "empty": "No users in this channel yet",
+    "loadError": "Failed to load users"
   }
 }

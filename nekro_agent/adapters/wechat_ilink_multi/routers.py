@@ -11,6 +11,7 @@ from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.services.adapter_instance_service import adapter_instance_service
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
+from nekro_agent.services.user.tenant_perm import assert_instance_accessible, get_tenant_scope, require_platform_owner
 
 from .adapter import WeChatILinkMultiAdapter
 from .bot_manager import BotManager
@@ -28,6 +29,17 @@ from .schemas import (
 ADAPTER_KEY = "wechat_ilink_multi"
 
 
+async def _assert_tenant_owns(user: DBUser, instance_key: str) -> None:
+    """租户身份下校验实例归属，越权与不存在同为 404；平台方直接放行，行为与改造前一致
+
+    必须带上本适配器的标识：另一个适配器下可以有同名实例归这个租户，
+    只按标识判会把那一行的归属当成这一行的。
+    """
+    if get_tenant_scope(user) is None:
+        return
+    await assert_instance_accessible(user, instance_key, adapter_key=ADAPTER_KEY)
+
+
 def _get_bot_manager() -> BotManager:
     """获取当前加载的 BotManager 实例。"""
     adapter = loaded_adapters.get(ADAPTER_KEY)
@@ -36,8 +48,11 @@ def _get_bot_manager() -> BotManager:
     return cast(WeChatILinkMultiAdapter, adapter).bot_manager
 
 
-def _to_detail_response(instance: DBAdapterInstance) -> InstanceDetailResponse:
-    """将 DBAdapterInstance 转换为 InstanceDetailResponse（不包含凭据）。"""
+def _to_detail_response(instance: DBAdapterInstance, *, hide_metadata: bool = False) -> InstanceDetailResponse:
+    """将 DBAdapterInstance 转换为 InstanceDetailResponse（不包含凭据）。
+
+    `hide_metadata` 用于租户视图——元数据由平台方维护（配额上限、协议端令牌等），不下发给租户。
+    """
     return InstanceDetailResponse(
         instance_key=instance.instance_key,
         display_name=instance.display_name,
@@ -46,7 +61,7 @@ def _to_detail_response(instance: DBAdapterInstance) -> InstanceDetailResponse:
         is_default=instance.is_default,
         provider=instance.provider,
         provider_account_id=instance.provider_account_id,
-        metadata_json=instance.metadata_json,
+        metadata_json="" if hide_metadata else instance.metadata_json,
         last_error=instance.last_error or None,
         last_active_at=instance.last_active_at,
         next_renew_at=instance.next_renew_at,
@@ -57,7 +72,15 @@ def _to_detail_response(instance: DBAdapterInstance) -> InstanceDetailResponse:
 
 
 def create_router() -> APIRouter:
-    """创建适配器管理路由"""
+    """创建适配器管理路由
+
+    ## 租户能碰到哪些端点
+
+    实例的新建、删除、启停、续期与续期策略是平台方的运维动作，与总后台的实例生命周期同一档，
+    租户身份一律 403（`Depends(require_platform_owner())`）。租户只能看、只能登录自己名下的实例：
+    列表按归属过滤，详情、事件与扫码绑定对别人的实例一律 404。扫码绑定是租户给自己的 Bot
+    登录的自助入口，绑定确认后连接由 `BotManager` 自己拉起，不需要租户再调启动接口。
+    """
     router = APIRouter(prefix="/instances", tags=["WeChat iLink Multi Instance Management"])
 
     @router.get("", response_model=InstanceListResponse)
@@ -65,9 +88,14 @@ def create_router() -> APIRouter:
     async def list_instances(
         _current_user: DBUser = Depends(get_current_active_user),
     ) -> InstanceListResponse:
-        """获取所有实例"""
+        """获取实例列表（租户只看得到自己名下的实例）"""
         instances = await adapter_instance_service.list_instances(adapter_key=ADAPTER_KEY)
-        return InstanceListResponse(instances=[_to_detail_response(inst) for inst in instances])
+        scope = get_tenant_scope(_current_user)
+        if scope is None:
+            return InstanceListResponse(instances=[_to_detail_response(inst) for inst in instances])
+        return InstanceListResponse(
+            instances=[_to_detail_response(inst, hide_metadata=True) for inst in instances if inst.tenant_id == scope],
+        )
 
     @router.post("", response_model=InstanceCreateResponse, status_code=201)
     @require_role(Role.Admin)
@@ -75,6 +103,7 @@ def create_router() -> APIRouter:
         body: InstanceCreateRequest,
         response: Response,
         _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
     ) -> InstanceCreateResponse:
         """创建实例（幂等）"""
         if not body.instance_key:
@@ -116,21 +145,30 @@ def create_router() -> APIRouter:
         _current_user: DBUser = Depends(get_current_active_user),
     ) -> InstanceDetailResponse:
         """获取实例详情"""
+        await _assert_tenant_owns(_current_user, instance_key)
         instance = await adapter_instance_service.get_instance(
             adapter_key=ADAPTER_KEY,
             instance_key=instance_key,
         )
         if instance is None:
             raise NotFoundError(resource=f"实例 {instance_key}")
-        return _to_detail_response(instance)
+        return _to_detail_response(instance, hide_metadata=get_tenant_scope(_current_user) is not None)
 
     @router.delete("/{instance_key}", status_code=204)
     @require_role(Role.Admin)
     async def delete_instance(
         instance_key: str,
         _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
     ) -> None:
-        """软删除实例"""
+        """软删除实例，并停掉它仍在运行的连接
+
+        只落软删标记不会让连接退出：BotConnection 持有独立的长轮询任务，会一直空转拉取并推进同步游标
+        （入站闸门 `is_instance_active` 会丢掉这些消息，但拉下来的消息也就此丢了）。
+
+        顺序是先落软删标记、再停连接：「不可接收」在数据库侧先一步生效，停止窗口里到达的在途消息
+        被闸门挡下；`BotManager.stop_instance` 不会把 `deleted` 覆写成 `offline`。
+        """
         instance = await adapter_instance_service.get_instance(
             adapter_key=ADAPTER_KEY,
             instance_key=instance_key,
@@ -139,6 +177,13 @@ def create_router() -> APIRouter:
             raise NotFoundError(resource=f"实例 {instance_key}")
         await adapter_instance_service.soft_delete_instance(instance)
 
+        # 适配器可能没有加载（配置里关掉了），这时没有可停的连接，不阻塞删除
+        try:
+            bot_manager = _get_bot_manager()
+        except ValidationError:
+            return
+        await bot_manager.stop_instance(instance_key, update_status=False)
+
     @router.post("/{instance_key}/bind/start", response_model=BindStartResponse)
     @require_role(Role.Admin)
     async def start_bind(
@@ -146,6 +191,7 @@ def create_router() -> APIRouter:
         _current_user: DBUser = Depends(get_current_active_user),
     ) -> BindStartResponse:
         """开始二维码绑定"""
+        await _assert_tenant_owns(_current_user, instance_key)
         bot_manager = _get_bot_manager()
         result = await bot_manager.start_bind(instance_key)
         return BindStartResponse(
@@ -164,6 +210,7 @@ def create_router() -> APIRouter:
         _current_user: DBUser = Depends(get_current_active_user),
     ) -> BindStatusResponse:
         """轮询绑定状态"""
+        await _assert_tenant_owns(_current_user, instance_key)
         bot_manager = _get_bot_manager()
         result = await bot_manager.poll_bind(instance_key, bind_session_id)
         message = result.error_message
@@ -192,6 +239,7 @@ def create_router() -> APIRouter:
     async def start_instance(
         instance_key: str,
         _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
     ) -> None:
         """启动实例"""
         bot_manager = _get_bot_manager()
@@ -204,6 +252,7 @@ def create_router() -> APIRouter:
     async def stop_instance(
         instance_key: str,
         _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
     ) -> None:
         """停止实例"""
         bot_manager = _get_bot_manager()
@@ -214,6 +263,7 @@ def create_router() -> APIRouter:
     async def renew_instance(
         instance_key: str,
         _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
     ) -> InstanceDetailResponse:
         """触发续期"""
         bot_manager = _get_bot_manager()
@@ -226,6 +276,7 @@ def create_router() -> APIRouter:
         instance_key: str,
         body: RenewPolicyRequest,
         _current_user: DBUser = Depends(get_current_active_user),
+        _owner: DBUser = Depends(require_platform_owner()),
     ) -> InstanceDetailResponse:
         """更新续期策略"""
         instance = await adapter_instance_service.get_instance(
@@ -236,7 +287,8 @@ def create_router() -> APIRouter:
             raise NotFoundError(resource=f"实例 {instance_key}")
 
         instance.renew_before_minutes = body.renew_before_minutes
-        await instance.save()
+        # 只写这一列：整行写回会把读出之后别处改的列（租户改划、停用、连接写的状态）冲回旧值
+        await instance.save(update_fields=["renew_before_minutes", "update_time"])
         return _to_detail_response(instance)
 
     @router.get("/{instance_key}/events", response_model=list[EventResponse])
@@ -246,6 +298,7 @@ def create_router() -> APIRouter:
         _current_user: DBUser = Depends(get_current_active_user),
     ) -> list[EventResponse]:
         """获取实例事件列表"""
+        await _assert_tenant_owns(_current_user, instance_key)
         instance = await adapter_instance_service.get_instance(
             adapter_key=ADAPTER_KEY,
             instance_key=instance_key,

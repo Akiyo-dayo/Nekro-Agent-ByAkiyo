@@ -475,8 +475,13 @@ def _infer_sender_role(context: CommandExecutionContext) -> str:
 
 
 def _is_legacy_super_user(context: CommandExecutionContext) -> bool:
-    configured_super_users = {str(user_id) for user_id in getattr(config, "SUPER_USERS", [])}
-    return context.is_super_user or str(context.user_id) in configured_super_users
+    """只认框架算好的标志
+
+    框架在消息入口已经按「名单匹配 ∧ 来源可信」判过（`services/user/super_users.py`）。
+    这里再拿用户 ID 自己比一次名单，会把框架拒掉的来源（SSE 的 `from_id`、租户自运行的协议端）重新放进来：
+    旧命令一律以 PUBLIC 注册、任何适配器都能触发，这道守卫是它们唯一的门槛。
+    """
+    return context.is_super_user
 
 
 async def _resolve_legacy_bot(chat_key: str) -> Any:

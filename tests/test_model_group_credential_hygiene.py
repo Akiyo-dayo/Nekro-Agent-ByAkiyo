@@ -3,7 +3,7 @@
 ## 这里钉的是什么
 
 `test_model_group_credential_at_rest.py` 钉的是「库里是密文」本身；本文件钉它上游两条
-残留路径（PROJECT_STATE §3 #61 / #64，round-22 登记时均**已实测复现**）：
+残留路径（两条均**已实测复现**）：
 
 1. **#64**：密钥丢了之后那一行的 ORM 属性是空串（fail-closed），改造前任何一次普通保存
    （后台改个名字、`update_group()` 走一遍"掩码=保持不变"）都会把空串加密写回，
@@ -26,7 +26,7 @@ at_rest 的 `cipher_env` 把 `model_group_service.save_config` 整个换成 no-o
 落盘）。本文件**恰恰要断言落盘内容**，所以不掐 `save_config`，而是把配置文件路径
 （`config._config_file_path`，导入期就从 `OsEnv.DATA_DIR` 算好的那个常量的实例级副本）
 指到 tmp 目录——指不对的后果不是"测试脏"，是把开发机上的真实配置写坏
-（at_rest 文件 §2.29 的教训，那边为此留了逐字节看门人，这里照搬）。
+（at_rest 文件踩过这个坑，那边为此留了逐字节看门人，这里照搬）。
 """
 
 from pathlib import Path
@@ -147,7 +147,7 @@ async def hygiene_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     finally:
         await Tortoise.close_connections()
         reset_credential_cipher_cache()
-        # 看门人：落盘路径指歪了会让用例改写开发机上的真实配置文件（at_rest §2.29 的教训）
+        # 看门人：落盘路径指歪了会让用例改写开发机上的真实配置文件（at_rest 文件踩过这个坑）
         if before is not None:
             assert config_file.read_bytes() == before, (
                 f"用例改写了开发机上的真实配置文件 {config_file}；"

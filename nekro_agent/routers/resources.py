@@ -28,7 +28,7 @@
 `orphan_binding_count` 描述的是**其他**工作区（含别的租户的），所以租户视角下这三个字段
 被清空，只保留"这条资源绑在我这儿"这一个事实。
 
-## 悬空绑定（PROJECT_STATE §3 #41）
+## 悬空绑定
 
 `binding-health` / `binding-purge` 两条端点是"看得见"那一半。它们读整张
 `workspace_resource_binding`，天然是跨工作区、跨租户的，所以与其余 `/resources*`
@@ -142,7 +142,7 @@ async def check_resource_binding_health(
 ) -> WorkspaceResourceBindingHealthResponse:
     """列出指向已不存在工作区（或已不存在资源）的绑定
 
-    这两条端点是 §3 #41 的"看得见"那一半：改前这些行在后台上没有任何入口，
+    这两条端点是资源绑定悬空的"看得见"那一半：改前这些行在后台上没有任何入口，
     上一轮只能直连数据库收拾。它们描述的是**跨工作区的全局状态**
     （包括别的租户的工作区），所以与 `/resources*` 其余端点一样是平台方专属。
     """

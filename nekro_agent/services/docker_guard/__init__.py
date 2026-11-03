@@ -3,7 +3,7 @@
 - `policy`：纯函数判据核心（表驱动单测覆盖）
 - `proxy`：aiohttp 转发层
 
-背景与决策见 `PROJECT_STATE.md` §3 的 #19（RK3）。
+背景与部署方式见 `docs/docker-guard.md`。
 """
 
 from nekro_agent.services.docker_guard.policy import (

@@ -1,4 +1,4 @@
-"""删除工作区的级联，与悬空资源绑定（PROJECT_STATE §3 #41）
+"""删除工作区的级联，与悬空资源绑定
 
 ## 复现出来的现象
 
@@ -94,7 +94,7 @@ def _cc_prompt_cache_identity() -> Tuple[str, str]:
     这份缓存的唯一写入方是 `plugins/builtin/cc_workspace/main.py` 里那句
     `plugin.store.set(chat_key=..., store_key=...)`，而清理它的两处
     （`delete_workspace` 的级联、`reset_session`）都在核心里**硬编码**同一对字面量 ——
-    核心不能反向 import 插件（PROJECT_STATE §0.5），所以这条跨模块契约没有任何
+    核心不能反向 import 插件，所以这条跨模块契约没有任何
     编译期/类型层面的保障。
 
     在测试里也照抄那对字面量就等于什么都没测：实测把插件里的 `last_cc_task_prompt`

@@ -38,6 +38,11 @@
     "native": {
       "description": "使用 qqbot_openclaw、email、minecraft 等原生适配器直接对接平台，不经过 OneBot 协议端。",
       "cost": "不创建容器，零额外资源开销"
+    },
+    "builtin_qbob": {
+      "description": "接入 QQ 官方机器人：经本部署附带的 qbob 转成 OneBot，扫码或填写 AppID / AppSecret 即可，由 NA 自动接线。",
+      "cost": "所有 bot 共用一个 qbob 容器，约 100~200MB 内存",
+      "unavailable": "本部署没有附带 qbob（安装时加 --with-qbob），暂不可选"
     }
   },
   "basic": {
@@ -191,5 +196,61 @@
     "waiting": "正在获取二维码…",
     "scanHint": "使用手机客户端扫描二维码完成登录，二维码会自动刷新。",
     "pollingStopped": "已停止自动刷新，点击「刷新二维码」继续。"
+  },
+  "qbob": {
+    "intro": "把一个 QQ 官方机器人接到本实例。NA 会在附带的 qbob 里建好 bot、绑定账号并接好反向 WebSocket，不需要打开 qbob 自己的管理台。",
+    "serviceUnavailable": "附带的 qbob 暂不可用，请检查 qbob 容器是否在运行。",
+    "attachedHint": "已接入 bot {{appid}}，OneBot 账号 {{selfId}} 已绑定到本实例。",
+    "groupHint": "群里要让机器人收发消息，需要群主在群设置里打开机器人的「主动发言」与「接收全部消息」。QQ 官方机器人的被动回复有时间与条数限制，定时任务等主动消息可能发不出去。",
+    "license": "qbob 是 AGPL-3.0 许可的独立项目，不适用本项目的协议；镜像由本机从上游源码构建：",
+    "licenseCommit": "所用提交：",
+    "credential": {
+      "title": "提供 qbob 服务账号",
+      "intro": "NA 需要一个 qbob 的 admin 账号来管理 bot。qbob 的初始口令已不可用时，请在 qbob 管理台里建一个 admin 账号并填在这里。",
+      "username": "qbob 账号",
+      "password": "口令",
+      "passwordHint": "只写不读，加密后保存在 NA 数据目录",
+      "save": "保存",
+      "saved": "qbob 服务账号已保存"
+    },
+    "connect": {
+      "scanTab": "扫码接入",
+      "manualTab": "填写 AppID",
+      "scanIntro": "生成二维码后，用机器人主人的手机 QQ 扫码并确认授权，完成后会自动接入。",
+      "generate": "生成二维码",
+      "regenerate": "重新生成",
+      "waitingScan": "等待扫码确认…",
+      "pollStopped": "连续 5 次查询扫码结果失败，已停止轮询。请重新生成二维码或稍后再试。",
+      "manualIntro": "在 QQ 开放平台创建机器人后，填入它的 AppID 与 AppSecret。AppSecret 只交给 qbob 保存，不会存进 NA。",
+      "appid": "AppID",
+      "appidInvalid": "AppID 应为纯数字",
+      "secret": "AppSecret",
+      "secretHint": "只写不读，提交后不会再显示",
+      "attach": "接入"
+    },
+    "panel": {
+      "readOnly": "只读成员无法查看协议端状态。",
+      "notAttached": "本实例尚未接入 QQ 官方机器人。",
+      "askProvider": "请联系服务提供方为本实例接入机器人。",
+      "ids": "AppID {{appid}} · OneBot 账号 {{selfId}}",
+      "reload": "重载",
+      "reloaded": "bot 已重载",
+      "rewire": "重新接线",
+      "rewired": "反向 WebSocket 已重新接好",
+      "detach": "解绑",
+      "detached": "已解绑",
+      "running": "运行中",
+      "stopped": "未运行",
+      "qqConnected": "已连 QQ 平台",
+      "onebotConnected": "已连本 NA",
+      "endpointMismatch": "端点被改动",
+      "lastError": "qbob 记录的最近错误：{{error}}",
+      "enabled": "启用 bot",
+      "markdown": "启用 markdown（群聊真 @ 需要）",
+      "reportSelf": "上报 bot 自己发的消息",
+      "advancedHint": "高级功能（插件、分组、消息记录）在 qbob 自己的管理台里：它只绑宿主机的 127.0.0.1（端口见 .env 的 QBOB_ADMIN_EXPOSE_PORT，默认 17810），远程请用 SSH 隧道访问。",
+      "detachConfirmTitle": "解绑机器人",
+      "detachConfirmBody": "将从 qbob 删除 bot {{appid}}，并解除本实例的账号绑定。实例本身保留，之后可以重新接入。"
+    }
   }
 }

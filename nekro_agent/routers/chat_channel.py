@@ -2,16 +2,33 @@ import asyncio
 import random
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 import json5
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from tortoise.expressions import Q
 from tortoise.queryset import QuerySet
 
 from nekro_agent.adapters import get_adapter
+from nekro_agent.adapters.onebot_v11.core.bot import BotInstanceOfflineError, get_bot_by_chat_key
+from nekro_agent.adapters.onebot_v11.core.message_id import parse_message_id
+from nekro_agent.adapters.onebot_v11.tools import video as onebot_video
+from nekro_agent.adapters.onebot_v11.tools.video import (
+    ADAPTER_KEY as ONEBOT_ADAPTER_KEY,
+)
+from nekro_agent.adapters.onebot_v11.tools.video import (
+    PROXY_SECURITY_HEADERS,
+    OnebotVideoError,
+    VideoRecord,
+    VideoStream,
+    VideoStreamResponse,
+    VideoUnavailableReason,
+    find_video_record,
+    open_message_video,
+)
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import SANDBOX_SHARED_HOST_DIR, USER_UPLOAD_DIR
 from nekro_agent.models.db_announcement import (
@@ -29,7 +46,14 @@ from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.agent_message import AgentMessageSegment, AgentMessageSegmentType
-from nekro_agent.schemas.errors import AdapterUnavailableError, NotFoundError, ValidationError
+from nekro_agent.schemas.errors import (
+    AdapterUnavailableError,
+    MessageVideoBusyError,
+    MessageVideoGoneError,
+    MessageVideoUnavailableError,
+    NotFoundError,
+    ValidationError,
+)
 from nekro_agent.services.announcement import (
     AnnouncementDetail,
     AnnouncementInstanceOption,
@@ -41,17 +65,35 @@ from nekro_agent.services.announcement import (
     announcement_service,
 )
 from nekro_agent.services.channel_broadcaster import channel_broadcaster
+from nekro_agent.services.command.base import CommandPermission
+from nekro_agent.services.command.manager import (
+    USER_PERMISSION_SOURCE_MANUAL,
+    UserPermissionRecord,
+    command_manager,
+    is_group_admin_detection_enabled,
+)
 from nekro_agent.services.config_resolver import config_resolver
 from nekro_agent.services.identity_admin import PRESET_SWITCH_REVERSIBLE_NOTE, preview_preset_switch
 from nekro_agent.services.message_service import message_service
+from nekro_agent.services.user.auth import expected_pwd_gen_claim
 from nekro_agent.services.user.deps import get_current_active_user
-from nekro_agent.services.user.perm import Role, require_role
+from nekro_agent.services.user.perm import Role, check_role, require_role
+from nekro_agent.services.user.super_users import is_super_user_source_trusted_for_display, matches_super_users
 from nekro_agent.services.user.tenant_perm import (
-    accessible_instance_keys,
+    InstanceRef,
+    accessible_instance_refs,
     assert_instance_accessible,
     get_tenant_scope,
+    instance_refs_filter,
 )
 from nekro_agent.tools.path_convertor import sanitize_chat_key_for_path
+from nekro_agent.tools.video_access import (
+    build_video_url,
+    issue_video_access_token,
+    verify_video_access_token,
+    video_token_expiry,
+    video_token_matches_generation,
+)
 
 router = APIRouter(prefix="/chat-channel", tags=["ChatChannel"])
 
@@ -66,18 +108,19 @@ async def visible_channels(user: DBUser) -> QuerySet[DBChatChannel]:
     """
     if get_tenant_scope(user) is None:
         return DBChatChannel.all()
-    return DBChatChannel.filter(instance_key__in=await accessible_instance_keys(user))
+    return DBChatChannel.filter(instance_refs_filter(await accessible_instance_refs(user)))
 
 
 async def assert_channel_accessible(user: DBUser, chat_key: str) -> None:
     """校验当前身份能否访问某个频道
 
     频道不存在、或属于别的租户的实例，一律 404：403 会把平台方的频道变成可枚举的。
+    归属按 `(adapter_key, instance_key)` 成对比较，理由见 `accessible_instance_refs`。
     """
     if get_tenant_scope(user) is None:
         return
     channel = await DBChatChannel.filter(chat_key=chat_key).first()
-    if channel is None or channel.instance_key not in await accessible_instance_keys(user):
+    if channel is None or (channel.adapter_key, channel.instance_key) not in await accessible_instance_refs(user):
         raise NotFoundError(resource="聊天频道")
 
 
@@ -308,7 +351,7 @@ async def stream_chat_channel_list(
     subscription = channel_broadcaster.subscribe()
     # 广播是全局的，租户订阅时必须逐条按作用域过滤，否则列表接口挡住的频道会从实时流里漏出去
     tenant_scoped = get_tenant_scope(_current_user) is not None
-    scoped_instance_keys = set(await accessible_instance_keys(_current_user)) if tenant_scoped else set()
+    scoped_instances = await accessible_instance_refs(_current_user) if tenant_scoped else set()
 
     def cleanup_subscription() -> None:
         subscription.close()
@@ -330,7 +373,7 @@ async def stream_chat_channel_list(
 
                 if tenant_scoped:
                     channel = await DBChatChannel.filter(chat_key=event.chat_key).first()
-                    if channel is None or channel.instance_key not in scoped_instance_keys:
+                    if channel is None or (channel.adapter_key, channel.instance_key) not in scoped_instances:
                         continue
 
                 yield {"data": json.dumps(event.model_dump())}
@@ -566,6 +609,153 @@ async def get_chat_channel_messages(
     return ChatMessageListResponse(total=total, items=items)
 
 
+class MessageVideoAccess(BaseModel):
+    """视频预览的探测结果
+
+    `status` 是 `ok` 或 `VideoUnavailableReason` 的取值。这些都是业务状态而不是请求错误，走 200，
+    前端按它选文案：`<video>` 的 `onError` 读不到响应体，只能靠这条接口说清楚为什么放不了。
+    """
+
+    status: str
+    url: str = ""
+    expires_at: int = 0
+    file_name: str = ""
+    file_size: int = 0
+
+
+def _parse_video_message_id(message_id: str) -> int:
+    parsed = parse_message_id(message_id)
+    if parsed is None:
+        raise NotFoundError(resource="视频")
+    return parsed
+
+
+async def _video_channel_or_404(chat_key: str) -> DBChatChannel:
+    """只有 OneBot 的占位视频走这条路，别的适配器的视频段是落盘文件，走上传目录"""
+    channel = await DBChatChannel.filter(chat_key=chat_key, adapter_key=ONEBOT_ADAPTER_KEY).first()
+    if channel is None:
+        raise NotFoundError(resource="视频")
+    return channel
+
+
+async def _open_channel_video(chat_key: str, record: VideoRecord, range_header: Optional[str]) -> VideoStream:
+    try:
+        bot = await get_bot_by_chat_key(chat_key)
+    except BotInstanceOfflineError as e:
+        raise OnebotVideoError(VideoUnavailableReason.OFFLINE, "协议端不在线") from e
+    return await open_message_video(bot, record, chat_key=chat_key, range_header=range_header)
+
+
+# 探测只要一个字节；判文件头需要的那几个字节由 `open_video_stream` 自己向上游多要
+VIDEO_PROBE_RANGE = "bytes=0-0"
+
+
+def _tenant_slot_key(user: DBUser) -> Optional[str]:
+    """转发名额按租户分桶的键；平台方（`tenant_id` 为空）只受每用户与全局上限约束"""
+    return None if user.tenant_id is None else str(user.tenant_id)
+
+
+@router.get("/{chat_key}/messages/{message_id}/video-access", summary="探测消息视频并签发播放地址")
+@require_role(Role.Admin)
+async def get_message_video_access(
+    chat_key: str,
+    message_id: str,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> MessageVideoAccess:
+    """这是视频预览唯一的授权点：能拿到地址 == 能看这个频道
+
+    真的向上游要一个字节再签发，这样过期、离线、撤回都能在这里说清楚，而不是让 `<video>` 报一个读不到原因的错。
+    探测同样要协议端 `get_msg`、连上游，所以和转发共用名额；没名额时回 `unavailable`（稍后可重试）。
+    """
+    await assert_channel_accessible(_current_user, chat_key)
+    await _video_channel_or_404(chat_key)
+    numeric_id = _parse_video_message_id(message_id)
+    release = onebot_video.video_stream_slots.try_acquire(str(_current_user.id), _tenant_slot_key(_current_user))
+    if release is None:
+        logger.info(f"视频转发名额已满，探测被拒: user_id={_current_user.id}")
+        return MessageVideoAccess(status=VideoUnavailableReason.UNAVAILABLE.value)
+    try:
+        try:
+            record = await find_video_record(chat_key, numeric_id)
+            stream = await _open_channel_video(chat_key, record, VIDEO_PROBE_RANGE)
+        except OnebotVideoError as e:
+            if e.reason is VideoUnavailableReason.NOT_FOUND:
+                raise NotFoundError(resource="视频") from e
+            logger.info(f"视频不可预览: chat_key={chat_key} message_id={numeric_id}: {e}")
+            return MessageVideoAccess(status=e.reason.value)
+        await stream.close()
+    finally:
+        release()
+    token = issue_video_access_token(
+        chat_key, str(numeric_id), int(_current_user.id), generation=expected_pwd_gen_claim(_current_user),
+    )
+    return MessageVideoAccess(
+        status="ok",
+        url=build_video_url(chat_key, str(numeric_id), token),
+        expires_at=video_token_expiry(token),
+        file_name=record.video_name,
+        file_size=record.file_size,
+    )
+
+
+@router.get("/{chat_key}/messages/{message_id}/video", summary="转发消息里的视频（凭签名）")
+async def stream_message_video(
+    chat_key: str,
+    message_id: str,
+    request: Request,
+    sig: str = Query(default="", description="取件签名，见 tools/video_access.py"),
+) -> Response:
+    """供 `<video src>` 直接访问
+
+    每次请求都现取链接，不落盘，不缓存。签名错、过期、越权都是同一个 404，不泄露频道与消息是否存在。
+
+    签名里的用户此刻还得是一个有权看的人。签发要过 `require_role(Role.Admin)` 与
+    `get_current_active_user`（含口令世代），这里逐项再过一遍，令牌有效期内的改密、降级、封禁、
+    移出租户都立刻生效：先验不需要查库的那段签名，再按用户号取行、用它当前的口令世代验第二段签名；
+    再看未封禁、至少 Admin、能访问这个频道。
+
+    名额在碰协议端之前拿，满了回 429；名额与上游连接由 `VideoStreamResponse` 在任何结束方式下归还。
+    """
+    # 第一段签名不查库：伪造的令牌在这里就挡掉，匿名请求碰不到数据库
+    user_id = verify_video_access_token(sig, chat_key, message_id)
+    user = await DBUser.get_or_none(id=user_id) if user_id is not None else None
+    if (
+        user is None
+        or not video_token_matches_generation(sig, chat_key, message_id, generation=expected_pwd_gen_claim(user))
+        or not user.is_active
+        or not check_role(user, Role.Admin)
+    ):
+        raise NotFoundError(resource="视频")
+    await assert_channel_accessible(user, chat_key)
+    await _video_channel_or_404(chat_key)
+    numeric_id = _parse_video_message_id(message_id)
+    release = onebot_video.video_stream_slots.try_acquire(str(user.id), _tenant_slot_key(user))
+    if release is None:
+        logger.info(f"视频转发名额已满，拒绝: user_id={user.id}")
+        raise MessageVideoBusyError()
+    try:
+        record = await find_video_record(chat_key, numeric_id)
+        stream = await _open_channel_video(chat_key, record, request.headers.get("range"))
+    except OnebotVideoError as e:
+        release()
+        if e.reason is VideoUnavailableReason.NOT_FOUND:
+            raise NotFoundError(resource="视频") from e
+        logger.info(f"视频转发失败: chat_key={chat_key} message_id={numeric_id}: {e}")
+        if e.reason in (VideoUnavailableReason.RECALLED, VideoUnavailableReason.EXPIRED):
+            raise MessageVideoGoneError() from e
+        raise MessageVideoUnavailableError() from e
+    except BaseException:
+        release()
+        raise
+
+    headers = {**PROXY_SECURITY_HEADERS, **stream.headers}
+    if stream.body is None:
+        release()
+        await stream.close()
+        return Response(status_code=stream.status_code, headers=headers)
+    return VideoStreamResponse(stream, headers=headers, on_close=release)
+
+
 class PresetSwitchImpactResponse(BaseModel):
     """换人设的影响面
 
@@ -710,6 +900,15 @@ class ChatChannelUser(BaseModel):
 
     platform_userid: str
     nickname: str
+    # 此人在**本频道**执行聊天命令时的档位：user / advanced / super_user
+    command_permission: str = CommandPermission.USER.value
+    # 档位的来源：channel（本频道授权）/ group_role（群角色，注册时的快照；执行命令时按实时群角色）；
+    # 平台方调用者额外分得出 super_users（平台方名单）与 global（平台方的全局授权），
+    # 租户调用者看到的这两类一律是 platform。档位本身照实给租户：这些人确实能在租户的频道里
+    # 执行对应的命令，租户该知道谁能操作自己的机器人；隐去的只是「平台方用的是名单还是授权」
+    command_permission_source: Optional[str] = None
+    # 是否有本频道授权（与来源分开给：超级用户名下也可能挂着一条本频道授权，界面要能撤掉它）
+    channel_granted: bool = False
 
 
 class ChatChannelUsersResponse(BaseModel):
@@ -717,6 +916,37 @@ class ChatChannelUsersResponse(BaseModel):
 
     total: int
     items: List[ChatChannelUser]
+
+
+def _channel_command_permission(
+    channel: DBChatChannel,
+    platform_userid: str,
+    super_users: Set[str],
+    channel_grants: Dict[str, UserPermissionRecord],
+    *,
+    group_role_enabled: bool,
+) -> Tuple[CommandPermission, Optional[str]]:
+    """某人在这个频道里的命令档位与来源，判据与 `collector._resolve_user_command_flags` 一致
+
+    平台来源的全局记录只在本频道开了群角色识别、且 `channel_id` 等于本频道时才算：
+    它是群角色的快照，别的群里的角色不该出现在这里，更不该出现在别的租户的频道里。
+    """
+    if platform_userid in super_users:
+        return CommandPermission.SUPER_USER, "super_users"
+    if platform_userid in channel_grants:
+        return CommandPermission.ADVANCED, "channel"
+    record = command_manager.get_user_permission_record(channel.adapter_key, platform_userid)
+    if record.permission in (CommandPermission.ADVANCED, CommandPermission.SUPER_USER):
+        if record.source == USER_PERMISSION_SOURCE_MANUAL:
+            return CommandPermission.ADVANCED, "global"
+        if group_role_enabled and record.channel_id == channel.channel_id:
+            return CommandPermission.ADVANCED, "group_role"
+    return CommandPermission.USER, None
+
+
+# 租户调用者看不到平台方内部的区分：「在平台方名单里」与「平台方全局授权」一律显示成平台方设置。
+# 档位不隐去（超级用户 / 频道管理员照实显示），理由见 `ChatChannelUser.command_permission_source`
+_TENANT_VISIBLE_SOURCE = {"super_users": "platform", "global": "platform"}
 
 
 @router.get("/{chat_key}/users", summary="获取聊天频道用户列表")
@@ -746,13 +976,84 @@ async def get_chat_channel_users(
         if userid and userid != '-1' and nickname and nickname != 'SYSTEM':
             users_dict[userid] = nickname
 
+    # 本频道授权过、但还没在这里说过话的人也列出来：否则这份授权在界面上看不见、也撤不掉
+    channel_grants = command_manager.list_channel_user_permissions(chat_key, channel.adapter_key)
+    for userid in channel_grants:
+        users_dict.setdefault(userid, "")
+
+    # 与聊天命令同一套判定（名单匹配 ∧ 来源可信）：名单里的号码在这个频道是不是超级用户，
+    # 取决于这个频道的适配器与实例；来源只判一次，名单匹配逐人做。
+    # 这里没有事件、也就没有连接，只判实例这一侧（连接这一侧只在真正执行命令时才判得了）
+    source_trusted = await is_super_user_source_trusted_for_display(channel.adapter_key, channel.instance_key)
+    super_users = (
+        {uid for uid in users_dict if matches_super_users(channel.adapter_key, uid)} if source_trusted else set()
+    )
+    group_role_enabled = await is_group_admin_detection_enabled(chat_key)
+    is_tenant_caller = get_tenant_scope(_current_user) is not None
+    items: List[ChatChannelUser] = []
     # 按昵称排序
-    items = [
-        ChatChannelUser(platform_userid=uid, nickname=nickname)
-        for uid, nickname in sorted(users_dict.items(), key=lambda x: x[1])
-    ]
+    for uid, nickname in sorted(users_dict.items(), key=lambda x: x[1]):
+        permission, source = _channel_command_permission(
+            channel, uid, super_users, channel_grants, group_role_enabled=group_role_enabled,
+        )
+        if is_tenant_caller and source is not None:
+            source = _TENANT_VISIBLE_SOURCE.get(source, source)
+        items.append(
+            ChatChannelUser(
+                platform_userid=uid,
+                nickname=nickname,
+                command_permission=permission.value,
+                command_permission_source=source,
+                channel_granted=uid in channel_grants,
+            ),
+        )
 
     return ChatChannelUsersResponse(total=len(items), items=items)
+
+
+class SetChannelUserCommandPermissionRequest(BaseModel):
+    # 只有这两档：频道管理员（授予）与普通用户（撤销）。超级用户只认平台方的 SUPER_USERS
+    permission: Literal["advanced", "user"]
+
+
+@router.put(
+    "/{chat_key}/users/{platform_userid}/command-permission",
+    summary="设置用户在本频道的命令权限",
+)
+@require_role(Role.Admin)
+async def set_chat_channel_user_command_permission(
+    chat_key: str,
+    platform_userid: str,
+    body: SetChannelUserCommandPermissionRequest,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ActionResponse:
+    """授予或撤销某人在**这一个频道**里的频道管理员档位
+
+    授权只在这个 `chat_key` 上生效，换到任何别的频道都不存在，所以租户在这里改不到别的租户。
+    别人的频道与不存在的频道一律 404（`assert_channel_accessible`），与「频道不存在」不可区分；
+    租户普通成员被 `Role.Admin` 挡在外面。平台方的全局授权与 `SUPER_USERS` 不在这里改。
+    """
+    await assert_channel_accessible(_current_user, chat_key)
+
+    channel = await DBChatChannel.filter(chat_key=chat_key).first()
+    if channel is None:
+        raise NotFoundError(resource="聊天频道")
+
+    target_userid = platform_userid.strip()
+    if not target_userid or len(target_userid) > 128:
+        raise ValidationError(reason="平台用户 ID 不能为空，且不超过 128 个字符")
+
+    await command_manager.set_channel_user_permission(
+        chat_key,
+        channel.adapter_key,
+        target_userid,
+        CommandPermission(body.permission),
+    )
+    logger.info(
+        f"频道用户命令授权: chat_key={chat_key}, platform_userid={target_userid}, "
+        f"permission={body.permission}, operator={_current_user.username}",
+    )
+    return ActionResponse(ok=True)
 
 
 class PokeRequest(BaseModel):
@@ -1032,11 +1333,14 @@ class AnnouncementInstanceOptionsResponse(BaseModel):
     items: List[AnnouncementInstanceOption]
 
 
-async def _announcement_instance_keys(announcements: Sequence[DBAnnouncement]) -> Dict[int, Optional[Set[str]]]:
+async def _announcement_instance_refs(
+    announcements: Sequence[DBAnnouncement],
+) -> Dict[int, Optional[Set[InstanceRef]]]:
     """算出每条公告触达了哪些适配器实例，作为它的归属判据
 
     Returns:
-        公告 ID -> 实例标识集合；`None` 表示这条公告的覆盖面**收不敛到具体实例**。
+        公告 ID -> `(adapter_key, instance_key)` 集合；`None` 表示这条公告的覆盖面**收不敛到具体实例**。
+        成对给出是因为只有标识的话，另一个适配器下归别的租户的同名实例会被当成同一个。
 
     公告表没有租户列，也不可能有：历史行是在多租户之前写下的，加一列也只会全是 NULL。
     所以归属只能从"它打到了谁的实例上"反推，与工作区按引用它的频道反推归属是同一条路子。
@@ -1055,7 +1359,7 @@ async def _announcement_instance_keys(announcements: Sequence[DBAnnouncement]) -
     而那里的 `AnnouncementScopeType(...)` 会抛 `ValueError` —— 租户一侧是对**全表**逐行调用的，
     一行脏数据就会让租户的每一页历史都 500，而平台方只有正好落在那一页时才受影响。
     """
-    instance_keys: Dict[int, Set[str]] = {}
+    instances: Dict[int, Set[InstanceRef]] = {}
     chat_keys_of: Dict[int, List[str]] = {}
     unattributable: Set[int] = set()
     attributable_scope_types = {AnnouncementScopeType.INSTANCES.value, AnnouncementScopeType.CHANNELS.value}
@@ -1065,30 +1369,35 @@ async def _announcement_instance_keys(announcements: Sequence[DBAnnouncement]) -
             unattributable.add(announcement.id)
             continue
         scope = announcement_service.load_scope(announcement)
-        instance_keys[announcement.id] = {ref.instance_key for ref in scope.instances if ref.instance_key}
+        instances[announcement.id] = {(ref.adapter_key, ref.instance_key) for ref in scope.instances if ref.instance_key}
         chat_keys_of[announcement.id] = list(scope.chat_keys)
 
     wanted_chat_keys = {chat_key for chat_keys in chat_keys_of.values() for chat_key in chat_keys}
     if wanted_chat_keys:
-        channel_instances = dict(
-            await DBChatChannel.filter(chat_key__in=wanted_chat_keys).values_list("chat_key", "instance_key"),
-        )
+        channel_instances: Dict[str, InstanceRef] = {
+            chat_key: (adapter_key, instance_key)
+            for chat_key, adapter_key, instance_key in await DBChatChannel.filter(
+                chat_key__in=wanted_chat_keys,
+            ).values_list("chat_key", "adapter_key", "instance_key")
+            if instance_key
+        }
         for announcement_id, chat_keys in chat_keys_of.items():
-            instance_keys[announcement_id].update(
-                channel_instances[chat_key] for chat_key in chat_keys if channel_instances.get(chat_key)
+            instances[announcement_id].update(
+                channel_instances[chat_key] for chat_key in chat_keys if chat_key in channel_instances
             )
 
-    if instance_keys:
-        delivered = await DBAnnouncementDelivery.filter(announcement_id__in=list(instance_keys)).values_list(
+    if instances:
+        delivered = await DBAnnouncementDelivery.filter(announcement_id__in=list(instances)).values_list(
             "announcement_id",
+            "adapter_key",
             "instance_key",
         )
-        for announcement_id, instance_key in delivered:
-            if instance_key and announcement_id in instance_keys:
-                instance_keys[announcement_id].add(instance_key)
+        for announcement_id, adapter_key, instance_key in delivered:
+            if instance_key and announcement_id in instances:
+                instances[announcement_id].add((adapter_key, instance_key))
 
     return {
-        announcement.id: None if announcement.id in unattributable else instance_keys[announcement.id]
+        announcement.id: None if announcement.id in unattributable else instances[announcement.id]
         for announcement in announcements
     }
 
@@ -1101,11 +1410,9 @@ async def _accessible_announcements(user: DBUser, announcements: Sequence[DBAnno
     """
     if get_tenant_scope(user) is None:
         return list(announcements)
-    allowed = set(await accessible_instance_keys(user))
-    keys_of = await _announcement_instance_keys(announcements)
-    return [
-        announcement for announcement in announcements if (keys := keys_of[announcement.id]) and keys <= allowed
-    ]
+    allowed = await accessible_instance_refs(user)
+    reached = await _announcement_instance_refs(announcements)
+    return [announcement for announcement in announcements if (refs := reached[announcement.id]) and refs <= allowed]
 
 
 async def _accessible_announcement_or_404(user: DBUser, announcement_id: int) -> DBAnnouncement:
@@ -1146,16 +1453,18 @@ async def _scope_within_reach(user: DBUser, scope: AnnouncementScope) -> Announc
 
     if scope.scope_type == AnnouncementScopeType.INSTANCES:
         for ref in scope.instances:
-            await assert_instance_accessible(user, ref.instance_key)
+            # 投递按 (适配器, 实例) 分组，所以校验也必须落在同一对上：只校验标识的话，
+            # 租户拿自己实例的标识配上另一个适配器，就能把公告发进别人同名实例的群里
+            await assert_instance_accessible(user, ref.instance_key, adapter_key=ref.adapter_key)
         return scope
 
-    allowed = set(await accessible_instance_keys(user))
+    allowed = await accessible_instance_refs(user)
     return AnnouncementScope(
         scope_type=AnnouncementScopeType.INSTANCES,
         instances=[
             AnnouncementInstanceRef(adapter_key=option.adapter_key, instance_key=option.instance_key)
             for option in await announcement_service.list_instance_options()
-            if option.instance_key in allowed
+            if (option.adapter_key, option.instance_key) in allowed
         ],
     )
 
@@ -1215,8 +1524,8 @@ async def list_announcement_instances(
     """列出可作为公告范围的适配器实例及其活跃会话数量（租户只看得到自己名下的实例）。"""
     options = await announcement_service.list_instance_options()
     if get_tenant_scope(_current_user) is not None:
-        allowed = set(await accessible_instance_keys(_current_user))
-        options = [option for option in options if option.instance_key in allowed]
+        allowed = await accessible_instance_refs(_current_user)
+        options = [option for option in options if (option.adapter_key, option.instance_key) in allowed]
     return AnnouncementInstanceOptionsResponse(items=options)
 
 
@@ -1273,7 +1582,7 @@ async def stream_bot_announcement_events(
     因此断线重连或中途打开页面都能得到完整状态。
 
     归属必须在建流**之前**判：`EventSourceResponse` 一旦返回状态码就是 200，
-    在生成器里再抛 404 只会变成一条建好又断的连接（同 PROJECT_STATE §3 #12）。
+    在生成器里再抛 404 只会变成一条建好又断的连接。
     """
     from nekro_agent.services.runtime_state import is_shutting_down
 

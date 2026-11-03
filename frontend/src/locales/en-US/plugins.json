@@ -3,6 +3,7 @@
   "tabs": {
     "info": "Info",
     "config": "Config",
+    "webui": "Page",
     "methods": "Methods",
     "webhook": "Webhook",
     "data": "Data Management"
@@ -60,6 +61,18 @@
       "always_loaded": "Always fully visible"
     }
   },
+  "callPriority": {
+    "label": "Call Priority",
+    "description": "When multiple plugins provide equivalent capabilities, prefer higher-priority plugins and fall back to medium or low if needed. Auto leaves the decision to the model.",
+    "globalNote": "This setting applies to every instance, regardless of the instance currently selected.",
+    "platformOnly": "Only the platform owner can change it.",
+    "options": {
+      "auto": "Auto",
+      "high": "High",
+      "medium": "Medium",
+      "low": "Low"
+    }
+  },
   "methods": {
     "name": "Method Name",
     "title": "Title",
@@ -87,6 +100,11 @@
     "copied": "Webhook URL copied!",
     "description": "Description",
     "noEndpoints": "No webhook endpoints defined for this plugin"
+  },
+  "webui": {
+    "title": "{{name}} Plugin Page",
+    "loading": "Loading plugin page...",
+    "openInNewPage": "Open in New Page"
   },
   "data": {
     "title": "Plugin Data",
@@ -151,6 +169,7 @@
     "resetFailed": "Reset failed",
     "refreshFailed": "Refresh failed",
     "updateFailedWithMessage": "Update failed: {{message}}",
+    "callPriorityUpdated": "Plugin call priority updated",
     "activationStrategyUpdated": "Plugin activation strategy updated",
     "pluginNotFound": "Target plugin not found"
   },

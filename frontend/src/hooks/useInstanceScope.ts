@@ -31,7 +31,7 @@ export interface InstanceScope {
   /**
    * 「全局视图」这一档是否存在
    *
-   * **租户没有全局视图**（见 PROJECT_STATE §1.4）：`instance_key` 为空对平台方是"看全部"，
+   * **租户没有全局视图**：`instance_key` 为空对平台方是"看全部"，
    * 对租户则被后端 `resolve_instance_scope` 直接 400。切换器据此决定要不要渲染那一项 ——
    * 渲染出来就是一个点了必然被弹回别的实例的选项，而"弹回别的实例"比"没有这一项"危险得多。
    *

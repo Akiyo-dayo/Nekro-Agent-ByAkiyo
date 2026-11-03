@@ -9,8 +9,13 @@
 
 import axios from './axios'
 
-/** 实例背后的协议端形态 */
-export const INSTANCE_PROVIDERS = ['builtin_napcat', 'remote_onebot', 'native'] as const
+/**
+ * 实例背后的协议端形态
+ *
+ * `builtin_qbob`：附带的 qbob（QQ 官方机器人 → OneBot v11）里由 NA 托管的 bot，
+ * 接入与运维见 `consoleQbob.ts`
+ */
+export const INSTANCE_PROVIDERS = ['builtin_napcat', 'remote_onebot', 'native', 'builtin_qbob'] as const
 export type InstanceProvider = (typeof INSTANCE_PROVIDERS)[number]
 
 /**
@@ -96,6 +101,8 @@ export interface InstanceInfo {
   last_error: string
   /** 掉线起始时间 */
   offline_since: string | null
+  /** 内置 qbob 实例已接入的 AppID；非空表示 qbob 里还挂着这个 bot */
+  qbob_appid: string
 }
 
 /** 实例列表 */
@@ -220,6 +227,9 @@ export interface UnclaimedInstanceItem {
   message_count_today: number
   last_active_at: string | null
   first_seen_at: string | null
+  /** 认领之前它的消息会不会被丢弃（部署级令牌为空、曾对租户可见、或曝光记录不可用） */
+  dispatch_paused: boolean
+  dispatch_paused_reason: string
 }
 
 /** 可以作为「并入」目标的既有实例 */

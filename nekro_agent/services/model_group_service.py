@@ -49,8 +49,8 @@ Windows 上用 `icacls` 收紧 ACL——`0o600` 在那里只影响只读位；�
 `import_config_group()` 全部引用它；WebUI 表单那一份由
 `tests/test_model_group_default_visibility.py` 读 `.tsx` 钉在一起。
 默认 shared 意味着新开一个租户即可选用平台方的模型组 —— 那是一条**授权**路径，
-#51 堵的越权路径堵不到它。**接口层不许自带 `or <某个默认>`**（改造前
-`routers/console/model_groups.py` 就有一句，它盖过了字段默认；见 PROJECT_STATE §2.27）。
+写入侧的越权检查管不到它。**接口层不许自带 `or <某个默认>`**（改造前
+`routers/console/model_groups.py` 就有一句，它盖过了字段默认）。
 
 ## 「谁能引用哪个模型组」
 
@@ -68,13 +68,15 @@ Windows 上用 `icacls` 收紧 ACL——`0o600` 在那里只影响只读位；�
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Type
 
 import yaml
 from pydantic import BaseModel
@@ -123,7 +125,36 @@ from nekro_agent.tools.redaction import is_credential_mask, mask_credential
 
 logger = get_sub_logger("model_group")
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
+# 组名字符集，最长 64 字符：
+#
+# - 文字：半角字母数字 + 中日韩文字。中日韩文字用**显式码段**而不是 `\w`：`\w` 把西里尔 / 希腊同形字
+#   （`dеfault`）、全角字母（`ｄｅｆａｕｌｔ`）、甚至肉眼不可见的韩文填充符（U+3164 / U+FFA0 / U+115F，
+#   类别 Lo）都算作字母。显式码段也让前后端不受各自 Unicode 版本影响（Python 3.11 与浏览器差一万多个码点）。
+# - 标点：上游原版几乎不限字符，`GPT-4o（备用）`、`DeepSeek V3`、`qwen2.5:7b`、`通义千问·Max`、`【主】模型`
+#   都是常见命名，这些标点照样放行；`/ \ ? # % & =` 这类 URL 结构字符、控制字符与零宽字符不放。
+# - 首字符须是文字或左括号；不许连续空格（`a  b` 与 `a b` 肉眼几乎分不出），首尾空白在校验前去掉。
+#
+# 字符集挡不住所有形近字（片假名 カ 与汉字 力、英文 I 与 l）。防止平台方选错组的主手段是配置下拉框里
+# 标出租户自建的组（`ConfigTable.tsx`），字符集只挡掉代价最低的那几类。
+# 前端 `ModelGroupFormDialog.tsx` 的 `GROUP_NAME_PATTERN` 是同一条规则的 JS 写法，
+# 两处由 `tests/test_model_group_name_and_batch_delete.py` 逐码点比对钉在一起
+_NAME_LETTERS = (
+    "A-Za-z0-9"
+    "\u3400-\u4dbf\u4e00-\u9fff"  # 汉字：扩展 A、基本区
+    "\U00020000-\U0002a6df\U0002a700-\U0002ee5f\U00030000-\U000323af"  # 汉字：扩展 B–I
+    "\u3041-\u3096\u309d-\u309f"  # 平假名
+    "\u30a1-\u30fa\u30fc-\u30ff"  # 片假名（含长音符 ー，不含中点 ・）
+    "\uac00-\ud7a3"  # 韩文音节（不含填充符与单独字母）
+)
+# 可出现在文字之间的标点（含空格）：_ . - ( ) + : @ · （ ） 【 】 、 ：
+_NAME_PUNCT = "_.\\-()+:@ \u00b7\uff08\uff09\u3010\u3011\u3001\uff1a"
+# 可以打头的标点只有左括号：( （ 【
+_NAME_OPENERS = "(\uff08\u3010"
+_NAME_RE = re.compile(f"(?!.*  )[{_NAME_LETTERS}{_NAME_OPENERS}][{_NAME_LETTERS}{_NAME_PUNCT}]{{0,63}}")
+
+# `DBModelGroup.name` 的列宽。更长的名字不可能存在，按不存在处理；不先拦下的话 Tortoise 在
+# 过滤时就抛 `tortoise.exceptions.ValidationError`，一路冒成 500
+_NAME_COLUMN_MAX = 128
 
 # 该组名被 `USE_MODEL_GROUP` 等配置项当作兜底默认值，删掉会让全局配置直接指空
 DEFAULT_GROUP_NAME = "default"
@@ -313,8 +344,8 @@ async def upgrade_credentials_report() -> CredentialUpgradeReport:
     "有一行解不开"，不说是哪个组，运维拿着它没法行动；而这里本来就查着整张表，
     组名就在手上，不点名等于把已经拿到的信息扔掉。
 
-    跳过不是只在这一条路径上孤立成立的：`DBModelGroup.save()` 上有一道回查守卫
-    （PROJECT_STATE §3 #64），解不开的行在**任何一次普通保存**里也会原样保留
+    跳过不是只在这一条路径上孤立成立的：`DBModelGroup.save()` 上有一道回查守卫，
+    解不开的行在**任何一次普通保存**里也会原样保留
     `api_key` 原列——后台改个名字、走一遍"掩码=保持不变"都不再毁掉密文。
     仍然会覆盖它的只剩"显式填入新 Key"（那本来就是覆盖指令）。
 
@@ -441,11 +472,11 @@ def find_handwritten_keys_backups() -> List[Path]:
 def backup_handwritten_keys(groups: Dict[str, ModelConfigGroup]) -> HandwrittenKeysBackup:
     """把 YAML 里手填、却没导入数据库的模型组原值备份成一个仅属主可访问的文件，返回路径与保护结果
 
-    **这是一份新的明文副本**，与 #61「整目录打包的备份不再带出明文 Key」的目标有张力，所以：只含分歧的组
+    **这是一份新的明文副本**，与「整目录打包的备份不再带出明文 Key」的目标有张力，所以：只含分歧的组
     （与库值一致的组明文本来就在库里、不进来）；一次性（掩码之后重启不再分歧，不会越攒越多）；
     调用方在日志里逐字点名路径、如实说明保护程度并要求取出后删除，之后每次启动还在就再提醒；
     失败不吞（调用方据此退回「不落盘」）。
-    选它而不选「运行期保留该组 YAML 原值」的理由见 DECISIONS：后者要让明文无限期留在 YAML 里，
+    不选「运行期保留该组 YAML 原值」，是因为后者要让明文无限期留在 YAML 里，
     而且操作者在后台改了 Key 之后那份旧明文仍会赖着不走。
     """
     directory = Path(OsEnv.DATA_DIR) / "configs"
@@ -470,7 +501,7 @@ async def bootstrap_model_groups() -> None:
 
     幂等：导入以 `name` 是否已存在为准，重复启动只会命中"已存在"分支。
 
-    **落盘决策**（#61，round-27）：数据库接管完成、且库里**没有**解不开的行时，**每次启动
+    **落盘规则**：数据库接管完成、且库里**没有**解不开的行时，**每次启动
     都落盘一次**——YAML 里的 `API_KEY` 因此在升级后的**首次启动**就被掩码成占位符/空串，
     而不是等到下一次碰巧的配置落盘（旧实现 `persist=bool(imported)`：普通重启不落盘，
     升级部署的明文 YAML 会一直留着）。**存在解不开的行时不落盘**：那些组在 YAML 里可能
@@ -495,9 +526,9 @@ async def bootstrap_model_groups() -> None:
         )
 
     # 库里已有同名行时导入会跳过（库内行绝不被覆盖），若此时 YAML 里手填的明文 Key 与库值不一致，
-    # 那份明文既没导入、又会在落盘里被掩码抹掉——静默丢失（round-27 复核 P2-3）。
+    # 那份明文既没导入、又会在落盘里被掩码抹掉——静默丢失。
     # 在导入之前比对（`import_config_group` 之后同名行必然已存在，信息就没了）。占位符 / 空串不是手填的 Key，不参与。
-    # 处理（第二轮复核 P2-6）：只跳过启动这一次落盘是漏的——「后台编辑该模型组」同样会落盘并抹掉它。
+    # 处理：只跳过启动这一次落盘是漏的——「后台编辑该模型组」同样会落盘并抹掉它。
     # 所以首次掩码落盘之前先把分歧组手填的原值备份成一个 0600 文件（见 `backup_handwritten_keys`），
     # 然后照常掩码；备份写不出来才退回「不落盘」并如实告知。
     diverged: List[str] = []
@@ -573,8 +604,8 @@ async def bootstrap_model_groups() -> None:
             )
     # 库里解不开的组，其 YAML 原值（明文或占位符）此刻是该凭据在库外仅剩的痕迹：记下来，之后任何一次
     # 别的配置落盘（WebUI 保存系统配置、后台改别的模型组）都对它们原样写回，而不是随内存里 fail-closed 的
-    # 空串一起抹掉（#61 残留，A4）。每次启动整体重记：原密钥放回去重启后 `report.unreadable` 为空，记账随之清零。
-    # 取舍（DECISIONS）：只管「别的落盘」，启动这一趟的整体不落盘保持原状——那条已有用例钉着，且
+    # 空串一起抹掉。每次启动整体重记：原密钥放回去重启后 `report.unreadable` 为空，记账随之清零。
+    # 取舍：只管「别的落盘」，启动这一趟的整体不落盘保持原状——那条已有用例钉着，且
     # 同时落盘「别的组照常掩码」要拆开那条语义，方案变大。
     held_values: Dict[str, str] = {}
     for name in report.unreadable:
@@ -607,6 +638,8 @@ async def list_visible_groups(identity: CurrentIdentity) -> List[ModelGroupInfo]
 
 async def get_visible_group(name: str, identity: CurrentIdentity) -> DBModelGroup:
     """取出当前身份可见的模型组；不可见时按不存在处理"""
+    if len(name) > _NAME_COLUMN_MAX:
+        raise ModelGroupNotFoundError(name=f"{name[:_NAME_COLUMN_MAX]}…")
     row = await DBModelGroup.get_or_none(name=name)
     if row is None or not can_view_group(row, identity):
         raise ModelGroupNotFoundError(name=name)
@@ -624,11 +657,19 @@ async def get_editable_group(name: str, identity: CurrentIdentity) -> DBModelGro
 def validate_group_name(name: str) -> str:
     """校验模型组名
 
-    组名同时是运行时视图的字典键与配置文件里的 YAML 键，限制字符集避免出现无法引用的名字。
+    组名同时是运行时视图的字典键、配置文件里的 YAML 键（`allow_unicode=True` 落盘）与
+    `/console/model-groups/{name}` 的路径参数，限制字符集避免出现无法引用的名字。
+    上游原版允许中文组名与常见标点，这里同样放行；用 `fullmatch` 而不是 `^...$`：后者的 `$`
+    会放过结尾的换行。
     """
     normalized = name.strip()
-    if not _NAME_RE.match(normalized):
-        raise ValidationError(reason="模型组名仅允许字母数字与 _ . -，需以字母或数字开头，最长 64 字符")
+    if not _NAME_RE.fullmatch(normalized):
+        raise ValidationError(
+            reason=(
+                "模型组名可用中文（及日文假名、韩文）、半角字母数字、空格与 _ . - ( ) + : @ · （ ） 【 】 、 ：，"
+                "需以文字、字母、数字或左括号开头，不能有连续空格，最长 64 字符"
+            ),
+        )
     return normalized
 
 
@@ -703,9 +744,107 @@ async def delete_group(row: DBModelGroup) -> None:
     """删除模型组"""
     if row.name == DEFAULT_GROUP_NAME:
         raise ValidationError(reason="默认模型组不可删除")
-    await row.delete()
+    # 按影响行数判定，与批量删除同一口径：并发里已被别人删掉的组报不存在，而不是报"已删除"
+    if not await DBModelGroup.filter(id=row.id).delete():
+        raise ModelGroupNotFoundError(name=row.name)
     await refresh_runtime_view()
-    logger.info(f"删除模型组 {row.name}")
+    logger.info(f"删除模型组 {row.name!r}")
+
+
+class DeleteRefusal(str, Enum):
+    """批量删除里某个组没删成的原因
+
+    与单个删除端点的结论一一对应，不多分一档：不存在与"存在但不可见"同为 `not_found`
+    （两者一旦可区分，差异本身就是组名存在性探针，见 `can_view_group`）；
+    看得见但改不了（租户眼里的平台 shared 组、只读成员）是 `forbidden`。
+    `error` 是意料之外的异常（详情只进日志）：单个组出错不能中断整批，也不能让已删的那些组
+    在响应里"消失"——那正是"删了一半再 500、调用方不知道删了哪些"。
+    """
+
+    NOT_FOUND = "not_found"
+    FORBIDDEN = "forbidden"
+    DEFAULT_GROUP = "default_group"
+    ERROR = "error"
+
+
+class BatchDeleteOutcome(NamedTuple):
+    """批量删除的结算结果"""
+
+    deleted: List[str]
+    refused: List[Tuple[str, DeleteRefusal]]
+
+
+# 批量删除收尾（重建运行时视图）的后台任务。被 `asyncio.shield` 保护的内层任务在外层被取消后
+# 仍要跑完，这里持有强引用，免得它在跑到一半时被回收
+_SETTLING_TASKS: Set["asyncio.Task[None]"] = set()
+
+
+def _shown_name(name: str) -> str:
+    """回显 / 写日志用的组名：超过列宽的截断（那种名字不可能存在，原样回显只是放大请求）"""
+    return name if len(name) <= _NAME_COLUMN_MAX else f"{name[:_NAME_COLUMN_MAX]}…"
+
+
+async def _settle_batch_delete(deleted: List[str], identity: CurrentIdentity) -> None:
+    try:
+        await refresh_runtime_view()
+    except Exception:
+        # 行已经删了、视图没跟上：审计信息不能随这次失败一起丢掉。视图会在下一次任意模型组写入或重启时重建
+        logger.exception(f"批量删除模型组 {deleted!r} 已落库，但重建运行时视图失败")
+        raise
+    logger.info(f"批量删除模型组 {deleted!r}（操作者 {identity.username!r}，租户 {identity.tenant_id}）")
+
+
+async def delete_groups(names: Sequence[str], identity: CurrentIdentity) -> BatchDeleteOutcome:
+    """批量删除模型组
+
+    每个组名走与单个删除**同一套**判定（`get_editable_group` + 默认组保护），不另写权限逻辑。
+    逐个结算而不是全有全无（同 `routers/console/quota.py` 的批量配额）：列表是旧的、某个组刚被
+    别人删掉时，其余组照常删除，结果里如实列出哪些没删成、为什么。重复的组名只处理一次。
+
+    单个组上意料之外的异常记为 `error` 并接着处理下一个（同批量配额的"单个失败不中断整批"）。
+    删除按影响行数判定：两个管理员同时删同一个组时，后到的那一边删了 0 行，记 `not_found`，
+    不会两边都报"已删除"。
+
+    运行时视图只在最后重建一次（单个删除每次都重建并落盘配置文件，批量时没必要重复 N 次）。
+    重建放在 `finally` 里，并用 `asyncio.shield` 包住：请求被取消时，已经删掉的行也必须从运行时
+    视图里消失，否则对话仍会拿着已删除组的凭据去调上游，配置文件镜像里也还留着它们（下次启动会被
+    当作存量组重新导入）。只靠 `finally` 不够：anyio 的取消作用域（Starlette 中间件、uvicorn 关停时
+    取消在途请求）会在作用域内的**每一次** await 上重复投递取消，`finally` 里的重建同样会被打断。
+
+    回显与日志里的组名都经 `_shown_name` 截断、日志用 `!r` 转义，换行之类不会伪造出新的日志行。
+    """
+    deleted: List[str] = []
+    refused: List[Tuple[str, DeleteRefusal]] = []
+    try:
+        for name in dict.fromkeys(names):
+            shown = _shown_name(name)
+            try:
+                row = await get_editable_group(name, identity)
+                # 先判权限再判默认组：租户看不见的 default 必须报 not_found，而不是泄露"它是默认组"
+                if row.name == DEFAULT_GROUP_NAME:
+                    refused.append((shown, DeleteRefusal.DEFAULT_GROUP))
+                    continue
+                if not await DBModelGroup.filter(id=row.id).delete():
+                    refused.append((shown, DeleteRefusal.NOT_FOUND))
+                    continue
+            except ModelGroupNotFoundError:
+                refused.append((shown, DeleteRefusal.NOT_FOUND))
+                continue
+            except PermissionDeniedError:
+                refused.append((shown, DeleteRefusal.FORBIDDEN))
+                continue
+            except Exception:  # noqa: BLE001 - 单个组失败不能中断整批
+                logger.exception(f"批量删除模型组时出错，跳过该组: {shown!r}")
+                refused.append((shown, DeleteRefusal.ERROR))
+                continue
+            deleted.append(row.name)
+    finally:
+        if deleted:
+            settling = asyncio.ensure_future(_settle_batch_delete(list(deleted), identity))
+            _SETTLING_TASKS.add(settling)
+            settling.add_done_callback(_SETTLING_TASKS.discard)
+            await asyncio.shield(settling)
+    return BatchDeleteOutcome(deleted=deleted, refused=refused)
 
 
 async def upsert_platform_group(name: str, group: ModelConfigGroup) -> DBModelGroup:
@@ -945,19 +1084,26 @@ async def enforce_channel_model_group_scope(
     config_obj: CoreConfig,
     *,
     instance_key: str,
+    adapter_key: str = "",
     chat_key: str = "",
 ) -> List[Tuple[str, str, str]]:
     """`enforce_model_group_scope()` 的频道入口：由实例反查租户后再判定
 
     实例未绑定租户（平台方自有实例）、实例不存在、以及未启用多租户的部署都在这里直接返回，
     一次数据库查询都不会多做归属判定，平台方行为逐字不变。
+
+    调用方手上有 `adapter_key` 时必须一起传：另一个适配器下可以有同名实例归平台方，
+    只按标识反查会把租户的频道判成平台方，越权的模型组就此放行。
     """
     if not instance_key:
         return []
 
     from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 
-    instance = await DBAdapterInstance.filter(instance_key=instance_key).first()
+    query = DBAdapterInstance.filter(instance_key=instance_key)
+    if adapter_key:
+        query = query.filter(adapter_key=adapter_key)
+    instance = await query.order_by("id").first()
     if instance is None or instance.tenant_id is None:
         return []
     return await enforce_model_group_scope(

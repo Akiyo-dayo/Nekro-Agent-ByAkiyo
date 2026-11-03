@@ -4,8 +4,8 @@
 
 改之前，`routers/console/containers.py` 的 11 个端点与 `routers/console/health.py` 的
 3 个端点**全部** `Role.Super`。于是「QQ 掉线 / 需要重新扫码」——最高频的那类运营事件——
-对定制版客户是一个红点加零个按钮，而 R19「与其他需求的耦合」明写过：租户
-**最多能「重启我的 NapCat」**，且必须由后端校验该容器确实属于该租户。
+对定制版客户是一个红点加零个按钮。边界应当是：租户
+**最多能「重启自己的 NapCat」**，且必须由后端校验该容器确实属于该租户。
 
 现在切成两档，这份文件把两档的**行为**逐条钉住（分档结果本身钉在
 `tests/test_route_permission_contract.py::TestProtocolSelfServiceSplitIsPinned`）：

@@ -42,6 +42,7 @@ from nekro_agent.api.plugin import (
     SandboxMethodType,
 )
 from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.services.message_service import message_service
 from nekro_agent.tools.common_util import calculate_text_similarity
@@ -306,6 +307,9 @@ async def send_text_message(_ctx: AgentCtx, chat_key: str, message_text: str, tt
     返回:
         无
     """
+    # `chat_key` 是模型自由填写的参数：同一租户内允许跨频道，跨租户一律拒绝
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
+
     global SEND_MSG_CACHE
 
     # 检查消息列表是否为空或者长度不匹配
@@ -406,6 +410,9 @@ async def set_expression(_ctx: AgentCtx, chat_key: str, expression: str, duratio
     返回:
         一个float值,代表设置的表情从delay到duration结束后持续的总时间,你可以使用此返回值来精确控制动画的顺序
     """
+
+    # `chat_key` 是模型自由填写的参数：同一租户内允许跨频道，跨租户一律拒绝
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
 
     room_id = chat_key.replace("bilibili_live-", "")
     ws_client = _ctx.adapter.get_ws_client_by_room_id(room_id)  # type: ignore
@@ -519,6 +526,9 @@ async def play_sound(_ctx: AgentCtx, chat_key: str, sound_name: str, volume: flo
     返回:
         一个float值,代表播放的音频从delay到结束持续的总时间,你可以使用此返回值来精确控制动画的顺序
     """
+    # `chat_key` 是模型自由填写的参数：同一租户内允许跨频道，跨租户一律拒绝
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
+
     room_id = chat_key.replace("bilibili_live-", "")
     ws_client = _ctx.adapter.get_ws_client_by_room_id(room_id)  # type: ignore
     if ws_client:
@@ -566,6 +576,9 @@ async def play_preformed_animation(_ctx: AgentCtx, chat_key: str, animation_name
             0.0
         )
     """
+    # `chat_key` 是模型自由填写的参数：同一租户内允许跨频道，跨租户一律拒绝
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
+
     room_id = chat_key.replace("bilibili_live-", "")
     ws_client = _ctx.adapter.get_ws_client_by_room_id(room_id)  # type: ignore
     if ws_client:
@@ -608,6 +621,9 @@ async def send_execute(_ctx: AgentCtx, chat_key: str, loop: int):
     返回:
         无
     """
+    # `chat_key` 是模型自由填写的参数：同一租户内允许跨频道，跨租户一律拒绝
+    chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
+
     room_id = chat_key.replace("bilibili_live-", "")
     ws_client = _ctx.adapter.get_ws_client_by_room_id(room_id)  # type: ignore
     if ws_client:

@@ -1,4 +1,4 @@
-"""LLM 上游报错原文的脱敏回归测试（PROJECT_STATE §3 #39）
+"""LLM 上游报错原文的脱敏回归测试
 
 ## 保护的契约
 
@@ -104,7 +104,7 @@ UPSTREAM_502_RELAY_KEY = (
     "', 'type': 'relay_error'}}"
 )
 
-#: 能力不匹配那一类（§3 #32）的原文，外加一段被回显的凭据。
+#: 能力不匹配那一类的原文，外加一段被回显的凭据。
 #: 用来钉住「脱敏不能把分类判据吃掉」
 UPSTREAM_VISION_400_WITH_KEY = (
     "Error code: 400 - {'error': {'message': '当前模型不支持该能力：vision', "
@@ -686,14 +686,14 @@ class TestTheRedactionIsActuallyWiredIn:
     """§2.7：零件全对、调用点没了，测试会全绿
 
     这一组按**实参**判，不按「函数名出现在源码里」判——后者只要文件里有一次 import
-    就恒成立（§3 #37 踩过同款）。
+    就恒成立（以前就踩过这个坑）。
     """
 
     def test_gen_chat_response_does_not_use_logger_exception(self) -> None:
         """按 AST 的 Call 节点判，不按源码文本判
 
         这个文件的 docstring 里就写着 `logger.exception` 四个字（在讲这条缺陷的由来），
-        按文本判会恒不成立——§3 #37 正是这样被一句局部 import 骗过去的。
+        按文本判会恒不成立——以前的一次检查正是这样被一句局部 import 骗过去的。
         """
         tree = ast.parse(_module_source(_AGENT_DIR / "openai.py"))
         offenders = [

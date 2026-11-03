@@ -45,6 +45,7 @@ from nekro_agent.services.sandbox.credential_guard import (
 from nekro_agent.services.sandbox.ext_caller import get_api_caller_code
 from nekro_agent.tools.file_utils import FileSystem
 from nekro_agent.tools.path_convertor import convert_to_host_path
+from tests.rpc_sandbox_client import request_body
 
 PLATFORM_API_KEY = "sk-platform-tenant-must-never-see-this-0123456789"
 PLATFORM_BASE_URL = "https://api.platform-internal.example/v1"
@@ -157,11 +158,11 @@ def sandbox_client(stub_plugin: _StubPlugin, monkeypatch: pytest.MonkeyPatch):
         chat_key: str = CHAT_KEY,
         container_key: str = CONTAINER_KEY,
     ):
-        body = pickle.dumps({"method": method, "args": args, "kwargs": {}})
+        body = request_body(method, *args)  # 沙盒侧真实的编码器（JSON），见 `tests/rpc_sandbox_client.py`
         return client.post(
             f"/ext/rpc_exec?container_key={container_key}&from_chat_key={chat_key}",
             content=body,
-            headers={"Content-Type": "application/octet-stream", "X-RPC-Token": token_override or token},
+            headers={"Content-Type": "application/json", "X-RPC-Token": token_override or token},
         )
 
     yield call
@@ -191,7 +192,7 @@ class TestSecretCollection:
         assert "abc" not in collect_platform_secrets()
 
     def test_collects_the_credential_cipher_master_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """模型组凭据的静态加密主密钥（round-22）同样不能回到沙盒
+        """模型组凭据的静态加密主密钥同样不能回到沙盒
 
         它比这张表里任何一项都值钱：拿到它 + 一份库 dump = 全部租户与平台方的 API Key。
         改造前它没被登记进 `_OS_ENV_SECRET_ATTRS`，而**没有任何用例会因此变红**
@@ -215,7 +216,7 @@ class TestEveryOsEnvSecretIsRegistered:
 
     `collect_platform_secrets()` 对配置树是自动下钻的（新增插件配置、新增模型组自动纳入），
     但 `OsEnv` 上的进程级凭据必须逐个登记。漏登记没有任何运行时信号：脱敏只是少遮一个值，
-    既有断言一条都不会动。round-22 新增 `CREDENTIAL_SECRET_KEY` 时就漏了。
+    既有断言一条都不会动。新增 `CREDENTIAL_SECRET_KEY` 时就漏过一次。
 
     判据用的是本模块自己那条凭据命名正则（`_SECRET_FIELD_NAME_PATTERN`，与
     `nekro_log_hygiene.SECRET_ENV_KEY_PATTERN` 同源），只看**字符串**字段：

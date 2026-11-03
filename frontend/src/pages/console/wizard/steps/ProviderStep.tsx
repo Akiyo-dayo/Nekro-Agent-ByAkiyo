@@ -1,13 +1,16 @@
 import { ReactNode } from 'react'
 import { Box, Card, CardActionArea, Chip, Stack, Typography, alpha, useTheme } from '@mui/material'
+import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import CheckCircleIcon from '@mui/icons-material/CheckCircle'
+import CloudQueueIcon from '@mui/icons-material/CloudQueue'
 import ExtensionIcon from '@mui/icons-material/Extension'
 import HubIcon from '@mui/icons-material/Hub'
 import MemoryIcon from '@mui/icons-material/Memory'
 import SmartToyIcon from '@mui/icons-material/SmartToy'
 import { BORDER_RADIUS, CARD_VARIANTS, CHIP_VARIANTS } from '../../../../theme/variants'
 import type { InstanceProvider } from '../../../../services/api/console'
+import { consoleQbobApi } from '../../../../services/api/consoleQbob'
 
 interface ProviderStepProps {
   value: InstanceProvider
@@ -25,11 +28,21 @@ const PROVIDER_OPTIONS: ProviderOption[] = [
   { provider: 'builtin_napcat', icon: <SmartToyIcon />, costTone: 'warning' },
   { provider: 'remote_onebot', icon: <HubIcon />, costTone: 'success' },
   { provider: 'native', icon: <ExtensionIcon />, costTone: 'success' },
+  // 附带的 qbob 是一个常驻容器（一个容器带多个 bot），按"要吃资源"标
+  { provider: 'builtin_qbob', icon: <CloudQueueIcon />, costTone: 'warning' },
 ]
 
 export default function ProviderStep({ value, onChange }: ProviderStepProps) {
   const { t } = useTranslation(['console-setup', 'console'])
   const theme = useTheme()
+
+  // 本部署没附带 qbob（没设 NEKRO_QBOB_ADMIN_URL）时这一项置灰：建出来也接不进任何 bot
+  const qbobServiceQuery = useQuery({
+    queryKey: ['console-qbob-service'],
+    queryFn: () => consoleQbobApi.getService(),
+    staleTime: 30_000,
+  })
+  const qbobUnavailable = !qbobServiceQuery.data?.configured
 
   return (
     <Stack spacing={2}>
@@ -40,6 +53,7 @@ export default function ProviderStep({ value, onChange }: ProviderStepProps) {
       <Stack spacing={1.5}>
         {PROVIDER_OPTIONS.map(option => {
           const selected = value === option.provider
+          const disabled = option.provider === 'builtin_qbob' && qbobUnavailable
           const costColor =
             option.costTone === 'warning' ? theme.palette.warning.main : theme.palette.success.main
 
@@ -54,8 +68,9 @@ export default function ProviderStep({ value, onChange }: ProviderStepProps) {
               }}
             >
               <CardActionArea
+                disabled={disabled}
                 onClick={() => onChange(option.provider)}
-                sx={{ p: 2, alignItems: 'stretch' }}
+                sx={{ p: 2, alignItems: 'stretch', opacity: disabled ? 0.55 : 1 }}
               >
                 <Stack direction="row" spacing={2} alignItems="flex-start">
                   <Box
@@ -110,6 +125,11 @@ export default function ProviderStep({ value, onChange }: ProviderStepProps) {
                     <Typography variant="body2" color="text.secondary">
                       {t(`provider.${option.provider}.description`)}
                     </Typography>
+                    {disabled ? (
+                      <Typography variant="caption" color="warning.main">
+                        {t('provider.builtin_qbob.unavailable')}
+                      </Typography>
+                    ) : null}
 
                     <Stack direction="row" spacing={0.75} alignItems="center">
                       <MemoryIcon sx={{ fontSize: 16, color: costColor }} />

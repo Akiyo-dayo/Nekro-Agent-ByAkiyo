@@ -17,7 +17,7 @@ from nekro_agent.schemas.console import ConsoleOverview, InstanceStatus
 from nekro_agent.services.console.instance_manager import build_overview, resolve_instance_status
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
-from nekro_agent.services.user.tenant_perm import get_tenant_scope
+from nekro_agent.services.user.tenant_perm import get_tenant_scope, instance_refs_filter
 
 router = APIRouter(tags=["Console"])
 
@@ -36,12 +36,13 @@ async def get_console_overview(
         return await build_overview()
 
     instances = await DBAdapterInstance.filter(tenant_id=scope)
-    instance_keys = [instance.instance_key for instance in instances]
+    # 成对匹配：只按标识的话，另一个适配器下归别人的同名实例的会话与消息会被算进来
+    owned = instance_refs_filter((instance.adapter_key, instance.instance_key) for instance in instances)
     today_start = db_now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     channel_total, message_count_today = await asyncio.gather(
-        DBChatChannel.filter(instance_key__in=instance_keys).count(),
-        DBChatMessage.filter(instance_key__in=instance_keys, create_time__gte=today_start).count(),
+        DBChatChannel.filter(owned).count(),
+        DBChatMessage.filter(owned, create_time__gte=today_start).count(),
     )
 
     # 与 `build_overview()` 同一套状态解析：未绑定账号的实例必须从"离线"里分出来，
