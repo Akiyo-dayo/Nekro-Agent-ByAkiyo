@@ -75,6 +75,7 @@ from nekro_agent.services.command.manager import (
 from nekro_agent.services.config_resolver import config_resolver
 from nekro_agent.services.identity_admin import PRESET_SWITCH_REVERSIBLE_NOTE, preview_preset_switch
 from nekro_agent.services.message_service import message_service
+from nekro_agent.services.plugin.scope import instance_scope
 from nekro_agent.services.user.auth import expected_pwd_gen_claim
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, check_role, require_role
@@ -390,20 +391,18 @@ async def stream_chat_channel_list(
     )
 
 
-@router.get("/detail/{chat_key}", summary="获取聊天频道详情")
-@require_role(Role.Admin)
-async def get_chat_channel_detail(chat_key: str, _current_user: DBUser = Depends(get_current_active_user)) -> ChatChannelDetail:
-    """获取聊天频道详情"""
-    await assert_channel_accessible(_current_user, chat_key)
+async def _build_chat_channel_detail(channel: DBChatChannel) -> ChatChannelDetail:
+    """按频道行构建详情响应
 
-    channel = await DBChatChannel.filter(chat_key=chat_key).first()
-    if not channel:
-        raise NotFoundError(resource="聊天频道")
-
-    message_count = await DBChatMessage.filter(chat_key=chat_key, create_time__gte=channel.conversation_start_time).count()
-    last_message = await DBChatMessage.filter(chat_key=chat_key).order_by("-create_time").first()
+    详情与「刷新频道信息」两个端点共用，保证两边字段与算法完全一致。
+    """
+    message_count = await DBChatMessage.filter(
+        chat_key=channel.chat_key,
+        create_time__gte=channel.conversation_start_time,
+    ).count()
+    last_message = await DBChatMessage.filter(chat_key=channel.chat_key).order_by("-create_time").first()
     last_message_time = last_message.create_time if last_message else None
-    unique_users = await DBChatMessage.filter(chat_key=chat_key).distinct().values_list("sender_id", flat=True)
+    unique_users = await DBChatMessage.filter(chat_key=channel.chat_key).distinct().values_list("sender_id", flat=True)
 
     # 检测适配器是否支持 WebUI 发送
     can_send = False
@@ -416,7 +415,7 @@ async def get_chat_channel_detail(chat_key: str, _current_user: DBUser = Depends
     # 获取频道有效配置
     ai_always_include_msg_id = False
     try:
-        effective_config = await config_resolver.get_effective_config(chat_key)
+        effective_config = await config_resolver.get_effective_config(channel.chat_key)
         ai_always_include_msg_id = effective_config.AI_ALWAYS_INCLUDE_MSG_ID
     except Exception:
         pass
@@ -439,6 +438,110 @@ async def get_chat_channel_detail(chat_key: str, _current_user: DBUser = Depends
         can_send=can_send,
         ai_always_include_msg_id=ai_always_include_msg_id,
     )
+
+
+async def _fetch_channel_name(channel: DBChatChannel) -> str:
+    """按频道所属实例实时取一次频道名，取不到就返回空串
+
+    不直接调 `DBChatChannel.sync_channel_name()`，原因有三：
+    - 它依赖调用链路的实例上下文。后台请求没有这个上下文，OneBot 的 `get_bot()` 在
+      **只有一个账号在线**时会直接用那个账号——可能是另一个租户的号，也可能不是群成员；
+    - OneBot 取失败时把 `channel_id` 当名字返回，`sync_channel_name()` 又无条件 `save()`，
+      于是真名被 `group_123456` 覆盖掉；
+    - 它整行写回，会把并发改动的 `data` / `status` 冲回旧值。
+    """
+    adapter = get_adapter(channel.adapter_key)
+
+    if channel.adapter_key == "onebot_v11":
+        # OneBot 的账号上下文是它自己的 contextvar：`set_current_instance` 必须在**新任务**里
+        # 设（`create_task` 拷贝当前上下文），否则会漏给同一个请求里后续的代码
+        from nekro_agent.adapters.onebot_v11.core.instance import (
+            lookup_cached_account_id,
+            resolve_account_id,
+            set_current_instance,
+        )
+
+        instance_key = channel.instance_key or ""
+        account_id = lookup_cached_account_id(instance_key)
+        if not account_id:
+            account_id = await resolve_account_id(instance_key)
+        if not account_id:
+            # 实例为空（单实例部署的历史频道）或账号查不到：无从判断该问哪个号，直接放弃
+            return ""
+
+        async def _query_in_instance() -> str:
+            set_current_instance(instance_key, account_id)
+            return (await adapter.get_channel_info(channel.channel_id)).channel_name
+
+        return await asyncio.create_task(_query_in_instance())
+
+    # 其他适配器走与适配器无关的实例作用域
+    with instance_scope(channel.instance_key or ""):
+        return (await adapter.get_channel_info(channel.channel_id)).channel_name
+
+
+async def _refresh_channel_name(channel: DBChatChannel) -> None:
+    """向平台实时取频道名，只在拿到有效名称时更新两列
+
+    「有效」= 非空且不等于 `channel_id`（OneBot 的失败返回值就是这个形状）。
+    任何异常都吞掉：刷新是尽力而为，不该让详情页报错。
+    """
+    try:
+        name = (await _fetch_channel_name(channel)).strip()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"刷新频道名称失败（保留原名）: {channel.chat_key} | {e!s}")
+        return
+    if not name or name == channel.channel_id:
+        logger.info(f"平台未返回有效频道名称，保留原名: {channel.chat_key}")
+        return
+    # 列宽 64：Telegram 等平台的群名可以更长，不截断会在 PostgreSQL 上写库报错
+    name = name[:64]
+    if name == channel.channel_name:
+        return
+    channel.channel_name = name
+    await channel.save(update_fields=["channel_name", "update_time"])
+    await channel_broadcaster.publish_update(
+        event_type="updated",
+        chat_key=channel.chat_key,
+        channel_name=channel.channel_name,
+        custom_channel_name=channel.get_custom_channel_name(),
+        is_active=channel.is_active,
+        status=channel.channel_status.value,
+    )
+
+
+@router.get("/detail/{chat_key}", summary="获取聊天频道详情")
+@require_role(Role.Admin)
+async def get_chat_channel_detail(chat_key: str, _current_user: DBUser = Depends(get_current_active_user)) -> ChatChannelDetail:
+    """获取聊天频道详情"""
+    await assert_channel_accessible(_current_user, chat_key)
+
+    channel = await DBChatChannel.filter(chat_key=chat_key).order_by("id").first()
+    if not channel:
+        raise NotFoundError(resource="聊天频道")
+
+    return await _build_chat_channel_detail(channel)
+
+
+@router.post("/detail/{chat_key}/refresh", summary="刷新聊天频道信息")
+@require_role(Role.Admin)
+async def refresh_chat_channel_detail(
+    chat_key: str,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ChatChannelDetail:
+    """向平台实时同步频道名称，并返回最新详情
+
+    取不到就保留原名（不覆盖、不报错）：平台侧没上线、账号不在线、适配器不支持都会走到
+    这条兜底，用户看到的是「刷新了，但名字没变」而不是一个 500。
+    """
+    await assert_channel_accessible(_current_user, chat_key)
+
+    channel = await DBChatChannel.filter(chat_key=chat_key).order_by("id").first()
+    if not channel:
+        raise NotFoundError(resource="聊天频道")
+
+    await _refresh_channel_name(channel)
+    return await _build_chat_channel_detail(channel)
 
 
 @router.post("/{chat_key}/active", summary="设置聊天频道激活状态")

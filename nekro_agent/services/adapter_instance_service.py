@@ -14,6 +14,7 @@ from nekro_agent.models.db_adapter_instance_event import DBAdapterInstanceEvent
 from nekro_agent.models.db_adapter_instance_session import DBAdapterInstanceSession
 from nekro_agent.schemas.errors import ConflictError
 from nekro_agent.services.system_broadcast import publish_adapter_instance_status
+from nekro_agent.tools.text_sanitize import strip_nul
 
 logger = get_sub_logger("adapter_instance")
 
@@ -297,7 +298,8 @@ class AdapterInstanceService:
             )
             return instance
         old_status = instance.status
-        last_error = message if new_status == "error" else ""
+        # `filter().update()` 不走 ORM 的保存信号；错误信息来自上游/协议端，可能是带 NUL 的原文
+        last_error = strip_nul(message) if new_status == "error" else ""
         written = (
             await DBAdapterInstance.filter(id=instance.id, enabled=True)
             .exclude(status__in=list(ADMIN_INTENT_STATUSES))

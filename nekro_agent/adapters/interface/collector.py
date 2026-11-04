@@ -86,6 +86,17 @@ async def collect_message(
 
     # 命令检测与执行（在 is_active 检查之前，确保 na_on 等命令在频道关闭时仍可用）
     content_text = platform_message.content_text.strip()
+
+    # 适配器可声明"命令原文也写进聊天记录"（`record_command_input`，网页适配器为真）：
+    # 命令会被命令系统消费、不再走下面的 `push_human_message`，不在这里补一条，
+    # 用户看到的历史里就只有命令的输出、没有他自己发的那句话。
+    # 用 `getattr` 读：不认识这个属性的适配器（含第三方插件里手写的假适配器）照旧不记录。
+    if content_text and getattr(adapter, "record_command_input", False) and adapter.detect_command(content_text):
+        await message_service.record_human_message(
+            _build_chat_message(adapter, db_chat_channel, platform_channel, platform_user, platform_message),
+            db_chat_channel=db_chat_channel,
+        )
+
     if content_text and await _dispatch_try_handle_command(
         adapter, chat_key, platform_channel, platform_user, platform_message, content_text,
     ):
@@ -126,24 +137,7 @@ async def collect_message(
         logger.info(f'接收自身消息 "{platform_message.content_text}"，跳过...')
         return
 
-    chat_message: ChatMessage = ChatMessage(
-        message_id=platform_message.message_id,
-        sender_id=platform_user.user_id,
-        sender_name=platform_user.user_name,
-        sender_nickname=platform_message.sender_nickname,
-        adapter_key=adapter.key,
-        instance_key=db_chat_channel.instance_key,
-        platform_userid=platform_user.user_id,
-        is_tome=platform_message.is_tome,
-        is_recalled=False,
-        chat_key=chat_key,
-        chat_type=platform_channel.channel_type,
-        content_text=platform_message.content_text,
-        content_data=platform_message.content_data,
-        raw_cq_code="",
-        ext_data=platform_message.ext_data.model_dump() if platform_message.ext_data else {},
-        send_timestamp=int(time.time()),
-    )
+    chat_message: ChatMessage = _build_chat_message(adapter, db_chat_channel, platform_channel, platform_user, platform_message)
 
     ref_str: str = (
         f" (ref: {platform_message.ext_data.ref_msg_id})"
@@ -159,6 +153,37 @@ async def collect_message(
         message=chat_message,
         user=user,
         db_chat_channel=db_chat_channel,
+    )
+
+
+def _build_chat_message(
+    adapter: "BaseAdapter",
+    db_chat_channel: DBChatChannel,
+    platform_channel: "PlatformChannel",
+    platform_user: "PlatformUser",
+    platform_message: "PlatformMessage",
+) -> ChatMessage:
+    """把一条平台消息转成入库用的 `ChatMessage`
+
+    命令原文入库与正常入站两条路径共用同一份构造，避免两边字段（尤其 `instance_key`）不一致。
+    """
+    return ChatMessage(
+        message_id=platform_message.message_id,
+        sender_id=platform_user.user_id,
+        sender_name=platform_user.user_name,
+        sender_nickname=platform_message.sender_nickname,
+        adapter_key=adapter.key,
+        instance_key=db_chat_channel.instance_key,
+        platform_userid=platform_user.user_id,
+        is_tome=platform_message.is_tome,
+        is_recalled=False,
+        chat_key=db_chat_channel.chat_key,
+        chat_type=platform_channel.channel_type,
+        content_text=platform_message.content_text,
+        content_data=platform_message.content_data,
+        raw_cq_code="",
+        ext_data=platform_message.ext_data.model_dump() if platform_message.ext_data else {},
+        send_timestamp=int(time.time()),
     )
 
 

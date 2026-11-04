@@ -229,6 +229,28 @@ def assert_connected_peer_safe(peer_ip: Optional[str]) -> None:
         raise UnsafeDownloadUrlError("下载连接的对端不是公网地址")
 
 
+def assert_tenant_connected_peer_safe(peer_ip: Optional[str]) -> None:
+    """校验租户发起的连接的实际对端 IP
+
+    与 `assert_connected_peer_safe` 的差别同 `assert_tenant_endpoint_url_safe` 与
+    `assert_download_url_safe`：**不认 `ALLOW_PRIVATE_NETWORK_DOWNLOAD`**。那个开关是部署方
+    对自己「允许从内网拉素材」的授权，把它顺延成「允许租户连内网」就是越权通道。
+
+    `DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 仍然生效（判据沿用 `_is_allowed_target_ip`）：它显式
+    声明的是「这些非内网网段算安全」，与部署方是否允许内网下载是两件事。
+
+    Raises:
+        UnsafeDownloadUrlError: 对端不是允许访问的地址，或取不到对端地址
+    """
+    try:
+        ip = _normalize_ip(peer_ip or "")
+    except ValueError as e:
+        raise UnsafeDownloadUrlError("无法确认连接的对端地址") from e
+    if not _is_allowed_target_ip(ip):
+        logger.warning(f"拒绝连接到非公网对端的租户出站连接: {ip}")
+        raise UnsafeDownloadUrlError(f"连接的对端不是公网地址: {ip}")
+
+
 async def assert_tenant_endpoint_url_safe(url: str) -> None:
     """校验租户提交的出站接口地址
 
@@ -255,7 +277,7 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
 # `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求触发发布的 git tag 与它一致（标签写法见 publish.yml）。
-FORK_VERSION = "0.4.2"
+FORK_VERSION = "0.4.3"
 FORK_AUTHOR = "Akiyo_dayo"
 
 # 本分支代码所基于的上游 NekroAgent 发布版，只用于署名「基于 NekroAgent 某版本」。
@@ -264,7 +286,9 @@ FORK_AUTHOR = "Akiyo_dayo"
 # 插件可见的接口追平上游某版本时，插件兼容版本就可以先提上去，让市场里按那个版本写的插件装得上；
 # 但只有上游那个版本的功能都已吸收（或明确不跟）之后，才能说本分支「基于」它。
 # 公开版 NOTICE 告诉读者「拿本树与上游这个版本比对就能看出改了哪些文件」，写早了会误导读者。
-UPSTREAM_BASE_VERSION = "2.3.3"
+# 2.3.3 -> 2.4.0：上游 v2.4.0 以内的提交都已移植或已覆盖，所有者 2026-11-03 拍板改口径；
+# 按本分支多租户规则改了做法的几处写在 CHANGELOG 与公开版 NOTICE 里。
+UPSTREAM_BASE_VERSION = "2.4.0"
 
 
 def get_fork_version() -> str:
@@ -403,6 +427,43 @@ async def _fetch_following_redirects(client: httpx.AsyncClient, url: str) -> byt
     raise UnsafeDownloadUrlError(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次")
 
 
+class UnsafeUploadPathError(ValueError):
+    """落盘目标不在上传目录里"""
+
+
+# Windows 上有特殊含义的字符：`:` 是盘符与 NTFS 备用数据流，其余是保留字符
+_UPLOAD_NAME_FORBIDDEN_CHARS = frozenset('<>:"|?*')
+
+
+def safe_upload_file_name(file_name: str) -> str:
+    """把调用方给的文件名收成上传目录里的「一个文件名」
+
+    文件名常常来自外部：协议端上报的附件名、聊天平台里发件人自己起的文件名。原样拼进
+    `USER_UPLOAD_DIR/<会话>/` 的话，`../../x` 或一个绝对路径就能把文件写到上传目录之外
+    （`Path("a") / "/etc/x"` 直接得到 `/etc/x`）。这里只留最后一段（`/` 与 `\\` 都算分隔符），
+    去掉控制字符与 Windows 保留字符；收完是空串、`.` 或 `..` 时返回空串，调用方照旧退回按内容哈希命名。
+    """
+    name = str(file_name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(char for char in name if char >= " " and char != "\x7f" and char not in _UPLOAD_NAME_FORBIDDEN_CHARS).strip()
+    if name in ("", ".", ".."):
+        return ""
+    # 按 UTF-8 字节截：文件系统的上限是 255 字节，按字符截时中文名可以超过它，写盘报错
+    return name.encode("utf-8")[:200].decode("utf-8", "ignore")
+
+
+def _upload_save_path(file_name: str, from_chat_key: str) -> Path:
+    """上传目录里的落盘目标；`file_name` 必须已经过 `safe_upload_file_name`
+
+    再按 resolve 之后的路径确认一次仍在上传目录里：会话目录本身是符号链接之类的情况，
+    文件名清洗管不到。
+    """
+    base = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(from_chat_key) if from_chat_key else Path(USER_UPLOAD_DIR)
+    save_path = base / file_name
+    if not save_path.resolve().is_relative_to(Path(USER_UPLOAD_DIR).resolve()):
+        raise UnsafeUploadPathError("落盘目标不在上传目录里")
+    return save_path
+
+
 async def download_file(
     url: str,
     file_path: str = "",
@@ -433,16 +494,13 @@ async def download_file(
                 mime = magic.from_buffer(content, mime=True)
                 use_suffix = f'.{mime.split("/")[1]}' if mime and len(mime.split("/")) > 1 else ""
             if not file_path:
-                file_name = file_name or f"{hashlib.md5(content).hexdigest()}{use_suffix}"
-                if from_chat_key:
-                    save_path = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(from_chat_key) / Path(file_name)
-                else:
-                    save_path = Path(USER_UPLOAD_DIR) / Path(file_name)
+                file_name = safe_upload_file_name(file_name) or f"{hashlib.md5(content).hexdigest()}{use_suffix}"
+                save_path = _upload_save_path(file_name, from_chat_key)
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path = str(save_path)
             Path(file_path).write_bytes(content)
             Path(file_path).chmod(0o755)
-    except UnsafeDownloadUrlError:
+    except (UnsafeDownloadUrlError, UnsafeUploadPathError):
         raise
     except Exception:
         if retry_count > 0:
@@ -477,11 +535,8 @@ async def download_file_from_bytes(
     """
 
     if not file_path:
-        file_name = file_name or f"{hashlib.md5(bytes_data).hexdigest()}{use_suffix}"
-        if from_chat_key:
-            save_path = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(from_chat_key) / Path(file_name)
-        else:
-            save_path = Path(USER_UPLOAD_DIR) / Path(file_name)
+        file_name = safe_upload_file_name(file_name) or f"{hashlib.md5(bytes_data).hexdigest()}{use_suffix}"
+        save_path = _upload_save_path(file_name, from_chat_key)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         file_path = str(save_path)
     Path(file_path).write_bytes(bytes_data)
@@ -513,11 +568,8 @@ async def download_file_from_base64(
         base64_str = base64_str.split(",")[1]
 
     if not file_path:
-        file_name = file_name or f"{hashlib.md5(base64_str.encode()).hexdigest()}{use_suffix}"
-        if from_chat_key:
-            save_path = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(from_chat_key) / Path(file_name)
-        else:
-            save_path = Path(USER_UPLOAD_DIR) / Path(file_name)
+        file_name = safe_upload_file_name(file_name) or f"{hashlib.md5(base64_str.encode()).hexdigest()}{use_suffix}"
+        save_path = _upload_save_path(file_name, from_chat_key)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         file_path = str(save_path)
     Path(file_path).write_bytes(base64.b64decode(base64_str.encode(encoding="utf-8")))
@@ -540,12 +592,8 @@ async def copy_to_upload_dir(
     Returns:
         Tuple[str, str]: 文件路径, 文件名
     """
-    if not file_name:
-        file_name = f"{hashlib.md5(Path(file_path).read_bytes()).hexdigest()}{use_suffix}"
-    if from_chat_key:
-        save_path = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(from_chat_key) / Path(file_name)
-    else:
-        save_path = Path(USER_UPLOAD_DIR) / Path(file_name)
+    file_name = safe_upload_file_name(file_name) or f"{hashlib.md5(Path(file_path).read_bytes()).hexdigest()}{use_suffix}"
+    save_path = _upload_save_path(file_name, from_chat_key)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     Path(save_path).write_bytes(Path(file_path).read_bytes())
     Path(save_path).chmod(0o755)

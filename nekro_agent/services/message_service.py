@@ -3,6 +3,7 @@ import json
 import random
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -35,6 +36,7 @@ from nekro_agent.schemas.chat_message import (
     ChatMessageSegmentUntrusted,
     ChatType,
     merge_video_placeholders,
+    segments_from_list,
 )
 from nekro_agent.schemas.errors import AdapterUnavailableError
 from nekro_agent.schemas.signal import MsgSignal
@@ -43,7 +45,7 @@ from nekro_agent.services.memory.feature_flags import is_memory_system_enabled
 from nekro_agent.services.message_broadcaster import message_broadcaster
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.quota_service import quota_service
-from nekro_agent.services.user.super_users import is_super_user
+from nekro_agent.services.user.super_users import is_super_user, is_trusted_listed_user
 from nekro_agent.tools.at_markup import AT_MARKUP_PATTERN, normalize_malformed_at_markup
 from nekro_agent.tools.common_util import (
     check_content_trigger,
@@ -51,9 +53,39 @@ from nekro_agent.tools.common_util import (
     copy_to_upload_dir,
     random_chat_check,
 )
-from nekro_agent.tools.untrusted_content import UntrustedToolResult
+from nekro_agent.tools.text_sanitize import strip_nul
+from nekro_agent.tools.untrusted_content import MAX_TOOL_RESULT_BODY_CHARS, TRUNCATION_MARK, UntrustedToolResult
 
 logger = get_sub_logger("message_pipeline")
+
+
+def _without_nul(message: ChatMessage) -> ChatMessage:
+    """把入站消息里的 NUL 先剔掉，落库、触发判断、广播看到同一份数据
+
+    只在确有字段变化时才复制：绝大多数消息不带 NUL，白复制一次会让下游拿到的对象
+    与调用方手里的不是同一个，插件按对象身份做的记录（若有）也会错位。
+
+    `chat_key` / `sender_id` / `platform_userid` / `message_id` 刻意不在这里动：
+    `chat_key` 用来查频道，改了会查不到；这几个字段本身也是协议端的标识，
+    该不该清洗属于协议层的判断，库这一侧由 `nul_guard` 的 `pre_save` 兜底。
+
+    `content_data` 先转成字典再清洗，不是在 `json.dumps` 之后的字符串上替换：
+    `json.dumps` 会把 NUL 转义成字面的 `\\u0000`（不是真 NUL），字符上替换不掉；
+    而它读回来又会变回真 NUL，流进提示词。
+    """
+    changed: Dict[str, Any] = {}
+    for field_name in ("content_text", "sender_name", "sender_nickname", "raw_cq_code", "ext_data"):
+        original = getattr(message, field_name)
+        cleaned = strip_nul(original)
+        if cleaned != original:
+            changed[field_name] = cleaned
+
+    dumped = [segment.model_dump() for segment in message.content_data]
+    cleaned_segments = strip_nul(dumped)
+    if cleaned_segments != dumped:
+        changed["content_data"] = segments_from_list(cleaned_segments)
+
+    return message.model_copy(update=changed) if changed else message
 
 
 async def _notify_memory_scheduler(chat_key: str, workspace_id: int | None, content_length: int) -> None:
@@ -75,10 +107,16 @@ async def _notify_memory_scheduler(chat_key: str, workspace_id: int | None, cont
 async def is_quota_exempt(message: ChatMessage, config: Any) -> bool:
     """这条消息的发送者是否免配额：配额白名单，或（开了豁免时）超级用户
 
-    超级用户按聊天命令同一套判定（名单匹配 ∧ 来源可信）。只比 `sender_id` 的话，邮件的 `From`、
-    SSE 的 `from_id`、租户自运行协议端上报的号码都能填成名单里的值，白用平台的配额。
+    两份名单都按聊天命令的超级用户同一套判定（名单匹配 ∧ 来源可信，名单格式也相同：纯号码只当 OneBot 的
+    QQ 号，其他平台写 `适配器标识:用户ID`）。只比 `sender_id` 的话，别的平台恰好同号的人，邮件的 `From`、
+    SSE 的 `from_id`、租户自运行协议端上报的号码，都能填成名单里的值，白用平台的配额。
     """
-    if message.sender_id in config.AI_CHAT_QUOTA_WHITELIST_USERS:
+    if await is_trusted_listed_user(
+        message.adapter_key,
+        message.instance_key,
+        message.sender_id,
+        config.AI_CHAT_QUOTA_WHITELIST_USERS,
+    ):
         return True
     return bool(config.AI_CHAT_QUOTA_SUPER_USERS_EXEMPT) and await is_super_user(
         message.adapter_key,
@@ -409,6 +447,10 @@ class MessageService:
         这里只要漏出一条触发，NA 回话会让对方再回话，就是死循环；好感、配额、随机搭话、关键词
         也都在这条返回之后，一并绕开。
         """
+        # 清洗必须排在最前面：下面要用 `message.chat_key` 查频道，而触发判断、落库、
+        # 广播都应当基于同一份数据——否则落库的那行（被 pre_save 清洗过）与广播出去的
+        # 那份（还带 NUL）不一致
+        message = _without_nul(message)
         db_chat_channel = db_chat_channel or await DBChatChannel.get_channel(chat_key=message.chat_key)
 
         # 闸门必须排在本函数最前面，不能只挡 `schedule_agent_task`：
@@ -431,8 +473,6 @@ class MessageService:
             logger.warning("消息校验失败，跳过本次处理...")
             return
 
-        content_data = [o.model_dump() for o in message.content_data]
-
         if check_forbidden_message(message.content_text, config):
             logger.info(f"消息 {message.content_text} 被禁止，跳过本次处理...")
             return
@@ -449,49 +489,7 @@ class MessageService:
                 return
 
         # 落库的文本补上 OneBot 视频占位；上面的伪造检查、禁词与下面的触发判断都用不带占位的原文
-        stored_text = merge_video_placeholders(message.content_text, message.content_data)
-        stored_message = message if stored_text == message.content_text else message.model_copy(update={"content_text": stored_text})
-
-        # 添加聊天记录
-        await DBChatMessage.create(
-            message_id=message.message_id,
-            sender_id=message.sender_id,
-            sender_name=message.sender_name,
-            sender_nickname=message.sender_nickname,
-            adapter_key=message.adapter_key,
-            instance_key=message.instance_key,
-            platform_userid=message.platform_userid,
-            is_tome=message.is_tome,
-            is_recalled=message.is_recalled,
-            chat_key=message.chat_key,
-            chat_type=message.chat_type,
-            content_text=stored_text,
-            content_data=json.dumps(content_data, ensure_ascii=False),
-            raw_cq_code=message.raw_cq_code,
-            ext_data=json.dumps(message.ext_data, ensure_ascii=False),
-            send_timestamp=int(time.time()),  # 使用处理后的时间戳
-        )
-
-        # 通知记忆调度器（非阻塞）
-        asyncio.create_task(
-            _notify_memory_scheduler(
-                chat_key=message.chat_key,
-                workspace_id=db_chat_channel.workspace_id,
-                content_length=len(stored_text),
-            ),
-        )
-
-        # 广播消息到所有订阅者：与库里的那一行一致
-        await message_broadcaster.publish(message.chat_key, stored_message)
-
-        # 同时广播频道更新事件，使频道列表实时更新（新消息会将频道移到最上面）
-        await channel_broadcaster.publish_update(
-            event_type="updated",
-            chat_key=message.chat_key,
-            channel_name=db_chat_channel.channel_name,
-            is_active=db_chat_channel.is_active,
-            status=db_chat_channel.channel_status,
-        )
+        await self._persist_human_message(message, db_chat_channel)
 
         if self_sent or ctx is None:
             return
@@ -582,22 +580,25 @@ class MessageService:
                             return
                         # 通过适配器发送可见通知
                         quota_msg = f"今日回复配额已用完 ({daily_count}/{effective_limit})，请明天再试或联系管理员使用 /quota_boost 临时提升配额"
+                        quota_recorded = False
                         try:
                             adapter = await adapter_utils.get_adapter_for_chat(message.chat_key)
                         except AdapterUnavailableError as e:
                             logger.warning(f"[message_service] 配额通知发送失败，适配器不可用: {e}")
                         else:
-                            await adapter.forward_message(
+                            plt_response = await adapter.forward_message(
                                 PlatformSendRequest(
                                     chat_key=message.chat_key,
                                     segments=[PlatformSendSegment(type=PlatformSendSegmentType.TEXT, content=quota_msg)],
                                 )
                             )
-                        await self.push_system_message(
-                            chat_key=message.chat_key,
-                            agent_messages=quota_msg,
-                            db_chat_channel=db_chat_channel,
-                        )
+                            quota_recorded = plt_response.recorded
+                        if not quota_recorded:
+                            await self.push_system_message(
+                                chat_key=message.chat_key,
+                                agent_messages=quota_msg,
+                                db_chat_channel=db_chat_channel,
+                            )
                         return
 
                     # 每小时限额检查
@@ -619,25 +620,108 @@ class MessageService:
                             if not should_notify_quota_exhausted:
                                 return
                             hourly_msg = f"本小时回复配额已用完 ({hourly_count}/{hourly_limit})，请稍后再试"
+                            hourly_recorded = False
                             try:
                                 adapter = await adapter_utils.get_adapter_for_chat(message.chat_key)
                             except AdapterUnavailableError as e:
                                 logger.warning(f"[message_service] 小时配额通知发送失败，适配器不可用: {e}")
                             else:
-                                await adapter.forward_message(
+                                plt_response = await adapter.forward_message(
                                     PlatformSendRequest(
                                         chat_key=message.chat_key,
                                         segments=[PlatformSendSegment(type=PlatformSendSegmentType.TEXT, content=hourly_msg)],
                                     )
                                 )
-                            await self.push_system_message(
-                                chat_key=message.chat_key,
-                                agent_messages=hourly_msg,
-                                db_chat_channel=db_chat_channel,
-                            )
+                                hourly_recorded = plt_response.recorded
+                            if not hourly_recorded:
+                                await self.push_system_message(
+                                    chat_key=message.chat_key,
+                                    agent_messages=hourly_msg,
+                                    db_chat_channel=db_chat_channel,
+                                )
                             return
 
             await self.schedule_agent_task(message=message, ctx=ctx)
+
+    async def record_human_message(
+        self,
+        message: ChatMessage,
+        db_chat_channel: Optional[DBChatChannel] = None,
+    ) -> None:
+        """只记录并广播人类用户消息，不触发插件和 Agent。
+
+        命令消息会在适配器收集阶段被命令系统消费，不能复用
+        `push_human_message()` 的完整流程，否则 Web 私聊命令会因为
+        `is_tome=True` 被再次调度给 Agent。
+
+        实例闸门与 `push_human_message` 同一处：被停用的实例不该继续往会话里堆记录，
+        也不该把消息广播给实时流。NUL 清洗也与它同一处、同一个位置（理由见 `_without_nul`）。
+        """
+        message = _without_nul(message)
+        db_chat_channel = db_chat_channel or await DBChatChannel.get_channel(chat_key=message.chat_key)
+
+        if not await DBAdapterInstance.is_instance_active(db_chat_channel.adapter_key, db_chat_channel.instance_key):
+            logger.debug(f"实例或其所属租户已停用，丢弃入站消息记录: chat_key={message.chat_key}")
+            return
+
+        if not await self._message_validation_check(message):
+            logger.warning("消息校验失败，跳过本次处理...")
+            return
+
+        await self._persist_human_message(message, db_chat_channel)
+
+    async def _persist_human_message(
+        self,
+        message: ChatMessage,
+        db_chat_channel: DBChatChannel,
+    ) -> None:
+        """持久化并广播人类用户消息"""
+        # 落库的文本补上 OneBot 视频占位；上面的伪造检查、禁词与下面的触发判断都用不带占位的原文
+        stored_text = merge_video_placeholders(message.content_text, message.content_data)
+        stored_message = message if stored_text == message.content_text else message.model_copy(update={"content_text": stored_text})
+
+        content_data = [o.model_dump() for o in message.content_data]
+
+        # 添加聊天记录
+        await DBChatMessage.create(
+            message_id=message.message_id,
+            sender_id=message.sender_id,
+            sender_name=message.sender_name,
+            sender_nickname=message.sender_nickname,
+            adapter_key=message.adapter_key,
+            instance_key=message.instance_key,
+            platform_userid=message.platform_userid,
+            is_tome=message.is_tome,
+            is_recalled=message.is_recalled,
+            chat_key=message.chat_key,
+            chat_type=message.chat_type,
+            content_text=stored_text,
+            content_data=json.dumps(content_data, ensure_ascii=False),
+            raw_cq_code=message.raw_cq_code,
+            ext_data=json.dumps(message.ext_data, ensure_ascii=False),
+            send_timestamp=int(time.time()),  # 使用处理后的时间戳
+        )
+
+        # 通知记忆调度器（非阻塞）
+        asyncio.create_task(
+            _notify_memory_scheduler(
+                chat_key=message.chat_key,
+                workspace_id=db_chat_channel.workspace_id,
+                content_length=len(stored_text),
+            ),
+        )
+
+        # 广播消息到所有订阅者：与库里的那一行一致
+        await message_broadcaster.publish(message.chat_key, stored_message)
+
+        # 同时广播频道更新事件，使频道列表实时更新（新消息会将频道移到最上面）
+        await channel_broadcaster.publish_update(
+            event_type="updated",
+            chat_key=message.chat_key,
+            channel_name=db_chat_channel.channel_name,
+            is_active=db_chat_channel.is_active,
+            status=db_chat_channel.channel_status,
+        )
 
     async def push_bot_message(
         self,
@@ -902,17 +986,71 @@ class MessageService:
         )
 
         if trigger_agent or signal == MsgSignal.FORCE_TRIGGER:
-            if not db_chat_channel.is_active:
-                logger.info(f"聊天频道 {chat_key} 已被禁用，跳过本次处理...")
-                return
+            await self._trigger_after_push(chat_key, db_chat_channel, ctx, signal, f"系统消息 {content_text}")
 
-            if db_chat_channel.observe_mode:
-                logger.info(f"聊天频道 {chat_key} 处于旁观模式，跳过 Agent 触发...")
-                return
-            if signal not in [MsgSignal.CONTINUE, MsgSignal.FORCE_TRIGGER]:
-                logger.info(f"系统消息 {content_text} 被插件阻止触发，跳过本次处理...")
-                return
-            await self.schedule_agent_task(chat_key=chat_key, ctx=ctx)
+    async def _trigger_after_push(
+        self,
+        chat_key: str,
+        db_chat_channel: DBChatChannel,
+        ctx: AgentCtx,
+        signal: MsgSignal,
+        label: str,
+    ) -> None:
+        """插件推送之后触发 Agent 的闸门：频道禁用、旁观模式、插件阻止触发时都不触发"""
+        if not db_chat_channel.is_active:
+            logger.info(f"聊天频道 {chat_key} 已被禁用，跳过本次处理...")
+            return
+
+        if db_chat_channel.observe_mode:
+            logger.info(f"聊天频道 {chat_key} 处于旁观模式，跳过 Agent 触发...")
+            return
+        if signal not in [MsgSignal.CONTINUE, MsgSignal.FORCE_TRIGGER]:
+            logger.info(f"{label} 被插件阻止触发，跳过本次处理...")
+            return
+        await self.schedule_agent_task(chat_key=chat_key, ctx=ctx)
+
+    async def push_untrusted_message(
+        self,
+        chat_key: str,
+        result: UntrustedToolResult,
+        trigger_agent: bool = False,
+        db_chat_channel: Optional[DBChatChannel] = None,
+    ) -> None:
+        """插件主动推送外部内容（CC 的执行结果、GitHub 事件……），可选触发 Agent
+
+        `push_system_message` 落的是 SYSTEM 消息，而提示词要求模型信任 SYSTEM 消息，外部内容不能走那条路。
+        这里落库与 `push_tool_result` 相同：身份不是 SYSTEM，正文只进不可信块、渲染时用当轮令牌包裹，
+        `content_text` 只放可信摘要。插件自己写的引导语放 `summary`，外部正文放 `body`。
+
+        其余与 `push_system_message` 一致：实例停用即丢弃，经过 `on_system_message` 挂载点（挂载点只看得到
+        可信摘要），触发时同样受频道禁用、旁观模式、插件阻止的约束。
+        """
+        db_chat_channel = db_chat_channel or await DBChatChannel.get_channel(chat_key=chat_key)
+        if not await DBAdapterInstance.is_instance_active(db_chat_channel.adapter_key, db_chat_channel.instance_key):
+            logger.debug(f"实例或其所属租户已停用，丢弃推送的外部内容: chat_key={chat_key}")
+            return
+
+        if len(result.body) > MAX_TOOL_RESULT_BODY_CHARS:
+            # 与 RPC 出口同一条硬底线，见 `MAX_TOOL_RESULT_BODY_CHARS`
+            result = replace(result, body=result.body[:MAX_TOOL_RESULT_BODY_CHARS] + TRUNCATION_MARK)
+
+        ctx: AgentCtx = await AgentCtx.create_by_chat_key(chat_key=chat_key)
+        signal = await plugin_collector.handle_on_system_message(ctx, result.summary)
+        if signal == MsgSignal.BLOCK_ALL:
+            logger.info(f"推送的 {result.kind} 被插件阻止响应，跳过本次处理...")
+            return
+
+        await self._record_untrusted_result(chat_key, db_chat_channel, result)
+        await channel_broadcaster.publish_update(
+            event_type="updated",
+            chat_key=chat_key,
+            channel_name=db_chat_channel.channel_name,
+            is_active=db_chat_channel.is_active,
+            status=db_chat_channel.channel_status,
+        )
+
+        if trigger_agent or signal == MsgSignal.FORCE_TRIGGER:
+            await self._trigger_after_push(chat_key, db_chat_channel, ctx, signal, f"推送的 {result.kind}")
 
     async def push_tool_result(self, chat_key: str, result: UntrustedToolResult) -> None:
         """落一条不可信的工具结果
@@ -924,7 +1062,10 @@ class MessageService:
         if not await DBAdapterInstance.is_instance_active(db_chat_channel.adapter_key, db_chat_channel.instance_key):
             logger.debug(f"实例或其所属租户已停用，丢弃工具结果: chat_key={chat_key}")
             return
+        await self._record_untrusted_result(chat_key, db_chat_channel, result)
 
+    async def _record_untrusted_result(self, chat_key: str, db_chat_channel: DBChatChannel, result: UntrustedToolResult) -> None:
+        """落库并广播一条不可信结果行（`push_tool_result` 与 `push_untrusted_message` 共用）"""
         segment = ChatMessageSegmentUntrusted(
             type=ChatMessageSegmentType.UNTRUSTED,
             text=result.body,

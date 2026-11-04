@@ -3,6 +3,7 @@ import datetime
 import json
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from lunar_python import Lunar
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 
 from nekro_agent.core.config import CoreConfig, ModelConfigGroup, config
 from nekro_agent.core.logger import get_sub_logger
+from nekro_agent.core.os_env import USER_UPLOAD_DIR
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import (
@@ -29,10 +31,12 @@ from nekro_agent.services.memory.recall_contract import (
     MemoryTypeHint,
     build_enhanced_recall_user_prompt,
 )
+from nekro_agent.services.skill_scope import is_within
 from nekro_agent.tools.common_util import compress_image
 from nekro_agent.tools.path_convertor import (
     convert_filename_to_access_path,
     convert_filename_to_sandbox_upload_path,
+    sanitize_chat_key_for_path,
 )
 
 from ..creator import ContentSegment, OpenAIChatMessage
@@ -558,6 +562,34 @@ class HistoryPrompt(PromptTemplate):
     lunar_time: str
 
 
+def _resolve_image_access_path(seg: ChatMessageSegmentImage, chat_key: str) -> Optional[Path]:
+    """解析历史图片在宿主机上的可读路径
+
+    早期 Web Chat 入站图片只写入 `file_name`，没有写 `local_path`；新记录会写入保存后的
+    `local_path`。这里同时兼容两种记录，避免图片已显示在 WebUI 历史里、却被视觉上下文跳过。
+
+    `local_path` 是消息段里的自由字段，**不能**直接当成"读哪个宿主路径"的授权：入库路径之外
+    还有插件、命令输出、导入的旧数据能写进这一列。所以只接受 resolve 之后仍落在本会话上传目录
+    （`USER_UPLOAD_DIR/<sanitize(chat_key)>`）里的候选，其余丢弃并告警；`file_name` 候选仍按
+    本分支既有的 `convert_filename_to_access_path` 推导（那条路径本身就限定在上传目录内）。
+    """
+    candidates: list[Path] = []
+    if seg.local_path:
+        upload_dir = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(chat_key)
+        local_path = Path(seg.local_path)
+        if is_within(upload_dir, local_path):
+            candidates.append(local_path)
+        else:
+            logger.warning(f"忽略会话上传目录之外的图片 local_path: chat_key={chat_key}, local_path={seg.local_path}")
+    if seg.file_name:
+        candidates.append(convert_filename_to_access_path(seg.file_name, chat_key))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 async def render_history_data(
     chat_key: str,
     db_chat_channel: DBChatChannel,
@@ -627,14 +659,16 @@ async def render_history_data(
         for seg in image_segments[::-1]:
             if len(img_seg_set) >= config.AI_VISION_IMAGE_LIMIT:
                 break
-            if seg.local_path:
-                if seg.file_name in img_seg_set:
+            if seg.local_path or seg.file_name:
+                image_key = seg.file_name or seg.local_path or ""
+                if image_key in img_seg_set:
                     continue
-                access_path = convert_filename_to_access_path(seg.file_name, chat_key)
-                if not access_path.exists():
-                    logger.warning(f"图片不存在: {access_path}")
+                access_path = _resolve_image_access_path(seg, chat_key)
+                if access_path is None:
+                    logger.warning(f"图片不存在: local_path={seg.local_path}, file_name={seg.file_name}")
                     continue
-                img_seg_set.add(seg.file_name)
+                img_seg_set.add(image_key)
+                sandbox_path = convert_filename_to_sandbox_upload_path(seg.file_name or access_path.name)
                 # 检查图片大小
                 if access_path.stat().st_size > config.AI_VISION_IMAGE_SIZE_LIMIT_KB * 1024:
                     # 压缩图片
@@ -645,7 +679,7 @@ async def render_history_data(
                         continue
                     img_seg_pairs.append(
                         (
-                            f"<{one_time_code} | Image:{convert_filename_to_sandbox_upload_path(seg.file_name)}>",
+                            f"<{one_time_code} | Image:{sandbox_path}>",
                             ContentSegment.image_content_from_path(str(compressed_path)),
                         ),
                     )
@@ -653,7 +687,7 @@ async def render_history_data(
                 else:
                     img_seg_pairs.append(
                         (
-                            f"<{one_time_code} | Image:{convert_filename_to_sandbox_upload_path(seg.file_name)}>",
+                            f"<{one_time_code} | Image:{sandbox_path}>",
                             ContentSegment.image_content_from_path(str(access_path)),
                         ),
                     )

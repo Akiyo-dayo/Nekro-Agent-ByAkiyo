@@ -4,7 +4,9 @@ from zoneinfo import ZoneInfo
 
 from tortoise import fields
 from tortoise.models import Model
+from tortoise.signals import pre_save
 
+from nekro_agent.models.nul_guard import strip_nul_before_save
 from nekro_agent.schemas.tenant import TenantRole
 
 
@@ -99,3 +101,7 @@ class DBUser(Model):
                 f"取最早一行 id={rows[0].id}；请执行去重（见迁移 24 的处理口径）",
             )
         return rows[0] if rows else None
+
+
+# username 是 varchar、ext_data 是 jsonb，两者在 PG 上都不收 NUL；写入前统一剔除
+pre_save(DBUser)(strip_nul_before_save)

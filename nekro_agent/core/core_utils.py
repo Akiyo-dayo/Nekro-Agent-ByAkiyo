@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import (
     Any,
@@ -22,6 +24,65 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field, PrivateAttr
 
 from nekro_agent.schemas.i18n import I18nDict
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """原子地写一个文本文件：要么是完整的新内容，要么还是旧内容
+
+    `Path.write_text` 先截断再写。写到一半失败（磁盘满、进程被杀、机器断电）留下的是一个
+    被截断的 YAML，而 `CoreConfig` 的加载是严格校验的——下次启动直接起不来，运维只能靠手工
+    重建配置。配置是「丢了就回不来」的那类数据，所以先写临时文件、`os.replace` 换上去：
+    换名在 POSIX 与 Windows 上都是原子的，读者永远只会看到完整的旧内容或完整的新内容。
+
+    临时文件必须落在**目标同目录**：只有同一文件系统内 `os.replace` 才是原子重命名，
+    跨盘会退化成复制 + 删除。名字以点开头，不会被配置目录的扫描当成一个配置文件。
+
+    刻意不用 `tempfile.mkstemp`：它建出来的文件权限固定 0600，而 `write_text` 新建的文件是
+    0666 & ~umask（通常 0644）。配置里可能有挂载卷上其他用户需要读的内容，悄无声息地把它
+    变严就是一次权限回归。这里用 `os.open(..., 0o666)` 让 umask 决定，与 `write_text` 一致。
+
+    目标已存在时先 `copymode` 把原权限位搬过来：`write_text` 是就地改写，权限位本来就不变，
+    换成"新建再换名"之后必须显式保留，否则同样是一次权限回归。
+
+    任何一步失败都把临时文件删掉再原样抛出（用 `raise`，不包装）：调用方需要看到真实的
+    `OSError`（磁盘满 / 权限不足），而不是一个被包装过的类型。成功路径上目录里不留临时文件。
+    """
+    tmp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    # 只在 O_CREAT | O_EXCL 下生效的权限位；O_BINARY 是 Windows 上防止 CRT 再做一次换行翻译
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd: Optional[int] = os.open(tmp_path, flags, 0o666)
+    file = None
+    try:
+        file = os.fdopen(fd, "w", encoding=encoding)
+        # 句柄所有权已交给 file，下面出错时由 file.close() 负责关掉它
+        fd = None
+        file.write(text)
+        file.flush()
+        os.fsync(file.fileno())
+        file.close()
+        file = None
+        if path.exists():
+            # 就地改写时权限位不会变；这里是新文件，必须显式搬过来
+            shutil.copymode(path, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if file is not None:
+            try:
+                file.close()
+            except OSError:
+                pass
+        elif fd is not None:
+            # `os.fdopen` 就失败了的路径：句柄还没交出去，必须自己关
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            # 临时文件可能压根没建出来（os.open 就失败了），或已经被 replace 走
+            pass
+        raise
 
 
 class ArgTypes:
@@ -419,7 +480,7 @@ class ConfigBase(BaseModel):
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         if target_path.suffix == ".json":
-            target_path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+            atomic_write_text(target_path, self.model_dump_json(indent=2), encoding="utf-8")
         elif target_path.suffix in [".yaml", ".yml"]:
             yaml_str = yaml.dump(
                 data=self._dump_data(),
@@ -427,7 +488,7 @@ class ConfigBase(BaseModel):
                 sort_keys=False,
                 allow_unicode=True,
             )
-            target_path.write_text(yaml_str, encoding="utf-8")
+            atomic_write_text(target_path, yaml_str, encoding="utf-8")
         else:
             raise ValueError(f"Unsupported file type: {target_path}")
 

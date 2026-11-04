@@ -1555,8 +1555,17 @@ class CoreConfig(ConfigBase):
             i18n_category=i18n_text(zh_CN="回复配额", en_US="Reply Quota"),
             i18n_title=i18n_text(zh_CN="配额白名单用户", en_US="Quota Whitelist Users"),
             i18n_description=i18n_text(
-                zh_CN="列表中的用户（sender_id）发送的消息不受每日/每小时配额限制",
-                en_US="Messages from users (sender_id) in this list bypass quota limits",
+                zh_CN=(
+                    "列表中的用户发送的消息不受每日/每小时配额限制。格式与管理员列表相同：纯号码为 OneBot V11 的 QQ 号，"
+                    "其他平台写成「适配器标识:用户ID」，例如 telegram:123456；同样只在平台方可信的来源生效"
+                    "（租户名下的实例、待认领实例、SSE / 邮件等发送者 ID 可由调用方填写的适配器里不生效）"
+                ),
+                en_US=(
+                    "Messages from users in this list bypass daily/hourly quota limits. Same format as the "
+                    "administrator list: a bare number is a OneBot V11 QQ number, other platforms use "
+                    "'adapter_key:user_id' (e.g. telegram:123456). Only honored from platform-trusted sources "
+                    "(not in tenant instances, unclaimed instances, or adapters whose sender ID is caller-supplied such as SSE / email)"
+                ),
             ),
         ).model_dump(),
     )

@@ -20,7 +20,7 @@ from nekro_agent.adapters.interface.collector import (
 )
 from nekro_agent.adapters.interface.schemas.platform import PlatformChannel, PlatformMessage, PlatformUser
 from nekro_agent.adapters.onebot_v11.adapter import OnebotV11Adapter
-from nekro_agent.schemas.chat_message import ChatType
+from nekro_agent.schemas.chat_message import ChatMessage, ChatType
 from nekro_agent.schemas.i18n import i18n_text
 from nekro_agent.services.command.base import BaseCommand, CommandMetadata, CommandPermission
 from nekro_agent.services.command.built_in.user import GrantAdvancedCommand, RevokeAdvancedCommand
@@ -75,6 +75,7 @@ class _PermissionCommand(BaseCommand):
 
 class _FakeAdapter:
     key = "fake"
+    record_command_input = False
 
     def __init__(
         self,
@@ -305,6 +306,193 @@ async def test_collector_reuses_adapter_permission_for_wait_input() -> None:
     assert adapter.wait_kwargs is not None
     assert adapter.wait_kwargs["is_super_user"] is False
     assert adapter.wait_kwargs["is_advanced_user"] is True
+
+
+@pytest.mark.asyncio
+async def test_collect_message_records_command_input_without_agent_trigger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`record_command_input` 为真的适配器：命令原文先入库，再交给命令系统，不触发 Agent
+
+    本分支的 `collect_message` 前面还有实例闸门（`is_inbound_dispatch_allowed`），一并打桩放行。
+    """
+    from nekro_agent.adapters.interface import collector as collector_mod
+
+    class _FakeDbChatChannel:
+        chat_key = "fake-channel"
+        instance_key = ""
+        is_active = True
+        channel_name = "Channel"
+        channel_status = "active"
+        workspace_id = "workspace"
+
+    async def fake_is_inbound_dispatch_allowed(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        return True
+
+    async def fake_get_or_create(**kwargs: Any) -> _FakeDbChatChannel:
+        del kwargs
+        return _FakeDbChatChannel()
+
+    recorded_messages: list[dict[str, Any]] = []
+
+    async def fake_record_human_message(*args: Any, **kwargs: Any) -> None:
+        recorded_messages.append({"args": args, "kwargs": kwargs})
+
+    async def fake_push_human_message(**kwargs: Any) -> None:
+        raise AssertionError("command input must not enter normal human-message trigger flow")
+
+    monkeypatch.setattr(collector_mod, "is_inbound_dispatch_allowed", fake_is_inbound_dispatch_allowed)
+    monkeypatch.setattr(collector_mod.DBChatChannel, "get_or_create", fake_get_or_create)
+    monkeypatch.setattr(collector_mod.message_service, "record_human_message", fake_record_human_message)
+    monkeypatch.setattr(collector_mod.message_service, "push_human_message", fake_push_human_message)
+
+    adapter = _FakeAdapter(CommandPermission.ADVANCED, command_detected=True)
+    adapter.record_command_input = True
+    channel = PlatformChannel(channel_id="channel", channel_name="Channel", channel_type=ChatType.PRIVATE)
+    user = PlatformUser(platform_name="fake", user_id="advanced-user", user_name="Advanced User")
+    message = PlatformMessage(
+        message_id="msg-command",
+        sender_id="advanced-user",
+        sender_name="Advanced User",
+        content_text="/test raw",
+        is_tome=True,
+    )
+
+    await collect_message(adapter, channel, user, message)
+
+    assert len(recorded_messages) == 1
+    recorded_message = recorded_messages[0]["args"][0]
+    assert recorded_message.message_id == "msg-command"
+    assert recorded_message.content_text == "/test raw"
+    assert recorded_message.chat_key == "fake-channel"
+    assert recorded_message.instance_key == ""
+    assert recorded_messages[0]["kwargs"]["db_chat_channel"].chat_key == "fake-channel"
+    assert adapter.executed_kwargs is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_factory", ["record_command_input_false", "no_attribute"], ids=["attr_false", "no_attr"])
+async def test_collect_message_does_not_record_command_input_when_adapter_does_not_ask(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_factory: str,
+) -> None:
+    """`record_command_input` 为假、或适配器根本没有这个属性时，一律不调 `record_human_message`"""
+    from nekro_agent.adapters.interface import collector as collector_mod
+
+    class _FakeDbChatChannel:
+        chat_key = "fake-channel"
+        instance_key = ""
+        is_active = True
+        channel_name = "Channel"
+        channel_status = "active"
+        workspace_id = "workspace"
+
+    async def fake_is_inbound_dispatch_allowed(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        return True
+
+    async def fake_get_or_create(**kwargs: Any) -> _FakeDbChatChannel:
+        del kwargs
+        return _FakeDbChatChannel()
+
+    recorded_messages: list[dict[str, Any]] = []
+
+    async def fake_record_human_message(*args: Any, **kwargs: Any) -> None:
+        recorded_messages.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(collector_mod, "is_inbound_dispatch_allowed", fake_is_inbound_dispatch_allowed)
+    monkeypatch.setattr(collector_mod.DBChatChannel, "get_or_create", fake_get_or_create)
+    monkeypatch.setattr(collector_mod.message_service, "record_human_message", fake_record_human_message)
+
+    adapter = _FakeAdapter(CommandPermission.ADVANCED, command_detected=True)
+    if adapter_factory == "no_attribute":
+        # 复制一份类字典再构造（去掉 `record_command_input`），避免删掉共享类上的属性污染后续用例
+        no_attr_attrs = {key: value for key, value in _FakeAdapter.__dict__.items() if key != "record_command_input"}
+        no_attr_cls = type("_NoRecordCommandInputAdapter", (), no_attr_attrs)
+        adapter = no_attr_cls(CommandPermission.ADVANCED, command_detected=True)
+        assert not hasattr(adapter, "record_command_input")
+    else:
+        adapter.record_command_input = False
+
+    channel = PlatformChannel(channel_id="channel", channel_name="Channel", channel_type=ChatType.PRIVATE)
+    user = PlatformUser(platform_name="fake", user_id="advanced-user", user_name="Advanced User")
+    message = PlatformMessage(
+        message_id="msg-command",
+        sender_id="advanced-user",
+        sender_name="Advanced User",
+        content_text="/test raw",
+        is_tome=True,
+    )
+
+    await collect_message(adapter, channel, user, message)
+
+    assert recorded_messages == []
+    assert adapter.executed_kwargs is not None
+
+
+@pytest.mark.asyncio
+async def test_record_human_message_skips_persist_when_instance_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """实例已停用时不落库：与 `push_human_message` 同一道闸门"""
+    from nekro_agent.services import message_service as message_service_mod
+    from nekro_agent.services.message_service import message_service
+
+    class _FakeDbChatChannel:
+        adapter_key = "fake"
+        instance_key = ""
+        chat_key = "fake-channel"
+        channel_name = "Channel"
+        channel_status = "active"
+        is_active = True
+        workspace_id = None
+
+    persisted: list[Any] = []
+
+    async def fake_is_instance_active(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        return False
+
+    async def fake_persist(*args: Any, **kwargs: Any) -> None:
+        persisted.append((args, kwargs))
+
+    monkeypatch.setattr(message_service_mod.DBAdapterInstance, "is_instance_active", fake_is_instance_active)
+    monkeypatch.setattr(message_service, "_persist_human_message", fake_persist)
+
+    message = ChatMessage.create_empty("fake-channel")
+    await message_service.record_human_message(message, db_chat_channel=_FakeDbChatChannel())  # type: ignore[arg-type]
+
+    assert persisted == []
+
+
+@pytest.mark.asyncio
+async def test_record_human_message_persists_when_instance_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nekro_agent.services import message_service as message_service_mod
+    from nekro_agent.services.message_service import message_service
+
+    class _FakeDbChatChannel:
+        adapter_key = "fake"
+        instance_key = ""
+        chat_key = "fake-channel"
+        channel_name = "Channel"
+        channel_status = "active"
+        is_active = True
+        workspace_id = None
+
+    persisted: list[Any] = []
+
+    async def fake_is_instance_active(*args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        return True
+
+    async def fake_persist(*args: Any, **kwargs: Any) -> None:
+        persisted.append((args, kwargs))
+
+    monkeypatch.setattr(message_service_mod.DBAdapterInstance, "is_instance_active", fake_is_instance_active)
+    monkeypatch.setattr(message_service, "_persist_human_message", fake_persist)
+
+    channel = _FakeDbChatChannel()
+    message = ChatMessage.create_empty("fake-channel")
+    await message_service.record_human_message(message, db_chat_channel=channel)  # type: ignore[arg-type]
+
+    assert persisted == [((message, channel), {})]
 
 
 @pytest.mark.asyncio

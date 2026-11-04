@@ -5,7 +5,7 @@
 > **这是一个非官方的二次开发版本。** 它基于 [KroMiose/nekro-agent](https://github.com/KroMiose/nekro-agent)（NekroAgent）修改而来，
 > 与 NekroAgent 项目维护方没有任何隶属或背书关系。**基于 NekroAgent 项目构建**——上游项目地址：<https://github.com/KroMiose/nekro-agent>。
 >
-> - 当前版本：**0.4.2**（本版本自己的版本号；所基于的上游版本是 `2.3.3`，插件兼容到上游 `2.4.0`：按 2.4.0 编写的插件可以直接安装使用）
+> - 当前版本：**0.4.3**（本版本自己的版本号；所基于的上游版本是 `2.4.0`，按 2.4.0 编写的插件可以直接安装使用。几处上游功能按本版本的多租户规则改了做法或暂未开放，例如网页聊天 MCP 不给工作区发密钥，见 [`CHANGELOG.md`](./CHANGELOG.md)）
 > - 许可证：沿用上游的 [Nekro Agent 开源协议 V1.1](./LICENSE)（基于 Apache License 2.0 修改），详见下方「许可证」与 [`NOTICE`](./NOTICE)
 > - 变更记录：[`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -61,7 +61,7 @@ sudo -E bash -c "$(curl -fsSL https://raw.githubusercontent.com/Akiyo-dayo/Nekro
 
 标签：
 
-- **版本号**（如 `0.4.2`）与 `latest`：打 `v*.*.*` 标签时构建，适用于生产；
+- **版本号**（如 `0.4.3`）与 `latest`：打 `v*.*.*` 标签时构建，适用于生产；
 - `preview` / `preview-<提交短 SHA>`：`main` 分支更新时构建，包含最新改动，适用于测试。
 
 ```bash
@@ -112,7 +112,7 @@ docker pull ghcr.io/akiyo-dayo/nekro-agent-byakiyo-sandbox:latest
 - **大规模商业使用**（你及关联实体运营的所有实例，频道总数累计超过 1000，或注册用户总数累计超过 50000）须事先获得上游维护方的书面授权，且不得用多实例、多实体等方式拆分规避；授权联系方式见 `LICENSE`；
 - 提供技术支持、搭建部署等服务时，须向服务对象说明所支持的项目是 NekroAgent 及其官方开源地址，不得暗示该项目为服务提供者自主开发，也不得暗示与项目维护方存在关联；
 - 本项目基于大模型生成并执行代码，使用者应自行评估并告知最终用户相关风险（见 `LICENSE` 第一节第 3 条）；
-- 本项目**对原有文件的修改**在 [`NOTICE`](./NOTICE) 的 "Statement of changes" 与 [`CHANGELOG.md`](./CHANGELOG.md) 中说明。本仓库没有逐提交的历史（它由维护者的开发仓库整体导出），所以要精确识别哪些文件被改过，请把本仓库的树与上游 `2.3.3` 发布版做比对。
+- 本项目**对原有文件的修改**在 [`NOTICE`](./NOTICE) 的 "Statement of changes" 与 [`CHANGELOG.md`](./CHANGELOG.md) 中说明。本仓库没有逐提交的历史（它由维护者的开发仓库整体导出），所以要精确识别哪些文件被改过，请把本仓库的树与上游 `2.4.0` 发布版做比对；上面说的那几处改了做法的上游功能，在比对里同样显示为改动。
 
 这份提示不是法律意见，也不替代 `LICENSE`。
 

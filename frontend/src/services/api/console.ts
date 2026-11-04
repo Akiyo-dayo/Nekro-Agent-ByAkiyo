@@ -362,6 +362,32 @@ export interface ActionOkResponse {
   message: string
 }
 
+/** 新令牌的送达结果 */
+export type AccessTokenDelivery =
+  | 'restarted'
+  | 'config_written'
+  | 'rewired'
+  | 'not_attached'
+  | 'manual'
+  | 'failed'
+
+/**
+ * 更换实例接入令牌的结果（平台方专属）
+ *
+ * 新令牌只在这条响应里下发；`delivery` 说明它有没有送到协议端，`failed` 时 `delivery_error`
+ * 带原因——此时旧令牌已经失效、新令牌已经生效，只是协议端还没拿到。
+ */
+export interface InstanceAccessTokenRotateResponse {
+  /** 服务端新生成的接入令牌 */
+  token: string
+  /** 凭旧令牌握手、已被断开的在线连接条数 */
+  disconnected: number
+  /** 新令牌的送达结果 */
+  delivery: AccessTokenDelivery
+  /** 送达失败的原因；空串表示没出错 */
+  delivery_error: string
+}
+
 /** 单个实例的健康快照（含掉线时长） */
 export interface InstanceHealthSnapshot {
   /** 适配器标识 */
@@ -585,6 +611,19 @@ export const consoleApi = {
     const response = await axios.get<InstanceHealthEventListResponse>(
       `${CONSOLE_BASE}/health/events`,
       { params: query }
+    )
+    return response.data
+  },
+
+  /**
+   * 更换实例自己的 OneBot 接入令牌（平台方专属）
+   *
+   * 旧令牌当场失效、凭它握手的在线连接被断开；新令牌只由服务端生成，随响应返回。
+   * 这是一次会重启容器 / 重新接线的写操作，失败也不回滚（响应里的 `delivery` 说明结果）。
+   */
+  async rotateAccessToken(instanceKey: string): Promise<InstanceAccessTokenRotateResponse> {
+    const response = await axios.post<InstanceAccessTokenRotateResponse>(
+      `${instancePath(instanceKey)}/access-token/rotate`
     )
     return response.data
   },

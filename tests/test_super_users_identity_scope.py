@@ -125,6 +125,7 @@ async def legit_handshake(instance_key: str) -> Optional[HandshakeRecord]:
         source=TokenSource.INSTANCE if read_container_metadata(row).access_token else TokenSource.DEPLOYMENT,
         instance_key=instance_key,
         token_fingerprint=token_fingerprint(resolve_access_token(row)),
+        presented_fingerprint=token_fingerprint(resolve_access_token(row)),
     )
 
 
@@ -451,15 +452,31 @@ class TestLegacyCommandGuard:
 
 
 class TestQuotaExemption:
-    """配额豁免的「管理员」与聊天命令同一套判定"""
+    """配额豁免的「管理员」与配额白名单，都与聊天命令同一套判定
+
+    白名单原先只比 `sender_id`：别的平台恰好同号的人、SSE 自填的 `from_id`、邮件的 `From`、租户自运行协议端
+    上报的号码，都能填成名单里的值免配额。现在白名单与超级用户名单同一种格式（纯号码 = QQ 号，其他平台带前缀），
+    同样要求来源可信。
+    """
 
     @staticmethod
-    async def exempt(adapter_key: str, instance_key: str, sender_id: str = SUPER_QQ, whitelist: Optional[List[str]] = None) -> bool:
+    async def exempt(
+        adapter_key: str,
+        instance_key: str,
+        sender_id: str = SUPER_QQ,
+        whitelist: Optional[List[str]] = None,
+        *,
+        super_users_exempt: bool = True,
+        handshake: Any = _LEGIT,
+    ) -> bool:
         from nekro_agent.services.message_service import is_quota_exempt
 
         message = SimpleNamespace(adapter_key=adapter_key, instance_key=instance_key, sender_id=sender_id)
-        quota_config = SimpleNamespace(AI_CHAT_QUOTA_WHITELIST_USERS=whitelist or [], AI_CHAT_QUOTA_SUPER_USERS_EXEMPT=True)
-        with connection(await as_connection(adapter_key, instance_key, _LEGIT)):
+        quota_config = SimpleNamespace(
+            AI_CHAT_QUOTA_WHITELIST_USERS=whitelist or [],
+            AI_CHAT_QUOTA_SUPER_USERS_EXEMPT=super_users_exempt,
+        )
+        with connection(await as_connection(adapter_key, instance_key, handshake)):
             return await is_quota_exempt(message, quota_config)  # type: ignore[arg-type]
 
     async def test_super_user_from_a_trusted_instance_is_exempt(self, db) -> None:
@@ -469,8 +486,124 @@ class TestQuotaExemption:
     async def test_forged_super_user_is_not_exempt(self, db, adapter_key: str, instance_key: str) -> None:
         assert await self.exempt(adapter_key, instance_key) is False
 
-    async def test_the_plain_whitelist_is_unchanged(self, db) -> None:
-        assert await self.exempt("email", "", sender_id="someone", whitelist=["someone"]) is True
+    async def test_whitelisted_qq_number_from_a_trusted_instance_is_exempt(self, db) -> None:
+        assert await self.exempt(ONEBOT, "napcat_platform", sender_id="20202", whitelist=["20202"], super_users_exempt=False) is True
+
+    @pytest.mark.parametrize(
+        ("adapter_key", "instance_key", "entry"),
+        [
+            ("email", "", "someone"),
+            ("email", "", "email:someone"),
+            ("sse", "", "20202"),
+            ("sse", "", "sse:20202"),
+            (ONEBOT, "remote_tenant", "20202"),
+            (ONEBOT, "napcat_tenant", "20202"),
+            (ONEBOT, "anon", "20202"),
+        ],
+    )
+    async def test_forged_whitelisted_sender_is_not_exempt(self, db, adapter_key: str, instance_key: str, entry: str) -> None:
+        """发送者 ID 由调用方填写的适配器、租户名下的实例、待认领实例：名单写没写前缀都不算"""
+        sender_id = entry.partition(":")[2] or entry
+        assert await self.exempt(adapter_key, instance_key, sender_id=sender_id, whitelist=[entry], super_users_exempt=False) is False
+
+    @pytest.mark.parametrize("adapter_key", ["telegram", "discord"])
+    async def test_same_number_on_another_platform_is_not_exempt(self, adapter_key: str) -> None:
+        """纯号码只当 QQ 号：别的平台恰好同号的人不免配额"""
+        assert await self.exempt(adapter_key, "", sender_id="20202", whitelist=["20202"], super_users_exempt=False) is False
+
+    async def test_prefixed_entry_works_on_its_own_platform_only(self, db) -> None:
+        assert await self.exempt("telegram", "", sender_id="555", whitelist=["telegram:555"], super_users_exempt=False) is True
+        assert await self.exempt("discord", "", sender_id="555", whitelist=["telegram:555"], super_users_exempt=False) is False
+        assert await self.exempt(ONEBOT, "napcat_platform", sender_id="555", whitelist=["telegram:555"], super_users_exempt=False) is False
+
+    async def test_whitelisted_number_on_a_forged_connection_is_not_exempt(self, db) -> None:
+        """平台方实例的账号，被别人凭部署级令牌连上来（握手对不上这个实例）：同样不算"""
+        forged = HandshakeRecord(
+            self_id="",
+            source=TokenSource.DEPLOYMENT,
+            instance_key="napcat_platform",
+            token_fingerprint=token_fingerprint(DEPLOYMENT_TOKEN),
+            presented_fingerprint=token_fingerprint(DEPLOYMENT_TOKEN),
+        )
+        assert (
+            await self.exempt(
+                ONEBOT, "napcat_platform", sender_id="20202", whitelist=["20202"], super_users_exempt=False, handshake=forged,
+            )
+            is False
+        )
+
+    async def test_control_empty_whitelist_exempts_nobody(self, db) -> None:
+        assert await self.exempt(ONEBOT, "napcat_platform", sender_id="20202", whitelist=[], super_users_exempt=False) is False
+
+    def test_whitelist_format_problems_are_reported_at_startup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """存量白名单里给其他平台写的纯号码改判成 QQ 号之后不再生效，启动时要说出来"""
+        from nekro_agent.core.config import config
+        from nekro_agent.services.user import super_users as super_users_mod
+
+        monkeypatch.setattr(config, "AI_CHAT_QUOTA_WHITELIST_USERS", ["20202", "telegrm:555", "telegram:556"])
+        monkeypatch.setattr(super_users_mod, "_enabled_non_onebot_adapters", lambda: ["telegram"])
+
+        reported = super_users_mod.collect_quota_whitelist_warnings()
+        unmatchable = [item for item in reported if "不会匹配任何人" in item]
+        assert len(unmatchable) == 1
+        assert "配额白名单" in unmatchable[0] and "telegrm:555" in unmatchable[0]
+        assert "20202" not in unmatchable[0] and "telegram:556" not in unmatchable[0]
+        assert any("配额白名单" in item and "telegram:123456" in item for item in reported)
+
+    def test_control_well_formed_whitelist_reports_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from nekro_agent.core.config import config
+        from nekro_agent.services.user import super_users as super_users_mod
+
+        monkeypatch.setattr(config, "AI_CHAT_QUOTA_WHITELIST_USERS", ["20202", "telegram:556"])
+        monkeypatch.setattr(super_users_mod, "_enabled_non_onebot_adapters", lambda: [])
+
+        assert super_users_mod.collect_quota_whitelist_warnings() == []
+
+    def test_untrusted_adapter_prefix_in_the_whitelist_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`sse:` / `email:` 这类前缀永远不生效（发送者 ID 由调用方填写），启动时说出来"""
+        from nekro_agent.core.config import config
+        from nekro_agent.services.user import super_users as super_users_mod
+
+        monkeypatch.setattr(config, "AI_CHAT_QUOTA_WHITELIST_USERS", ["sse:20202", "email:a@b.c", "20202"])
+        monkeypatch.setattr(super_users_mod, "_enabled_non_onebot_adapters", lambda: [])
+
+        reported = [item for item in super_users_mod.collect_quota_whitelist_warnings() if "由调用方填写" in item]
+        assert len(reported) == 1
+        assert "sse:20202" in reported[0] and "email:a@b.c" in reported[0]
+        assert reported[0].count("20202") == 1  # 纯号码那条（QQ 号）不在里面
+
+    async def test_untrusted_adapter_prefix_in_super_users_names_what_does_not_work(
+        self, db, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """超级用户名单里的 `sse:` 条目：命令权限不生效（只做名单匹配的展示口、冷处理豁免仍认它），措辞只说前者"""
+        from nekro_agent.core.config import config
+        from nekro_agent.services.user.super_users import collect_super_user_warnings
+
+        monkeypatch.setattr(config, "SUPER_USERS", [SUPER_QQ, "sse:555"])
+
+        reported = [item for item in await collect_super_user_warnings() if "由调用方填写" in item]
+        assert len(reported) == 1
+        assert "sse:555" in reported[0] and "超级用户权限不生效" in reported[0]
+
+    async def test_startup_logs_the_whitelist_warnings(self, db, monkeypatch: pytest.MonkeyPatch) -> None:
+        from nekro_agent.core.config import config
+        from nekro_agent.services.user import super_users as super_users_mod
+
+        logged: List[str] = []
+
+        class _Recorder:
+            def __getattr__(self, _name: str) -> Any:
+                return lambda *_a, **_k: None
+
+            def warning(self, message: str, *_a: Any, **_k: Any) -> None:
+                logged.append(message)
+
+        monkeypatch.setattr(super_users_mod, "logger", _Recorder())
+        monkeypatch.setattr(config, "AI_CHAT_QUOTA_WHITELIST_USERS", ["telegrm:555"])
+
+        await super_users_mod.log_super_user_warnings()
+
+        assert any("配额白名单" in item and "telegrm:555" in item for item in logged)
 
     async def test_exemption_switch_off(self, db) -> None:
         from nekro_agent.services.message_service import is_quota_exempt
@@ -489,6 +622,147 @@ class TestQuotaExemption:
         source = inspect.getsource(message_service.MessageService.push_human_message)
         assert "await is_quota_exempt(message, config)" in source
         assert "SUPER_USERS" not in source
+
+
+class TestQuotaWhitelistCommand:
+    """`/quota_whitelist add`：永远不会生效的写法当场拒绝，不回「已添加」"""
+
+    @pytest.fixture
+    def whitelist(self, monkeypatch: pytest.MonkeyPatch) -> List[str]:
+        import sys
+
+        from nekro_agent.core.config import config
+
+        # `nekro_agent.core` 包把 `config` 实例导了出来，按属性取拿到的是实例而不是模块
+        config_mod = sys.modules["nekro_agent.core.config"]
+        entries: List[str] = []
+        monkeypatch.setattr(config, "AI_CHAT_QUOTA_WHITELIST_USERS", entries)
+        monkeypatch.setattr(config_mod, "save_config", lambda *_a, **_k: None)
+        return entries
+
+    @staticmethod
+    async def add(entry: str, adapter_key: str = ONEBOT) -> Any:
+        from nekro_agent.services.command.built_in.quota_cmd import QuotaWhitelistCommand
+
+        context = CommandExecutionContext(
+            user_id=SUPER_QQ,
+            chat_key=f"{adapter_key}-group_1",
+            username="x",
+            adapter_key=adapter_key,
+            is_super_user=True,
+            is_advanced_user=True,
+        )
+        return await QuotaWhitelistCommand().execute(context, f"add {entry}")
+
+    @pytest.mark.parametrize(
+        "entry",
+        ["telegrm:555", "sse:20202", "email:a@b.c", "someone", "onebot_v11:abc", "０１２３", "²"],
+    )
+    async def test_entries_that_never_apply_are_refused(self, whitelist: List[str], entry: str) -> None:
+        from nekro_agent.services.command.schemas import CommandResponseStatus
+
+        response = await self.add(entry)
+
+        assert response.status != CommandResponseStatus.SUCCESS
+        assert "没有添加" in response.message
+        assert whitelist == []
+
+    async def test_bare_number_added_from_another_platform_says_it_is_a_qq_number(self, whitelist: List[str]) -> None:
+        response = await self.add("555", adapter_key="telegram")
+
+        assert whitelist == ["555"]
+        assert "telegram:555" in response.message
+
+    @pytest.mark.parametrize(("entry", "adapter_key"), [("20202", ONEBOT), ("telegram:555", "telegram")])
+    async def test_control_well_formed_entries_are_added(self, whitelist: List[str], entry: str, adapter_key: str) -> None:
+        response = await self.add(entry, adapter_key=adapter_key)
+
+        assert whitelist == [entry]
+        assert "纯号码只匹配 QQ 号" not in response.message
+
+
+class TestQuotaThroughTheMessageEntry:
+    """从消息入口走到底：今日配额已用完的频道里，冒用白名单号码的消息照样被配额拦下
+
+    频道每日上限 1、今天已经回过 1 条；发送者 20202 在白名单里（纯号码 = QQ 号），超级用户豁免关掉。
+    """
+
+    WHITELISTED = "20202"
+
+    @pytest.fixture
+    def entry(self, monkeypatch: pytest.MonkeyPatch, isolated_config_files):  # noqa: ARG002 - 改道配置落盘
+        from nekro_agent.adapters.utils import adapter_utils
+        from nekro_agent.core.config import config
+        from nekro_agent.services.message_service import message_service
+
+        quota_config = config.model_copy(
+            update={
+                "AI_CHAT_DAILY_REPLY_LIMIT": 1,
+                "AI_CHAT_ENABLE_HOURLY_LIMIT": False,
+                "AI_CHAT_QUOTA_WHITELIST_USERS": [self.WHITELISTED],
+                "AI_CHAT_QUOTA_SUPER_USERS_EXEMPT": False,
+                "AI_CHAT_RANDOM_REPLY_PROBABILITY": 0.0,
+            },
+        )
+
+        async def _effective_config(_self: Any) -> Any:
+            return quota_config
+
+        scheduled: List[str] = []
+        notices: List[str] = []
+
+        async def _schedule(*, message: Any, ctx: Any = None) -> None:  # noqa: ARG001
+            scheduled.append(message.chat_key)
+
+        class _Adapter:
+            async def forward_message(self, request: Any) -> Any:
+                from nekro_agent.adapters.interface.schemas.platform import PlatformSendResponse
+
+                notices.append(request.segments[0].content)
+                return PlatformSendResponse(success=True, message_id="1")
+
+        async def _adapter_for_chat(_chat_key: str) -> Any:
+            return _Adapter()
+
+        monkeypatch.setattr(DBChatChannel, "get_effective_config", _effective_config)
+        monkeypatch.setattr(message_service, "schedule_agent_task", _schedule)
+        monkeypatch.setattr(adapter_utils, "get_adapter_for_chat", _adapter_for_chat)
+        return SimpleNamespace(service=message_service, scheduled=scheduled, notices=notices)
+
+    async def push(self, entry: Any, instance_key: str) -> None:
+        from nekro_agent.schemas.chat_message import ChatMessage
+
+        chat_key = await add_channel(instance_key)
+        await DBChatMessage.create(
+            message_id="r1", sender_id=-1, sender_name="bot", sender_nickname="bot", adapter_key=ONEBOT,
+            instance_key=instance_key, platform_userid="-1", is_tome=0, is_recalled=False, chat_key=chat_key,
+            chat_type="group", content_text="今天已经回过一条", content_data="[]", raw_cq_code="", ext_data="{}",
+            send_timestamp=int(datetime.datetime.now().timestamp()),
+        )
+        message = ChatMessage(
+            message_id="m1", sender_id=self.WHITELISTED, sender_name="x", sender_nickname="x", adapter_key=ONEBOT,
+            instance_key=instance_key, platform_userid=self.WHITELISTED, is_tome=1, is_recalled=False,
+            chat_key=chat_key, chat_type=ChatType.GROUP, content_text="在吗", content_data=[], raw_cq_code="",
+            ext_data={}, send_timestamp=0,
+        )
+        with connection(await legit_handshake(instance_key)):
+            await entry.service.push_human_message(message=message)
+
+    @pytest.mark.parametrize("instance_key", ["remote_tenant", "napcat_tenant", "anon"])
+    async def test_whitelisted_number_on_a_tenant_or_unclaimed_instance_is_still_limited(
+        self, db, entry, instance_key: str,
+    ) -> None:
+        """租户名下的实例、待认领实例：协议端是别人在跑，上报的号码不能用来免配额，即使连接本身是这个实例自己的"""
+        await self.push(entry, instance_key)
+
+        assert entry.scheduled == []
+        assert len(entry.notices) == 1 and "配额已用完" in entry.notices[0]
+
+    async def test_control_whitelisted_number_on_a_platform_instance_is_exempt(self, db, entry) -> None:
+        await self.push(entry, "napcat_platform")
+
+        assert entry.scheduled == [f"{ONEBOT}-napcat_platform-group_1"]
+        assert entry.notices == []
 
 
 class TestRegistrationSkip:
@@ -837,6 +1111,19 @@ class TestStartupWarnings:
         monkeypatch.setattr(super_users_mod, "_enabled_non_onebot_adapters", lambda: ["telegram"])
 
         assert any("telegram:123456" in item for item in await self.warnings())
+
+    def test_web_adapter_is_not_listed_in_the_prefix_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`web` 默认启用、用户 ID 由服务端拼出：列进提示只会给每个部署加一条无意义告警"""
+        import nekro_agent.adapters as adapters_mod
+        from nekro_agent.services.user import super_users as super_users_mod
+
+        monkeypatch.setattr(
+            adapters_mod,
+            "loaded_adapters",
+            {"onebot_v11": object(), "web": object(), "telegram": object()},
+        )
+
+        assert super_users_mod._enabled_non_onebot_adapters() == ["telegram"]
 
     async def test_entries_that_can_never_match_are_reported(self, db, monkeypatch: pytest.MonkeyPatch) -> None:
         """前缀拼错的条目会落成 OneBot 号码，而 OneBot 的号码只有数字：它永远匹配不上任何人"""
@@ -1358,6 +1645,7 @@ class TestHandshakeContext:
             source=TokenSource.INSTANCE,
             instance_key="napcat_platform",
             token_fingerprint=token_fingerprint("own-np"),
+            presented_fingerprint=token_fingerprint("own-np"),
         )
         # 用完复位，外面读不到
         assert current_handshake() is None

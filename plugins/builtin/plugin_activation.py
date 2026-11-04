@@ -6,6 +6,7 @@
 from nekro_agent.api import i18n
 from nekro_agent.api.plugin import NekroPlugin, SandboxMethodType
 from nekro_agent.api.schemas import AgentCtx
+from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.prompt_activation import (
     activate_module_for_chat,
@@ -14,6 +15,7 @@ from nekro_agent.services.plugin.prompt_activation import (
     is_sleep_effective,
     render_plugin_prompt_for_agent,
 )
+from nekro_agent.services.plugin.scope import resolve_active_plugins
 from nekro_agent.tools.untrusted_content import echo_inline
 
 plugin = NekroPlugin(
@@ -51,19 +53,27 @@ async def plugin_activation_prompt(_ctx: AgentCtx) -> str:
     )
 
 
-def _get_sleepable_plugin(module_name: str) -> NekroPlugin | None:
+async def _get_visible_plugin(_ctx: AgentCtx, module_name: str) -> NekroPlugin | None:
+    """查找当前会话看得见的插件（不要求可休眠），看不见的一律按不存在处理
+
+    看得见的集合与本轮提示词、沙盒方法白名单同一个来源：按 会话 > 实例 > 全局 解析
+    （`resolve_active_plugins`），再按适配器支持范围过滤（与 `get_all_sandbox_methods` 一致）。
+    只看进程级 `is_enabled` 的话，在当前实例或会话里被关掉的插件，模型按名字激活一下就能拿到
+    它的完整插件块（方法说明、按当前会话渲染的注入上下文）。
+    """
     target = plugin_collector.get_plugin_by_module_name(module_name)
     if not target or not target.is_enabled:
         return None
-    if not is_sleep_effective(target):
+    if target.support_adapter and _ctx.adapter_key not in target.support_adapter:
         return None
-    return target
 
-
-def _get_existing_plugin(module_name: str) -> NekroPlugin | None:
-    """查找插件（不要求可休眠），用于区分"不存在/禁用"与"不可休眠"两种情况。"""
-    target = plugin_collector.get_plugin_by_module_name(module_name)
-    if not target or not target.is_enabled:
+    chat_key = _ctx.from_chat_key or ""
+    db_chat_channel = _ctx.db_chat_channel
+    if db_chat_channel is None and chat_key:
+        db_chat_channel = await DBChatChannel.get_or_none(chat_key=chat_key)
+    instance_key = db_chat_channel.instance_key if db_chat_channel else ""
+    active = await resolve_active_plugins(instance_key=instance_key, chat_key=chat_key)
+    if not any(plugin.key == target.key for plugin in active):
         return None
     return target
 
@@ -81,15 +91,14 @@ async def activate_plugin(_ctx: AgentCtx, module_name: str, rounds: int = 5) -> 
         rounds (int): Visible runs to keep after activation. Default is 5.
     """
     # 返回值会落成 SYSTEM 消息，`module_name` 是模型传入的：一律压成单行再回显（找不到插件时它可以是任意文字）
-    target = _get_sleepable_plugin(module_name)
+    target = await _get_visible_plugin(_ctx, module_name)
     if not target:
-        existing = _get_existing_plugin(module_name)
-        if existing:
-            return (
-                f"Plugin {echo_inline(module_name)} is always visible and does not need activation. "
-                "You can use its predefined methods directly."
-            )
         return f"Plugin {echo_inline(module_name)} is missing or disabled."
+    if not is_sleep_effective(target):
+        return (
+            f"Plugin {echo_inline(module_name)} is always visible and does not need activation. "
+            "You can use its predefined methods directly."
+        )
 
     state = await get_activation_state(_ctx.chat_key)
     current_rounds = max(0, state.module_rounds.get(module_name, 0))
@@ -122,15 +131,14 @@ async def extend_plugin_activation(_ctx: AgentCtx, module_name: str, rounds: int
         rounds (int): Additional visible runs to append. Default is 3.
     """
     # BEHAVIOR 方法的返回值同样落成 SYSTEM 消息：`module_name` 压成单行再回显
-    target = _get_sleepable_plugin(module_name)
+    target = await _get_visible_plugin(_ctx, module_name)
     if not target:
-        existing = _get_existing_plugin(module_name)
-        if existing:
-            return (
-                f"Plugin {echo_inline(module_name)} is always visible and does not need to be extended. "
-                "You can use its predefined methods directly."
-            )
         return f"Plugin {echo_inline(module_name)} is missing or disabled."
+    if not is_sleep_effective(target):
+        return (
+            f"Plugin {echo_inline(module_name)} is always visible and does not need to be extended. "
+            "You can use its predefined methods directly."
+        )
 
     final_rounds = await extend_module_for_chat(_ctx.chat_key, module_name, rounds)
     return f"Plugin {echo_inline(module_name)} visibility extended. {final_rounds} runs remain."

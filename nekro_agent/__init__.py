@@ -131,6 +131,52 @@ async def _report_onebot_instance_status(adapter_name: str, self_id: str, *, is_
         logger.warning(f"同步 OneBot 实例连接状态失败: self_id={self_id}, online={is_online}, error={e}")
 
 
+async def _should_mail_bot_status(adapter_name: str, self_id: str) -> bool:
+    """这次连上 / 断开要不要给管理员发状态邮件
+
+    OneBot 只给已认领、在用的实例发：连接钩子在入站闸门之前执行，部署级令牌为空时任何人都能带一个陌生账号
+    连上来（被自动登记成待认领实例），反复连断就能刷管理员邮箱。「在用」与收发闸门同一个判据
+    （`DBAdapterInstance.is_instance_active`：实例停用 / 归档 / 软删、所属租户停用都算不在用）——
+    不认识的待认领实例，管理员的处理就是归档，之后再连上来不该再发信。查不到绑定这个账号的实例
+    （自动登记失败一类）同样不发。其他适配器照旧，靠 `send_bot_status_email` 的限频兜底。
+    """
+    if adapter_name != "OneBot V11":
+        return True
+    try:
+        from nekro_agent.adapters.onebot_v11.core.channel import ADAPTER_KEY
+        from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+        from nekro_agent.services.unclaimed_dispatch import UNCLAIMED_STATUS
+
+        row = await DBAdapterInstance.get_by_bound_account(ADAPTER_KEY, self_id)
+        if row is None or row.status.strip().lower() == UNCLAIMED_STATUS:
+            return False
+        return await DBAdapterInstance.is_instance_active(ADAPTER_KEY, row.instance_key)
+    except Exception as e:
+        logger.warning(f"查询 OneBot 实例失败，本次不发连接状态邮件: self_id={self_id}, error={e}")
+        return False
+
+
+async def _on_bot_status_change(bot: Bot, *, is_online: bool) -> None:
+    """NoneBot 连接 / 断开钩子的全部工作
+
+    先同步实例状态再决定发不发邮件：陌生账号要到 `_report_onebot_instance_status` 里才被登记成待认领实例
+    （或归给刚扫码登录的内置 NapCat），邮件按登记之后的状态判。
+    """
+    adapter: str = bot.adapter.get_name()
+    bot_id: str = bot.self_id
+    if is_online and adapter == "OneBot V11":
+        # 协议端识别与自检是附加信息：查询失败不能影响下面的连接状态同步
+        try:
+            from nekro_agent.adapters.onebot_v11.core.endpoint_status import on_onebot_connect
+
+            await on_onebot_connect(bot)
+        except Exception as e:
+            logger.warning(f"初始化 OneBot 协议端自检失败: {e}")
+    await _report_onebot_instance_status(adapter, bot_id, is_online=is_online)
+    if await _should_mail_bot_status(adapter, bot_id):
+        await send_bot_status_email(adapter, bot_id, is_online)
+
+
 class _Config(BaseModel):
     pass
 
@@ -232,6 +278,12 @@ if _driver is not None:
             logger.warning(f"初始化 CC 工作区网络隔离失败（非致命）: {e}")
 
         await init_adapters(app)
+
+        # 轮换 Web Chat MCP 的运行期密钥，并重写引用内置条目的工作区 .mcp.json。
+        # 必须排在 init_adapters 之后：它要读适配器注册表判断内置条目是否可用
+        from nekro_agent.services.mcp.web_chat_auth import init_web_chat_mcp_runtime_auth
+
+        await init_web_chat_mcp_runtime_auth()
 
         # 注册内置命令
         from nekro_agent.services.command.built_in import register_built_in_commands
@@ -467,25 +519,11 @@ if _driver is not None:
 
     @_driver.on_bot_connect
     async def on_bot_connect(bot: Bot):
-        adapter: str = bot.adapter.get_name()
-        bot_id: str = bot.self_id
-        if adapter == "OneBot V11":
-            # 协议端识别与自检是附加信息：查询失败不能影响下面两条连接状态同步
-            try:
-                from nekro_agent.adapters.onebot_v11.core.endpoint_status import on_onebot_connect
-
-                await on_onebot_connect(bot)
-            except Exception as e:
-                logger.warning(f"初始化 OneBot 协议端自检失败: {e}")
-        await send_bot_status_email(adapter, bot_id, True)
-        await _report_onebot_instance_status(adapter, bot_id, is_online=True)
+        await _on_bot_status_change(bot, is_online=True)
 
     @_driver.on_bot_disconnect
     async def on_bot_disconnect(bot: Bot):
-        adapter: str = bot.adapter.get_name()
-        bot_id: str = bot.self_id
-        await send_bot_status_email(adapter, bot_id, False)
-        await _report_onebot_instance_status(adapter, bot_id, is_online=False)
+        await _on_bot_status_change(bot, is_online=False)
 
 
 __plugin_meta__ = PluginMetadata(

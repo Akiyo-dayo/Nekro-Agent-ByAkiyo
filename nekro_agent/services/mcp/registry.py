@@ -2,6 +2,9 @@
 
 from .schemas import McpEnvKeyDef, McpRegistryItem, McpServerType
 
+# 上游这里有一条内置网页聊天模板（`NekroWebChatTest`）。本分支这一版不往工作区 `.mcp.json` 写网页聊天条目
+# （见 `web_chat_mcp/na_app.py` 模块说明），模板加进库里也用不上，所以不列
+
 BUILTIN_REGISTRY: list[McpRegistryItem] = [
     # ── 推荐预置 MCP server ──
     McpRegistryItem(
@@ -118,5 +121,11 @@ BUILTIN_REGISTRY: list[McpRegistryItem] = [
 
 
 def get_registry() -> list[McpRegistryItem]:
-    """返回内置 MCP 服务注册表"""
-    return BUILTIN_REGISTRY
+    """返回内置 MCP 服务注册表
+
+    返回深拷贝：调用方（路由层）会按请求改字段，共享同一份对象会让改动漏到下一个请求。
+    """
+    registry: list[McpRegistryItem] = []
+    for item in BUILTIN_REGISTRY:
+        registry.append(item.model_copy(deep=True))
+    return registry

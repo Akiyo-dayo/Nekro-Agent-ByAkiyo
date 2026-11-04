@@ -97,14 +97,37 @@ NoneBot 的 `_handle_http` **完全不校验 access token**（只在配了 `oneb
 ⚠️ 这是本模块唯一一处「单实例老部署行为不是逐字不变」的地方：
 配了部署级令牌、且协议端走 HTTP 上报又不带 Authorization 头的部署，从此会收到 403。
 要退回上游行为，把 `_should_guard()` 里的 `http` 那一支去掉即可（有用例钉着这个取舍）。
+
+## 账号绑定之后：旧连接
+
+一条连接对某个账号「此刻仍被认可」= 它握手时**出示**的令牌，此刻重新握手仍会被接受。
+只在账号已经绑到一个**已认领**实例时判：该实例此刻应出示的令牌为空 → 认可；否则出示令牌的指纹
+等于它 → 认可；否则不认可。账号未绑定、或绑在未认领实例上时不判（那一格由 #100 的闸门管）。
+
+**比的是「出示的」令牌，不是握手时匹配上的期望令牌。** 部署级令牌为空时握手不校验，
+`HandshakeRecord.token_fingerprint` 是空串；而内置 NapCat 照样带着自己那枚令牌——按出示的比，
+它首次登录被归属推导绑到自己的实例之后不用重连。为此 `HandshakeRecord` 多了
+`presented_fingerprint`，原有 `token_fingerprint` 的语义不变（#98 / #100 照旧用它）。
+
+两处执行：
+
+1. 绑定变化时主动复核在线连接（`revalidate_live_connections`，由
+   `core/instance.py:clear_instance_cache` 排一个后台任务，软删实例复活另排一次）；
+2. 入站每条事件在已认领实例的闸门里再判一次（`services/unclaimed_dispatch.py`），
+   对不上就不分发并断开当前连接——挡住复核排队到真正执行之间到来的事件。
+
+两个配套：鉴权查库与连接登记之间绑定若变过（「绑定代次」），登记之后补排一次复核，免得那次复核
+恰好看不到这条连接；一条 WS 放行时，NoneBot 里这个账号若只挂着 HTTP 上报建出来、没有连接的 Bot，
+先把它移掉（见 `_evict_connectionless_bot`），否则谁抢先 POST 一条事件就能让这个账号的 WS 一直被判重复。
 """
 
+import asyncio
 import secrets
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, FrozenSet, List, MutableMapping, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, MutableMapping, Optional, Set, Tuple
 
 from nonebot.adapters.onebot.utils import get_auth_bearer
 
@@ -193,6 +216,15 @@ class HandshakeRecord:
     token_fingerprint: str
     """放行时匹配上的那枚期望令牌的指纹；期望令牌为空（不校验）时为空串"""
 
+    presented_fingerprint: str = ""
+    """协议端握手时**出示**的令牌的指纹（`token_fingerprint(presented or "")`），没带令牌时为空串
+
+    与 `token_fingerprint` 的区别：后者是「匹配上的那枚**期望**令牌」，期望为空（部署级令牌为空、
+    这次握手不校验）时是空串，与协议端带了什么无关；前者只看出示了什么。账号绑定之后的复核
+    （`connection_accepted_by`）必须看前者：部署级令牌为空时内置 NapCat 照样带着自己那枚令牌，
+    按期望令牌比会把它首次登录的那条连接误断掉。
+    """
+
 
 _current_handshake: ContextVar[Optional[HandshakeRecord]] = ContextVar("onebot_handshake", default=None)
 
@@ -200,6 +232,84 @@ _current_handshake: ContextVar[Optional[HandshakeRecord]] = ContextVar("onebot_h
 def current_handshake() -> Optional[HandshakeRecord]:
     """当前事件所在连接的握手记录；没经过本中间件的路径（含 NA 主动连出去的正向 WS）为 None"""
     return _current_handshake.get()
+
+
+def connection_accepted_by(record: HandshakeRecord, expected_token: str) -> bool:
+    """这条握手记录此刻是否仍被这个实例认可
+
+    规则见模块文档「账号绑定之后：旧连接」：期望令牌为空（本部署对这个协议端不校验）一律认可；
+    否则看协议端**出示**的令牌指纹是否等于期望令牌的指纹。纯函数，表驱动用例直接打它。
+    """
+    if not expected_token:
+        return True
+    return record.presented_fingerprint == token_fingerprint(expected_token)
+
+
+# ---------------------------------------------------------------------------
+# 在线 WS 连接登记表
+# ---------------------------------------------------------------------------
+
+# 断开任务放进这里持有强引用：`asyncio` 只弱引用任务，不持有的话它可能跑到一半被回收
+_close_tasks: Set["asyncio.Task[None]"] = set()
+
+
+class LiveConnection:
+    """一条放行的 WebSocket 连接：握手记录 + 由中间件包过的 `send`
+
+    断开时不走应用那一层：`cut()` 直接向服务器发 `websocket.close`，之后应用再发的
+    `websocket.accept` / `websocket.close` 吞掉、`websocket.send` 直接抛 `OSError`——
+    Starlette 把它翻成 `WebSocketDisconnect(1006)`，与往一条真断掉的连接上写是同一个表现：
+    NoneBot 那边 NA 的出站 API 调用立刻失败，不会再有消息发到这条连接上，也不会干等 API 超时。
+    """
+
+    def __init__(self, record: HandshakeRecord, send: Callable[[MutableMapping[str, Any]], Awaitable[None]]) -> None:
+        self.record = record
+        self._send = send
+        self.closed = False
+
+    def cut(self, reason: str) -> bool:
+        """断开这条连接；已经断开过返回 False
+
+        **同步**：只把关闭帧排进后台任务，不等关闭握手（对不回应关闭帧的对端，uvicorn 最多等关闭超时）。
+        """
+        if self.closed:
+            return False
+        self.closed = True
+        message = {"type": "websocket.close", "code": WS_CLOSE_CODE_POLICY_VIOLATION, "reason": reason}
+
+        async def _close() -> None:
+            try:
+                await self._send(message)
+            except Exception as e:  # noqa: BLE001 - 连接可能已经被服务器关掉了，断开失败没有补救动作
+                # 只记类型：异常文本里可能带着别的请求内容，这条日志不该成为泄露渠道
+                logger.debug(f"发送 OneBot 连接的关闭帧失败（连接可能已经断开）: {type(e).__name__}")
+
+        task = asyncio.get_running_loop().create_task(_close())
+        _close_tasks.add(task)
+        task.add_done_callback(_close_tasks.discard)
+        return True
+
+    async def send(self, message: MutableMapping[str, Any]) -> None:
+        """给应用用的 `send` 包装：断开之后拒绝再往这条连接上写"""
+        if not self.closed:
+            await self._send(message)
+            return
+        message_type = message.get("type")
+        if message_type in ("websocket.accept", "websocket.close"):
+            return
+        if message_type == "websocket.send":
+            raise OSError("OneBot connection was closed by NekroAgent")
+        await self._send(message)
+
+
+# 进程内的在线连接登记表；NA 是单进程部署。连接结束时（中间件的 finally）移除
+_live_connections: Set[LiveConnection] = set()
+_current_connection: ContextVar[Optional[LiveConnection]] = ContextVar("onebot_live_connection", default=None)
+
+
+def current_connection() -> Optional[LiveConnection]:
+    """当前事件所在连接的断开句柄；HTTP 上报（没有长连接）与没经过本中间件的路径为 None"""
+    return _current_connection.get()
 
 
 # 账号还没绑定实例时握手出示过的令牌指纹。账号之后被并进 / 改绑到租户实例上时，这些令牌就在那个租户手里了
@@ -492,6 +602,9 @@ class OneBotAccessTokenMiddleware:
         self_id = headers.get(SELF_ID_HEADER, "").strip()
         presented = get_auth_bearer(headers.get(AUTHORIZATION_HEADER))
 
+        # 鉴权要查库（账号归属、待绑实例的令牌），绑定可能恰好在这之间变掉、复核也已经跑完：
+        # 那次复核看不到这条还没登记的连接。登记之后代次变过就补排一次
+        generation = _binding_generation
         verdict, expected = await authorize_handshake(self_id, presented)
         if not verdict.allowed:
             # 只记账号与来源，绝不记令牌本身（明文或掩码都不记）——这条日志会进 app.log
@@ -509,14 +622,180 @@ class OneBotAccessTokenMiddleware:
             source=expected.source,
             instance_key=expected.instance_key,
             token_fingerprint=token_fingerprint(expected.token),
+            presented_fingerprint=token_fingerprint(presented or ""),
         )
         _remember_unbound_presentation(record)
         # 用完复位：同一个任务里后面的请求（HTTP keep-alive）不该继承这一次的握手
         reset = _current_handshake.set(record)
+        connection: Optional[LiveConnection] = None
+        if scope.get("type") == "websocket":
+            # 只有长连接进登记表：HTTP 上报每次都重新握手，没有可断的「旧连接」
+            connection = LiveConnection(record, send)
+            _live_connections.add(connection)
+            if _binding_generation != generation:
+                schedule_live_connection_revalidation()
+            _evict_connectionless_bot(self_id)
+        # HTTP 上报显式置 None：它没有长连接，`current_connection()` 必须是 None
+        connection_reset = _current_connection.set(connection)
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, connection.send if connection is not None else send)
         finally:
+            if connection is not None:
+                _live_connections.discard(connection)
+            _current_connection.reset(connection_reset)
             _current_handshake.reset(reset)
+
+
+# ---------------------------------------------------------------------------
+# 账号绑定之后：复核在线连接
+# ---------------------------------------------------------------------------
+
+# 与 `services/unclaimed_dispatch.py:UNCLAIMED_STATUS` 同值；不 import 那个模块：它反过来延迟导入本模块
+_UNCLAIMED_STATUS = "unclaimed"
+
+# 关闭帧的原因只写这一句 ASCII：ASGI 的 close reason 要能编成对端看得懂的字节，且**绝不带令牌**
+CUT_REASON = "Access token does not match the instance this account is bound to"
+
+# 已经排了、还没开始跑的复核。绑定连续变更多次时只跑一遍：它读的是复核那一刻的库
+_revalidation_scheduled = False
+# 复核任务的强引用（`asyncio` 只弱引用任务），完成后移除
+_revalidation_tasks: Set["asyncio.Task[None]"] = set()
+# 绑定代次：每次绑定变化（排复核）与每次复核开始都加一。中间件在鉴权前记下它，连接登记之后发现变过就补排一次复核
+_binding_generation = 0
+
+
+def _note_binding_change() -> None:
+    global _binding_generation
+    _binding_generation += 1
+
+
+def _nonebot_onebot_adapter() -> Optional[Any]:
+    """NoneBot 里注册的 OneBot V11 适配器；NoneBot 没初始化（测试、CLI）或没注册它时为 None"""
+    try:
+        import nonebot
+        from nonebot.adapters.onebot.v11 import Adapter
+
+        return nonebot.get_adapter(Adapter)
+    except Exception:  # noqa: BLE001 - 取不到就当没有，调用方只是做一次清理
+        return None
+
+
+def _evict_connectionless_bot(self_id: str) -> None:
+    """一条 WS 刚按此刻的绑定放行：NoneBot 里这个账号如果只挂着一个没有 WS 连接的 Bot，先把它移掉
+
+    NoneBot 的 HTTP 上报（`_handle_http`）收到一个陌生账号的事件就 `bot_connect` 一个没有连接的 Bot，
+    而且永远不移除；`_handle_ws` 一看账号已在 `bots` 里就以 `Duplicate X-Self-ID` 拒绝。于是谁在账号
+    还没绑定时凭备选令牌（部署级令牌为空时什么都不用带）POST 一条事件，就能让这个账号此后的 WS 全部被拒，
+    直到重启。这条 WS 已经通过了按实例的握手，它比一个没有连接的 Bot 更有资格占着这个账号；
+    真走 HTTP 上报的协议端下一次 POST 时，NoneBot 会改用这条 WS 的 Bot（或在没有 WS 时重建一个）。
+    已经有 WS 连接的账号不动：那由 NoneBot 自己的重复连接检查去拒。
+    """
+    adapter = _nonebot_onebot_adapter()
+    if adapter is None or not self_id:
+        return
+    bot = adapter.bots.get(self_id)
+    if bot is None or self_id in adapter.connections:
+        return
+    try:
+        adapter.bot_disconnect(bot)
+    except Exception as e:  # noqa: BLE001 - 清不掉就交给 NoneBot 照常判重复
+        logger.warning(f"移除账号 {self_id} 只有 HTTP 上报、没有连接的 Bot 失败: {type(e).__name__}")
+        return
+    logger.info(f"账号 {self_id} 的 WS 握手已放行，移除它此前由 HTTP 上报建立、没有连接的 Bot")
+
+
+async def revalidate_live_connections() -> int:
+    """按「账号此刻绑定的实例」复核一遍在线连接，断开不再被认可的，返回断开条数
+
+    规则见模块文档「账号绑定之后：旧连接」：账号未绑定、或绑在未认领实例上时不判（那一格由
+    #100 的闸门管）；实例此刻应出示的令牌为空一律认可；否则看协议端**出示**的令牌指纹。
+
+    **查库 / 读元数据出错时这个账号的连接一条都不断**（记 WARNING）：一次查库抖动不该踢掉所有协议端，
+    入站闸门照样兜着。日志只写账号与实例标识，绝不写令牌（明文与指纹都不写）。
+    """
+    # 先加代次再取快照：取快照之后才登记的连接会在中间件里看到代次变了，自己补排一次
+    _note_binding_change()
+    snapshot = list(_live_connections)
+    by_account: Dict[str, List[LiveConnection]] = {}
+    for connection in snapshot:
+        # 已经断开的不必再判；没有账号的握手（HTTP 上报不带 `X-Self-ID`）没有归属可查
+        if connection.closed or not connection.record.self_id:
+            continue
+        by_account.setdefault(connection.record.self_id, []).append(connection)
+
+    disconnected = 0
+    for account, connections in by_account.items():
+        try:
+            instance = await DBAdapterInstance.get_by_bound_account(ADAPTER_KEY, account)
+            if instance is None or instance.status.strip().lower() == _UNCLAIMED_STATUS:
+                continue
+            # 延迟导入：`container_manager` 会拖进 aiodocker / httpx，且它在模块级导入本包的
+            # `core.instance`，模块级反向导入会成环（与 `resolve_expected_token` 同一条理由）
+            from nekro_agent.services.console.container_manager import resolve_access_token
+
+            expected = resolve_access_token(instance)
+        except Exception as e:  # noqa: BLE001 - 判不出来就不动，见 docstring
+            logger.warning(f"复核账号 {account} 的在线连接失败，本次不断开它的任何连接: {type(e).__name__}")
+            continue
+
+        for connection in connections:
+            if connection_accepted_by(connection.record, expected):
+                continue
+            if not connection.cut(CUT_REASON):
+                continue
+            disconnected += 1
+            logger.warning(
+                f"账号 {account} 已绑定到实例 {instance.instance_key}，"
+                f"断开一条握手对不上的旧连接: 握手时实例={connection.record.instance_key or '(未绑定)'}, "
+                f"现在绑定的实例={instance.instance_key}, 原因=握手出示的令牌与这个实例此刻应出示的不同",
+            )
+    return disconnected
+
+
+async def _run_revalidation() -> None:
+    """后台复核任务的入口：先把「排了还没开始」的标记清掉，异常只记 error"""
+    global _revalidation_scheduled
+    _revalidation_scheduled = False
+    try:
+        await revalidate_live_connections()
+    except Exception:  # noqa: BLE001 - 后台任务里抛出去没人接
+        logger.error("复核 OneBot 在线连接失败", exc_info=True)
+
+
+def schedule_live_connection_revalidation() -> None:
+    """排一个后台复核；没有在线连接、没有运行中的事件循环、或已经排着一个时什么都不做
+
+    同步函数，供 `core/instance.py:clear_instance_cache()` 这类同步调用点使用：绑定关系变了，
+    在线连接要按新绑定复核。**只排一次**：连续改绑时复核读的是真正跑起来那一刻的库，
+    多排几个只是白查几遍。
+    """
+    global _revalidation_scheduled
+    # 先记代次：此刻没有在线连接，正在握手、还没登记的那条也要能看出绑定变过
+    _note_binding_change()
+    if not _live_connections:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 启动期、CLI 这类没有事件循环的地方调用：没有连接可断，也没有地方跑任务
+        return
+    if _revalidation_scheduled:
+        return
+    _revalidation_scheduled = True
+    task = loop.create_task(_run_revalidation())
+    _revalidation_tasks.add(task)
+    task.add_done_callback(_revalidation_tasks.discard)
+
+
+async def wait_for_pending_revalidation() -> None:
+    """等当前所有已排的复核任务结束（测试用）
+
+    复核任务本身不再排复核，循环一次即可；写成循环是为了兜住「等待期间又被排了一个」。
+    `gather` 之后让出一轮：任务的 done 回调（从 `_revalidation_tasks` 里移除）排在下一轮事件循环。
+    """
+    while _revalidation_tasks:
+        await asyncio.gather(*list(_revalidation_tasks), return_exceptions=True)
+        await asyncio.sleep(0)
 
 
 async def _reject(scope: MutableMapping[str, Any], receive: Any, send: Any, message: str) -> None:

@@ -29,6 +29,7 @@ from nekro_agent.adapters.onebot_v11.core.self_sent import (
     self_sent_registry,
 )
 from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message
+from nekro_agent.adapters.onebot_v11.tools.display_name import clean_display_name
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
     gen_chat_text,
     get_chat_info,
@@ -139,7 +140,12 @@ async def handle_self_sent_event(adapter: BaseAdapter, event: MessageEvent, bot:
     if quoted is not None:
         content_data.append(quoted)
 
-    nickname = event.sender.card or event.sender.nickname or (await db_chat_channel.get_preset()).name
+    # 先清理再走回退链：协议端上报的彩色群名片是原始字节，清理后可能变成空串
+    nickname = (
+        clean_display_name(event.sender.card)
+        or clean_display_name(event.sender.nickname)
+        or (await db_chat_channel.get_preset()).name
+    )
     plt_user = PlatformUser(platform_name="qq", user_id=str(bot.self_id), user_name=nickname)
     plt_msg = PlatformMessage(
         message_id=message_id,
@@ -199,11 +205,13 @@ def register_matcher(adapter: BaseAdapter):
             # get_channel_info 只认识 channel_id，实例归属必须由本条事件的账号决定
             plt_channel.instance_key = instance_key
 
-        # 用户信息处理
-        sender_name: Optional[str] = event.sender.nickname or event.sender.card
+        # 用户信息处理：先清理再走回退链，清理后为空也要落到下一级
+        user_qq = str(event.sender.user_id)
+        # 昵称与名片都清理成空串时退回 QQ 号：只由控制字符组成的名字以前会原样通过，
+        # 清理之后变成空串，不兜底的话这条消息会被下面的断言整条丢掉
+        sender_name: str = clean_display_name(event.sender.nickname) or clean_display_name(event.sender.card) or user_qq
         assert sender_name
 
-        user_qq = str(event.sender.user_id)
         user_avatar: str = f"https://q1.qlogo.cn/g?b=qq&nk={user_qq}&s=640"
 
         plt_user: PlatformUser = PlatformUser(

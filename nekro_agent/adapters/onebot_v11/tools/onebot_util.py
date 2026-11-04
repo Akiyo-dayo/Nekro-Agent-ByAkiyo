@@ -14,6 +14,7 @@ from nonebot.exception import ActionFailed, ApiNotAvailable, NetworkError
 from nekro_agent.adapters.onebot_v11.core import channel
 from nekro_agent.adapters.onebot_v11.core.bot import get_bot_by_chat_key
 from nekro_agent.adapters.onebot_v11.core.instance import resolve_instance_key
+from nekro_agent.adapters.onebot_v11.tools.display_name import clean_display_name
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.schemas.chat_message import ChatType
@@ -87,10 +88,13 @@ _MEMBER_INFO_ERRORS = (ActionFailed, ApiNotAvailable, NetworkError)
 
 
 def _fallback_user_name(event: object, user_id: Union[int, str]) -> str:
-    """群成员信息查不到时用的名字：事件发送者就是这个人时用他的群名片 / 昵称，否则用 QQ 号"""
+    """群成员信息查不到时用的名字：事件发送者就是这个人时用他的群名片 / 昵称，否则用 QQ 号
+
+    名片可能是协议端上报的彩色群名片（原始字节），先清理再走回退链。
+    """
     sender = getattr(event, "sender", None)
     if sender is not None and str(getattr(sender, "user_id", "")) == str(user_id):
-        name = getattr(sender, "card", None) or getattr(sender, "nickname", None)
+        name = clean_display_name(getattr(sender, "card", None)) or clean_display_name(getattr(sender, "nickname", None))
         if name:
             return name
     return str(user_id)
@@ -107,7 +111,8 @@ async def get_user_name(
         return (await db_chat_channel.get_preset()).name
 
     if isinstance(event, GroupMessageEvent) and event.sub_type == "anonymous" and event.anonymous:  # 匿名消息
-        return f"[匿名]{event.anonymous.name}"
+        # 匿名昵称同样由协议端给出，可能是彩色名片那串原始字节
+        return f"[匿名]{clean_display_name(event.anonymous.name)}"
 
     if isinstance(event, (GroupMessageEvent, GroupIncreaseNoticeEvent, NoticeEvent)):
         group_id = getattr(event, "group_id", None)
@@ -123,11 +128,17 @@ async def get_user_name(
                 return _fallback_user_name(event, user_id)
         else:
             raise ValueError("获取群成员信息失败")
-        user_name = user_info.get("nickname", None)
-        user_name = user_info.get("card", None) or user_name or _fallback_user_name(event, user_id)
+        # 先清理再回退：彩色群名片清理后可能是空串，要能落到昵称、再落到事件自带的名字
+        user_name = (
+            clean_display_name(user_info.get("card"))
+            or clean_display_name(user_info.get("nickname"))
+            or _fallback_user_name(event, user_id)
+        )
     else:
         user_name = (
-            event.sender.nickname if not isinstance(event, GroupUploadNoticeEvent) and event.sender else event.get_user_id()
+            clean_display_name(event.sender.nickname)
+            if not isinstance(event, GroupUploadNoticeEvent) and event.sender
+            else event.get_user_id()
         )
 
     if not user_name:
@@ -156,7 +167,8 @@ async def get_user_group_card_name(
     except _MEMBER_INFO_ERRORS as e:
         logger.warning(f"获取群名片失败，改用 QQ 号: {e!r}")
         return str(user_id)
-    return user_info.get("card") or user_info.get("nickname", "未知")
+    # 先清理再回退：彩色群名片清理后可能变成空串，要能落到昵称、「未知」
+    return clean_display_name(user_info.get("card")) or clean_display_name(user_info.get("nickname")) or "未知"
 
 
 def _resolve_channel_body(

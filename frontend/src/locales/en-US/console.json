@@ -274,5 +274,40 @@
     },
     "undetermined": "NA has not sent enough messages on this connection to tell yet. Send a few messages, then refresh.",
     "counts": "On this connection: NA sent {{ownSends}} message(s), received {{echoes}} echo(es)"
+  },
+  "accessToken": {
+    "title": "Access token",
+    "description": "This instance's own OneBot access token. After rotating it the old token stops working immediately and connections to this instance that used it are dropped; rotating an exposed token makes the instance a trusted source again.",
+    "action": "Rotate access token",
+    "resultTitle": "Access token rotated",
+    "tokenLabel": "New access token",
+    "copy": "Copy",
+    "copySuccess": "New token copied",
+    "copyFailed": "Copy failed; select and copy it manually",
+    "disconnected": "Dropped {{n}} old connection(s).",
+    "close": "Close",
+    "cancel": "Cancel",
+    "confirm": {
+      "title": "Rotate access token",
+      "intro": "The new token is generated on the server. Once you confirm, the old token stops working immediately and new handshakes no longer accept it; online connections to this instance that used it are dropped, and the endpoint must switch to the new token before it can reconnect.",
+      "napcat": "Built-in NapCat: the network config is pushed again and the container is restarted, so the bot goes offline briefly. If the instance is disabled or the container is stopped, only the config is written and the container is not started.",
+      "remote": "Remote endpoint: copy the new token into the endpoint's configuration afterwards; until then it cannot connect. If someone other than the platform runs this endpoint, handing them the new token still leaves the instance a trusted source for super-user chat commands, so think twice.",
+      "qbob": "Built-in qbob: the new token is written back to qbob's endpoint configuration.",
+      "submit": "Rotate"
+    },
+    "delivery": {
+      "restarted": "Configuration pushed and container restarted; the endpoint will reconnect with the new token.",
+      "config_written": "The container is not running (or does not exist yet). The new configuration is written and takes effect when it starts.",
+      "rewired": "The new token has been written back to qbob.",
+      "not_attached": "The new token is in effect. No bot is attached in qbob yet; it will be used once one is.",
+      "manual": "The new token is in effect. Copy it into the endpoint's configuration; until then the endpoint cannot connect.",
+      "failed": "The new token is in effect, but it could not be delivered to the endpoint."
+    },
+    "failedHint": {
+      "napcat": "Restart the container manually from the Protocol tab so the new configuration takes effect.",
+      "qbob": "Rewire qbob from the Protocol tab.",
+      "remote": "Change the token in the endpoint manually and reconnect.",
+      "other": "Restart the endpoint or rewire it manually."
+    }
   }
 }

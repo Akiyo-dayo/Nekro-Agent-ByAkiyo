@@ -13,6 +13,7 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.tools.telemetry_util import generate_instance_id
+from nekro_agent.tools.text_sanitize import strip_nul
 
 
 if TYPE_CHECKING:
@@ -156,10 +157,12 @@ class WxWorkUserResolver:
             self._schedule_background_task(self._backfill_chat_message_names(user_id=user_id, user_name=user_name))
 
     async def _backfill_chat_message_names(self, *, user_id: str, user_name: str) -> None:
+        # `filter().update()` 不走 ORM 的保存信号，名字里的 NUL 要在这里去掉（PostgreSQL 的 text 列不收 0x00）
+        safe_name = strip_nul(user_name)
         await DBChatMessage.filter(
             adapter_key=self._adapter.key,
             platform_userid=user_id,
-        ).update(sender_name=user_name, sender_nickname=user_name)
+        ).update(sender_name=safe_name, sender_nickname=safe_name)
 
     async def _fetch_user_name(self, user_id: str) -> str:
         try:

@@ -16,7 +16,7 @@ Console（总后台，全局唯一）
 """
 
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -422,6 +422,27 @@ class ActionOkResponse(BaseModel):
 
     ok: bool = Field(default=True)
     message: str = Field(default="")
+
+
+class InstanceAccessTokenRotateResponse(BaseModel):
+    """更换实例接入令牌的结果
+
+    新令牌只在这一次响应里给出：平台方本来就能从 `network-config` / `onebot-token` 读到它，
+    这里只是省一次往返。`delivery` 说明它有没有送到协议端，`failed` 时 `delivery_error` 带原因
+    （此时旧令牌已经失效、新令牌已经生效，只是协议端还没拿到）。
+    """
+
+    token: str = Field(..., description="服务端新生成的接入令牌，只在此响应里下发")
+    disconnected: int = Field(default=0, description="凭旧令牌握手、已被断开的在线连接条数")
+    delivery: Literal["restarted", "config_written", "rewired", "not_attached", "manual", "failed"] = Field(
+        ...,
+        description=(
+            "新令牌的送达结果：restarted=内置 NapCat 已重启；config_written=容器未建、配置已重新下发；"
+            "rewired=已写回 qbob；not_attached=qbob 里还没有接入 bot；manual=远程协议端需人工抄写；"
+            "failed=送达失败"
+        ),
+    )
+    delivery_error: str = Field(default="", description="送达失败的原因；空串表示没出错")
 
 
 # ==================== 实例配额 ====================

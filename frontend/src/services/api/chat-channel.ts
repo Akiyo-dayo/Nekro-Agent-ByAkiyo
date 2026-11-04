@@ -311,6 +311,17 @@ export const chatChannelApi = {
     return response.data
   },
 
+  /**
+   * 向平台实时取频道名并返回最新详情（`POST /chat-channel/detail/{chatKey}/refresh`）
+   *
+   * 与 `getDetail` 的区别只在服务端：这条会先找适配器问一次频道名。适配器不支持、
+   * 取不到或超时时服务端保留库里原有的名字，仍然返回一份完整详情。
+   */
+  refreshDetail: async (chatKey: string): Promise<ChatChannelDetail> => {
+    const response = await axios.post<ChatChannelDetail>(`/chat-channel/detail/${chatKey}/refresh`)
+    return response.data
+  },
+
   getDirectory: async (): Promise<ChannelDirectoryEntry[]> => {
     const response = await axios.get<{ items: ChannelDirectoryEntry[] }>('/chat-channel/directory')
     return response.data.items

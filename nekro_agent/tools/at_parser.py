@@ -7,6 +7,7 @@ from typing import List, Optional, Union
 
 from pydantic import BaseModel
 
+from nekro_agent.adapters.onebot_v11.core.channel import parse_channel_id, parse_channel_target_id
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import get_user_group_card_name
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.tools.at_markup import normalize_malformed_at_markup
@@ -69,9 +70,19 @@ async def parse_at_from_text(text: str, db_chat_channel: DBChatChannel) -> List[
             uid = seg.replace("id:", "").strip()
             if not adapter.config.SESSION_ENABLE_AT:
                 if "group" in db_chat_channel.chat_key:
-                    group_id = db_chat_channel.chat_key.replace("group_", "")
-                    nickname = await get_user_group_card_name(group_id=group_id, user_id=uid, db_chat_channel=db_chat_channel)
-                    result.append(f"{nickname}")
+                    # chat_key 可能是多实例形态（`onebot_v11-inst1-group_123456`），
+                    # 直接 `replace("group_", "")` 会连实例段一起留下，下游 `int()` 直接抛
+                    group_id = parse_channel_target_id(parse_channel_id(db_chat_channel.chat_key))
+                    if not group_id.isdigit():
+                        # 解析不出数字群号时与「查不到群名片」同一行为：退回 QQ 号，别把脏值塞进 int()
+                        result.append(uid)
+                    else:
+                        nickname = await get_user_group_card_name(
+                            group_id=group_id,
+                            user_id=uid,
+                            db_chat_channel=db_chat_channel,
+                        )
+                        result.append(f"{nickname}")
                 else:
                     result.append("")
             else:

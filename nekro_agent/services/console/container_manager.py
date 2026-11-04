@@ -507,6 +507,17 @@ def resolve_access_token(instance: DBAdapterInstance) -> str:
     return read_container_metadata(instance).access_token or resolve_deployment_onebot_access_token()
 
 
+async def write_access_token(instance: DBAdapterInstance, token: str) -> None:
+    """把实例自己的接入令牌写进元数据（换令牌用）
+
+    走 `_write_container_metadata` 的行锁合并写：只动 `access_token` 这一个键，
+    期间别处写入的 `webui_port` / `desired_state` 原样保留。
+    """
+    # 键名与 `instance_manager.METADATA_ACCESS_TOKEN` 同值。不 import 那个常量：
+    # `instance_manager` 会反向延迟导入本模块，这里再反向 import 一次只是把环绕得更长。
+    await _write_container_metadata(instance, {"access_token": token})
+
+
 async def resolve_instance(instance_key: str) -> DBAdapterInstance:
     """按实例标识定位实例记录"""
     validate_instance_key(instance_key)

@@ -136,7 +136,8 @@ class UniversalChatService:
             raise ValueError(f"适配器发送消息失败，错误: {plt_response.error_message}")
 
         # 记录聊天记录
-        if record:
+        # 适配器已自行写入历史（`recorded=True`，如网页适配器的 forward_message）时不再重复写一条
+        if record and not plt_response.recorded:
             from nekro_agent.services.message_service import message_service
 
             try:

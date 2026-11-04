@@ -41,6 +41,7 @@ from nekro_agent.services.plugin.scope import (
     resolve_scoped_config,
 )
 from nekro_agent.services.plugin.task import TaskRunner
+from nekro_agent.tools.text_sanitize import strip_nul
 
 from .schema import PromptInjectMethod, SandboxMethod, SandboxMethodType, WebhookMethod
 
@@ -1200,6 +1201,9 @@ class PluginStore:
         Returns:
             int: 设置状态: 0 表示创建成功，1 表示更新成功
         """
+        # 插件存的值可能来自协议端文本（昵称、消息原文）。PostgreSQL 的 text 列不收 0x00，而这张表
+        # 不在 ORM 保存信号的兜底范围里，`filter().update()` 也不走保存信号，所以两条写入分支都用清理过的值
+        safe_value = strip_nul(value)
         if await DBPluginData.filter(
             plugin_key=self._plugin.key,
             target_chat_key=chat_key,
@@ -1211,14 +1215,14 @@ class PluginStore:
                 target_chat_key=chat_key,
                 target_user_id=user_key,
                 data_key=store_key,
-            ).update(data_value=value)
+            ).update(data_value=safe_value)
             return 1
         await DBPluginData.create(
             plugin_key=self._plugin.key,
             target_chat_key=chat_key,
             target_user_id=user_key,
             data_key=store_key,
-            data_value=value,
+            data_value=safe_value,
         )
         return 0
 

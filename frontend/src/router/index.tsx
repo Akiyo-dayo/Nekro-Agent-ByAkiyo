@@ -62,6 +62,12 @@ const router = createHashRouter([
         element: lazyLoad(() => import('../pages/dashboard')),
       },
       {
+        // 网页聊天：整块能力只给平台方，租户身份由 MainLayout 的
+        // `PLATFORM_ONLY_PATHS`（`/web-chat`）兜底拦住。
+        path: 'web-chat',
+        element: lazyLoad(() => import('../pages/web-chat')),
+      },
+      {
         path: 'console',
         children: [
           {

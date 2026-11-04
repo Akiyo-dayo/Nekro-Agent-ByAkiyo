@@ -511,14 +511,27 @@ async def resolve_workspace_network_group(workspace: "DBWorkspace") -> str:
     Returns:
         `workspace_group_key` 给出的分组键
     """
+    try:
+        return await resolve_workspace_owner_group_strict(workspace)
+    except Exception as e:
+        logger.warning(f"读取工作区 {workspace.id} 的频道绑定或实例归属失败，按平台方分组处理: {e}")
+        return PLATFORM_GROUP
+
+
+async def resolve_workspace_owner_group_strict(workspace: "DBWorkspace") -> str:
+    """与 `resolve_workspace_network_group` 同一套判定，但查询失败直接抛出
+
+    「读不到就按平台方」对网络分组是安全的一侧（不会把工作区塞进某个租户的网络），
+    拿来做**授权**却正好反了：读不到就放行。凭归属决定能不能用平台方能力的地方
+    （网页聊天 MCP 的工作区令牌，`services/mcp/web_chat_mcp/na_app.py`）必须用这一版，读不到就拒。
+
+    Raises:
+        Exception: 频道绑定或实例归属读取失败
+    """
     from nekro_agent.models.db_adapter_instance import DBAdapterInstance
     from nekro_agent.models.db_chat_channel import DBChatChannel
 
-    try:
-        bound = await DBChatChannel.filter(workspace_id=workspace.id).values_list("adapter_key", "instance_key")
-    except Exception as e:
-        logger.warning(f"读取工作区 {workspace.id} 的频道绑定失败，按平台方分组处理: {e}")
-        return PLATFORM_GROUP
+    bound = await DBChatChannel.filter(workspace_id=workspace.id).values_list("adapter_key", "instance_key")
     if not bound:
         return PLATFORM_GROUP
 
@@ -526,11 +539,7 @@ async def resolve_workspace_network_group(workspace: "DBWorkspace") -> str:
     named = sorted({instance_key for _, instance_key in refs if instance_key})
     tenant_by_ref: Dict[Tuple[str, str], Optional[int]] = {}
     if named:
-        try:
-            rows = await DBAdapterInstance.filter(instance_key__in=named).values("adapter_key", "instance_key", "tenant_id")
-        except Exception as e:
-            logger.warning(f"读取工作区 {workspace.id} 所属实例的租户归属失败，按平台方分组处理: {e}")
-            return PLATFORM_GROUP
+        rows = await DBAdapterInstance.filter(instance_key__in=named).values("adapter_key", "instance_key", "tenant_id")
         # 按 (适配器, 实例) 成对对上：另一个适配器下可以有归别的租户的同名实例
         tenant_by_ref = {(str(row["adapter_key"]), str(row["instance_key"])): row["tenant_id"] for row in rows}
 

@@ -60,6 +60,7 @@ from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
 from nekro_agent.schemas.console import (
     ConsoleOverview,
     ContainerInfo,
+    ContainerState,
     InstanceCreateRequest,
     InstanceInfo,
     InstanceListResponse,
@@ -69,7 +70,8 @@ from nekro_agent.schemas.console import (
     InstanceStatus,
     InstanceUpdateRequest,
 )
-from nekro_agent.schemas.errors import ConflictError, NotFoundError, ValidationError
+from nekro_agent.schemas.errors import AppError, ConflictError, NotFoundError, ValidationError
+from nekro_agent.schemas.i18n import SupportedLang
 from nekro_agent.services.adapter_instance_service import adapter_instance_service
 from nekro_agent.services.chat_key_migration import InstanceMigrationOutcome, migrate_instance_ownership
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
@@ -600,6 +602,7 @@ async def set_instance_enabled(instance: DBAdapterInstance, enabled: bool) -> DB
             if instance.status == STATUS_TOMBSTONE
             else ""
         )
+        was_tombstone = instance.status == STATUS_TOMBSTONE
         # 没绑账号的实例启用后落 `unbound`：它启用与否都不可能有连接，落 offline 只会
         # 让掉线监测立刻开始为它计时并告警
         instance = await adapter_instance_service.set_status(
@@ -613,6 +616,12 @@ async def set_instance_enabled(instance: DBAdapterInstance, enabled: bool) -> DB
             # 必须在总后台看得见——这条说明是唯一的现场线索
             instance.last_error = released
             await instance.save(update_fields=["last_error", "update_time"])
+        if was_tombstone:
+            # 复活等于把账号重新绑回这一行（上面可能刚解掉一个陈旧绑定），而它**不一定**清缓存：
+            # `clear_instance_cache()` 只在改绑那一支被调。在线连接要按新绑定复核一次
+            from nekro_agent.adapters.onebot_v11.core.access_token import schedule_live_connection_revalidation
+
+            schedule_live_connection_revalidation()
         return instance
 
     await instance.save(update_fields=["enabled", "update_time"])
@@ -631,12 +640,19 @@ async def claim_instance(instance: DBAdapterInstance, display_name: str) -> DBAd
     instance.display_name = name
     instance.enabled = True
     # 认领只是把实例登记到总后台，此刻的真实连接状态未知，交由掉线监测刷新
-    return await adapter_instance_service.set_status(
+    claimed = await adapter_instance_service.set_status(
         instance,
         STATUS_CONNECTING,
         message=f"实例已被认领: {name}",
         extra_fields=["display_name", "enabled"],
     )
+    # 账号没换行，但从「未认领」变成了「已认领」：在线连接的复核只判已认领实例，这一刻起它也归复核管。
+    # 握手出示的令牌不是这个实例此刻应出示的那枚（它没有自己的令牌，就是部署级令牌）的连接会被断开——
+    # 认领者以为是自己的协议端，其实可能是凭别家待绑实例的令牌抢先连上来的那条
+    from nekro_agent.adapters.onebot_v11.core.access_token import schedule_live_connection_revalidation
+
+    schedule_live_connection_revalidation()
+    return claimed
 
 
 # ==================== 认领流程：未认领协议端的两条出路 ====================
@@ -695,9 +711,10 @@ def _warn_if_adoption_changes_the_expected_token(
 
     协议端接入令牌是按实例校验的（`adapters/onebot_v11/core/access_token.py`），期望值由
     账号所属的实例决定。而未认领实例按定义没有自己的令牌——它一直是靠部署级令牌（或压根
-    不带令牌）连进来的。把它并进一个**有自己令牌**的实例，账号一过户，同一条连接下一次
-    重连出示的就是一枚不再被接受的令牌，表现是"认领完成之后 Bot 就掉线了"，
-    而界面上这一步显示的是成功。
+    不带令牌）连进来的。把它并进一个**有自己令牌**的实例，账号一过户，同一条连接握手时
+    出示的令牌就不再是这个实例要求的那枚，**旧连接会被当场断开**（`clear_instance_cache`
+    触发的那次复核）：远程协议端必须把目标实例的令牌抄进自己的配置才能重连，
+    不抄就只会看到"认领完成之后 Bot 就掉线了"，而界面上这一步显示的是成功。
 
     内置 NapCat 目标不用人管（`resync_network_config` 会把令牌下发进那份配置）；
     远程协议端 NA 碰不到它的配置文件，只能由人收尾，两条出路见
@@ -721,7 +738,7 @@ def _warn_if_adoption_changes_the_expected_token(
     logger.warning(
         f"认领后该协议端要出示的令牌变了: 账号 {account} 从 {source.instance_key} 过户到 "
         f"{target.instance_key}，而 {target.instance_key} 有自己的接入令牌。"
-        "远程协议端必须把该实例的令牌抄进它自己的配置，否则下一次重连会被拒 "
+        "旧连接已断开：远程协议端要把该实例的令牌抄进它自己的配置才能重连"
         "（另一条出路是清空该实例的 access_token，退回部署级令牌）——见 docs/operations.md §1.4",
     )
 
@@ -797,12 +814,15 @@ async def adopt_unclaimed_instance(
             target.provider_account_id = account
             await target.save(update_fields=["provider_account_id", "update_time"])
         account_moved = True
-        # 入站路由缓存装的正是「账号 -> 实例」，不清空的话下一条消息还会投给源实例
+        # 入站路由缓存装的正是「账号 -> 实例」，不清空的话下一条消息还会投给源实例。
+        # 同时排一次在线连接复核：握手出示的令牌与目标实例要求的不同时，旧连接会被断开
         clear_instance_cache()
         _warn_if_adoption_changes_the_expected_token(source, target, account)
-        # 不断开这条连接：它握手时账号还属于源实例，超级用户的来源判定不认它，协议端重连一次即恢复
+        # 出示的令牌与目标实例要求的不同 → 旧连接已被上面的复核断开（要按新绑定重连）；
+        # 相同则不断开，但超级用户命令仍要重连一次才在该实例上生效（#98 的规则，不变）
         logger.warning(
-            f"账号 {account} 已并入 {target.instance_key}：这个协议端要重连一次，聊天里的超级用户命令才会在该实例上生效",
+            f"账号 {account} 已并入 {target.instance_key}：握手出示的令牌与目标实例要求的不同时旧连接会被断开、"
+            "要按新绑定重连；相同则连接保留，但超级用户命令仍要重连一次才在该实例上生效",
         )
 
     if target.enabled:
@@ -1297,6 +1317,191 @@ async def purge_instance_vectors(instance_key: str) -> None:
         logger.warning(f"实例向量清理失败: instance_key={instance_key}, error={e}")
     else:
         logger.info(f"实例向量清理完成: instance_key={instance_key}")
+
+
+# ==================== 接入令牌更换 ====================
+
+
+class AccessTokenRotation(NamedTuple):
+    """一次换令牌的结果
+
+    `delivery` 是新令牌送没送到协议端：`restarted`（内置 NapCat 已重启）/ `config_written`
+    （容器还没建，配置已重新下发）/ `rewired`（qbob 已重新接线）/ `not_attached`（qbob 里还没有
+    bot）/ `manual`（远程协议端，要人抄过去）/ `failed`（送达失败，`delivery_error` 说明原因）。
+    """
+
+    token: str
+    disconnected: int
+    delivery: str
+    delivery_error: str
+
+
+def _delivery_error_text(error: Exception) -> str:
+    """送达失败时给界面看的那句话：`AppError` 取它的对外文案，其余取 `str`
+
+    只取文案、不碰异常里的任何请求/响应内容，令牌因此不会被带进响应、事件与日志。
+    """
+    if isinstance(error, AppError):
+        return error.get_message(SupportedLang.ZH_CN)
+    return str(error)
+
+
+def _redact_tokens(text: str, *tokens: str) -> str:
+    """把文本里出现的令牌换成掩码
+
+    异常文本是**第三方**给的（Docker、qbob、httpx），谁也无法保证它某天不会把请求体
+    原样带出来。这里是最后一道闸：日志、事件与响应都只经过它处理过的文本。
+    """
+    for token in tokens:
+        if token:
+            text = text.replace(token, "***")
+    return text
+
+
+async def rotate_access_token(instance: DBAdapterInstance, *, operator: str) -> AccessTokenRotation:
+    """更换实例自己的接入令牌，并把它送到协议端
+
+    ## 为什么只由服务端生成
+
+    令牌是握手凭据，不是可调参数：允许调用方指定就等于允许把一枚已知的字符串装进实例，
+    而「换令牌」的全部意义是作废旧的。这里与 `create_instance` 用同一个生成器
+    （`secrets.token_urlsafe(24)`），长度与熵一致。
+
+    ## 为什么不回滚
+
+    第 4 步（送达）失败时**不**把旧令牌写回去：旧令牌此刻已经不被接受了，回滚只会把一枚
+    正要作废的令牌救回来。失败原因进响应，由界面提示手动重启容器 / 在协议端页重新接线。
+
+    ## 为什么拒绝未认领实例
+
+    未认领实例的协议端凭部署级令牌（或压根不带令牌）连着，凭空给它一枚令牌，它下一次握手
+    就被拒——那正是 `create_instance` 的注释里说的「自动登记那条路径刻意不写这个键」。
+    要换先认领，认领之后它才有「自己的令牌」这回事。
+
+    ## 可信来源（#98）怎么自动恢复
+
+    曝光集合按令牌指纹记。新令牌的指纹不在里面，其余条件照旧（平台方、已认领、非空令牌），
+    于是这个实例的超级用户来源判定自动恢复可信；旧令牌的指纹留在集合里，凭它握手的连接
+    也不再被认可（`connection_accepted_by` 比的就是「出示的」与「此刻期望的」）。
+    **租户实例不记曝光**：租户实例本来就一律不可信，收回时会记下它当时生效的令牌
+    （那时已经是新令牌），启动扫描也会扫到，这里再记一次只会让日志多一条无用的告警。
+
+    ## 顺序
+
+    0. 同一实例的更换按实例排队（进程内锁），锁里再按库里当前值取旧令牌；
+    1. 行锁下把新令牌合并写进元数据（`container_manager.write_access_token`）；
+    2. 按 `id` 回读一行，后面全用这一行：写元数据只刷新了调用方那份的 `metadata_json`，
+       而状态、provider 这些列可能是几十秒前的快照；
+    3. `revalidate_live_connections()` 断开凭旧令牌握手、账号绑在已认领实例上的连接（#108）；
+       账号还没绑定 / 绑在未认领实例上的连接不在这里断，它们的消息本来就由未认领闸门挡着；
+    4. 按形态送达（失败不回滚）；内置 NapCat 在实例停用 / 归档、或容器被停着时只重写配置，不替管理员把容器拉起来；
+    5. 记一条实例事件与一条 WARNING 日志，两者都**不写令牌**；租户实例的事件租户看得见，不写平台方操作人与原始报错。
+    """
+    if instance.adapter_key != "onebot_v11":
+        raise ValidationError(reason="只有 OneBot V11 实例有接入令牌")
+    if map_status(instance.status) is InstanceStatus.UNCLAIMED:
+        raise ValidationError(reason="未认领实例没有自己的接入令牌，请先认领")
+
+    # 同一实例的两次更换排队：交错时后一次先写完库，前一次再拿自己那枚去下发配置，
+    # 库里与协议端配置里就是两枚不同的令牌，前一次的响应也给出一枚已经作废的令牌
+    async with _rotation_locks.setdefault(instance.id, asyncio.Lock()):
+        return await _rotate_access_token_locked(instance, operator=operator)
+
+
+# 实例 id -> 换令牌的锁（进程内；NA 是单进程部署）
+_rotation_locks: Dict[int, asyncio.Lock] = {}
+
+# 这几种容器状态表示「被停着」：Docker 的 restart 会把已停止的容器启动起来，换令牌不该替管理员做这个决定
+_STOPPED_CONTAINER_STATES = frozenset({ContainerState.EXITED, ContainerState.CREATED, ContainerState.PAUSED})
+
+
+async def _napcat_should_stay_down(instance: DBAdapterInstance) -> bool:
+    """内置 NapCat 换完令牌是只写配置，还是重启容器：停用 / 归档的实例与被停掉的容器只写配置"""
+    if not instance.enabled or instance.status in (STATUS_DISABLED, STATUS_ARCHIVED):
+        return True
+    from nekro_agent.services.console import container_manager
+
+    # 读不到（Docker 不可达、容器不存在）时按 `absent` 回答，交给下面的重启去报真实原因
+    info = await container_manager.get_container_info(instance)
+    return info is not None and info.state in _STOPPED_CONTAINER_STATES
+
+
+async def _rotate_access_token_locked(instance: DBAdapterInstance, *, operator: str) -> AccessTokenRotation:
+    token = secrets.token_urlsafe(24)
+    # 延迟导入：`container_manager` 反过来会导入本模块（见 `get_container_info` 那处同款注释）
+    from nekro_agent.services.console import container_manager, qbob_manager
+
+    # 在锁里按库里当前值取：调用方手里那份可能是上一次更换之前读的
+    current = await DBAdapterInstance.filter(id=instance.id).first()
+    if current is None:
+        raise NotFoundError(resource=f"实例 '{instance.instance_key}'")
+    # 换之前实际生效的那一枚（没有自己的令牌时就是部署级令牌）只用来给异常文本脱敏，绝不写进日志 / 事件 / 响应
+    previous_token = container_manager.resolve_access_token(current)
+    await container_manager.write_access_token(current, token)
+    fresh = await DBAdapterInstance.filter(id=instance.id).first()
+    if fresh is None:
+        # 写令牌与回读之间被彻底删掉了：实例已经不在，按「不存在」报错，不假装换成功
+        raise NotFoundError(resource=f"实例 '{instance.instance_key}'")
+
+    from nekro_agent.adapters.onebot_v11.core.access_token import revalidate_live_connections
+
+    disconnected = await revalidate_live_connections()
+
+    delivery = "manual"
+    delivery_error = ""
+    if container_manager._is_builtin_napcat(fresh):  # 与容器侧同一个判据，别在这里另写一份 provider 比较
+        try:
+            if await _napcat_should_stay_down(fresh):
+                await container_manager.resync_network_config(fresh)
+                delivery = "config_written"
+            else:
+                try:
+                    await container_manager.restart_container(fresh)
+                except NotFoundError:
+                    # 容器还没建：配置先落到数据目录，下次建容器时用的就是新令牌
+                    await container_manager.resync_network_config(fresh)
+                    delivery = "config_written"
+                else:
+                    delivery = "restarted"
+        except Exception as e:  # noqa: BLE001 - 送达失败不回滚，见 docstring
+            delivery = "failed"
+            delivery_error = _redact_tokens(_delivery_error_text(e), token, previous_token)
+            logger.warning(
+                f"实例 {fresh.instance_key} 的新接入令牌没能送达协议端（{delivery}），需要人工重启容器: {delivery_error}",
+            )
+    elif map_provider(fresh.provider) is InstanceProvider.BUILTIN_QBOB:
+        try:
+            if qbob_manager.attached_appid(fresh):
+                await qbob_manager.rewire(fresh)
+                delivery = "rewired"
+            else:
+                delivery = "not_attached"
+        except Exception as e:  # noqa: BLE001 - 同上
+            delivery = "failed"
+            delivery_error = _redact_tokens(_delivery_error_text(e), token, previous_token)
+            logger.warning(
+                f"实例 {fresh.instance_key} 的新接入令牌没能写回 qbob，需要在协议端页重新接线: {delivery_error}",
+            )
+
+    if fresh.tenant_id is None:
+        message = f"{operator} 更换了接入令牌，断开 {disconnected} 条旧连接，送达结果: {delivery}"
+        if delivery_error:
+            message += f"（{delivery_error}）"
+    else:
+        # 租户在自己实例的健康事件里看得到这一条：不写平台方操作人，也不写 Docker / qbob 的原始报错（日志里有）
+        message = f"平台方更换了接入令牌，断开 {disconnected} 条旧连接，送达结果: {delivery}"
+    await adapter_instance_service.record_event(
+        instance=fresh,
+        event_type="access_token_rotated",
+        status_from=fresh.status,
+        status_to=fresh.status,
+        message=message,
+    )
+    logger.warning(
+        f"实例 {fresh.instance_key} 的接入令牌已更换: 操作人={operator}, 断开旧连接={disconnected}, 送达={delivery}"
+        + (f", 原因={delivery_error}" if delivery_error else ""),
+    )
+    return AccessTokenRotation(token=token, disconnected=disconnected, delivery=delivery, delivery_error=delivery_error)
 
 
 async def probe_docker_available() -> bool:

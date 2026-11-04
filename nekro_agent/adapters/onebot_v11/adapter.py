@@ -33,6 +33,7 @@ from .core.instance import get_current_instance, lookup_cached_account_id, resol
 from .tools.at_parser import SegAt, parse_at_from_text
 from .tools.cq_markup import neutralize_onebot_cq_at_all_markup
 from .tools.convertor import get_channel_type
+from .tools.display_name import clean_display_name
 
 
 class OnebotV11Config(BaseAdapterConfig):
@@ -656,10 +657,13 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         channel_name = channel_id
         try:
             bot: Bot = get_bot()
+            # 频道名同样来自协议端：彩色群名片那串原始字节也会出现在群名 / 陌生人昵称里
             if chat_type == ChatType.GROUP:
-                channel_name = (await bot.get_group_info(group_id=int(channel_id.replace("group_", ""))))["group_name"]
+                group_info = await bot.get_group_info(group_id=int(channel_id.replace("group_", "")))
+                channel_name = clean_display_name(group_info.get("group_name")) or channel_name
             elif chat_type == ChatType.PRIVATE:
-                channel_name = (await bot.get_stranger_info(user_id=int(channel_id.replace("private_", ""))))["nickname"]
+                stranger_info = await bot.get_stranger_info(user_id=int(channel_id.replace("private_", "")))
+                channel_name = clean_display_name(stranger_info.get("nickname")) or channel_name
         except Exception as e:
             logger.error(f"获取频道名称失败: {channel_id} | {e!s}")
 

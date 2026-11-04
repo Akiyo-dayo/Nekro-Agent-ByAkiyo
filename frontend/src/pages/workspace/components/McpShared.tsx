@@ -39,6 +39,7 @@ import {
   PlayArrow as PlayArrowIcon,
   CheckCircle as CheckCircleIcon,
   ErrorOutline as ErrorOutlineIcon,
+  AutoAwesome as TemplateIcon,
 } from '@mui/icons-material'
 import { useQuery } from '@tanstack/react-query'
 import { useTheme } from '@mui/material/styles'
@@ -104,11 +105,12 @@ export function KeyValueEditor({
 // ── ServerFormDialog ──
 
 export function ServerFormDialog({
-  open, onClose, onSubmit, onValidate, initial, title, submitLabel, t,
+  open, onClose, onSubmit, onValidate, initial, title, submitLabel, t, lockName = false,
 }: {
   open: boolean; onClose: () => void; onSubmit: (server: McpServerConfig) => void
   onValidate?: (server: McpServerConfig) => Promise<McpValidationResult>
   initial: McpServerConfig; title: string; submitLabel: string; t: (key: string) => string
+  lockName?: boolean
 }) {
   const [form, setForm] = useState<McpServerConfig>(initial)
   const [validating, setValidating] = useState(false)
@@ -215,7 +217,7 @@ export function ServerFormDialog({
       <DialogTitle>{title}</DialogTitle>
       <DialogContent sx={{ pt: '12px !important' }}>
         <Stack spacing={2}>
-          <TextField label={t('detail.mcp.form.name')} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} size="small" fullWidth required />
+          <TextField label={t('detail.mcp.form.name')} value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} size="small" fullWidth required disabled={lockName} />
           <Box sx={{ display: 'flex', gap: 1 }}>
             {(['stdio', 'sse', 'http'] as McpServerType[]).map(tp => (
               <Chip key={tp} label={tp.toUpperCase()} color={form.type === tp ? typeColor(tp) as 'info' | 'warning' | 'success' : 'default'} variant={form.type === tp ? 'filled' : 'outlined'} onClick={() => setForm(f => ({ ...f, type: tp }))} icon={typeIcon(tp)} size="small" />
@@ -411,6 +413,8 @@ export function McpServerManager({
   // ── View & Dialog state ──
   const [viewMode, setViewMode] = useState<'cards' | 'list' | 'json'>('cards')
   const [addOpen, setAddOpen] = useState(false)
+  const [registryOpen, setRegistryOpen] = useState(false)
+  const [addInitial, setAddInitial] = useState<McpServerConfig>(() => emptyServer())
   const [editTarget, setEditTarget] = useState<McpServerConfig | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
   const [mutating, setMutating] = useState(false)
@@ -430,7 +434,7 @@ export function McpServerManager({
     for (const s of servers) {
       const include = isGlobal ? !!s.auto_inject : !!s.enabled
       if (!include) continue
-      const entry: Record<string, unknown> = { transport: s.type }
+      const entry: Record<string, unknown> = { type: s.type }
       if (s.type === 'stdio') {
         if (s.command) entry.command = s.command
         if (s.args && s.args.length > 0) entry.args = s.args
@@ -452,6 +456,28 @@ export function McpServerManager({
 
   const handleAdd = (server: McpServerConfig) =>
     withMutating(async () => { await onAdd(server); setAddOpen(false) })
+
+  const openManualAdd = () => {
+    setAddInitial(emptyServer())
+    setAddOpen(true)
+  }
+
+  const handleSelectRegistryItem = (item: McpRegistryItem) => {
+    const env = Object.fromEntries((item.env_keys ?? []).map(envKey => [envKey.key, '']))
+    setAddInitial({
+      name: item.name,
+      type: item.type,
+      auto_inject: false,
+      enabled: false,
+      command: item.command ?? '',
+      args: item.args ?? [],
+      env,
+      url: item.url ?? '',
+      headers: item.headers ?? {},
+    })
+    setRegistryOpen(false)
+    setAddOpen(true)
+  }
 
   const handleEdit = (server: McpServerConfig) => {
     if (!editTarget) return
@@ -630,7 +656,11 @@ export function McpServerManager({
                   {t('detail.mcp.addServer')}
                 </ActionButton>
                 <Menu anchorEl={addMenuAnchor} open={!!addMenuAnchor} onClose={() => setAddMenuAnchor(null)}>
-                  <MenuItem onClick={() => { setAddMenuAnchor(null); setAddOpen(true) }}>
+                  <MenuItem onClick={() => { setAddMenuAnchor(null); setRegistryOpen(true) }}>
+                    <ListItemIcon><TemplateIcon fontSize="small" /></ListItemIcon>
+                    {t('detail.mcp.fromTemplate')}
+                  </MenuItem>
+                  <MenuItem onClick={() => { setAddMenuAnchor(null); openManualAdd() }}>
                     <ListItemIcon><AddIcon fontSize="small" /></ListItemIcon>
                     {t('detail.mcp.addManual')}
                   </MenuItem>
@@ -678,7 +708,10 @@ export function McpServerManager({
             <Box sx={{ textAlign: 'center', py: 4, px: 2 }}>
               <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>{emptyText}</Typography>
               {emptyHint && <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>{emptyHint}</Typography>}
-              <ActionButton variant="outlined" startIcon={<AddIcon />} onClick={() => setAddOpen(true)}>{t('detail.mcp.addManual')}</ActionButton>
+              <Box sx={{ display: 'flex', justifyContent: 'center', gap: 1, flexWrap: 'wrap' }}>
+                <ActionButton variant="contained" startIcon={<TemplateIcon />} onClick={() => setRegistryOpen(true)}>{t('detail.mcp.fromTemplate')}</ActionButton>
+                <ActionButton variant="outlined" startIcon={<AddIcon />} onClick={openManualAdd}>{t('detail.mcp.addManual')}</ActionButton>
+              </Box>
             </Box>
           </Card>
         ) : isGlobal ? (
@@ -803,11 +836,14 @@ export function McpServerManager({
         </Card>
       )}
 
+      {/* Registry dialog */}
+      <RegistryDialog open={registryOpen} onClose={() => setRegistryOpen(false)} onSelect={handleSelectRegistryItem} t={t} />
+
       {/* Add dialog */}
-      <ServerFormDialog open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleAdd} onValidate={onValidate} initial={emptyServer()} title={t('detail.mcp.addTitle')} submitLabel={mutating ? t('detail.mcp.adding') : t('detail.mcp.add')} t={t} />
+      <ServerFormDialog open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleAdd} onValidate={onValidate} initial={addInitial} title={t('detail.mcp.addTitle')} submitLabel={mutating ? t('detail.mcp.adding') : t('detail.mcp.add')} t={t} />
 
       {/* Edit dialog */}
-      <ServerFormDialog open={!!editTarget} onClose={() => setEditTarget(null)} onSubmit={handleEdit} onValidate={onValidate} initial={editTarget ?? emptyServer()} title={t('detail.mcp.editTitle')} submitLabel={mutating ? t('detail.mcp.saving') : t('detail.mcp.save')} t={t} />
+      <ServerFormDialog open={!!editTarget} onClose={() => setEditTarget(null)} onSubmit={handleEdit} onValidate={onValidate} initial={editTarget ?? emptyServer()} title={t('detail.mcp.editTitle')} submitLabel={mutating ? t('detail.mcp.saving') : t('detail.mcp.save')} t={t} lockName={isGlobal} />
 
       {/* Delete dialog */}
       <Dialog open={!!deleteTarget} onClose={() => setDeleteTarget(null)} maxWidth="xs">

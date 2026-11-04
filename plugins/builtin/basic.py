@@ -98,6 +98,7 @@ plugin = NekroPlugin(
         "onebot_v11",
         "minecraft",
         "sse",
+        "web",
         "discord",
         "wechatpad",
         "telegram",
@@ -738,6 +739,9 @@ async def collect_available_methods(_ctx: AgentCtx) -> List[Callable]:
     elif _ctx.adapter_key == "onebot_v11":
         # 仅 OneBot 提供头像工具
         methods = [send_msg_text, send_msg_file, send_msg_mixed, get_user_avatar]
+    elif _ctx.adapter_key == "web":
+        # 网页会话只支持文本与单文件发送，没有图文混排
+        methods = [send_msg_text, send_msg_file]
     else:
         # 其他（包含 sse、wxwork、telegram、discord、wechatpad、qqbot_openclaw 等）
         methods = [send_msg_text, send_msg_file, send_msg_mixed]

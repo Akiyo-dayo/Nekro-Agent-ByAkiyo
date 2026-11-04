@@ -23,6 +23,7 @@ from nekro_agent.services.kb.reference_detector import detect_and_sync_document_
 from nekro_agent.services.memory.embedding_service import embed_kb_batch, get_kb_embedding_dimension
 from nekro_agent.services.system_broadcast import KbIndexProgressEvent, publish_kb_index_progress
 from nekro_agent.services.workspace.manager import WorkspaceService
+from nekro_agent.tools.text_sanitize import strip_nul
 
 logger = get_sub_logger("kb.index")
 
@@ -246,7 +247,8 @@ async def _swap_document_index(
                             workspace_id=document.workspace_id,
                             document_id=document.id,
                             chunk_index=index,
-                            heading_path=draft.heading_path,
+                            # bulk_create 不走 ORM 的保存信号；标题来自用户文档，可能带 NUL
+                            heading_path=strip_nul(draft.heading_path),
                             char_start=draft.char_start,
                             char_end=draft.char_end,
                             token_count=_estimate_tokens(draft.content),

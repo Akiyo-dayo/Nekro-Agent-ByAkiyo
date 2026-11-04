@@ -449,6 +449,7 @@ export interface KBAssetBindingsResponse {
 export type McpServerType = 'stdio' | 'sse' | 'http'
 
 export interface McpServerConfig {
+  id?: string
   name: string
   type: McpServerType
   /** 全局库视图：是否在新建工作区时自动启用 */
@@ -490,6 +491,7 @@ export interface McpRegistryItem {
   args?: string[]
   env_keys?: McpEnvKeyDef[]
   url?: string
+  headers?: Record<string, string>
   tags?: string[]
 }
 
@@ -505,6 +507,8 @@ export type McpValidationErrorKind =
   | 'transport_error'
   | 'container_not_running'
   | 'invalid_response'
+  /** 出站地址被拒：租户身份只允许连公网地址（回环 / 内网 / 元数据地址一律拒绝） */
+  | 'url_not_allowed'
 
 export interface McpValidationResult {
   ok: boolean

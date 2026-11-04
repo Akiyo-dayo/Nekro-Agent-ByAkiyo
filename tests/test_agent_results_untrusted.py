@@ -950,6 +950,10 @@ REVIEWED_RETURN_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
 
 # `UntrustedToolResult(summary=...)`：摘要渲染在不可信块之外，按可信文字对待
 REVIEWED_SUMMARY_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("cc_workspace/main.py", "_deliver_pending_result"): {
+        "headline": "宿主固定文案三选一（按错误 / 重启恢复 / 后台结果取值）",
+        "guidance": "宿主固定文案二选一",
+    },
     ("cc_workspace/main.py", "get_cc_context"): {
         "workspace.id": "库里的工作区 ID",
         "task_status_line": "宿主把任务信号映射成的固定文案",
@@ -965,6 +969,7 @@ REVIEWED_SUMMARY_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
 }
 REVIEWED_SUMMARY_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
     ("basic.py", "view_str_content"): {"meta_header": "宿主算出的行数、截断说明"},
+    ("cc_workspace/main.py", "_push_result"): {"guidance": "宿主固定文案三选一（按任务信号取值），CC 的结果与任务描述在正文里"},
     ("history_travel.py", "find_history_travel"): {"additional_info": "宿主固定文案与条数"},
     ("history_travel.py", "find_history_travel_range"): {"summary": "宿主固定文案与条数"},
     ("skill_loader/main.py", "load_skill"): {
@@ -979,16 +984,10 @@ REVIEWED_PUSH_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
     ("emotion.py", "collect_emotion"): {"emotion_id": "宿主按文件路径与描述算出的十六进制 ID"},
 }
 REVIEWED_PUSH_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
-    ("cc_workspace/main.py", "_deliver_pending_result"): {
-        "notify_msg": "已知未修：CC 的执行结果原样进了 SYSTEM。改走不可信包裹之前，不要对不可信的租户开放 CC 工作区",
-    },
     ("cc_workspace/main.py", "_push_result"): {
-        "notify_msg": "已知未修：CC 任务的结果信息原样进了 SYSTEM。改走不可信包裹之前，不要对不可信的租户开放 CC 工作区",
+        "guidance": "宿主固定文案；只在“中止且没存下任务描述”、没有任何外部内容时走 SYSTEM，其余走不可信包裹",
     },
     ("festival_greeting/handlers.py", "_festival_callback"): {"event_desc": "平台方配置的节日事件描述"},
-    ("github/handlers.py", "send_to_subscribers"): {
-        "message": "已知未修：issue / PR 的标题与正文原样进了 SYSTEM。改走不可信包裹之前，只订阅自己控制的仓库",
-    },
 }
 
 UNTRUSTED_RESULT_WRAPPERS = {

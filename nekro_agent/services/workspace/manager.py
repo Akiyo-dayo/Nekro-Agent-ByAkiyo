@@ -54,20 +54,38 @@ def _raw_to_disk_entry(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """把全局库的一条 raw 转成 .mcp.json 写盘格式（去 NA-internal 字段）
 
     仅 validation.status == 'validated' 的条目能进入 .mcp.json。
+
+    字段名跟着 Claude Code 的 schema 走：transport 类型叫 `type`，不叫 `transport`；`id` 是
+    NA 内部标识，写进 `.mcp.json` 只会让 CC 报未知字段。
     """
     validation = raw.get("validation") or {}
     if (validation.get("status") if isinstance(validation, dict) else None) != "validated":
         return None
     # 跳过 NA 内部字段
-    skip = {"name", "auto_inject", "enabled", "validation"}
+    skip = {"id", "name", "auto_inject", "enabled", "validation"}
     entry: Dict[str, Any] = {}
-    if raw.get("type"):
-        entry["transport"] = raw["type"]
     for k, v in raw.items():
-        if k in skip or k == "type":
+        if k in skip:
             continue
         entry[k] = v
     return entry
+
+
+def _resolve_library_entry(name: str, library: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """按名字在全局库里找条目，认不出名字时按「是不是内置网页聊天条目」兜底
+
+    兜底是为了改名：用户在库里把内置条目改成别的名字后，工作区 `mcp_servers_enabled` 里
+    记的仍是旧名；此时只要那个旧名指向的确实是这条内置条目，就退回库里唯一的那一条。
+    """
+    raw = library.get(name)
+    if raw is not None:
+        return raw
+
+    from nekro_agent.services.mcp.web_chat_auth import is_web_chat_mcp_entry
+
+    if not is_web_chat_mcp_entry({"name": name}):
+        return None
+    return next((entry for entry in library.values() if is_web_chat_mcp_entry(entry)), None)
 
 
 def _build_disk_mcp_config(
@@ -78,9 +96,15 @@ def _build_disk_mcp_config(
 
     向后兼容：当 mcp_servers_enabled 不存在时，回退读取老的 metadata.mcp_config.mcpServers
     （把其 key 视作 enabled name 列表，从全局库查配置）。
+
+    网页聊天条目**一律不写**，不论工作区此刻归谁：工作区归属会随频道绑定 / 解绑来回变，
+    写进 `.mcp.json` 的平台方令牌会留在租户读得到的地方，见 `web_chat_mcp/na_app.py` 模块说明。
+    按名字、`id` 或 URL 认出来的条目都跳过，平台方手工配的也一样。
     """
     if library is None:
         library = _global_library_by_name()
+
+    from nekro_agent.services.mcp.web_chat_auth import is_web_chat_mcp_entry
 
     enabled_names: List[str] = list(workspace_metadata.get("mcp_servers_enabled", []) or [])
     if not enabled_names:
@@ -90,8 +114,11 @@ def _build_disk_mcp_config(
 
     dst_servers: Dict[str, Any] = {}
     for name in enabled_names:
-        raw = library.get(name)
+        raw = _resolve_library_entry(name, library)
         if raw is None:
+            continue
+        if is_web_chat_mcp_entry(raw):
+            logger.debug(f"跳过网页聊天 MCP 条目 {name}：这一版不写进工作区 .mcp.json")
             continue
         entry = _raw_to_disk_entry(raw)
         if entry is None:
@@ -972,6 +999,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
                 auto_inject = bool(raw.get("auto_inject", raw.get("enabled", False)))
                 result.append(
                     McpServerConfig(
+                        id=raw.get("id"),
                         name=name,
                         type=server_type,
                         auto_inject=auto_inject,
@@ -1127,6 +1155,15 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         from nekro_agent.core.auto_inject_mcp import update_auto_inject_validation
 
         update_auto_inject_validation(server_name, validation_state)
+        await WorkspaceService.refresh_global_mcp_server_references(server_name)
+
+    @staticmethod
+    async def refresh_global_mcp_server_references(server_name: str) -> None:
+        """重写所有引用了指定全局 MCP server 的工作区 `.mcp.json`
+
+        「引用」按 `metadata.mcp_servers_enabled` 里的名字匹配。单个工作区失败只记警告：
+        一个坏工作区不该让整批刷新（例如启动时的令牌轮换）半途而废。
+        """
         affected = await DBWorkspace.filter(metadata__contains={"mcp_servers_enabled": [server_name]}).all()
         for ws in affected:
             try:

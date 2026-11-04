@@ -49,6 +49,7 @@ import InstanceStatusChip from './components/InstanceStatusChip'
 import UnclaimedProtocolPanel from './components/UnclaimedProtocolPanel'
 
 // 协议端面板由 NapCat 面板路实现，按需加载避免阻塞详情页首屏
+const AccessTokenCard = lazy(() => import('./components/AccessTokenCard'))
 const NapCatPanel = lazy(() => import('./components/NapCatPanel'))
 const QbobPanel = lazy(() => import('./components/QbobPanel'))
 const OnebotEndpointCard = lazy(() => import('./components/OnebotEndpointCard'))
@@ -192,6 +193,14 @@ function OverviewTab({ instance }: { instance: InstanceInfo }) {
   // 通用改绑 / 解绑会让 bot 重连时落到未认领实例，必须走协议端页的解绑
   const canBindAccount =
     isPlatformOwner && instance.provider !== 'native' && instance.provider !== 'builtin_qbob'
+
+  // 换接入令牌只对平台方开放（后端 `Role.Super`），且只对「有自己的令牌」的 OneBot 实例有意义：
+  // 未认领实例的协议端凭部署级令牌连着，凭空给它一枚会让它下一次握手就被拒（后端同样拒绝）
+  const canRotateAccessToken =
+    isPlatformOwner &&
+    instance.adapter_key === 'onebot_v11' &&
+    ['builtin_napcat', 'remote_onebot', 'builtin_qbob'].includes(instance.provider) &&
+    instance.status !== 'unclaimed'
 
   return (
     <Box
@@ -380,6 +389,13 @@ function OverviewTab({ instance }: { instance: InstanceInfo }) {
               </ActionButton>
             </CardContent>
           </Card>
+        )}
+
+        {/* 换接入令牌：平台方专属，且只对 OneBot 形态、已认领的实例有意义 */}
+        {canRotateAccessToken && (
+          <Suspense fallback={null}>
+            <AccessTokenCard instance={instance} />
+          </Suspense>
         )}
       </Box>
 

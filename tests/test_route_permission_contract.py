@@ -318,6 +318,9 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     # 也就是说把它从 Super 降到 Admin 这条测试不会红，而租户管理员正好就是 Admin。
     ("console.instances", "POST", "/instances/{instance_key}/adopt"),
     ("console.instances", "POST", "/instances/{instance_key}/disable"),
+    # 换接入令牌：响应里带**新令牌**（平台方本来就能从 network-config / onebot-token 读到），
+    # 且会断开凭旧令牌握手的在线连接、按形态重启容器 / 重新接线，与 `network-config` 同档
+    ("console.instances", "POST", "/instances/{instance_key}/access-token/rotate"),
     ("console.instances", "POST", "/instances/{instance_key}/enable"),
     # 待认领协议端清单：未认领实例恒归平台方（自动登记时不写 tenant_id），且这份清单
     # 的用途就是"接下来去认领谁"——认领会移动数据归属并改写账号绑定，与认领动作同一档
@@ -1696,6 +1699,18 @@ ADAPTER_PLATFORM_ONLY: Set[Tuple[str, str]] = {
     ("qqbot_openclaw", "session_clear"),
     ("qqbot_openclaw", "token_test"),
     ("wechat_openilink", "get_status"),
+    # 网页聊天整块能力不对租户开放：租户身份一律 403（§3.1）。这里登记的是"能力边界"，
+    # 不是资源归属，所以不用 404 掩盖
+    ("web", "get_web_mcp_auth_status"),
+    ("web", "update_web_mcp_external_auth"),
+    ("web", "generate_web_mcp_external_auth"),
+    ("web", "delete_web_mcp_external_auth"),
+    ("web", "list_web_sessions"),
+    ("web", "create_web_session"),
+    ("web", "update_web_session"),
+    ("web", "delete_web_session"),
+    ("web", "create_web_message"),
+    ("web", "create_web_upload_message"),
 }
 # 租户能碰的实例面：看自己的实例、看事件、给自己的 Bot 扫码登录
 ADAPTER_TENANT_SCOPED: Set[Tuple[str, str]] = {

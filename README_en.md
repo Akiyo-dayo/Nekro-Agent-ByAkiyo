@@ -5,7 +5,7 @@
 > **This is an unofficial derivative edition.** It is modified from [KroMiose/nekro-agent](https://github.com/KroMiose/nekro-agent) (NekroAgent) and has no affiliation with, or endorsement from, the NekroAgent maintainers.
 > **Built on the NekroAgent project** — upstream project: <https://github.com/KroMiose/nekro-agent>.
 >
-> - Version: **0.4.2** (this edition's own version number; the upstream version it is based on is `2.3.3`; plugin-compatible with upstream `2.4.0`, so plugins written for 2.4.0 install and run here)
+> - Version: **0.4.3** (this edition's own version number; the upstream version it is based on is `2.4.0`, so plugins written for 2.4.0 install and run here. A few upstream features were adapted to this edition's multi-tenant rules or are not enabled yet, for example web chat MCP gives no key to workspaces; see [`CHANGELOG.md`](./CHANGELOG.md))
 > - License: the upstream [Nekro Agent Open Source License V1.1](./LICENSE) (modified from Apache License 2.0); see "License" below and [`NOTICE`](./NOTICE)
 > - Changes: [`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -61,7 +61,7 @@ Images are published to the GitHub Container Registry (GHCR), built and pushed b
 
 Tags:
 
-- **version number** (e.g. `0.4.2`) and `latest`: built when a `v*.*.*` tag is pushed, suitable for production;
+- **version number** (e.g. `0.4.3`) and `latest`: built when a `v*.*.*` tag is pushed, suitable for production;
 - `preview` / `preview-<short commit SHA>`: built on every `main` update, includes the latest changes, suitable for testing.
 
 ```bash
@@ -112,7 +112,7 @@ This project keeps the upstream **Nekro Agent Open Source License V1.1** (modifi
 - **large-scale commercial use** (all instances operated by you and your affiliates exceed 1000 channels in total, or 50000 registered users in total) requires prior written authorization from the upstream maintainers, and must not be split across instances or entities to avoid the limit; contact details are in `LICENSE`;
 - when providing support or deployment services, tell the customer that the supported project is NekroAgent with its official source address, and never imply that the project is your own development or that you are associated with the maintainers;
 - the project generates and executes code with large language models; assess the risks yourself and inform end users (`LICENSE`, part 1, section 3);
-- **changes to the original files** are described in the "Statement of changes" of [`NOTICE`](./NOTICE) and in [`CHANGELOG.md`](./CHANGELOG.md). This repository has no per-commit history (it is exported as a whole from the maintainers' development repository), so to identify exactly which files were modified, compare this tree with the upstream `2.3.3` release.
+- **changes to the original files** are described in the "Statement of changes" of [`NOTICE`](./NOTICE) and in [`CHANGELOG.md`](./CHANGELOG.md). This repository has no per-commit history (it is exported as a whole from the maintainers' development repository), so to identify exactly which files were modified, compare this tree with the upstream `2.4.0` release; the adapted upstream features mentioned above also show up as modifications in that comparison.
 
 This is not legal advice and does not replace `LICENSE`.
 

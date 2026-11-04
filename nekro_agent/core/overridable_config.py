@@ -6,7 +6,7 @@ import yaml
 from pydantic import Field, create_model, model_validator
 
 from nekro_agent.core.config import CoreConfig
-from nekro_agent.core.core_utils import ConfigBase
+from nekro_agent.core.core_utils import ConfigBase, atomic_write_text
 
 
 class OverridableConfigBase(ConfigBase):
@@ -63,7 +63,8 @@ class OverridableConfigBase(ConfigBase):
                 active[name] = dumped[name]
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(
+        atomic_write_text(
+            target_path,
             yaml.dump(data=active, default_flow_style=False, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )

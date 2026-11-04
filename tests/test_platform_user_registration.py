@@ -205,6 +205,7 @@ class TestRegisterPlatformUserReportsCreation:
         real_get = DBUser.get_by_union_id
         real_create = DBUser.create
         both_checked = asyncio.Event()
+        winner_inserted = asyncio.Event()
         checked = {"n": 0}
         inserted = {"n": 0}
 
@@ -220,8 +221,16 @@ class TestRegisterPlatformUserReportsCreation:
         async def create_once(*args, **kwargs):
             inserted["n"] += 1
             if inserted["n"] > 1:
+                # 真库上唯一索引冲突只会发生在赢家那一行已经落库之后（输家的 INSERT 要等到赢家提交才报错），
+                # 所以输家在这里必须等赢家的 `create` 真的返回；否则「`create` 前后多一次 await」（例如
+                # `pre_save` 监听器）就会让输家的回读抢在赢家落库之前，读到「不存在」而把 IntegrityError 抛出去，
+                # 那是桩造出来的、真库上不可能出现的顺序
+                await winner_inserted.wait()
                 raise IntegrityError("duplicate key value violates unique constraint")
-            return await real_create(*args, **kwargs)
+            try:
+                return await real_create(*args, **kwargs)
+            finally:
+                winner_inserted.set()
 
         monkeypatch.setattr(DBUser, "get_by_union_id", get_after_both_checked)
         monkeypatch.setattr(DBUser, "create", create_once)

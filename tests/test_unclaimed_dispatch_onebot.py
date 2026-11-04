@@ -70,7 +70,11 @@ def connection(token: Optional[str]) -> Iterator[None]:
         None
         if token is None
         else HandshakeRecord(
-            self_id=BOT_ID, source=TokenSource.DEPLOYMENT, instance_key="", token_fingerprint=token_fingerprint(token),
+            self_id=BOT_ID,
+            source=TokenSource.DEPLOYMENT,
+            instance_key="",
+            token_fingerprint=token_fingerprint(token),
+            presented_fingerprint=token_fingerprint(token),
         )
     )
     reset = gate._current_handshake.set(record)  # noqa: SLF001

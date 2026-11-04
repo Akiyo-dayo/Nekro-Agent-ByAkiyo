@@ -1640,6 +1640,25 @@ class McpServersResponse(BaseModel):
     servers: List[McpServerConfig]
 
 
+def _hide_web_chat_mcp(servers: List[McpServerConfig], user: DBUser) -> List[McpServerConfig]:
+    """平台方之外看不到网页聊天条目（设计 §3.2）
+
+    网页聊天是平台方专属能力（整块 403）。它在工作区 MCP 列表里露出来，租户就会看到一条
+    自己永远用不了、也永远测不通的条目；更要紧的是「加入」接口若放行，工作区 `.mcp.json` 里
+    会多出一条指向平台方能力的记录。这里在读取侧直接摘掉，加入侧再补一道按「全局库不存在」拒。
+    """
+    from nekro_agent.services.mcp.web_chat_auth import is_web_chat_mcp_entry
+    from nekro_agent.services.user.tenant_perm import is_platform_owner
+
+    if is_platform_owner(user):
+        return servers
+    return [
+        server
+        for server in servers
+        if not is_web_chat_mcp_entry({"id": server.id, "name": server.name, "url": server.url or ""})
+    ]
+
+
 @router.get("/{workspace_id}/mcp/servers", summary="获取工作区已加入的 MCP 服务器列表", response_model=McpServersResponse)
 @require_role(Role.Admin)
 async def list_mcp_servers(
@@ -1648,7 +1667,7 @@ async def list_mcp_servers(
 ) -> McpServersResponse:
     """返回当前工作区已加入的 MCP 条目（不含全局库其他条目）"""
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    servers = await WorkspaceService.list_mcp_servers(ws)
+    servers = _hide_web_chat_mcp(await WorkspaceService.list_mcp_servers(ws), _current_user)
     return McpServersResponse(servers=servers)
 
 
@@ -1664,7 +1683,7 @@ async def list_available_mcp_servers(
 ) -> McpServersResponse:
     """供"添加 MCP 服务"对话框列出候选；已加入的不会出现在此列表里"""
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    servers = await WorkspaceService.list_available_mcp_servers(ws)
+    servers = _hide_web_chat_mcp(await WorkspaceService.list_available_mcp_servers(ws), _current_user)
     return McpServersResponse(servers=servers)
 
 
@@ -1679,12 +1698,16 @@ async def add_mcp_server_to_workspace(
     server_name: str,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ActionOkResponse:
-    """加入语义即启用。需要 server_name 在全局库中存在，否则 400"""
+    """加入语义即启用。需要 server_name 在全局库中存在，否则 400
+
+    租户加不进网页聊天条目：它在候选列表里已经被摘掉，这里按「全局库中不存在」拒绝，
+    与列表侧口径一致（不额外泄露「有这么一条，但你不能用」）。
+    """
     from nekro_agent.schemas.errors import ValidationError
 
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    library = await WorkspaceService.list_available_mcp_servers(ws)
-    library_all = await WorkspaceService.list_mcp_servers(ws)
+    library = _hide_web_chat_mcp(await WorkspaceService.list_available_mcp_servers(ws), _current_user)
+    library_all = _hide_web_chat_mcp(await WorkspaceService.list_mcp_servers(ws), _current_user)
     known = {s.name for s in library + library_all}
     if server_name not in known:
         raise ValidationError(reason=f"全局库中不存在名为 {server_name} 的 MCP 服务器")
@@ -1764,7 +1787,8 @@ async def test_mcp_server(
     target = next((s for s in servers if s.name == server_name), None)
     if target is None:
         raise NotFoundError(resource=f"MCP 服务器 {server_name}")
-    result = await validate_server(ws, target)
+    # `Role.Super` 端点：这是平台方。平台方是宿主所有者，出站不受限（同模型组 base_url）
+    result = await validate_server(ws, target, restrict_to_public_network=False)
 
     # 持久化结果到全局 MCP 库，所有引用此 server 的工作区都会跟着刷新
     if result.ok:
@@ -1798,11 +1822,15 @@ async def test_mcp_server_ad_hoc(
     server: McpServerConfig,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> McpValidationResponse:
-    """对未保存的配置预先做一次握手验证，便于用户先验后存"""
+    """对未保存的配置预先做一次握手验证，便于用户先验后存
+
+    出站限制随身份走：租户强制公网（判据同模型组 `base_url`），平台方豁免。
+    """
     from nekro_agent.services.mcp.validator import validate_server
+    from nekro_agent.services.user.tenant_perm import is_platform_owner
 
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    result = await validate_server(ws, server)
+    result = await validate_server(ws, server, restrict_to_public_network=not is_platform_owner(_current_user))
     return McpValidationResponse(**result.model_dump())
 
 

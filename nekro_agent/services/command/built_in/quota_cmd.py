@@ -284,12 +284,37 @@ class QuotaWhitelistCommand(BaseCommand):
         cmd = parts[0]
 
         if cmd == "add" and len(parts) >= 2:
+            from nekro_agent.services.user.super_users import ONEBOT_ADAPTER_KEY, entry_problem
+
             user_id = parts[1]
+            # 白名单与管理员列表同一套判定（名单匹配 ∧ 来源可信）：永远不会生效的写法当场拒绝，不回「已添加」
+            problem = entry_problem(user_id)
+            if problem == "untrusted_adapter":
+                return CmdCtl.failed(
+                    t(
+                        zh_CN=f"没有添加 {user_id}：这个适配器的发送者 ID 由调用方填写（SSE、邮件等），写进白名单也不生效",
+                        en_US=f"Not added {user_id}: this adapter's sender ID is supplied by the caller (SSE, email, ...), so a whitelist entry never applies",
+                    )
+                )
+            if problem == "unmatchable":
+                return CmdCtl.failed(
+                    t(
+                        zh_CN=f"没有添加 {user_id}：它会被当成 QQ 号，却不是纯数字（半角），不会匹配任何人——前缀拼错了，还是号码写错了？其他平台写成 适配器标识:用户ID（例如 telegram:123456）",
+                        en_US=f"Not added {user_id}: it is read as a QQ number but is not made of plain ASCII digits, so it matches nobody (misspelt prefix or number?). Use adapter_key:user_id for other platforms (e.g. telegram:123456)",
+                    )
+                )
+            plain_note_zh = plain_note_en = ""
+            if user_id.isdigit() and context.adapter_key and context.adapter_key != ONEBOT_ADAPTER_KEY:
+                plain_note_zh = f"（纯号码只匹配 QQ 号；要加本平台的用户请写 {context.adapter_key}:{user_id}）"
+                plain_note_en = f" (a bare number only matches a QQ number; for a user of this platform use {context.adapter_key}:{user_id})"
             if user_id not in config.AI_CHAT_QUOTA_WHITELIST_USERS:
                 config.AI_CHAT_QUOTA_WHITELIST_USERS.append(user_id)
                 save_config()
                 return CmdCtl.success(
-                    t(zh_CN=f"已将用户 {user_id} 添加到配额白名单", en_US=f"Added user {user_id} to quota whitelist")
+                    t(
+                        zh_CN=f"已将用户 {user_id} 添加到配额白名单{plain_note_zh}",
+                        en_US=f"Added user {user_id} to quota whitelist{plain_note_en}",
+                    )
                 )
             else:
                 return CmdCtl.success(
@@ -315,13 +340,16 @@ class QuotaWhitelistCommand(BaseCommand):
                     "用法:\n"
                     "  /quota_whitelist                — 查看当前用户白名单\n"
                     "  /quota_whitelist add <用户ID>   — 添加用户到白名单\n"
-                    "  /quota_whitelist remove <用户ID> — 从白名单移除用户"
+                    "  /quota_whitelist remove <用户ID> — 从白名单移除用户\n"
+                    "用户ID 的写法与管理员列表相同：纯号码是 QQ 号，其他平台写成 适配器标识:用户ID（例如 telegram:123456）"
                 ),
                 en_US=(
                     "Usage:\n"
                     "  /quota_whitelist                — View current user whitelist\n"
                     "  /quota_whitelist add <userID>   — Add user to whitelist\n"
-                    "  /quota_whitelist remove <userID> — Remove user from whitelist"
+                    "  /quota_whitelist remove <userID> — Remove user from whitelist\n"
+                    "userID uses the administrator list format: a bare number is a QQ number, "
+                    "other platforms use adapter_key:user_id (e.g. telegram:123456)"
                 ),
             )
         )

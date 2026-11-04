@@ -1,6 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from nekro_agent.tools.untrusted_content import sanitize_inline_text
+
+# issue / PR 标题的上限（GitHub 自己也限 256 字符）。标题由外部用户撰写，压成单行，免得在事件正文里接出伪造的字段行
+MAX_TITLE_CHARS = 256
+
 
 @dataclass(slots=True)
 class PullRequestEventSummary:
@@ -29,7 +34,7 @@ def build_pull_request_event_summary(repo_full_name: str, body: Mapping[str, Any
     sender = _get_mapping(body, "sender")
 
     pr_number = _get_str(pr, "number", default="?")
-    title = _get_str(pr, "title", default="无标题")
+    title = sanitize_inline_text(_get_str(pr, "title", default="无标题"), MAX_TITLE_CHARS) or "无标题"
     url = _get_str(pr, "html_url")
     creator_name = _get_nested_str(pr, "user", "login", default="Unknown")
     actor_name = _get_str(sender, "login", default=creator_name)

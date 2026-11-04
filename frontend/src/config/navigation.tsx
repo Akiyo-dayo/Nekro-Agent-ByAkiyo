@@ -181,6 +181,13 @@ export const PLATFORM_ONLY_PATHS = [
   // 两页按"主体是谁"拆开之后，`/profile` 是登录者本人的页面，**不再**是平台方专属 ——
   // 租户成员的自助改口令是它唯一的入口，登记在这里就等于继续锁死。
   '/cloud',
+  // 网页聊天：整块能力只给平台方（适配器子路由每个端点都是 `Role.Admin` +
+  // `require_platform_owner()`，租户身份一律 403）。菜单那一格标了
+  // `visibility: 'platformOnly'`，这里管直接敲 URL 时拦住，两份成对登记。
+  '/web-chat',
+  // 网页适配器自己的后台页（含「MCP 密钥」页签）：同样是平台方专属的一整块能力，
+  // 租户敲 `/adapters/web/mcp-auth` 会在每个请求上 403，所以连页面一起拦。
+  '/adapters/web',
 ] as const
 
 export const isPlatformOnlyPath = (pathname: string): boolean =>
@@ -206,6 +213,12 @@ export const TENANT_ADMIN_ONLY_PATHS = [
   '/console/model-groups',
   // 会话管理与机器人公告：`routers/chat_channel.py` 全族 `@require_role(Role.Admin)`
   '/chat-channel',
+  // 网页聊天：它挂在「聊天管理」组下，但自己标的是更严的 `platformOnly`（见
+  // `PLATFORM_ONLY_PATHS`）。这里再登记一次是给「组里每个子项都得被 URL 兜底清单覆盖」
+  // 那条契约用的（`tests/test_readonly_member_console_surface.py`）：只读成员确实进不去，
+  // 只是拦他的是平台方那一档。**不是**把网页聊天降级成「租户管理员可见」——
+  // `isTenantAdminOnlyPath()` 只在只读成员身上生效。
+  '/web-chat',
   '/affection',
   '/presets',
   '/plugins',
@@ -410,6 +423,17 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         icon: <ChatIcon />,
         parent: 'chatManagement',
         visibility: 'tenantAdminOnly',
+      },
+      {
+        // 网页聊天整块能力都是平台方专属：适配器子路由每个端点都是
+        // `@require_role(Role.Admin)` 加 `require_platform_owner()`，租户身份一律 403。
+        // 与 `PLATFORM_ONLY_PATHS` 的 `/web-chat` 成对登记。
+        path: '/web-chat',
+        text: t('menu.webChat'),
+        translationKey: 'menu.webChat',
+        icon: <CodeIcon />,
+        parent: 'chatManagement',
+        visibility: 'platformOnly',
       },
       {
         // 机器人公告：六个端点全是 `Role.Admin`。此前菜单画得出、整页 403，

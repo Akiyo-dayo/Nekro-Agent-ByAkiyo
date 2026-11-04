@@ -38,6 +38,7 @@ import { useIdentity } from '../../hooks/useIdentity'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 import { consolePaths } from '../../services/api/console'
 import { isChatKeyInScope, parseInstanceKeyFromChatKey } from '../../services/api/instance-scope'
+import { CHAT_CHANNEL_LIST_KEY } from './queryKeys'
 
 export default function ChatChannelPage() {
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -68,7 +69,7 @@ export default function ChatChannelPage() {
   const { isPlatformOwner } = useIdentity()
 
   const { data, isLoading } = useQuery({
-    queryKey: ['chat-channel-management-list', deferredSearch, chatType, status, currentInstanceKey],
+    queryKey: [CHAT_CHANNEL_LIST_KEY, deferredSearch, chatType, status, currentInstanceKey],
     queryFn: () =>
       chatChannelApi.getList({
         page: 1,

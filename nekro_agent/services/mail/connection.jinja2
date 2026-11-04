@@ -38,6 +38,13 @@
                                     </td>
                                 </tr>
                                 {% endif %}
+                                {% if quota_notice %}
+                                <tr>
+                                    <td style="font-size:14px;color:#a15c00;padding:0 40px 24px 40px">
+                                        {{ quota_notice }}
+                                    </td>
+                                </tr>
+                                {% endif %}
                             </tbody>
                         </table>
                     </div>

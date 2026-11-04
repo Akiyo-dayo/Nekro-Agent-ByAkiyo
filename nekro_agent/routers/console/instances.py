@@ -21,6 +21,7 @@ from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.console import (
     ActionOkResponse,
+    InstanceAccessTokenRotateResponse,
     InstanceAdoptRequest,
     InstanceAdoptTarget,
     InstanceClaimRequest,
@@ -60,6 +61,7 @@ from nekro_agent.services.console.instance_manager import (
     list_unclaimed_protocol_ends,
     purge_instance,
     resolve_instance_status,
+    rotate_access_token,
     set_instance_enabled,
     update_instance,
 )
@@ -286,6 +288,31 @@ async def disable_console_instance(
     instance = await assert_instance_accessible(_current_user, instance_key)
     await set_instance_enabled(instance, enabled=False)
     return ActionOkResponse(ok=True, message="实例已停用")
+
+
+@router.post("/instances/{instance_key}/access-token/rotate", summary="更换实例接入令牌")
+@require_role(Role.Super)
+async def rotate_console_instance_access_token(
+    instance_key: str,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> InstanceAccessTokenRotateResponse:
+    """更换实例自己的 OneBot 接入令牌
+
+    平台方专属：响应里带**新令牌**。这不算放宽——平台方本来就能从 `network-config`
+    （托管连接的 `token` 字段）与协议端页的 `onebot-token` 读到同一个值。
+
+    这是一次会**断开在线连接**并**重启容器**的写操作：旧令牌当场失效，凭它握手的连接
+    被断开（与 `network-config` 同档，登记在路由契约的 `PLATFORM_ONLY` 里）。新令牌只由
+    服务端生成，不接受调用方指定；送达失败不回滚，原因随响应返回。
+    """
+    instance = await assert_instance_accessible(_current_user, instance_key)
+    rotation = await rotate_access_token(instance, operator=_current_user.username)
+    return InstanceAccessTokenRotateResponse(
+        token=rotation.token,
+        disconnected=rotation.disconnected,
+        delivery=rotation.delivery,
+        delivery_error=rotation.delivery_error,
+    )
 
 
 def _describe_migration(outcome: Optional[InstanceMigrationOutcome]) -> Optional[InstanceMigrationResult]:

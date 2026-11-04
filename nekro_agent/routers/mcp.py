@@ -35,6 +35,10 @@ from nekro_agent.services.user.perm import Role, require_role
 
 router = APIRouter(prefix="/mcp", tags=["MCP"])
 
+# 判定「配置是否被改过」的字段集：`auto_inject`、`name`、`id` 的改动不影响能不能连上，
+# 不该让一次改名把已验证状态清成未验证（否则改名后 `.mcp.json` 里那条会静默消失）
+_MCP_VALIDATION_CONFIG_KEYS = ("type", "command", "args", "env", "url", "headers")
+
 
 class _ActionOk(BaseModel):
     ok: bool = True
@@ -56,6 +60,29 @@ class _McpValidationResponse(BaseModel):
     latency_ms: float
     error: Optional[str] = None
     error_kind: Optional[str] = None
+
+
+def _validation_config_fingerprint(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """只看「连得上连不上」相关的字段"""
+    return {key: raw.get(key) for key in _MCP_VALIDATION_CONFIG_KEYS}
+
+
+def _apply_server_owned_validation(entry: Dict[str, Any], prev: Dict[str, Any]) -> None:
+    """保留或重置后端验证状态，避免客户端提交 stale validation
+
+    验证状态由服务端独占：客户端提交的 `validation` 一律丢掉。配置指纹没变就沿用旧状态，
+    变了就重置为 `unvalidated`——否则改完 `url` 还能保留上一份「已验证」，`.mcp.json` 会
+    写入一条从没真正握手成功过的服务。
+    """
+    entry.pop("validation", None)
+    prev_validation = prev.get("validation")
+    if not isinstance(prev_validation, dict):
+        return
+
+    if _validation_config_fingerprint(entry) == _validation_config_fingerprint(prev):
+        entry["validation"] = prev_validation
+    else:
+        entry["validation"] = {"status": "unvalidated"}
 
 
 @router.get("/registry", summary="获取内置 MCP 服务注册表", response_model=List[McpRegistryItem])
@@ -133,12 +160,9 @@ async def update_auto_inject_mcp(
             entry["auto_inject"] = bool(entry.pop("enabled", False))
         else:
             entry.pop("enabled", None)
-        # 服务端保留 validation 不让客户端串改
+        # 验证状态服务端说了算：不接受客户端提交的 validation
         prev = existing_by_name.get(entry.get("name", ""), {})
-        if "validation" in prev:
-            entry["validation"] = prev["validation"]
-        else:
-            entry.pop("validation", None)
+        _apply_server_owned_validation(entry, prev)
         sanitized.append(entry)
     set_auto_inject_mcp_servers(sanitized)
     return _ActionOk()
@@ -161,7 +185,9 @@ async def test_auto_inject_server(
     """
     from nekro_agent.services.mcp.validator import validate_server
 
-    result = await validate_server(None, server)
+    # 这两个端点是 `Role.Super`：只有平台方能到这儿。平台方是宿主所有者，出站不受限
+    # （自建部署把 MCP 服务放内网是正常用法），与模型组 `base_url` 的判据一致
+    result = await validate_server(None, server, restrict_to_public_network=False)
     return _McpValidationResponse(**result.model_dump())
 
 
@@ -194,7 +220,7 @@ async def test_saved_auto_inject_server(
 
         raise ValidationError(reason=f"自动注入项配置无效: {e}") from e
 
-    result = await validate_server(None, server_config)
+    result = await validate_server(None, server_config, restrict_to_public_network=False)
 
     if result.ok:
         validation_state: Dict[str, Any] = {

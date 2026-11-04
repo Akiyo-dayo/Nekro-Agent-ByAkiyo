@@ -24,16 +24,27 @@
 
 握手阶段不拒绝连接：连接照常建立、照常自动登记，管理员在总后台看得到、能认领。认领之后状态变了，
 同一条连接的下一条事件就照常分发，不用重连。
+
+## 已认领实例的那一步是绑定变化的兜底
+
+已认领的实例不再无条件放行：还要判这条事件所在连接的握手**出示**的令牌，是否仍是这个实例此刻
+应出示的那枚（规则见 `adapters/onebot_v11/core/access_token.py` 的「账号绑定之后：旧连接」）。
+对不上就不分发，并断开当前连接（HTTP 上报没有长连接，只丢弃这一条）。它挡住的是绑定变化之后、
+`revalidate_live_connections` 那个后台复核真正跑起来之前到来的事件；只占着连接、不发事件的那条
+由复核清掉。没有握手记录（NA 主动连出去的正向 WS、内部调用）、或不是 OneBot 适配器时不判。
 """
 
 import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import OsEnv
+
+if TYPE_CHECKING:
+    from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 
 logger = get_sub_logger("unclaimed_dispatch")
 
@@ -45,13 +56,15 @@ _WARN_INTERVAL_SECONDS = 600.0
 # 记着「上次告警时间」的实例数上限（按插入顺序淘汰最早的；dict 保持插入顺序）
 _WARN_TRACK_LIMIT = 4096
 _last_warned: Dict[Tuple[str, str], float] = {}
+# 「握手对不上」另起一张：它与「未认领实例不分发」是两回事，混用会让两边互相压掉对方的告警
+_token_mismatch_last_warned: Dict[Tuple[str, str], float] = {}
 
 
-async def _instance_status(adapter_key: str, instance_key: str) -> Optional[str]:
+async def _instance_row(adapter_key: str, instance_key: str) -> Optional["DBAdapterInstance"]:
+    """取这个实例的行（只查一次，调用方自己看状态与元数据）；没有这一行时返回 None"""
     from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 
-    row = await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=instance_key).order_by("id").first()
-    return row.status.strip().lower() if row is not None else None
+    return await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=instance_key).order_by("id").first()
 
 
 async def unclaimed_pause_reason() -> str:
@@ -111,14 +124,87 @@ def _note_blocked(adapter_key: str, instance_key: str, reason: str) -> None:
         logger.debug(f"未认领实例 {instance_key} 的入站事件已丢弃（{reason}）")
 
 
+def _note_token_mismatch(adapter_key: str, instance_key: str) -> None:
+    """握手对不上时按实例限频记一条 WARNING（另起一张表，理由见 `_token_mismatch_last_warned`）"""
+    key = (adapter_key, instance_key)
+    now = time.monotonic()
+    if now - _token_mismatch_last_warned.get(key, float("-inf")) >= _WARN_INTERVAL_SECONDS:
+        _token_mismatch_last_warned.pop(key, None)
+        _token_mismatch_last_warned[key] = now
+        while len(_token_mismatch_last_warned) > _WARN_TRACK_LIMIT:
+            _token_mismatch_last_warned.pop(next(iter(_token_mismatch_last_warned)))
+        logger.warning(
+            f"实例 {instance_key} 的入站事件被丢弃：这条连接握手出示的令牌与这个实例此刻应出示的不同"
+            "（账号绑定变过）。这条连接会被断开（HTTP 上报没有长连接，只丢弃这一条），协议端要按新绑定重连一次"
+            "（本实例此后 10 分钟内的同类丢弃只记 debug）",
+        )
+    else:
+        logger.debug(f"实例 {instance_key} 的入站事件因握手令牌对不上而丢弃")
+
+
+async def _connection_matches_instance(
+    adapter_key: str,
+    instance_key: str,
+    row: Optional["DBAdapterInstance"],
+) -> bool:
+    """这条事件所在的连接，此刻是否仍被这个已认领实例认可（绑定变化的入站兜底）
+
+    规则见 `adapters/onebot_v11/core/access_token.py` 的「账号绑定之后：旧连接」：比的是握手时
+    **出示**的令牌，不是匹配上的期望令牌。没有握手记录（NA 主动连出去的正向 WS、内部调用）、
+    握手的账号不是这个实例绑定的账号、不是 OneBot、或查不到行时不判，照旧放行。
+
+    判不出来（读元数据抛异常）按**不分发、不断开**处理：一次读失败不该踢掉协议端，
+    下一条事件再判一次即可。
+    """
+    from nekro_agent.adapters.onebot_v11.core.access_token import (
+        CUT_REASON,
+        connection_accepted_by,
+        current_connection,
+        current_handshake,
+    )
+
+    if adapter_key != "onebot_v11" or row is None:
+        return True
+    handshake = current_handshake()
+    if handshake is None:
+        return True
+    if handshake.self_id != row.provider_account_id.strip():
+        # 握手的账号不是这个实例绑定的账号：这条事件不是从这条连接上来的（入站匹配器按连接的账号解析实例，
+        # 两者必然相同），而是继承了某条连接上下文的任务在替别的实例投递。握手记录对它没有意义，
+        # 不判，更不能把那条无关的连接断掉
+        return True
+    try:
+        # 延迟导入：`container_manager` 会拖进 aiodocker / httpx，且它在模块级导入适配器的
+        # `core.instance`；本模块是入站链路的第一步，不在模块级背这个包袱
+        from nekro_agent.services.console.container_manager import resolve_access_token
+
+        expected = resolve_access_token(row)
+    except Exception as e:  # noqa: BLE001 - 见 docstring
+        logger.warning(f"读取实例 {instance_key} 的接入令牌失败，本次不分发它的入站事件: {type(e).__name__}")
+        return False
+    if connection_accepted_by(handshake, expected):
+        return True
+
+    connection = current_connection()
+    if connection is not None:
+        connection.cut(CUT_REASON)
+    _note_token_mismatch(adapter_key, instance_key)
+    return False
+
+
 async def is_inbound_dispatch_allowed(adapter_key: str, instance_key: str) -> bool:
-    """入站闸门：实例停用 / 租户停用照旧拒绝；未认领实例另须凭当前未曝光的部署级令牌握手。任何异常按拒绝处理"""
+    """入站闸门：实例停用 / 租户停用照旧拒绝；未认领实例另须凭当前未曝光的部署级令牌握手；
+    已认领实例还要这条连接握手出示的令牌与它此刻应出示的一致（绑定变化的兜底，对不上就断开当前连接）。
+    任何异常按拒绝处理
+    """
     from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 
     if not await DBAdapterInstance.is_instance_active(adapter_key, instance_key):
         return False
-    if not instance_key or await _instance_status(adapter_key, instance_key) != UNCLAIMED_STATUS:
-        return True
+    # 状态与元数据都从同一行读：两条查询之间绑定 / 令牌可能已经被改掉
+    row = await _instance_row(adapter_key, instance_key) if instance_key else None
+    if not instance_key or row is None or row.status.strip().lower() != UNCLAIMED_STATUS:
+        return await _connection_matches_instance(adapter_key, instance_key, row)
     try:
         reason = await _unclaimed_block_reason()
     except Exception:  # noqa: BLE001 - 判不出来就不分发
@@ -171,6 +257,12 @@ async def auto_claim_unclaimed_with_history() -> List[str]:
         # 当场记一条：中途失败、下次重跑时，已经认领的这几个不会再出现在名单里
         logger.warning(f"升级时自动认领了有聊天记录的未认领实例 {row.instance_key}")
         claimed.append(row.instance_key)
+
+    if claimed:
+        # 与总后台的就地认领同一条规矩：已认领实例归在线连接复核管（启动期通常还没有连接，排不出任务）
+        from nekro_agent.adapters.onebot_v11.core.access_token import schedule_live_connection_revalidation
+
+        schedule_live_connection_revalidation()
 
     if failed:
         logger.error(f"有未认领实例没能自动认领（{', '.join(failed)}），迁移标记不写，下次启动重跑")

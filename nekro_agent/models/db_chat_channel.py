@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from tortoise import fields
 from tortoise.exceptions import IntegrityError
 from tortoise.models import Model
+from tortoise.signals import pre_save
 from tortoise.timezone import now as db_now
 from tortoise.transactions import in_transaction
 
@@ -13,9 +14,11 @@ from nekro_agent.adapters.utils import adapter_utils
 from nekro_agent.core import config
 from nekro_agent.core.logger import logger
 from nekro_agent.models.db_preset import DBPreset
+from nekro_agent.models.nul_guard import strip_nul_before_save
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.config_resolver import config_resolver
 from nekro_agent.services.plugin.collector import plugin_collector
+from nekro_agent.tools.text_sanitize import strip_nul
 
 if TYPE_CHECKING:
     from nekro_agent.adapters.interface.base import BaseAdapter
@@ -131,6 +134,9 @@ class DBChatChannel(Model):
         存在真实的竞争窗口。这里用两道闸门收口：认领失败后必须重查（赢家刚把历史行改成本实例的行），
         新建撞上唯一约束后也必须重查。两者都拿不到才是真的异常。
         """
+        # 下面既要拿它跟已有行的 channel_name 比，也要写进库；先清洗才能保证
+        # 「比较用的」与「写进去的」是同一个值（否则每次同步都会判成"名字变了"再写一遍）
+        channel_name = strip_nul(channel_name)
         resolved_chat_key = chat_key if chat_key is not None else f"{adapter_key}-{channel_id}"
         channel = await cls.get_by_identity(adapter_key, instance_key, channel_id)
         if not channel and instance_key:
@@ -461,3 +467,7 @@ class DBChatChannel(Model):
         preset_name = preset.name if hasattr(preset, "name") else "默认人设"
 
         return f"设置成功，当前人设: {preset_name}"
+
+
+# channel_name / chat_key 等文本列在 PG 上不收 NUL；写入前统一剔除
+pre_save(DBChatChannel)(strip_nul_before_save)

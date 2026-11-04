@@ -4,9 +4,11 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 import json5
 from tortoise import fields
 from tortoise.models import Model
+from tortoise.signals import pre_save
 
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
 from nekro_agent.core.config import CoreConfig
+from nekro_agent.models.nul_guard import strip_nul_before_save
 from nekro_agent.schemas.chat_message import (
     VIDEO_ANALYSIS_PLUGIN_KEY,
     VIDEO_UNAVAILABLE_NOTE,
@@ -277,3 +279,7 @@ def _render_segment_pieces(
 
     pieces.append((prompt_str, False))
     return [(text, is_block) for text, is_block in pieces if text]
+
+
+# PG 的 text / varchar 不收 NUL（chat_message 是协议端文本的主要落点）；写入前统一剔除
+pre_save(DBChatMessage)(strip_nul_before_save)

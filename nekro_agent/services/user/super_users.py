@@ -88,6 +88,22 @@ def parse_super_user_entry(entry: str, adapter_keys: Iterable[str]) -> Tuple[str
     return ONEBOT_ADAPTER_KEY, text
 
 
+def entry_problem(entry: str, adapter_keys: Optional[Iterable[str]] = None) -> str:
+    """一条名单为什么永远匹配不上任何人；没问题返回空串（超级用户名单与配额白名单共用）
+
+    - `untrusted_adapter`：前缀是发送者 ID 由调用方填写的适配器，来源判定恒不可信；
+    - `unmatchable`：归到 OneBot 却不是 ASCII 纯数字（OneBot V11 的 user_id 是整数；全角数字也匹配不上），
+      多半是前缀写错了。
+    """
+    keys = _registered_adapter_keys() if adapter_keys is None else adapter_keys
+    adapter_key, user_id = parse_super_user_entry(entry, keys)
+    if adapter_key in UNTRUSTED_SENDER_ADAPTERS:
+        return "untrusted_adapter"
+    if adapter_key == ONEBOT_ADAPTER_KEY and not (user_id.isascii() and user_id.isdigit()):
+        return "unmatchable"
+    return ""
+
+
 def matches_super_users(adapter_key: str, user_id: str, entries: Optional[Iterable[str]] = None) -> bool:
     """只做名单匹配，不判来源（展示口用；判定权限一律用 `is_super_user`）"""
     if entries is None:
@@ -256,6 +272,16 @@ async def is_super_user_source_trusted_for_display(adapter_key: str, instance_ke
         return False
 
 
+async def is_trusted_listed_user(adapter_key: str, instance_key: str, user_id: str, entries: Iterable[str]) -> bool:
+    """名单匹配 ∧ 来源可信，名单格式与 `SUPER_USERS` 相同；给配额白名单这类别的身份名单用
+
+    调用约束同 `is_trusted_super_user_source`：只能在入站事件自己的处理任务里调用。
+    """
+    if not matches_super_users(adapter_key, user_id, list(entries)):
+        return False
+    return await is_trusted_super_user_source(adapter_key, instance_key)
+
+
 async def is_super_user(adapter_key: str, instance_key: str, user_id: str) -> bool:
     """聊天命令里的超级用户判定：名单匹配 ∧ 来源可信"""
     if not matches_super_users(adapter_key, user_id):
@@ -318,7 +344,7 @@ async def collect_super_user_warnings() -> List[str]:
     if platform_own_token_exposed:
         warnings.append(
             f"这些平台方 OneBot 实例的令牌曾对租户可见（{', '.join(platform_own_token_exposed)}）：在那里超级用户命令不生效，"
-            "换了令牌才恢复（实例令牌目前没有更换入口）",
+            "在总后台实例详情里更换接入令牌才恢复",
         )
     if unclaimed:
         warnings.append(
@@ -326,29 +352,66 @@ async def collect_super_user_warnings() -> List[str]:
             "认领之前，消息只在协议端凭未曝光的部署级令牌连上来时才处理",
         )
 
+    warnings.extend(
+        _entry_format_warnings(
+            entries,
+            list_name="超级用户名单",
+            member_name="超级用户",
+            untrusted_effect="聊天命令的超级用户权限不生效",
+        ),
+    )
+    return warnings
+
+
+def _entry_format_warnings(
+    entries: List[str],
+    *,
+    list_name: str,
+    member_name: str,
+    untrusted_effect: str = "写了也不生效",
+) -> List[str]:
+    """名单格式的告警（前缀写错、前缀是不可信适配器、纯号码只当 QQ 号），超级用户名单与配额白名单共用"""
+    warnings: List[str] = []
     adapter_keys = _registered_adapter_keys()
     plain_entries = [item for item in entries if parse_super_user_entry(item, adapter_keys)[0] == ONEBOT_ADAPTER_KEY]
-    # 归到 OneBot 却不是纯数字的条目永远匹配不上（OneBot V11 的 user_id 是整数），多半是前缀写错了
-    unmatchable = [item for item in plain_entries if not item.isdigit()]
+    unmatchable = [item for item in entries if entry_problem(item, adapter_keys) == "unmatchable"]
     if unmatchable:
         warnings.append(
-            f"超级用户名单里这些条目既不是 QQ 号、前缀也不是已登记的适配器标识，不会匹配任何人（{', '.join(unmatchable)}）。"
+            f"{list_name}里这些条目既不是 QQ 号、前缀也不是已登记的适配器标识，不会匹配任何人（{', '.join(unmatchable)}）。"
             "其他平台请写成「适配器标识:用户ID」",
+        )
+    untrusted = [item for item in entries if entry_problem(item, adapter_keys) == "untrusted_adapter"]
+    if untrusted:
+        warnings.append(
+            f"{list_name}里这些条目所在的适配器，发送者 ID 由调用方填写（SSE、邮件等），{untrusted_effect}（{', '.join(untrusted)}）",
         )
     other_enabled = _enabled_non_onebot_adapters()
     if plain_entries and other_enabled:
         warnings.append(
-            f"超级用户名单里的纯号码只当 OneBot 的 QQ 号；已启用的其他适配器（{', '.join(other_enabled)}）"
-            "上的超级用户请写成「适配器标识:用户ID」，例如 telegram:123456",
+            f"{list_name}里的纯号码只当 OneBot 的 QQ 号；已启用的其他适配器（{', '.join(other_enabled)}）"
+            f"上的{member_name}请写成「适配器标识:用户ID」，例如 telegram:123456",
         )
     return warnings
 
 
+def collect_quota_whitelist_warnings() -> List[str]:
+    """配额白名单与超级用户名单同一套格式（`message_service.is_quota_exempt`），写法有问题时启动提示一次"""
+    from nekro_agent.core.config import config
+
+    entries = [str(item).strip() for item in config.AI_CHAT_QUOTA_WHITELIST_USERS if str(item).strip()]
+    return _entry_format_warnings(entries, list_name="配额白名单", member_name="白名单用户")
+
+
 def _enabled_non_onebot_adapters() -> List[str]:
+    """除 OneBot 之外已加载的适配器，用于提示"前缀要写全"
+
+    `web` 排除在外：它默认启用、用户 ID 由服务端按登录账号拼出（`admin_<id>`），
+    列进去只会让每个部署都多一条"请写成 web:admin_1"的无意义告警。
+    """
     try:
         from nekro_agent.adapters import loaded_adapters
 
-        return sorted(key for key in loaded_adapters if key != ONEBOT_ADAPTER_KEY)
+        return sorted(key for key in loaded_adapters if key not in {ONEBOT_ADAPTER_KEY, "web"})
     except Exception:  # noqa: BLE001 - 只用于告警文案
         return []
 
@@ -360,3 +423,8 @@ async def log_super_user_warnings() -> None:
             logger.warning(message)
     except Exception:  # noqa: BLE001
         logger.warning("检查超级用户来源配置失败", exc_info=True)
+    try:
+        for message in collect_quota_whitelist_warnings():
+            logger.warning(message)
+    except Exception:  # noqa: BLE001
+        logger.warning("检查配额白名单格式失败", exc_info=True)

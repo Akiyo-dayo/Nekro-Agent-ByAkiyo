@@ -32,6 +32,7 @@ from nekro_agent.services.user.tenant_perm import (
     tenant_perm_level,
     tenant_role_of,
 )
+from nekro_agent.tools.text_sanitize import strip_nul
 
 
 async def user_register(data: UserCreate) -> None:
@@ -83,6 +84,10 @@ async def register_platform_user(
     existing = await DBUser.get_by_union_id(adapter_key, platform_userid)
     if existing is not None:
         return existing, False
+    # 必须先去 NUL 再比保留名：`"adm\x00in"` 能躲过下面那条相等判断，等库那一侧的
+    # `pre_save` 把 NUL 剔掉，库里就多出一个叫 `admin` 的平台用户，而 `user_login`
+    # 按用户名单列查 admin，会炸成 MultipleObjectsReturned
+    username = strip_nul(username)
     if username == "admin":
         logger.warning(f"昵称 'admin' 是平台方保留名，拒绝登记平台用户: {adapter_key}:{platform_userid}")
         return None, False

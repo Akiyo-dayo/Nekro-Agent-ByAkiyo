@@ -7,10 +7,14 @@ from nekro_agent.api import core
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core.logger import logger
 from nekro_agent.services.message_service import message_service
+from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text, sanitize_inline_text
 
 from .models import ChatSubscriptions
 from .plugin import config, plugin, store
-from .pr_message import build_pull_request_event_summary, render_pull_request_event_message
+from .pr_message import MAX_TITLE_CHARS, build_pull_request_event_summary, render_pull_request_event_message
+
+# 一条事件正文的上限：各段预览本来就截到 200 字左右，这里只兜底
+MAX_EVENT_BODY_CHARS = 4000
 
 
 @plugin.mount_webhook_method(endpoint="github", name="处理GitHub webhook事件")
@@ -197,7 +201,7 @@ async def _handle_issues_event(repo_full_name: str, body: Dict) -> None:
         action = body.get("action", "unknown")
         issue = body.get("issue", {})
         issue_number = issue.get("number", "?")
-        issue_title = issue.get("title", "无标题")
+        issue_title = sanitize_inline_text(str(issue.get("title") or "无标题"), MAX_TITLE_CHARS)
         issue_body = issue.get("body", "无内容") or "无内容"
         issue_url = issue.get("html_url", "")
         issue_state = issue.get("state", "unknown")
@@ -626,7 +630,7 @@ async def _handle_generic_event(repo_full_name: str, event_type: str, body: Dict
             # Issue评论
             issue = body.get("issue", {})
             issue_number = issue.get("number", "?")
-            issue_title = issue.get("title", "无标题")
+            issue_title = sanitize_inline_text(str(issue.get("title") or "无标题"), MAX_TITLE_CHARS)
 
             comment = body.get("comment", {})
             comment_body = comment.get("body", "无内容") or "无内容"
@@ -641,7 +645,7 @@ async def _handle_generic_event(repo_full_name: str, event_type: str, body: Dict
             # PR审核或PR审核评论
             pr = body.get("pull_request", {})
             pr_number = pr.get("number", "?")
-            pr_title = pr.get("title", "无标题")
+            pr_title = sanitize_inline_text(str(pr.get("title") or "无标题"), MAX_TITLE_CHARS)
 
             review = body.get("review", {})
             review_state = review.get("state", "unknown") if review else "unknown"
@@ -706,17 +710,27 @@ async def _handle_generic_event(repo_full_name: str, event_type: str, body: Dict
 async def send_to_subscribers(repo_name: str, event_type: str, message: str):
     """向所有订阅的频道发送消息
 
+    事件正文里的标题、正文、评论、提交说明、分支名由任何能在仓库里开 issue / PR 的人撰写，只进不可信正文；
+    可信摘要只放宿主写的引导语与压成单行的仓库名、事件名。
+
     Args:
         repo_name: 仓库名称
         event_type: 事件类型
-        message: 要发送的消息
+        message: 要发送的消息（事件正文）
     """
     # 获取所有聊天频道
     from nekro_agent.models.db_chat_channel import DBChatChannel
 
     chat_channels = await DBChatChannel.all()
 
-    message += "\n\n[Attention] This message is visible for you only. Transfer to the chat channel to make other users see it."
+    result = UntrustedToolResult(
+        kind="GitHubEvent",
+        body=sanitize_block_text(message, MAX_EVENT_BODY_CHARS),
+        summary=(
+            f"[GitHub 订阅推送] 仓库 {echo_inline(repo_name)} 的 {echo_inline(event_type)} 事件，详情见下方不可信块。\n"
+            "[Attention] This message is visible for you only. Transfer to the chat channel to make other users see it."
+        ),
+    )
 
     # 遍历所有频道，查找订阅了该仓库的频道
     sent_count = 0
@@ -730,7 +744,7 @@ async def send_to_subscribers(repo_name: str, event_type: str, message: str):
         if chat_subs.is_subscribed(repo_name, event_type):
             try:
                 # 发送消息并触发AI响应
-                await message_service.push_system_message(chat_key=chat_key, agent_messages=message, trigger_agent=True)
+                await message_service.push_untrusted_message(chat_key=chat_key, result=result, trigger_agent=True)
                 sent_count += 1
                 core.logger.info(f"已向频道 {chat_key} 推送 {repo_name} 的 {event_type} 事件")
             except Exception as e:

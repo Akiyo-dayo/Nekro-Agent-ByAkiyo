@@ -45,6 +45,7 @@ import {
   type InstanceClaimResult,
   type UnclaimedInstanceItem,
 } from '../../../services/api/console'
+import { CHAT_CHANNEL_LIST_KEY } from '../../chat-channel/queryKeys'
 
 /** 认领的两条出路 */
 type ClaimMode = 'new' | 'adopt'
@@ -156,7 +157,7 @@ export default function UnclaimedProtocolPanel({
       void queryClient.invalidateQueries({ queryKey: ['console-instance'] })
       void queryClient.invalidateQueries({ queryKey: ['console-overview'] })
       void queryClient.invalidateQueries({ queryKey: ['instance-scope', 'instances'] })
-      void queryClient.invalidateQueries({ queryKey: ['chat-channel-management-list'] })
+      void queryClient.invalidateQueries({ queryKey: [CHAT_CHANNEL_LIST_KEY] })
       if (result.ok) onClaimed?.(result)
     },
     onError: (error: Error) => notification.error(error.message),

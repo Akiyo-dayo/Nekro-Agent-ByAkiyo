@@ -109,7 +109,11 @@ async def add_instance(
 
 def handshake(token: str, *, source: TokenSource = TokenSource.DEPLOYMENT, instance_key: str = "") -> HandshakeRecord:
     return HandshakeRecord(
-        self_id=ANON_ACCOUNT, source=source, instance_key=instance_key, token_fingerprint=token_fingerprint(token),
+        self_id=ANON_ACCOUNT,
+        source=source,
+        instance_key=instance_key,
+        token_fingerprint=token_fingerprint(token),
+        presented_fingerprint=token_fingerprint(token),
     )
 
 

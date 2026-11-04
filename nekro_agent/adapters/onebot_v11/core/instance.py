@@ -101,9 +101,16 @@ def clear_instance_cache() -> None:
     """清空账号与实例的映射缓存
 
     实例的账号绑定关系变更后必须调用，否则消息会继续路由到旧实例。
+    绑定关系变了，在线连接也要按新绑定复核：这里顺手排一个后台复核（登记表为空或没有运行中的
+    事件循环时什么都不做），见 `core/access_token.py:schedule_live_connection_revalidation`。
     """
     _account_to_instance.clear()
     _instance_to_account.clear()
+    # 延迟导入：`access_token` 模块级不导入本模块，但本模块被 `container_manager` 与
+    # `instance_manager` 在模块级导入，反过来在模块级导入 `access_token` 会把那条链拖成环
+    from .access_token import schedule_live_connection_revalidation
+
+    schedule_live_connection_revalidation()
 
 
 def lookup_cached_account_id(instance_key: str) -> Optional[str]:

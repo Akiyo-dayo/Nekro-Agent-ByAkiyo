@@ -245,6 +245,12 @@ def mount_api_routes(app: FastAPI):
 
     app.include_router(api)
 
+    # 内置 Web Chat MCP：与 NA 同进程，入口自带鉴权（`na_app.AuthenticatedMcpApp`）。
+    # 挂载点必须在 `/api` 之外单独 mount：MCP SDK 自己接管这个前缀下的路径与协议。
+    from nekro_agent.services.mcp.web_chat_mcp.na_app import create_web_chat_mcp_app
+
+    app.mount("/api/mcp/web-chat", create_web_chat_mcp_app(), name="web-chat-mcp")
+
     # 🎯 正确的静态文件挂载方案：/webui + 根路径重定向
     static_dir = Path(OsEnv.STATIC_DIR)
     if static_dir.exists():

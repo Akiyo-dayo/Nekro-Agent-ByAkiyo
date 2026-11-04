@@ -408,7 +408,8 @@
         "handshake_timeout": "握手超时（检查服务器是否启动 / 网络可达）",
         "transport_error": "传输层错误（连接失败 / URL 不可达）",
         "container_not_running": "工作区容器未运行，stdio 类型需先启动工作区",
-        "invalid_response": "握手响应无效（对方可能不是 MCP 服务）"
+        "invalid_response": "握手响应无效（对方可能不是 MCP 服务）",
+        "url_not_allowed": "地址不允许：只能连接公网地址"
       },
       "chip": {
         "validated": "已验证",

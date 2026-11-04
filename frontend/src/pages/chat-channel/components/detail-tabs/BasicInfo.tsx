@@ -40,6 +40,7 @@ import ActionButton from '../../../../components/common/ActionButton'
 import PresetSwitchConfirmDialog from '../../../../components/common/PresetSwitchConfirmDialog'
 import type { PresetSwitchImpact } from '../../../../services/api/types'
 import { useInstanceScope } from '../../../../hooks/useInstanceScope'
+import { CHANNEL_DIRECTORY_KEY, CHAT_CHANNEL_DETAIL_KEY, CHAT_CHANNEL_LIST_KEY } from '../../queryKeys'
 
 interface BasicInfoProps {
   channel: ChatChannelDetail
@@ -127,9 +128,9 @@ export default function BasicInfo({ channel }: BasicInfoProps) {
       await chatChannelApi.setCustomChannelName(channel.chat_key, nextName || null)
       enqueueSnackbar(t('basicInfo.saveCustomNameSuccess'), { variant: 'success' })
       setCustomNameDialogOpen(false)
-      queryClient.invalidateQueries({ queryKey: ['chat-channel-detail', channel.chat_key] })
-      queryClient.invalidateQueries({ queryKey: ['chat-channel-management-list'] })
-      queryClient.invalidateQueries({ queryKey: ['channel-directory'] })
+      queryClient.invalidateQueries({ queryKey: [CHAT_CHANNEL_DETAIL_KEY, channel.chat_key] })
+      queryClient.invalidateQueries({ queryKey: [CHAT_CHANNEL_LIST_KEY] })
+      queryClient.invalidateQueries({ queryKey: [CHANNEL_DIRECTORY_KEY] })
     } catch (_error) {
       enqueueSnackbar(t('basicInfo.saveCustomNameFailed'), { variant: 'error' })
     } finally {
@@ -155,7 +156,7 @@ export default function BasicInfo({ channel }: BasicInfoProps) {
       setPendingPreset(null)
 
       // 刷新聊天频道详情
-      queryClient.invalidateQueries({ queryKey: ['chat-channel-detail', channel.chat_key] })
+      queryClient.invalidateQueries({ queryKey: [CHAT_CHANNEL_DETAIL_KEY, channel.chat_key] })
     } catch (_error) {
       enqueueSnackbar(t('basicInfo.setPresetFailed'), { variant: 'error' })
     } finally {

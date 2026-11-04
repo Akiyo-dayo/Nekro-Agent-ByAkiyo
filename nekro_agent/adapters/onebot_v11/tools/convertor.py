@@ -15,6 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from nekro_agent.adapters.interface.base import BaseAdapter
 from nekro_agent.adapters.onebot_v11.core.message_id import parse_message_id
+from nekro_agent.adapters.onebot_v11.tools.display_name import clean_display_name
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import get_user_group_card_name
 from nekro_agent.adapters.onebot_v11.tools.segment_placeholder import describe_segment
 from nekro_agent.adapters.onebot_v11.tools.video import build_video_segment
@@ -278,9 +279,15 @@ async def _parse_forward_nodes(
             node_data = node_data.get("data", {}) or {}
 
         sender = node_data.get("sender", {}) or {}
-        raw_nickname = sender.get("nickname") or sender.get("card") or node_data.get("nickname") or ""
+        # 昵称来自协议端：彩色群名片是原始字节，先清掉控制字符再走回退链
+        raw_nickname = (
+            clean_display_name(sender.get("nickname"))
+            or clean_display_name(sender.get("card"))
+            or clean_display_name(node_data.get("nickname"))
+            or ""
+        )
         # 昵称由发送方任意构造，含换行时可伪造出格式合法的历史消息行
-        nickname = sanitize_inline_text(str(raw_nickname), MAX_FORWARD_NICKNAME_LENGTH) or "未知"
+        nickname = sanitize_inline_text(raw_nickname, MAX_FORWARD_NICKNAME_LENGTH) or "未知"
         content = node_data.get("content") or node_data.get("message") or []
         if isinstance(content, str):
             try:
@@ -402,9 +409,10 @@ async def _parse_forward_message(
     for node in messages[:MAX_FORWARD_NODES]:
         node_data = node if isinstance(node, dict) else (node.dict() if hasattr(node, "dict") else {})
         sender = node_data.get("sender", {}) or {}
-        raw_nickname = sender.get("nickname") or sender.get("card") or ""
+        # 同 `_parse_forward_nodes`：先清掉协议端原始字节里的控制字符，再走回退链
+        raw_nickname = clean_display_name(sender.get("nickname")) or clean_display_name(sender.get("card")) or ""
         # 昵称由发送方任意构造，含换行时可伪造出格式合法的历史消息行
-        nickname = sanitize_inline_text(str(raw_nickname), MAX_FORWARD_NICKNAME_LENGTH) or "未知"
+        nickname = sanitize_inline_text(raw_nickname, MAX_FORWARD_NICKNAME_LENGTH) or "未知"
         content = node_data.get("content") or node_data.get("message") or []
 
         text_parts: List[str] = []
