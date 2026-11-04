@@ -17,12 +17,17 @@
   },
   "columns": {
     "person": "Who",
+    "preset": "Preset",
     "relation": "Closeness",
     "feeling": "In the bot's eyes",
     "feelingEmpty": "No impression yet",
     "interactions": "Chats",
     "actions": "Actions",
-    "mergedInto": "Merged into {{person}}; this row is dormant, editing it has no effect"
+    "mergedInto": "Merged into {{person}}; this row is dormant, editing it has no effect",
+    "inUse": "In use · {{count}} channel(s)",
+    "notInUse": "No channel uses it",
+    "showOtherPresets": "{{count}} more preset(s) for this person",
+    "hideOtherPresets": "Hide other presets"
   },
   "empty": {
     "title": "Nobody remembered yet",
@@ -31,7 +36,14 @@
   "actions": {
     "detail": "See what happened",
     "adjust": "Adjust",
-    "reset": "Reset"
+    "clearNarrative": "Clear impression only",
+    "editNarrative": "Edit impression",
+    "reset": "Reset",
+    "deleteReason": "Delete this reason"
+  },
+  "scope": {
+    "thisShare": "the share of \"{{name}}\" under preset \"{{preset}}\"",
+    "notInUseWarning": "No channel currently uses this share: channels are using this person's share under another preset, so changes here won't affect ongoing conversations."
   },
   "detail": {
     "title": "This relationship",
@@ -43,16 +55,20 @@
       "reset": "Reset",
       "merge": "Merged in",
       "unmerge": "Merge revoked",
-      "domain_merge": "Domain join migration"
+      "domain_merge": "Domain join migration",
+      "blocked_clear": "Impression cleared after a block",
+      "narrative_clear": "Impression cleared",
+      "narrative_edit": "Impression edited"
     },
     "sourceAccount": "from account {{account}}",
     "scopeLine": "This affection belongs to: domain {{domain}} / preset {{preset}}",
     "presetDeleted": "That preset was deleted; this data is kept as an orphan (never cascade-deleted, clean it up manually under Console → Identity & Domains)",
-    "mergedAccounts": "Accounts merged into this person: {{accounts}}"
+    "mergedAccounts": "Accounts merged into this person: {{accounts}}",
+    "reasonDeleted": "Reason deleted by {{operator}} at {{time}}"
   },
   "adjustDialog": {
     "title": "Adjust affection",
-    "description": "Set the affection score directly. The written impression comes from the bot itself and cannot be edited here — use reset to clear anything inappropriate.",
+    "description": "Set the score of {{share}} directly. Only the score changes; to change the impression use \"Edit impression\" or \"Clear impression only\".",
     "score": "Affection score",
     "scoreHelper": "Ranges from -100 to 200; values outside are clamped",
     "scoreInvalid": "Please enter an integer",
@@ -61,11 +77,32 @@
   },
   "resetDialog": {
     "title": "Reset affection",
-    "description": "This clears the score for \"{{name}}\" and wipes the impression the bot wrote. It will build up again from the next conversation.",
+    "description": "This clears the score of {{share}} and wipes the impression the bot wrote. Shares under other presets are not affected; it will build up again from the next conversation.",
     "submit": "Reset"
+  },
+  "clearDialog": {
+    "title": "Clear impression only",
+    "description": "This wipes the impression and the recent note of {{share}}. The score stays. The bot will write a new one after the next conversation.",
+    "submit": "Clear"
+  },
+  "editDialog": {
+    "title": "Edit impression",
+    "description": "Rewrite the impression and the recent note of {{share}}. The score stays. Later conversations will keep evolving it from here.",
+    "stateText": "Impression",
+    "eventText": "Recent note",
+    "lengthHelper": "Up to {{max}} characters; anything longer is cut off on save",
+    "submit": "Save"
+  },
+  "deleteReasonDialog": {
+    "title": "Delete this reason",
+    "description": "Only the reason text of this entry is removed: the score and the entry itself stay, with a deletion trace. The impression and recent note are not affected; use \"Clear impression only\" or \"Edit impression\" for those.",
+    "submit": "Delete"
   },
   "messages": {
     "loadFailed": "Failed to load the affection list",
-    "resetDone": "Reset done"
+    "resetDone": "Reset done",
+    "clearDone": "Impression cleared",
+    "editDone": "Impression saved",
+    "reasonDeleted": "Reason deleted"
   }
 }

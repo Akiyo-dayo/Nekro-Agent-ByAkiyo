@@ -16,6 +16,7 @@ from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.schemas.chat_message import ChatMessage
 from nekro_agent.services.affection.evaluator import schedule_affection_evaluation
 from nekro_agent.services.affection.prompt import render_affection_prompt
+from nekro_agent.services.affection.suppression import lift_narrative_suppression, suppress_narrative
 from nekro_agent.services.agent.provider_refusal import (
     detect_provider_refusal,
     normalize_for_match,
@@ -474,13 +475,58 @@ async def run_agent(
         ctx = AgentCtx.create_by_db_chat_channel(db_chat_channel=db_chat_channel)
 
     with instance_scope(db_chat_channel.instance_key):
-        return await _run_agent_in_instance_scope(
+        return await _run_agent_with_affection_suppression(
             chat_key=chat_key,
             chat_message=chat_message,
             ctx=ctx,
             db_chat_channel=db_chat_channel,
             one_time_code=one_time_code,
         )
+
+
+def _round_was_blocked(error: BaseException) -> bool:
+    """这一轮是不是以「内容审核拦截」或「供应商拒答」收尾
+
+    内容审核拦截按尝试计：主模型组被拦、备用组又因为别的原因失败，被拦的那份上下文照样
+    有嫌疑（好感描述就在系统提示词里），所以任一次尝试被判成 `CONTENT_BLOCKED` 就算。
+    抑制只是暂时不注入两段描述，代价很小。
+
+    这里的判据与 `failure_feedback.describe_llm_failure` 的「全部尝试都是 `CONTENT_BLOCKED`」
+    不一样，是故意的：这里是为了不让同一段上下文再次触发拦截，那边是给用户看的失败说明。
+    """
+    if isinstance(error, AgentProviderRefusalError):
+        return True
+    return isinstance(error, AllLLMRequestsFailedError) and LLMFailureKind.CONTENT_BLOCKED in error.kinds
+
+
+async def _run_agent_with_affection_suppression(
+    chat_key: str,
+    chat_message: Optional[ChatMessage],
+    ctx: AgentCtx,
+    db_chat_channel: DBChatChannel,
+    one_time_code: str,
+) -> None:
+    """跑一轮，并按结果开关这个频道的好感描述抑制
+
+    一轮以内容审核拦截 / 供应商拒答收尾：给频道记标记，抑制期内好感块只注入昵称与阶段，
+    不注入两段描述——如果是描述里混进了会被拦的内容，下一轮就不会再被同一段描述锁住。
+    一轮正常收尾：清掉标记。其余失败（超时、无进展、没写代码……）与描述无关，不动标记。
+    标记只在进程内，重启即失，见 `services/affection/suppression.py`。
+    """
+    try:
+        await _run_agent_in_instance_scope(
+            chat_key=chat_key,
+            chat_message=chat_message,
+            ctx=ctx,
+            db_chat_channel=db_chat_channel,
+            one_time_code=one_time_code,
+        )
+    except (AllLLMRequestsFailedError, AgentProviderRefusalError) as error:
+        if _round_was_blocked(error):
+            suppress_narrative(chat_key)
+            logger.info(f"[run_agent] {chat_key} | 本轮被内容审核拦下或被供应商拒答，好感描述暂不注入这个频道")
+        raise
+    lift_narrative_suppression(chat_key)
 
 
 async def _run_agent_in_instance_scope(

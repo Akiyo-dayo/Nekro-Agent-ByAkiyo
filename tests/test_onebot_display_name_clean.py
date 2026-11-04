@@ -79,11 +79,24 @@ class TestCleanDisplayName:
     def test_only_control_chars_returns_empty_string(self) -> None:
         assert clean_display_name("\x00\x0e\x12\x1f\x7f") == ""
 
-    def test_leading_and_trailing_whitespace_is_stripped(self) -> None:
-        assert clean_display_name("  名字\t\n") == "名字"
+    def test_a_plain_name_keeps_its_spaces(self) -> None:
+        """不带控制字符的名字是协议端正常上报的，一个字不动，首尾空格也原样留着"""
+        assert clean_display_name(" 甲 乙 ") == " 甲 乙 "
 
-    def test_inner_space_is_kept(self) -> None:
-        assert clean_display_name(" 甲 乙 ") == "甲 乙"
+    @pytest.mark.parametrize("blank", ["　", " ", " ", "　　"])
+    def test_a_name_made_only_of_blanks_is_kept(self, blank: str) -> None:
+        """故意设成全角空格 / 不换行空格的「隐形名」：NapCat 原样上报，清理后必须还是它，不能变成空串"""
+        assert clean_display_name(blank) == blank
+
+    def test_a_raw_card_is_trimmed_after_its_control_chars_go(self) -> None:
+        """带控制字符的是原始字节拼出来的名片：去掉控制字符后，落到首尾的空白一起去掉"""
+        assert clean_display_name("  名字\t\n") == "名字"
+        assert clean_display_name("\x0e 测试 \x00") == "测试"
+
+    @pytest.mark.parametrize("residue", ["\x0a \x12", "\x0e　\x00", "\x12\x09   \x00"])
+    def test_a_raw_card_with_only_blanks_left_is_empty(self, residue: str) -> None:
+        """原始字节去掉控制字符后只剩空白：那是残渣、不是名字，得到空串让回退链接住"""
+        assert clean_display_name(residue) == ""
 
     def test_special_characters_are_kept(self) -> None:
         for text in ("$", '"', "ǿ", "Ā", "ÿ", "甲$ǿĀ"):
@@ -439,6 +452,34 @@ class TestEndToEnd:
         assert len(rows) == 1, "这条消息必须真的落库"
         assert rows[0].sender_name == USER_ID
         assert not _has_c0(rows[0].sender_nickname or "")
+
+    async def test_blank_invisible_name_is_kept_not_replaced_by_the_qq_number(
+        self,
+        chat_key: str,
+        pipeline: Callable[..., Any],
+    ) -> None:
+        """昵称与名片都是一个全角空格：入库的名字就是这个全角空格（与 NapCat / 0.4.2 一致），不是 QQ 号"""
+        blank = "　"
+        await pipeline(_message_event(card=blank, nickname=blank), _Bot(card=blank, nickname=blank))
+
+        rows = list(await DBChatMessage.filter(chat_key=chat_key))
+        assert len(rows) == 1, "这条消息必须真的落库"
+        assert rows[0].sender_name == blank
+        assert rows[0].sender_nickname == blank
+
+    async def test_raw_card_leaving_only_blanks_falls_back_to_the_nickname(
+        self,
+        chat_key: str,
+        pipeline: Callable[..., Any],
+    ) -> None:
+        """彩色名片的原始字节去掉控制字符后只剩一个空格：落到昵称，不留一个空白名字"""
+        residue = "\x0a \x12\x00"
+        await pipeline(_message_event(card=residue, nickname="事件昵称"), _Bot(card=residue, nickname="事件昵称"))
+
+        rows = list(await DBChatMessage.filter(chat_key=chat_key))
+        assert len(rows) == 1, "这条消息必须真的落库"
+        assert rows[0].sender_nickname == "事件昵称"
+        assert rows[0].sender_name == "事件昵称"
 
     async def test_reply_sender_name_is_cleaned(
         self,

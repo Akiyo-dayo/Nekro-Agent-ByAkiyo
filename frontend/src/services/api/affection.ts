@@ -61,6 +61,13 @@ export interface AffectionItem {
    * 「改了也不动」的行反复调整（删掉别名它就会立刻复活）。
    */
   merged_into: string
+  /**
+   * 这一行属于哪个人设（可读名字）。同一个人换过人设就有好几行，
+   * 不标出来的话只差分数和描述，重置很容易点在一行没人用的旧人设上。
+   */
+  preset_name: string
+  /** 本域里当前生效人设正是这一行人设的频道数；0 = 眼下没有频道在用这一份 */
+  in_use_channels: number
 }
 
 export interface AffectionListResponse {
@@ -77,9 +84,19 @@ export interface AffectionEventItem {
    * 变化来源。**必须与后端 `AffectionEventSource` 逐个取值对齐** ——
    * 这个值直接拼进 `t('detail.source.${source}')`，少一个取值前端就把 i18n 的键名
    * 原样显示成一行乱码（`merge` / `unmerge` 曾经就是这样漏掉的）。
-   * 对齐由 `tests/test_affection_scope_and_merge.py` 钉死。
+   * 对齐由 `tests/test_affection_domain_and_preset_coverage.py` 钉死（语言包那一侧）。
    */
-  source: 'llm' | 'manual' | 'reset' | 'merge' | 'unmerge'
+  source:
+    | 'llm'
+    | 'manual'
+    | 'reset'
+    | 'merge'
+    | 'unmerge'
+    | 'domain_merge'
+    | 'blocked_clear'
+    | 'narrative_clear'
+    | 'narrative_edit'
+  /** 理由已被删除时恒为空串，看 `deleted` */
   reason: string
   operator: string
   chat_key: string
@@ -90,6 +107,10 @@ export interface AffectionEventItem {
    */
   source_platform_userid: string
   create_time: string | null
+  /** 这一条的理由被管理员删掉了（软删：只删文字，分数与这一行都还在） */
+  deleted: boolean
+  deleted_by: string
+  deleted_at: string | null
 }
 
 /** 「这份好感属于：域 X / 人设 甲」 */
@@ -165,11 +186,46 @@ export const affectionApi = {
     return response.data
   },
 
-  /** 归零并清空 LLM 生成的描述；描述文本没有编辑入口，不合适的内容用重置抹掉 */
+  /** 归零并清空两段描述 */
   reset: async (recordId: number, instanceKey?: string): Promise<AffectionItem> => {
     const response = await axios.post<AffectionItem>(
       `/affection/${recordId}/reset`,
       {},
+      { params: { instance_key: instanceKey || undefined } }
+    )
+    return response.data
+  },
+
+  /** 只清两段描述，分数不动 */
+  clearNarrative: async (recordId: number, instanceKey?: string): Promise<AffectionItem> => {
+    const response = await axios.post<AffectionItem>(
+      `/affection/${recordId}/clear-narrative`,
+      {},
+      { params: { instance_key: instanceKey || undefined } }
+    )
+    return response.data
+  },
+
+  /** 改写两段描述，分数不动；超长由服务端按上限截断 */
+  editNarrative: async (
+    recordId: number,
+    body: { state_text: string; last_event_text: string },
+    instanceKey?: string
+  ): Promise<AffectionItem> => {
+    const response = await axios.put<AffectionItem>(`/affection/${recordId}/narrative`, body, {
+      params: { instance_key: instanceKey || undefined },
+    })
+    return response.data
+  },
+
+  /** 删一条流水的理由（软删：只删文字、留删除痕迹，分数不动） */
+  deleteEventReason: async (
+    recordId: number,
+    eventId: number,
+    instanceKey?: string
+  ): Promise<AffectionEventItem> => {
+    const response = await axios.delete<AffectionEventItem>(
+      `/affection/${recordId}/events/${eventId}`,
       { params: { instance_key: instanceKey || undefined } }
     )
     return response.data

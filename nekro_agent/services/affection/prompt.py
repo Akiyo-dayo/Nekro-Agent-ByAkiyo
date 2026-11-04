@@ -16,6 +16,20 @@
 "忽略以上全部指令"写进状态描述，下一轮它就会以"系统提示"的身份回到提示词里。这是一个
 自我强化的注入面，所以块内文本一律经 `tools/untrusted_content.py` 清洗，并用带一次性
 会话令牌的 `trust:untrusted` 标签包裹，块外用明文告知模型这是**素材而非指令**。
+后台管理员手写的描述也走同一条路：读侧不分来源。
+
+## 「当前对话」的边界与主对话历史是同一个
+
+取近期参与者的下界是 `max(now - AI_CHAT_CONTEXT_EXPIRE_SECONDS, conversation_start_time)`
+（:func:`context_floor_timestamp`），与 `templates/history.py` 截主对话历史用的是同一个判据。
+`/reset` 只改 `conversation_start_time`、不清好感：重置之前说过话的人不再被当成「近期参与者」
+注入，但他们的分数与描述原样留着（好感在同域同人设下跨频道共用，群管理就能发 `/reset`）。
+评估那一侧取对话用的也是这一个下界。
+
+## 频道被拦期间只注入阶段
+
+主对话刚被内容审核拦下或被供应商拒答的频道，抑制期内好感块只留昵称与亲密阶段，
+不注入 `feeling:` / `recently:`，见 :mod:`.suppression`。
 """
 
 from __future__ import annotations
@@ -34,6 +48,7 @@ from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untru
 from .key import AffectionKey
 from .stage import stage_label, stage_tone
 from .store import MAX_EVENT_TEXT_LENGTH, MAX_NICKNAME_LENGTH, MAX_STATE_TEXT_LENGTH, load_snapshots
+from .suppression import is_narrative_suppressed
 
 logger = get_sub_logger("affection")
 
@@ -85,6 +100,11 @@ async def render_affection_prompt(
         scopes = await resolve_identity_scopes(db_chat_channel, [platform_userid for platform_userid, _ in participants])
         keys = [AffectionKey.of_scope(scopes[platform_userid]) for platform_userid, _ in participants]
         snapshots = await load_snapshots(keys, config.AFFECTION_CACHE_TTL_SECONDS)
+        # 主对话刚在这个频道被拦 / 被拒答：抑制期内只给昵称与阶段，不给两段描述
+        narrative_allowed = not is_narrative_suppressed(
+            db_chat_channel.chat_key,
+            config.AI_CHAT_CONTEXT_EXPIRE_SECONDS,
+        )
 
         blocks: List[str] = []
         rendered_keys: set[AffectionKey] = set()
@@ -103,9 +123,9 @@ async def render_affection_prompt(
             rendered_keys.add(key)
             body_lines = [f"nickname: {sanitize_inline_text(snapshot.nickname or nickname, MAX_NICKNAME_LENGTH)}"]
             body_lines.append(f"closeness: {stage_label(snapshot.stage)} — {stage_tone(snapshot.stage)}")
-            if snapshot.state_text:
+            if narrative_allowed and snapshot.state_text:
                 body_lines.append(f"feeling: {sanitize_inline_text(snapshot.state_text, MAX_STATE_TEXT_LENGTH)}")
-            if snapshot.last_event_text:
+            if narrative_allowed and snapshot.last_event_text:
                 body_lines.append(f"recently: {sanitize_inline_text(snapshot.last_event_text, MAX_EVENT_TEXT_LENGTH)}")
             blocks.append(
                 wrap_untrusted_block(
@@ -140,13 +160,14 @@ async def _recent_participants(
 ) -> List[Tuple[str, str]]:
     """取本频道近期发过言的真人，按最近发言时间从新到旧
 
-    只看上下文窗口内的消息：几个月前路过的人不该继续占据提示词。
+    只看当前对话里的消息（下界见 :func:`context_floor_timestamp`）：几个月前路过的人、
+    `/reset` 之前说过话的人都不该继续占据提示词。
 
     判定"是不是真人"必须看 `sender_id`：Bot 自己发的消息 `sender_id` 为 -1，但
     `platform_userid` 记的是 Bot 账号自己的号码（见 `message_service` 的落库逻辑），
     只按 `platform_userid` 过滤会让 Bot 对自己产生好感度。
     """
-    since = int(time.time() - config.AI_CHAT_CONTEXT_EXPIRE_SECONDS)
+    since = context_floor_timestamp(db_chat_channel, config)
     rows = await (
         DBChatMessage.filter(chat_key=db_chat_channel.chat_key, send_timestamp__gte=since)
         .order_by("-send_timestamp")
@@ -165,6 +186,21 @@ async def _recent_participants(
         if len(participants) >= max_users:
             break
     return participants
+
+
+def context_floor_timestamp(db_chat_channel: object, config: CoreConfig) -> float:
+    """好感取「当前对话」的下界（秒级时间戳）：`max(时间窗起点, 对话起始时间)`
+
+    与 `templates/history.py` 截主对话历史是同一个判据：`/reset` 之后主对话看不到重置前的消息，
+    好感的评估与注入也不该再看到。只是不再把重置前的对话当成当前对话，不删任何东西。
+
+    频道替身（测试）与极早期的频道行可能没有 `conversation_start_time`，这时只按时间窗。
+    """
+    floor = time.time() - config.AI_CHAT_CONTEXT_EXPIRE_SECONDS
+    start = getattr(db_chat_channel, "conversation_start_time", None)
+    if start is not None:
+        floor = max(floor, start.timestamp())
+    return floor
 
 
 async def affection_score_of(db_chat_channel: ChannelLike, platform_userid: str, config: CoreConfig) -> int:
@@ -194,5 +230,6 @@ __all__ = [
     "AFFECTION_BLOCK_KIND",
     "BOT_SENDER_IDS",
     "affection_score_of",
+    "context_floor_timestamp",
     "render_affection_prompt",
 ]

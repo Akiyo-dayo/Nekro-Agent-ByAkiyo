@@ -36,6 +36,22 @@
 `delta` 会被 `clamp_delta` 收敛后才落库——用户可以诱导模型给出 `+9999`，
 但收敛之后最多也只是正常的一轮涨幅。`user_id` 必须命中本轮真实参与者，
 模型凭空写一个号码不会创建出记录。文本字段的清洗在 `store.apply_delta` 里统一做。
+
+## 评估被内容审核拦下
+
+评估提示词带着每个参与者当前的描述（`current:`）。描述里一旦混进会被拦的内容，评估就会
+一直被拦、描述永远盖不掉。所以被拦（`LLMContentBlockedError`）时去掉全部 `current:` 重试一次：
+
+- 重试成功：照常落库；重试里**没给出新描述**的参与者，他们的旧描述（两段）清空，分数不动，
+  各记一条 `blocked_clear` 事件——那些旧描述就在被拦的那份提示词里，有嫌疑。
+- 重试仍被拦：问题出在对话本身，**不清任何描述**，只记日志，跳过这一轮。
+
+## 取哪些对话
+
+下界 = `max(时间窗起点, 对话起始时间, 本轮参与者里最近一次后台写入的时间)`。前两项与主对话
+历史同一个判据（`/reset` 之后不再读重置前的对话）；第三项让管理员刚清掉的描述不会被旧对话
+原样写回来。筛完没有消息的参与者跳过这一轮。每个人落库前还要在行锁下复核一次：
+评估开始之后这一行有没有新的后台写入，有就丢掉这个人这一轮的结果（`store.AdminWriteGuard`）。
 """
 
 from __future__ import annotations
@@ -58,14 +74,25 @@ from nekro_agent.services.identity_scope import resolve_identity_scopes
 from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untrusted_block
 
 from .key import AffectionKey
-from .prompt import BOT_SENDER_IDS
+from .prompt import BOT_SENDER_IDS, context_floor_timestamp
 from .stage import (
     AffectionEventSource,
     AffectionRateLimits,
     clamp_delta,
     stage_label,
 )
-from .store import MAX_STATE_TEXT_LENGTH, apply_delta, load_snapshots, throttle_llm_delta
+from .store import (
+    MAX_STATE_TEXT_LENGTH,
+    REASON_BLOCKED_CLEAR,
+    AdminWriteGuard,
+    AffectionSnapshot,
+    AffectionWriteSuperseded,
+    apply_delta,
+    clear_narrative,
+    latest_admin_writes,
+    load_snapshots,
+    throttle_llm_delta,
+)
 
 logger = get_sub_logger("affection")
 
@@ -92,6 +119,8 @@ EVALUATION_SYSTEM_PROMPT = (
     "Never write like an audit log: no scores, no percentages, no '好感度 +2' phrasing.\n"
     "- `feeling` is a standing impression of that person (one or two sentences). "
     "`reason` is what just happened that moved it (one short sentence).\n"
+    "- Summarize `feeling` and `reason` in your own words. Never quote or paraphrase closely what users said, "
+    "and never repeat content that may violate content policies; describe the gist instead.\n"
     "- `delta` is a small integer. Ordinary pleasant chat is +1~+2. Genuine warmth, help or vulnerability is +3~+5. "
     "Rudeness, manipulation or boundary-pushing is negative. Nothing notable is 0.\n"
     "- Only mention participants that actually appear in the transcript, identified by the exact user id given.\n"
@@ -193,8 +222,11 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
     """评估一个频道最近的对话并更新好感度
 
     Returns:
-        实际发生更新的人数
+        实际落库的写入次数（含评估被拦后清掉旧描述的那几条）
     """
+    from nekro_agent.services.agent.openai import LLMContentBlockedError
+
+    chat_key = db_chat_channel.chat_key
     messages = await _recent_messages(db_chat_channel, config)
     participants = _participants_of(messages)
     if not participants:
@@ -207,24 +239,74 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
     # `DBChatChannel.get_effective_preset_id` 里有一份）。
     scopes = await resolve_identity_scopes(db_chat_channel, list(participants))
     keys = {user_id: AffectionKey.of_scope(scope) for user_id, scope in scopes.items()}
+
+    # 只读本轮参与者里最近一次后台写入之后的对话。取的是**所有**候选人里最晚的那一次：
+    # 同一轮里其他人也会因此少看一点旧对话，只影响这一轮；反过来按人分别截，
+    # 被清掉的那个人的旧话仍然会作为别人的上下文出现在同一份提示词里。
+    # 消息本来就是按时间倒序取的最近若干条，把下界抬高等价于在已取到的列表上再筛一遍。
+    admin_marks = await latest_admin_writes(keys.values())
+    newest_admin_write = max((mark for mark in admin_marks.values() if mark is not None), default=None)
+    if newest_admin_write is not None:
+        floor = newest_admin_write.timestamp()
+        messages = [message for message in messages if message.send_timestamp >= floor]
+        participants = _participants_of(messages)
+        if not participants:
+            logger.debug(f"好感度评估跳过：后台写入之后还没有新的对话: chat_key={chat_key}")
+            return 0
+        keys = {user_id: keys[user_id] for user_id in participants}
+
     snapshots = await load_snapshots(list(keys.values()), config.AFFECTION_CACHE_TTL_SECONDS)
-
     preset = await db_chat_channel.get_preset()
-    user_prompt = _build_user_prompt(
-        persona=getattr(preset, "content", "")[:MAX_PERSONA_LENGTH],
-        one_time_code=one_time_code,
-        participants=participants,
-        current_states={
-            user_id: (stage_label(snapshots[key].stage), snapshots[key].state_text)
-            for user_id, key in keys.items()
-        },
-        messages=messages,
-    )
+    persona = getattr(preset, "content", "")[:MAX_PERSONA_LENGTH]
 
-    chat_key = db_chat_channel.chat_key
-    verdicts = await _request_verdicts(config, user_prompt, chat_key)
+    def build_prompt(*, with_current: bool) -> str:
+        return _build_user_prompt(
+            persona=persona,
+            one_time_code=one_time_code,
+            participants=participants,
+            current_states={
+                user_id: (stage_label(snapshots[key].stage), snapshots[key].state_text if with_current else "")
+                for user_id, key in keys.items()
+            },
+            messages=messages,
+        )
+
+    retried_without_current = False
+    try:
+        verdicts = await _request_verdicts(config, build_prompt(with_current=True), chat_key)
+    except LLMContentBlockedError:
+        if not any(snapshots[key].state_text for key in keys.values()):
+            # 提示词里本来就没有旧描述：「去掉 current: 重试」发出去的是逐字相同的请求
+            _report_blocked_conversation(chat_key)
+            return 0
+        logger.info(f"好感度评估被内容审核拦下，去掉参与者的旧印象重试一次: chat_key={chat_key}")
+        try:
+            verdicts = await _request_verdicts(config, build_prompt(with_current=False), chat_key)
+        except LLMContentBlockedError:
+            _report_blocked_conversation(chat_key)
+            return 0
+        retried_without_current = True
+
+    # 落库前复核用的判据：评估开始时每一行最近一次后台写入的时间
+    guards = {key: AdminWriteGuard(seen=admin_marks[key]) for key in keys.values()}
+    superseded: set[AffectionKey] = set()
+    applied = 0
+
+    # 顺序是有意的：先清旧描述（blocked_clear，delta=0），再照常落这一轮的结果。
+    # 空 feeling 但 delta≠0 的人因此是「两段描述先清空 → 分数照常变 → last_event_text 写新 reason，
+    # state_text 保持空」：新 reason 来自没被拦的那次重试，提示词又要求模型用自己的话概括，可以写进去。
+    if retried_without_current:
+        applied += await _clear_suspect_narratives(
+            chat_key=chat_key,
+            keys=keys,
+            snapshots=snapshots,
+            verdicts=verdicts,
+            guards=guards,
+            superseded=superseded,
+        )
+
     if not verdicts:
-        return 0
+        return applied
 
     max_delta = config.AFFECTION_MAX_DELTA_PER_ROUND
     limits = AffectionRateLimits(
@@ -233,7 +315,6 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
         weekly_gain=config.AFFECTION_WEEKLY_GAIN_LIMIT,
         diminishing=config.AFFECTION_ENABLE_DIMINISHING_RETURNS,
     )
-    applied = 0
     # 本轮已经写过的分数：**同一个键可能被写不止一次**——模型可能对同一个 user_id 给两条结果，
     # 而合并过的人在同一个群里用两个号说话时，两个 user_id 本来就解析成同一个键。
     # 继续用快照里的旧分数会让递减收益按"写之前"的档位算（高分段被当成低分段，涨幅翻几倍），
@@ -252,6 +333,8 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
             else:
                 logger.debug(message)
             continue
+        if key in superseded:
+            continue
 
         # 先用不依赖配置的硬上限封住单轮，再叠加递减收益与滚动窗口预算：
         # 前者防的是模型被诱导给出极端值，后者防的是有人拿正常数值反复刷。
@@ -261,28 +344,34 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
             current_score=current_scores[key],
             limits=limits,
         )
-        feeling = str(verdict.get("feeling", "")).strip()[:MAX_STATE_TEXT_LENGTH]
+        feeling = _feeling_of(verdict)
         reason = str(verdict.get("reason", "")).strip()
         if delta == 0 and not feeling:
             continue
 
-        snapshot = await apply_delta(
-            key,
-            delta=delta,
-            reason=reason,
-            source=AffectionEventSource.LLM,
-            chat_key=db_chat_channel.chat_key,
-            nickname=participants[user_id],
-            state_text=feeling or None,
-            event_text=reason,
-            # 说话的是这个号，记的是这个人。合并过之后两者不同，不留下来源账号就再也
-            # 说不清"这条是哪个号干的"（`models/db_affection.py` 的合并语义要求保留）。
-            source_platform_userid=user_id,
-        )
+        try:
+            snapshot = await apply_delta(
+                key,
+                delta=delta,
+                reason=reason,
+                source=AffectionEventSource.LLM,
+                chat_key=db_chat_channel.chat_key,
+                nickname=participants[user_id],
+                state_text=feeling or None,
+                event_text=reason,
+                # 说话的是这个号，记的是这个人。合并过之后两者不同，不留下来源账号就再也
+                # 说不清"这条是哪个号干的"（`models/db_affection.py` 的合并语义要求保留）。
+                source_platform_userid=user_id,
+                guard=guards[key],
+            )
+        except AffectionWriteSuperseded:
+            superseded.add(key)
+            _report_superseded(chat_key, key)
+            continue
         current_scores[key] = snapshot.score
         applied += 1
 
-    if not applied:
+    if not applied and not superseded:
         # 模型给了结果却一个人也没落库，说明 id 对不上或额度全被吃光，两种都不该静默
         message = f"好感度评估拿到 {len(verdicts)} 条结果但没有一条落库: chat_key={chat_key}"
         if _report_once(chat_key, "nothing_applied"):
@@ -291,6 +380,78 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
             logger.debug(message)
 
     return applied
+
+
+async def _clear_suspect_narratives(
+    *,
+    chat_key: str,
+    keys: Dict[str, AffectionKey],
+    snapshots: Dict[AffectionKey, AffectionSnapshot],
+    verdicts: List[Dict[str, Any]],
+    guards: Dict[AffectionKey, AdminWriteGuard],
+    superseded: set[AffectionKey],
+) -> int:
+    """评估被拦、去掉旧描述重试成功之后：清掉没拿到新描述的那些人的旧描述
+
+    「没拿到新描述」包括模型给了空 feeling，也包括结果里根本没提到这个人。重试成功只说明
+    被拦那份提示词里**某一段** `current:` 有问题，看不出是谁的；只清返回空 feeling 的人，
+    出问题的那段要是落在没被提到的人身上，下一轮还会「被拦 → 重试」，主对话也还会照常注入它。
+    分数留着、只清文字，文字之后会重新写出来，这个代价可以接受。拿到了新描述的人不用清：
+    新描述马上就会盖掉旧的。同一个人的两个号算一个人，任一个号拿到新描述就不清。
+
+    只清两段描述，分数、阶段不动；每人一条 `blocked_clear` 事件（`delta=0`，宿主固定文案）。
+    两段描述本来就是空的人没什么可清，不写事件。照样过落库前复核：管理员这期间动过的人不碰。
+
+    Returns:
+        实际清掉的人数
+    """
+    refreshed = {
+        keys[user_id]
+        for user_id in (str(verdict.get("user_id", "")).strip() for verdict in verdicts if _feeling_of(verdict))
+        if user_id in keys
+    }
+    cleared = 0
+    for key in dict.fromkeys(keys.values()):
+        snapshot = snapshots[key]
+        if key in refreshed or not (snapshot.state_text or snapshot.last_event_text):
+            continue
+        try:
+            await clear_narrative(
+                key,
+                source=AffectionEventSource.BLOCKED_CLEAR,
+                reason=REASON_BLOCKED_CLEAR,
+                chat_key=chat_key,
+                guard=guards[key],
+            )
+        except AffectionWriteSuperseded:
+            superseded.add(key)
+            _report_superseded(chat_key, key)
+            continue
+        cleared += 1
+    if cleared:
+        logger.info(f"好感度评估被拦后重试成功，已清空 {cleared} 人有嫌疑的旧印象（分数不变）: chat_key={chat_key}")
+    return cleared
+
+
+def _feeling_of(verdict: Dict[str, Any]) -> str:
+    return str(verdict.get("feeling", "")).strip()[:MAX_STATE_TEXT_LENGTH]
+
+
+def _report_blocked_conversation(chat_key: str) -> None:
+    """去掉旧描述之后仍被拦：问题出在对话本身，什么描述都不清"""
+    message = (
+        f"好感度评估被内容审核拦下，去掉旧印象之后仍被拦（或本来就没有旧印象），判定为对话本身触发；"
+        f"不清任何印象，跳过这一轮: chat_key={chat_key}"
+    )
+    if _report_once(chat_key, "blocked_by_conversation"):
+        logger.warning(message)
+    else:
+        logger.debug(message)
+
+
+def _report_superseded(chat_key: str, key: AffectionKey) -> None:
+    """进行中的评估输给了后台写入：管理员在评估开始之后动过这一行，这个人这一轮的结果作废"""
+    logger.info(f"好感度评估结果作废：评估开始之后这一行有了后台写入: chat_key={chat_key}, key={key}")
 
 
 def parse_verdict_payload(content: str) -> Dict[str, Any]:
@@ -437,7 +598,8 @@ def _build_user_prompt(
 
 
 async def _recent_messages(db_chat_channel: DBChatChannel, config: CoreConfig) -> List[DBChatMessage]:
-    since = int(time.time() - config.AI_CHAT_CONTEXT_EXPIRE_SECONDS)
+    # 下界与主对话历史同一个判据（`/reset` 之后不再读重置前的对话），见 `prompt.context_floor_timestamp`
+    since = context_floor_timestamp(db_chat_channel, config)
     messages = await (
         DBChatMessage.filter(chat_key=db_chat_channel.chat_key, send_timestamp__gte=since)
         .order_by("-send_timestamp")

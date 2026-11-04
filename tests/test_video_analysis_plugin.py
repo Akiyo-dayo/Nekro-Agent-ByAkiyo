@@ -1851,7 +1851,7 @@ class TestFfmpegMissing:
 class TestDeployment:
     def test_the_image_installs_ffmpeg(self) -> None:
         text = (REPO_ROOT / "dockerfile").read_text(encoding="utf-8")
-        assert re.search(r"^RUN apt install .*\bffmpeg\b", text, re.M)
+        assert re.search(r"^RUN .*\bapt(?:-get)? install\b.*\bffmpeg\b", text, re.M)
 
     def test_ci_installs_ffmpeg_and_refuses_to_skip_the_real_cases(self) -> None:
         workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "backend-tests.yml").read_text(encoding="utf-8"))

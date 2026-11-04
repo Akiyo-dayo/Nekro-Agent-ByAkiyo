@@ -2,12 +2,20 @@ name: Build Preview Images
 
 # 本 fork 只推 GHCR（ghcr.io/<owner 小写>/nekro-agent-byakiyo 与 nekro-agent-byakiyo-sandbox 的 preview 标签），
 # 只用内置的 GITHUB_TOKEN，不依赖任何 Docker Hub 密钥。
+# 手动运行时可以把 push_images 取消勾选：两个镜像照常按 amd64 / arm64 构建，但不登录、不推送，
+# 用来在合 main 之前验证镜像能不能构建（例如换基础镜像之后）。推送到 main 时仍按原样构建并推送。
 
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      push_images:
+        description: Push preview images after building
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -52,13 +60,12 @@ jobs:
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-        with:
-          image: tonistiigi/binfmt:qemu-v7.0.0-28
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
       - name: Login to GitHub Container Registry
+        if: github.event_name == 'push' || inputs.push_images
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -79,7 +86,7 @@ jobs:
           context: .
           file: dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' || inputs.push_images }}
           tags: |
             ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo:preview
             ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo:preview-${{ steps.sha.outputs.short_sha }}
@@ -87,6 +94,7 @@ jobs:
           cache-to: type=gha,mode=max
       
       - name: Docker Logout
+        if: github.event_name == 'push' || inputs.push_images
         run: |
           docker logout ghcr.io
 
@@ -99,13 +107,12 @@ jobs:
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-        with:
-          image: tonistiigi/binfmt:qemu-v7.0.0-28
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
       - name: Login to GitHub Container Registry
+        if: github.event_name == 'push' || inputs.push_images
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -126,7 +133,7 @@ jobs:
           context: ./sandbox
           file: sandbox/dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' || inputs.push_images }}
           tags: |
             ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo-sandbox:preview
             ghcr.io/${{ steps.repo.outputs.owner }}/nekro-agent-byakiyo-sandbox:preview-${{ steps.sha.outputs.short_sha }}
@@ -134,5 +141,6 @@ jobs:
           cache-to: type=gha,mode=max
       
       - name: Docker Logout
+        if: github.event_name == 'push' || inputs.push_images
         run: |
           docker logout ghcr.io

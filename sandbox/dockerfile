@@ -1,5 +1,5 @@
 # 使用 Python 官方镜像作为基础镜像
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim-bookworm
 
 # 设置环境变量
 # PIP_CACHE_DIR 必须显式指定：容器以 nobody 运行，而 nobody 的 HOME 是 /nonexistent，
@@ -13,17 +13,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 设置时区
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo 'Asia/Shanghai' > /etc/timezone
-
-# Debian 11 (bullseye) 已 EOL：deb.debian.org / debian-security 上它的包已被撤走（pool 里 404），
-# 只剩 archive.debian.org。不改源的话下面第一条 `apt install` 就是 exit 100，镜像永远构建不出来。
-# archive 的 Release 早已过了 Valid-Until，所以同时关掉有效期检查（签名校验仍然开着）。
-# 长期出路是把基础镜像升到 bookworm（要同步处理包名差异，例如 libgl1-mesa-glx），不在这次改动里。
-RUN printf '%s\n' \
-        'deb http://archive.debian.org/debian bullseye main' \
-        'deb http://archive.debian.org/debian bullseye-updates main' \
-        'deb http://archive.debian.org/debian-security bullseye-security main' \
-        > /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive-bullseye
 
 # 系统更新与基础工具安装
 RUN apt update && apt install -y \
@@ -46,7 +35,10 @@ RUN apt update && apt install -y \
     swig \
     # 系统库
     tzdata \
-    libgl1-mesa-glx \
+    # libGL：bookworm 的 libgl1-mesa-glx 只是依赖这两个包的过渡空包（trixie 已删除），
+    # 直接装实包，装出来的文件不变
+    libgl1 \
+    libglx-mesa0 \
     libglib2.0-0 \
     libffi-dev \
     libssl-dev \

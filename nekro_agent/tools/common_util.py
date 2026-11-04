@@ -277,7 +277,7 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
 # `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求触发发布的 git tag 与它一致（标签写法见 publish.yml）。
-FORK_VERSION = "0.4.3"
+FORK_VERSION = "0.4.4"
 FORK_AUTHOR = "Akiyo_dayo"
 
 # 本分支代码所基于的上游 NekroAgent 发布版，只用于署名「基于 NekroAgent 某版本」。

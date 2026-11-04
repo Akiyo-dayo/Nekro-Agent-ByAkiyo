@@ -1095,6 +1095,40 @@ class TestIssue29ModulesAreAuditedEndpointByEndpoint:
         assert leaked == []
 
 
+# 好感度后台的整表登记。全部归**租户作用域**一类（与最早的 reset / adjust 同档）：
+# `@require_role(Role.Admin)`，先 `resolve_instance_scope`，带 `{record_id}` 的再 `_get_visible_record`，
+# 越权一律 404。只清印象、编辑印象、删流水理由三条是后加的写接口，删流水理由那条还要再在
+# 这一行那个人的流水里按 `event_id` 找——它们滑到别的桶、或者漏掉记录归属判定，都要在这里显式改一次。
+AFFECTION_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
+    ("affection", "GET", "/affection/list"),
+    ("affection", "GET", "/affection/summary"),
+    ("affection", "GET", "/affection/{record_id}"),
+    ("affection", "POST", "/affection/{record_id}/adjust"),
+    ("affection", "POST", "/affection/{record_id}/reset"),
+    ("affection", "POST", "/affection/{record_id}/clear-narrative"),
+    ("affection", "PUT", "/affection/{record_id}/narrative"),
+    ("affection", "DELETE", "/affection/{record_id}/events/{event_id}"),
+}
+
+
+class TestAffectionConsoleIsAuditedEndpointByEndpoint:
+    def test_every_affection_route_is_tenant_scoped_and_registered(self, routes: List[RouteFacts]) -> None:
+        actual = {_key(route) for route in routes if route.module == "affection"}
+        assert actual == AFFECTION_TENANT_SCOPED
+        assert all(_categorize(route) == "TENANT_SCOPED" for route in routes if route.module == "affection")
+
+    def test_record_routes_resolve_the_scope_then_the_visible_record(self, routes: List[RouteFacts]) -> None:
+        """吃 `record_id` 的端点：作用域守卫 + 「这一行对该作用域可见」两步都得在端点里"""
+        missing = []
+        for route in routes:
+            if route.module != "affection" or "{record_id}" not in route.path:
+                continue
+            names = _identifiers(_endpoint_source(route))
+            if not {"resolve_instance_scope", "_get_visible_record"} <= names:
+                missing.append(f"{route.method} {route.path}")
+        assert missing == []
+
+
 def _endpoint_source(route: RouteFacts) -> str:
     module = importlib.import_module(f"nekro_agent.routers.{route.module}")
     for candidate in module.router.routes:

@@ -82,7 +82,7 @@ def _pick_longest_legacy_span(text: str) -> str:
 def _is_parsable_python(text: str) -> bool:
     """整段内容是否真的是一段能编译的 Python 源码
 
-    判据用的是**宿主机**的 Python 语法，而沙盒镜像固定在 `python:3.11-slim-bullseye`
+    判据用的是**宿主机**的 Python 语法，而沙盒镜像固定在 `python:3.11-slim-bookworm`
     （`sandbox/dockerfile:2`），宿主机自身被 `pyproject.toml` 限死在 `>=3.11,<3.13`。
     两端同为 3.11 时判据与沙盒逐字一致；宿主机是 3.12 时判据只会**更宽松**（新语法能过闸门、
     到沙盒里照旧报错），也就是最坏退回改造前的行为，不会把本来能跑的代码挡在门外。

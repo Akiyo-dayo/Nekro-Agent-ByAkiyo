@@ -141,10 +141,15 @@ class DBAffectionEvent(Model):
 
     delta = fields.IntField(default=0, description="本次变化量")
     score_after = fields.IntField(default=0, description="变化后的好感度数值")
-    # llm / manual / reset —— 见 services/affection/stage.py 的 AffectionEventSource
+    # llm / manual / reset / ... —— 见 services/affection/stage.py 的 AffectionEventSource
     source = fields.CharField(max_length=16, default="llm", index=True, description="变化来源")
     reason = fields.TextField(default="", description="变化原因叙述（不可信内容）")
     operator = fields.CharField(max_length=128, default="", description="人工调整的操作者用户名")
+
+    # 软删：管理员只删这一条的理由文字。`reason` 置空，行与 `delta` / `score_after` 原样保留——
+    # 流水是账本（滚动窗口额度从它算），删行会改掉别人的额度，也抹掉了「这里删过东西」的痕迹。
+    deleted_at = fields.DatetimeField(null=True, description="理由被删除的时间；NULL 表示没删过")
+    deleted_by = fields.CharField(max_length=128, default="", description="删除理由的操作者用户名")
 
     create_time = fields.DatetimeField(auto_now_add=True, index=True, description="创建时间")
 

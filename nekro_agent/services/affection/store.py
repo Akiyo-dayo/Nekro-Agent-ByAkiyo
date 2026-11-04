@@ -38,6 +38,14 @@
 "最近一天涨了多少"直接对 `affection_event` 做聚合（:func:`window_usage`）。用进程内计数器
 会有两个致命缺陷：重启即清零，等于给刷分的人送一次免费重置；多进程部署下每个进程各记一份，
 额度会被悄悄放大成进程数倍。流水表本来就逐条记着 `delta` 与 `create_time`，它就是权威账本。
+
+## 后台写入要留得住
+
+后台的重置、只清印象、编辑印象都是「对着一行改描述」。它们本身当场生效，但评估是后台任务：
+一种是下一轮评估照着同一段旧对话把内容复述回来，另一种是一轮在写入之前就开始的评估在写入
+之后落库，把它盖回去。两件事共用一个判据——这个人这一行最近一次**后台写入事件**的
+`create_time`（:func:`latest_admin_write_at`），不新增列：评估取对话的下界跟它取 `max`，
+落库前再在行锁下复核一遍它变没变（:class:`AdminWriteGuard`）。
 """
 
 from __future__ import annotations
@@ -58,10 +66,12 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_affection import DBAffection, DBAffectionEvent
 from nekro_agent.models.db_identity import DBIdentityAlias
 from nekro_agent.services.identity_scope import ScopeDomain, resolve_affection_domain
+from nekro_agent.tools.text_sanitize import strip_nul
 from nekro_agent.tools.untrusted_content import sanitize_block_text, sanitize_inline_text
 
 from .key import AffectionKey
 from .stage import (
+    ADMIN_WRITE_SOURCES,
     AFFECTION_DAILY_WINDOW_SECONDS,
     AFFECTION_WEEKLY_WINDOW_SECONDS,
     AffectionEventSource,
@@ -84,6 +94,31 @@ MAX_EVENT_TEXT_LENGTH = 160
 # 缓存条目上限。超出后整体清空而不是做精细淘汰：好感度快照重建代价极低，
 # 与其为它维护一套 LRU，不如让缓存偶尔冷启动一次。
 _CACHE_MAX_ENTRIES = 4096
+
+# 「只动描述」事件的理由一律是宿主固定文案：不抄新旧描述——被清掉的那段文字可能正是
+# 不该再出现的内容，抄进流水等于换个地方原样留着。
+REASON_BLOCKED_CLEAR = "评估请求被内容审核拦下，去掉旧印象重试后成功；旧印象有嫌疑，已清空（分数不变）"
+REASON_NARRATIVE_CLEAR = "管理员清空了印象（分数不变）"
+REASON_NARRATIVE_EDIT = "管理员编辑了印象（分数不变）"
+
+
+class AffectionWriteSuperseded(Exception):
+    """落库前复核发现：这一行在评估开始之后有了新的后台写入，本次写入作废
+
+    不是错误，是评估这一轮「输给了管理员」：调用方记一条日志、跳过这个人即可。
+    """
+
+
+@dataclass(frozen=True)
+class AdminWriteGuard:
+    """进行中评估的作废判据
+
+    `seen` 是评估开始时这一行最近一次后台写入的时间（没有就是 None）。落库时在行锁下
+    再取一次，不相等就说明这期间管理员动过这一行，评估的结果是照着旧状态算的，必须丢掉。
+    比较的是**同一张表上读回来的同一个值**，不拿应用时钟去比，没有时钟偏差的问题。
+    """
+
+    seen: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -294,6 +329,7 @@ async def apply_delta(
     bump_interaction: bool = True,
     source_platform_userid: str = "",
     update_event_text: bool = True,
+    guard: Optional[AdminWriteGuard] = None,
 ) -> AffectionSnapshot:
     """按增量更新好感度，并记录一条变化事件
 
@@ -314,6 +350,8 @@ async def apply_delta(
         update_event_text: 是否刷新"最近一次变化叙述"。账号合并的补偿事件传 False——
             那不是这段关系里发生的事，把它写进 `last_event_text` 会被下一轮提示词
             当成"最近发生了什么"念给用户听
+        guard: 自动评估传入：落库前在行锁下复核这一行有没有新的后台写入，有就抛
+            :class:`AffectionWriteSuperseded`、什么都不写
 
     Returns:
         更新后的快照
@@ -332,6 +370,62 @@ async def apply_delta(
         bump_interaction=bump_interaction,
         source_platform_userid=source_platform_userid,
         update_event_text=update_event_text,
+        guard=guard,
+    )
+
+
+async def clear_narrative(
+    key: AffectionKey,
+    *,
+    source: AffectionEventSource,
+    reason: str,
+    operator: str = "",
+    chat_key: str = "",
+    guard: Optional[AdminWriteGuard] = None,
+) -> AffectionSnapshot:
+    """只清两段描述（`state_text` / `last_event_text`），分数、阶段、互动次数都不动
+
+    记一条 `delta=0` 的事件。后台「只清印象」与评估被拦后的清理共用这一个入口，
+    区别只在 `source` 与是否带 `guard`。
+    """
+    return await _write(
+        key,
+        delta=0,
+        target_score=None,
+        reason=reason,
+        source=source,
+        chat_key=chat_key,
+        state_text="",
+        event_text="",
+        operator=operator,
+        bump_interaction=False,
+        guard=guard,
+    )
+
+
+async def edit_narrative(
+    key: AffectionKey,
+    *,
+    state_text: str,
+    last_event_text: str,
+    operator: str,
+) -> AffectionSnapshot:
+    """管理员改写两段描述，分数不动
+
+    先去 NUL、再按两列各自的上限截断，然后照常走 `_write` 的清洗——人写的和模型写的
+    落进同一列、同样回注提示词，清洗口径不能有两套。注入时仍按不可信块包裹（读侧不分来源）。
+    事件只记宿主固定文案，不抄新旧文字。
+    """
+    return await _write(
+        key,
+        delta=0,
+        target_score=None,
+        reason=REASON_NARRATIVE_EDIT,
+        source=AffectionEventSource.NARRATIVE_EDIT,
+        state_text=strip_nul(state_text)[:MAX_STATE_TEXT_LENGTH],
+        event_text=strip_nul(last_event_text)[:MAX_EVENT_TEXT_LENGTH],
+        operator=operator,
+        bump_interaction=False,
     )
 
 
@@ -377,6 +471,7 @@ async def _write(
     bump_interaction: bool = True,
     source_platform_userid: str = "",
     update_event_text: bool = True,
+    guard: Optional[AdminWriteGuard] = None,
 ) -> AffectionSnapshot:
     """好感度的唯一写入口
 
@@ -390,6 +485,10 @@ async def _write(
     时间戳一律取 `tortoise.timezone.now()`：同表的 `create_time` 由 `auto_now_add` 写成
     带时区的值，这两列若写成朴素本地时间，同一列里就会混着两种表示，把"这条状态是什么时候
     生成的"变成一个要看是谁写的才能回答的问题。
+
+    `guard` 的复核放在**拿到行锁之后**：后台写入走的也是这里、也要先拿同一把行锁，
+    于是它要么已经提交（这里读得到它的事件，作废），要么排在本次写入后面（它会盖掉本次）。
+    放在锁外复核会留下一个「复核完、写入前」的窗口，管理员恰好在那一刻点下去就会被盖回。
     """
     clean_reason = sanitize_inline_text(reason, MAX_EVENT_TEXT_LENGTH)
     clean_nickname = sanitize_inline_text(nickname, MAX_NICKNAME_LENGTH)
@@ -402,6 +501,8 @@ async def _write(
         record = await DBAffection.filter(**key.as_columns()).select_for_update().first()
         if record is None:  # pragma: no cover - `_ensure_record` 之后只有并发删除才会走到
             raise RuntimeError(f"好感度记录在写入前被删除: {key}")
+        if guard is not None and await latest_admin_write_at(key) != guard.seen:
+            raise AffectionWriteSuperseded(f"评估开始之后这一行有了新的后台写入，本次结果作废: {key}")
 
         effective_delta = target_score - record.score if target_score is not None else delta
         record.score = clamp_score(record.score + effective_delta)
@@ -449,11 +550,65 @@ async def list_events(key: AffectionKey, limit: int = 20) -> List[DBAffectionEve
     也会被历史数据导入写入带旧时间戳的行——那时按 id 排会把一条更早发生的事显示在最上面。
     同一时刻的并列再按 id 兜底，保证同一份数据两次读出来的顺序相同。
     """
-    return await (
-        DBAffectionEvent.filter(**key.scope_columns(), platform_userid__in=await person_account_ids(key))
+    return await (await _person_events(key)).order_by("-create_time", "-id").limit(limit)
+
+
+async def _person_events(key: AffectionKey) -> QuerySet[DBAffectionEvent]:
+    """这一行对应的那个人的全部流水：同域、同人设，人取全部账号的并集
+
+    详情页的时间线（:func:`list_events`）、删一条流水的理由（:func:`redact_event_reason`）、
+    后台写入的时间点（:func:`latest_admin_write_at`）都只认这一个范围。
+    删理由那一条尤其要紧：它按 `event_id` 定位，范围一旦比详情页宽，就能拿别人的
+    流水编号删到别的域、别的人设、别的人头上。
+    """
+    return DBAffectionEvent.filter(**key.scope_columns(), platform_userid__in=await person_account_ids(key))
+
+
+async def redact_event_reason(key: AffectionKey, event_id: int, *, operator: str) -> Optional[DBAffectionEvent]:
+    """软删一条流水的理由：`reason` 置空，记下删除时间与操作者，行与分数一概不动
+
+    Returns:
+        处理后的事件；这条流水不在这一行那个人的范围里时返回 None（调用方按 404 处理）。
+
+    已经删过的再删一次原样返回、不改删除记录：第一次是谁、什么时候删的才是要留的痕迹。
+    `last_event_text` 跟流水是两回事，这里不连带它（要改它走 :func:`clear_narrative` /
+    :func:`edit_narrative`）。快照里没有流水，但照样让缓存失效，与另外两个后台操作同一口径。
+    """
+    event = await (await _person_events(key)).filter(id=event_id).first()
+    if event is None:
+        return None
+    if event.deleted_at is None:
+        event.reason = ""
+        event.deleted_at = db_now()
+        event.deleted_by = operator[:128]
+        await event.save(update_fields=["reason", "deleted_at", "deleted_by"])
+    invalidate_cache(key)
+    return event
+
+
+async def latest_admin_write_at(key: AffectionKey) -> Optional[datetime]:
+    """这个人这一行最近一次后台写入（重置 / 只清印象 / 编辑印象）的时间；没有就是 None
+
+    范围与详情页的时间线相同（同域、同人设、含合并过来的账号），来源见
+    `stage.ADMIN_WRITE_SOURCES`。不新增列：流水本来就逐条记着来源与时间。
+    """
+    rows = (
+        await (await _person_events(key))
+        .filter(source__in=sorted(source.value for source in ADMIN_WRITE_SOURCES))
         .order_by("-create_time", "-id")
-        .limit(limit)
+        .limit(1)
+        .values_list("create_time", flat=True)
     )
+    return rows[0] if rows else None
+
+
+async def latest_admin_writes(keys: Iterable[AffectionKey]) -> Dict[AffectionKey, Optional[datetime]]:
+    """批量取 :func:`latest_admin_write_at`，键去重；一轮评估的参与者通常只有几个人"""
+    result: Dict[AffectionKey, Optional[datetime]] = {}
+    for key in keys:
+        if key not in result:
+            result[key] = await latest_admin_write_at(key)
+    return result
 
 
 async def throttle_llm_delta(

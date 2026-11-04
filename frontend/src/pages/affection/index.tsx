@@ -5,17 +5,22 @@
  * 分数只作为一个小小的副标题跟在关系阶段后面。好感度是给人玩的，
  * 做成一张按分数排序的审计表就没意思了——数值该在的地方是排序键和调整入口，不是主角。
  *
- * 作用域跟随顶栏的实例切换器：好感度按 (实例, 用户) 隔离，
+ * 作用域跟随顶栏的实例切换器：好感度按 (域, 人, 人设) 隔离，
  * 全局视图看到全部实例的数据，实例视图只看该实例的。租户身份的越权访问由服务端按 404 处理。
+ *
+ * 一行是「某人在人设 X 下的那一份」：同一个人换过人设就有好几行。列表因此标出人设与
+ * 「在用」（本域里有几个频道当前正用着这个人设），同一个人的多行折叠在一起，
+ * 每个改动对话框都写明改的是哪个人设那一份——否则重置很容易落在一行没人用的旧人设上。
  */
 
-import { useMemo, useState } from 'react'
+import { Fragment, useMemo, useState } from 'react'
 import {
   Alert,
   Box,
   Chip,
   CircularProgress,
   Divider,
+  Link,
   Stack,
   SxProps,
   Table,
@@ -31,6 +36,9 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import AutoFixHighRoundedIcon from '@mui/icons-material/AutoFixHighRounded'
+import CleaningServicesRoundedIcon from '@mui/icons-material/CleaningServicesRounded'
+import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded'
+import EditNoteRoundedIcon from '@mui/icons-material/EditNoteRounded'
 import FavoriteRoundedIcon from '@mui/icons-material/FavoriteRounded'
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
 import RestartAltRoundedIcon from '@mui/icons-material/RestartAltRounded'
@@ -57,11 +65,42 @@ const PAGE_SIZE = 20
 
 const SORT_OPTIONS: AffectionSortBy[] = ['score_desc', 'score_asc', 'recent', 'interaction']
 
+// 两段描述的长度上限，只用于输入框提示；真正的截断在服务端（`store.MAX_*_LENGTH`）
+const STATE_TEXT_MAX = 300
+const EVENT_TEXT_MAX = 160
+
 function formatDateTime(value: string | null, fallback: string): string {
   if (!value) return fallback
   const timestamp = new Date(value).getTime()
   if (Number.isNaN(timestamp)) return fallback
   return new Date(timestamp).toLocaleString()
+}
+
+/**
+ * 把一页里同一个人的几行（不同人设）折到一起
+ *
+ * 「同一个人」= 同域 + 同一个人标识。组内在用的那一份排在最前面（运营最常要动的就是它），
+ * 其余保持服务端给的顺序；组与组之间也保持服务端顺序，排序选项因此照常生效。
+ * 分页在服务端，所以只折得到同一页里的行。
+ */
+function groupByPerson(items: AffectionItem[]): AffectionItem[][] {
+  const groups = new Map<string, AffectionItem[]>()
+  for (const item of items) {
+    const key = `${item.domain_id}|${item.platform_userid}`
+    const group = groups.get(key)
+    if (group) group.push(item)
+    else groups.set(key, [item])
+  }
+  return Array.from(groups.values()).map(group =>
+    group
+      .map((item, index) => ({ item, index }))
+      .sort(
+        (a, b) =>
+          Number(b.item.in_use_channels > 0) - Number(a.item.in_use_channels > 0) ||
+          a.index - b.index
+      )
+      .map(entry => entry.item)
+  )
 }
 
 export default function AffectionPage() {
@@ -81,6 +120,13 @@ export default function AffectionPage() {
   const [adjustTarget, setAdjustTarget] = useState<AffectionItem | null>(null)
   const [adjustScore, setAdjustScore] = useState('0')
   const [adjustReason, setAdjustReason] = useState('')
+  const [clearTarget, setClearTarget] = useState<AffectionItem | null>(null)
+  const [editTarget, setEditTarget] = useState<AffectionItem | null>(null)
+  const [editStateText, setEditStateText] = useState('')
+  const [editEventText, setEditEventText] = useState('')
+  const [deleteReasonEventId, setDeleteReasonEventId] = useState<number | null>(null)
+  // 展开了「其他人设」的人，键与 `groupByPerson` 的分组键相同
+  const [expandedPeople, setExpandedPeople] = useState<Set<string>>(() => new Set())
 
   // 作用域是这些接口的必填参数（租户身份下服务端直接 400），因此必须等它确定后再发请求
   const scopeParam = currentInstanceKey ?? undefined
@@ -152,7 +198,77 @@ export default function AffectionPage() {
     onError: (error: Error) => notification.error(error.message),
   })
 
-  const items = listQuery.data?.items ?? []
+  const clearMutation = useMutation({
+    mutationFn: (id: number) => affectionApi.clearNarrative(id, scopeParam),
+    onSuccess: () => {
+      notification.success(t('messages.clearDone'))
+      setClearTarget(null)
+      invalidate()
+    },
+    onError: (error: Error) => notification.error(error.message),
+  })
+
+  const editMutation = useMutation({
+    mutationFn: (payload: { id: number; state_text: string; last_event_text: string }) =>
+      affectionApi.editNarrative(
+        payload.id,
+        { state_text: payload.state_text, last_event_text: payload.last_event_text },
+        scopeParam
+      ),
+    onSuccess: () => {
+      notification.success(t('messages.editDone'))
+      setEditTarget(null)
+      invalidate()
+    },
+    onError: (error: Error) => notification.error(error.message),
+  })
+
+  const deleteReasonMutation = useMutation({
+    mutationFn: (payload: { recordId: number; eventId: number }) =>
+      affectionApi.deleteEventReason(payload.recordId, payload.eventId, scopeParam),
+    onSuccess: () => {
+      notification.success(t('messages.reasonDeleted'))
+      setDeleteReasonEventId(null)
+      invalidate()
+    },
+    onError: (error: Error) => notification.error(error.message),
+  })
+
+  /** 「某人在人设 X 下的那一份」——每个改动对话框都要写明改的是哪一份 */
+  const shareOf = (item: AffectionItem | null): string =>
+    item
+      ? t('scope.thisShare', {
+          name: item.nickname || item.platform_userid,
+          preset: item.preset_name,
+        })
+      : ''
+
+  /** 改的不是任何频道在用的那一份时，提醒一句 */
+  const notInUseWarning = (item: AffectionItem | null) =>
+    item && item.in_use_channels === 0 ? (
+      <Alert severity="warning" variant="outlined">
+        {t('scope.notInUseWarning')}
+      </Alert>
+    ) : null
+
+  const togglePerson = (key: string) => {
+    setExpandedPeople(previous => {
+      const next = new Set(previous)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const openEdit = (item: AffectionItem) => {
+    setEditTarget(item)
+    setEditStateText(item.state_text)
+    setEditEventText(item.last_event_text)
+  }
+
+  const listItems = listQuery.data?.items
+  const items = listItems ?? []
+  const groups = useMemo(() => groupByPerson(listItems ?? []), [listItems])
   const total = listQuery.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
@@ -283,7 +399,12 @@ export default function AffectionPage() {
               isLoading 为 false 会让页面先闪一帧「暂无数据」 */}
           {listQuery.isPending ? (
             <Box
-              sx={{ minHeight: 240, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              sx={{
+                minHeight: 240,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
             >
               <CircularProgress />
             </Box>
@@ -311,6 +432,9 @@ export default function AffectionPage() {
                     {t('columns.person')}
                   </TableCell>
                   <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('columns.preset')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
                     {t('columns.relation')}
                   </TableCell>
                   <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
@@ -325,91 +449,181 @@ export default function AffectionPage() {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {items.map(item => (
-                  <TableRow key={item.id} hover sx={UNIFIED_TABLE_STYLES.row as SxProps<Theme>}>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                      <Typography variant="body2" fontWeight={600} noWrap>
-                        {item.nickname || item.platform_userid}
-                      </Typography>
-                      <Typography variant="caption" color="text.secondary" noWrap>
-                        {item.platform_userid}
-                        {item.instance_key ? ` · ${item.instance_key}` : ''}
-                      </Typography>
-                      {/* 被合并掉的副号那一行是**休眠**数据：Bot 读的是主账号那一行，
-                          在这里调分数不会有任何效果。不标出来的话管理员会对着一个
-                          「改了也不动」的行反复调整。 */}
-                      {item.merged_into && (
-                        <Typography variant="caption" color="warning.main" noWrap display="block">
-                          {t('columns.mergedInto', { person: item.merged_into })}
-                        </Typography>
-                      )}
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                      <Chip
-                        size="small"
-                        label={item.stage_label}
-                        sx={CHIP_VARIANTS.getCustomColorChip(stageColor(item.stage), true)}
-                      />
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        sx={{ display: 'block', mt: 0.25 }}
-                      >
-                        {item.score}
-                      </Typography>
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                      <Typography variant="body2">
-                        {item.state_text || t('columns.feelingEmpty')}
-                      </Typography>
-                      {item.last_event_text && (
-                        <Typography variant="caption" color="text.secondary">
-                          {item.last_event_text}
-                        </Typography>
-                      )}
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>} align="right">
-                      {item.interaction_count}
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>} align="center">
-                      <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'center' }}>
-                        <SimpleTooltip title={t('actions.detail')}>
-                          <span>
-                            <IconActionButton
-                              size="small"
-                              tone="primary"
-                              onClick={() => setDetailId(item.id)}
+                {groups.map(group => {
+                  const [primary, ...others] = group
+                  const groupKey = `${primary.domain_id}|${primary.platform_userid}`
+                  const expanded = expandedPeople.has(groupKey)
+                  return (
+                    <Fragment key={groupKey}>
+                      {[primary, ...(expanded ? others : [])].map((item, index) => {
+                        const nested = index > 0
+                        return (
+                          <TableRow
+                            key={item.id}
+                            hover
+                            sx={
+                              [
+                                UNIFIED_TABLE_STYLES.row,
+                                nested ? { bgcolor: theme.palette.action.hover } : {},
+                              ] as SxProps<Theme>
+                            }
+                          >
+                            <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                              <Box sx={{ pl: nested ? 2 : 0 }}>
+                                <Typography variant="body2" fontWeight={600} noWrap>
+                                  {item.nickname || item.platform_userid}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary" noWrap>
+                                  {item.platform_userid}
+                                  {item.instance_key ? ` · ${item.instance_key}` : ''}
+                                </Typography>
+                                {/* 被合并掉的副号那一行是**休眠**数据：Bot 读的是主账号那一行，
+                                    在这里调分数不会有任何效果。不标出来的话管理员会对着一个
+                                    「改了也不动」的行反复调整。 */}
+                                {item.merged_into && (
+                                  <Typography
+                                    variant="caption"
+                                    color="warning.main"
+                                    noWrap
+                                    display="block"
+                                  >
+                                    {t('columns.mergedInto', { person: item.merged_into })}
+                                  </Typography>
+                                )}
+                                {!nested && others.length > 0 && (
+                                  <Link
+                                    component="button"
+                                    type="button"
+                                    variant="caption"
+                                    underline="hover"
+                                    onClick={() => togglePerson(groupKey)}
+                                    sx={{ display: 'block', mt: 0.25 }}
+                                  >
+                                    {expanded
+                                      ? t('columns.hideOtherPresets')
+                                      : t('columns.showOtherPresets', { count: others.length })}
+                                  </Link>
+                                )}
+                              </Box>
+                            </TableCell>
+                            <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                              <Typography variant="body2" noWrap>
+                                {item.preset_name}
+                              </Typography>
+                              {item.in_use_channels > 0 ? (
+                                <Chip
+                                  size="small"
+                                  label={t('columns.inUse', { count: item.in_use_channels })}
+                                  sx={CHIP_VARIANTS.getCustomColorChip(
+                                    theme.palette.success.main,
+                                    true
+                                  )}
+                                />
+                              ) : (
+                                <Typography variant="caption" color="text.secondary">
+                                  {t('columns.notInUse')}
+                                </Typography>
+                              )}
+                            </TableCell>
+                            <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                              <Chip
+                                size="small"
+                                label={item.stage_label}
+                                sx={CHIP_VARIANTS.getCustomColorChip(stageColor(item.stage), true)}
+                              />
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                sx={{ display: 'block', mt: 0.25 }}
+                              >
+                                {item.score}
+                              </Typography>
+                            </TableCell>
+                            <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                              <Typography variant="body2">
+                                {item.state_text || t('columns.feelingEmpty')}
+                              </Typography>
+                              {item.last_event_text && (
+                                <Typography variant="caption" color="text.secondary">
+                                  {item.last_event_text}
+                                </Typography>
+                              )}
+                            </TableCell>
+                            <TableCell
+                              sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}
+                              align="right"
                             >
-                              <TimelineRoundedIcon fontSize="small" />
-                            </IconActionButton>
-                          </span>
-                        </SimpleTooltip>
-                        <SimpleTooltip title={t('actions.adjust')}>
-                          <span>
-                            <IconActionButton
-                              size="small"
-                              tone="subtle"
-                              onClick={() => openAdjust(item)}
+                              {item.interaction_count}
+                            </TableCell>
+                            <TableCell
+                              sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}
+                              align="center"
                             >
-                              <AutoFixHighRoundedIcon fontSize="small" />
-                            </IconActionButton>
-                          </span>
-                        </SimpleTooltip>
-                        <SimpleTooltip title={t('actions.reset')}>
-                          <span>
-                            <IconActionButton
-                              size="small"
-                              tone="danger"
-                              onClick={() => setResetTarget(item)}
-                            >
-                              <RestartAltRoundedIcon fontSize="small" />
-                            </IconActionButton>
-                          </span>
-                        </SimpleTooltip>
-                      </Box>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                              <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'center' }}>
+                                <SimpleTooltip title={t('actions.detail')}>
+                                  <span>
+                                    <IconActionButton
+                                      size="small"
+                                      tone="primary"
+                                      onClick={() => setDetailId(item.id)}
+                                    >
+                                      <TimelineRoundedIcon fontSize="small" />
+                                    </IconActionButton>
+                                  </span>
+                                </SimpleTooltip>
+                                <SimpleTooltip title={t('actions.adjust')}>
+                                  <span>
+                                    <IconActionButton
+                                      size="small"
+                                      tone="subtle"
+                                      onClick={() => openAdjust(item)}
+                                    >
+                                      <AutoFixHighRoundedIcon fontSize="small" />
+                                    </IconActionButton>
+                                  </span>
+                                </SimpleTooltip>
+                                <SimpleTooltip title={t('actions.editNarrative')}>
+                                  <span>
+                                    <IconActionButton
+                                      size="small"
+                                      tone="subtle"
+                                      onClick={() => openEdit(item)}
+                                    >
+                                      <EditNoteRoundedIcon fontSize="small" />
+                                    </IconActionButton>
+                                  </span>
+                                </SimpleTooltip>
+                                <SimpleTooltip title={t('actions.clearNarrative')}>
+                                  <span>
+                                    <IconActionButton
+                                      size="small"
+                                      tone="subtle"
+                                      disabled={!item.state_text && !item.last_event_text}
+                                      onClick={() => setClearTarget(item)}
+                                    >
+                                      <CleaningServicesRoundedIcon fontSize="small" />
+                                    </IconActionButton>
+                                  </span>
+                                </SimpleTooltip>
+                                <SimpleTooltip title={t('actions.reset')}>
+                                  <span>
+                                    <IconActionButton
+                                      size="small"
+                                      tone="danger"
+                                      onClick={() => setResetTarget(item)}
+                                    >
+                                      <RestartAltRoundedIcon fontSize="small" />
+                                    </IconActionButton>
+                                  </span>
+                                </SimpleTooltip>
+                              </Box>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </Fragment>
+                  )
+                })}
               </TableBody>
             </Table>
           )}
@@ -504,10 +718,20 @@ export default function AffectionPage() {
                         true
                       )}
                     />
-                    <Box sx={{ minWidth: 0 }}>
-                      <Typography variant="body2">
-                        {event.reason || t(`detail.source.${event.source}`)}
-                      </Typography>
+                    <Box sx={{ minWidth: 0, flex: 1 }}>
+                      {/* 删过理由的条目只给删除痕迹，不给理由（服务端也不再返回它） */}
+                      {event.deleted ? (
+                        <Typography variant="body2" color="text.secondary" fontStyle="italic">
+                          {t('detail.reasonDeleted', {
+                            operator: event.deleted_by || '—',
+                            time: formatDateTime(event.deleted_at, '—'),
+                          })}
+                        </Typography>
+                      ) : (
+                        <Typography variant="body2">
+                          {event.reason || t(`detail.source.${event.source}`)}
+                        </Typography>
+                      )}
                       <Typography variant="caption" color="text.secondary">
                         {formatDateTime(event.create_time, '—')}
                         {' · '}
@@ -523,6 +747,19 @@ export default function AffectionPage() {
                         {event.operator ? ` · ${event.operator}` : ''}
                       </Typography>
                     </Box>
+                    {!event.deleted && event.reason && (
+                      <SimpleTooltip title={t('actions.deleteReason')}>
+                        <span>
+                          <IconActionButton
+                            size="small"
+                            tone="danger"
+                            onClick={() => setDeleteReasonEventId(event.id)}
+                          >
+                            <DeleteOutlineRoundedIcon fontSize="small" />
+                          </IconActionButton>
+                        </span>
+                      </SimpleTooltip>
+                    )}
                   </Box>
                 ))}
               </Stack>
@@ -560,8 +797,9 @@ export default function AffectionPage() {
       >
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
           <Typography variant="body2" color="text.secondary">
-            {t('adjustDialog.description')}
+            {t('adjustDialog.description', { share: shareOf(adjustTarget) })}
           </Typography>
+          {notInUseWarning(adjustTarget)}
           <TextField
             size="small"
             fullWidth
@@ -606,10 +844,125 @@ export default function AffectionPage() {
           </>
         }
       >
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+          <Typography variant="body2">
+            {t('resetDialog.description', { share: shareOf(resetTarget) })}
+          </Typography>
+          {notInUseWarning(resetTarget)}
+        </Box>
+      </NekroDialog>
+
+      <NekroDialog
+        open={clearTarget !== null}
+        onClose={() => setClearTarget(null)}
+        title={t('clearDialog.title')}
+        maxWidth="xs"
+        actions={
+          <>
+            <ActionButton tone="ghost" onClick={() => setClearTarget(null)}>
+              {tCommon('actions.cancel')}
+            </ActionButton>
+            <ActionButton
+              tone="danger"
+              disabled={clearMutation.isPending}
+              onClick={() => {
+                if (!clearTarget) return
+                clearMutation.mutate(clearTarget.id)
+              }}
+            >
+              {t('clearDialog.submit')}
+            </ActionButton>
+          </>
+        }
+      >
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+          <Typography variant="body2">
+            {t('clearDialog.description', { share: shareOf(clearTarget) })}
+          </Typography>
+          {notInUseWarning(clearTarget)}
+        </Box>
+      </NekroDialog>
+
+      <NekroDialog
+        open={editTarget !== null}
+        onClose={() => setEditTarget(null)}
+        title={t('editDialog.title')}
+        maxWidth="sm"
+        actions={
+          <>
+            <ActionButton tone="ghost" onClick={() => setEditTarget(null)}>
+              {tCommon('actions.cancel')}
+            </ActionButton>
+            <ActionButton
+              tone="primary"
+              disabled={editMutation.isPending}
+              onClick={() => {
+                if (!editTarget) return
+                editMutation.mutate({
+                  id: editTarget.id,
+                  state_text: editStateText,
+                  last_event_text: editEventText,
+                })
+              }}
+            >
+              {t('editDialog.submit')}
+            </ActionButton>
+          </>
+        }
+      >
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+          <Typography variant="body2" color="text.secondary">
+            {t('editDialog.description', { share: shareOf(editTarget) })}
+          </Typography>
+          {notInUseWarning(editTarget)}
+          <TextField
+            size="small"
+            fullWidth
+            multiline
+            minRows={3}
+            label={t('editDialog.stateText')}
+            value={editStateText}
+            error={editStateText.length > STATE_TEXT_MAX}
+            helperText={`${editStateText.length} / ${STATE_TEXT_MAX} · ${t('editDialog.lengthHelper', { max: STATE_TEXT_MAX })}`}
+            onChange={event => setEditStateText(event.target.value)}
+          />
+          <TextField
+            size="small"
+            fullWidth
+            label={t('editDialog.eventText')}
+            value={editEventText}
+            error={editEventText.length > EVENT_TEXT_MAX}
+            helperText={`${editEventText.length} / ${EVENT_TEXT_MAX} · ${t('editDialog.lengthHelper', { max: EVENT_TEXT_MAX })}`}
+            onChange={event => setEditEventText(event.target.value)}
+          />
+        </Box>
+      </NekroDialog>
+
+      <NekroDialog
+        open={deleteReasonEventId !== null}
+        onClose={() => setDeleteReasonEventId(null)}
+        title={t('deleteReasonDialog.title')}
+        maxWidth="xs"
+        actions={
+          <>
+            <ActionButton tone="ghost" onClick={() => setDeleteReasonEventId(null)}>
+              {tCommon('actions.cancel')}
+            </ActionButton>
+            <ActionButton
+              tone="danger"
+              disabled={deleteReasonMutation.isPending}
+              onClick={() => {
+                if (detailId === null || deleteReasonEventId === null) return
+                deleteReasonMutation.mutate({ recordId: detailId, eventId: deleteReasonEventId })
+              }}
+            >
+              {t('deleteReasonDialog.submit')}
+            </ActionButton>
+          </>
+        }
+      >
         <Typography variant="body2" sx={{ pt: 1 }}>
-          {t('resetDialog.description', {
-            name: resetTarget?.nickname || resetTarget?.platform_userid || '',
-          })}
+          {t('deleteReasonDialog.description')}
         </Typography>
       </NekroDialog>
     </Box>

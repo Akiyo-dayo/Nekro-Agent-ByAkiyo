@@ -10,7 +10,7 @@
 因此本模块做两件事：
 
 1. **按平台探测一条字体链**：中文主字体 → 彩色 emoji 字体 → 符号兜底字体。
-   Docker 镜像（`python:3.11-slim-bullseye`）自身不带任何 CJK 字体，必须由 dockerfile
+   Docker 镜像（`python:3.11-slim-bookworm`）自身不带任何 CJK 字体，必须由 dockerfile
    安装 `fonts-noto-cjk`；候选路径表里同时列出 Noto / 文泉驿 / 微软雅黑 / 苹方，
    让开发机、服务器、容器三种环境都能自己找到可用字体。
 2. **按字形覆盖切分文本**：用 fontTools 读出每个字体的 cmap，把一段文本切成若干"这一段

@@ -127,6 +127,18 @@ class AffectionEventSource(StrEnum):
 
     `DOMAIN_MERGE` 是实例入域并入存量好感留下的折叠补偿，见
     `services/identity_admin.py:merge_self_domain_into_group`。
+
+    下面三种都是 `delta=0` 的「只动描述」事件，分数与阶段一律不变：
+
+    - `BLOCKED_CLEAR`：评估请求被上游内容审核拦下，去掉旧描述重试成功之后，系统清掉了
+      重试里没给出新描述的那些人的旧描述——它们就在被拦的那份提示词里，有嫌疑。
+      见 :mod:`.evaluator`。
+    - `NARRATIVE_CLEAR` / `NARRATIVE_EDIT`：管理员在后台只清印象、编辑印象。
+      事件里只写宿主固定文案，不抄新旧文字。
+
+    `RESET` / `NARRATIVE_CLEAR` / `NARRATIVE_EDIT` 合称**后台写入**（:data:`ADMIN_WRITE_SOURCES`）：
+    评估只读最近一次后台写入之后的对话，进行中的评估遇上它要作废，否则管理员刚清掉的内容
+    会被旧对话或那一轮评估原样写回来。
     """
 
     LLM = "llm"
@@ -135,6 +147,20 @@ class AffectionEventSource(StrEnum):
     MERGE = "merge"
     UNMERGE = "unmerge"
     DOMAIN_MERGE = "domain_merge"
+    BLOCKED_CLEAR = "blocked_clear"
+    NARRATIVE_CLEAR = "narrative_clear"
+    NARRATIVE_EDIT = "narrative_edit"
+
+
+# 后台写入：这几种事件的 `create_time` 是评估取对话的下界，也是进行中评估的作废判据。
+# 人工调分（`MANUAL`）不在里面：它不碰描述，旧对话写回不了它改过的东西。
+ADMIN_WRITE_SOURCES: frozenset[AffectionEventSource] = frozenset(
+    {
+        AffectionEventSource.RESET,
+        AffectionEventSource.NARRATIVE_CLEAR,
+        AffectionEventSource.NARRATIVE_EDIT,
+    },
+)
 
 
 class AffectionRateLimits(NamedTuple):

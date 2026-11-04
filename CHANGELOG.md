@@ -4,6 +4,30 @@ Version numbers here are this derivative edition's own (`FORK_VERSION` in `nekro
 NekroAgent `2.4.0` (`UPSTREAM_BASE_VERSION`; up to v0.4.2 it was based on `2.3.3`). The `version` in `pyproject.toml` is the plugin-compatibility version (`2.4.0`): plugins written for that
 upstream version install and run here. It drives plugin-compatibility checks and update checks, and is not this edition's own version.
 
+## v0.4.4 (2026-11-04)
+
+Both Docker images move to Debian 12 (bookworm). Affection descriptions that the model provider blocked can be cleared again, `/reset` and admin resets stick, and the affection page gets three description-only operations and a preset column. OneBot names made only of blank characters are shown again instead of the QQ number. One database migration, no new dependency.
+
+### Fixed
+- OneBot nicknames and group cards made only of blank characters (for example a single full-width space used as an "invisible name") were shown as the QQ number since v0.4.3. They are kept as the protocol endpoint reports them again. A coloured or special group card that leaves only blanks once its control characters are removed still falls back to the nickname.
+- **Affection descriptions that the model provider blocked could not be cleared, and the chat kept getting empty replies or refusals.** The affection evaluation sends each participant's current description along; once a description contained something the provider blocks, those evaluations were blocked and the description was never replaced, while every reply in the chat injected it again. A blocked evaluation is now retried once without the current descriptions. If that works, results are saved as usual and the descriptions of participants who got no new one are cleared (scores unchanged, recorded in the history). If it is still blocked, the conversation itself is the cause and nothing is cleared.
+- After a reply in a chat ends with a content block or a provider refusal, that chat's affection block carries only nickname and closeness, without the written descriptions, until the next normal reply or for the length of the chat context window (`AI_CHAT_CONTEXT_EXPIRE_SECONDS`). This is kept in memory only and is reset by a restart.
+- After `/reset`, affection no longer reads the conversation from before the reset (the same cut-off as the chat history). `/reset` still does not clear affection or change scores, on purpose: any group admin can send it, and affection is shared across chats.
+- An admin reset could be written back by the old conversation, or overwritten by an evaluation that was already running. Evaluations now read only messages after the latest admin reset, clear or edit of the people involved, and an evaluation that started before such an admin change drops its result for that person.
+- The affection page did not show which preset (persona) a row belongs to, so a reset could land on a row that no chat uses. It now shows a preset column with an "in use" marker (how many chats in that domain currently use that preset), folds the rows of one person together, and every dialog that changes a row says which preset's share it changes.
+
+### Added
+- Affection page: **clear impression only** (keeps the score), **edit impression**, and **delete the reason of one history entry** (the text is removed, the entry and its score effect stay, and the deletion is recorded). Old and new texts are not copied into the history. All three are available to tenant admins for their own instances.
+
+### Changed
+- The affection evaluation asks the model to write feelings and reasons in its own words, without quoting users or repeating content that may violate content policies.
+- **Both Docker images are now based on Debian 12 (bookworm)** (`python:3.11-slim-bookworm`, as upstream). Debian 11 no longer gets security updates, and the images no longer need the `archive.debian.org` package sources. Python stays 3.11; system packages such as ffmpeg and iptables move to their Debian 12 versions.
+- The image build workflows no longer pin an old QEMU version, which broke the arm64 sandbox build on Debian 12. A manual run of the preview workflow can build both images without pushing them.
+
+### Upgrade notes
+- Pull both new images (the main image and the sandbox image); new sandbox containers use the Debian 12 image.
+- **Database migration 28** (`28_20261103194330_affection_event_soft_delete`) runs automatically on start. It only adds two columns to the affection history table (when and by whom a reason was deleted); existing rows are not rewritten.
+
 ## v0.4.3 (2026-11-03)
 
 Bug fixes, a cross-tenant OneBot account takeover fix, a way to change an instance's access token, two security fixes in the MCP server test, a prompt-injection fix for the CC workspace and GitHub plugins, fixes for status-mail flooding, the quota whitelist and plugin activation, and web chat from upstream 2.4.0. No database migration, no new dependency; the new `web` adapter brings its own adapter settings.

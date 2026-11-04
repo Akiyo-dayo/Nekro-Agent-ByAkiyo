@@ -27,15 +27,30 @@
 否则管理员会对着一个"分数永远不动"的行反复调整。事件流水则按人取并集（`store.list_events`），
 每条都带上真正的来源账号。
 
-## 数值可调，描述只读
+## 一行对应「某人在人设 X 下的那一份」
 
-后台能改的是 `score`（以及重置），改完由系统按阈值重新派生阶段。
-`state_text` 这类叙述文本由 LLM 生成，后台不提供编辑入口：手改一段"人设口吻的自述"
-只会和下一次评估打架。要抹掉不合适的描述用重置。
+同一个人换过人设就有好几行。列表因此带上 `preset_name` 与 `in_use_channels`
+（本域里当前生效人设正是这一行人设的频道数，0 = 眼下没有频道在用这一份）。
+「当前生效人设」只认 `DBChatChannel.get_effective_preset_id` 那一条回退链
+（经 `identity_scope.resolve_preset_id`），这里不另写一套。
+
+## 后台能做什么
+
+- 调分（`adjust`）与重置（`reset`，分数归零 + 清两段描述）；
+- 只清印象（`clear-narrative`）：清两段描述，分数不动；
+- 编辑印象（`narrative`）：改写两段描述，去 NUL、按上限截断，注入时照旧按不可信块包裹；
+- 删一条流水的理由（`events/{event_id}`）：软删，只删文字、留删除痕迹，分数与 `score_after` 不动。
+  只在这一行那个人的流水里找（同域、同人设、含合并过来的账号），与详情页时间线同一个范围。
+
+后面三项都只记宿主固定文案，不把新旧文字抄进流水；做完当场让快照缓存失效，下一轮提示词
+就是新内容；评估只读这之后的对话、进行中的评估遇上它作废（见 `services/affection/store.py`）。
+所有写操作与读操作同档：`Role.Admin`，先 `resolve_instance_scope` 再 `_get_visible_record`，
+越权一律 404（不暴露记录在不在）。
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -46,8 +61,9 @@ from tortoise.queryset import QuerySet
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_affection import DBAffection, DBAffectionEvent
+from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_identity import DBIdentityAlias
-from nekro_agent.models.db_instance_group import SELF_DOMAIN_GROUP_ID
+from nekro_agent.models.db_instance_group import SELF_DOMAIN_GROUP_ID, DBInstanceDomainBinding
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.services.affection.merge import list_person_accounts
@@ -61,10 +77,14 @@ from nekro_agent.services.affection.stage import (
     stage_of,
 )
 from nekro_agent.services.affection.store import (
+    REASON_NARRATIVE_CLEAR,
     affection_domain_of_instance,
     apply_delta,
+    clear_narrative,
+    edit_narrative,
     key_of_record,
     list_events,
+    redact_event_reason,
     set_score,
 )
 from nekro_agent.services.identity_admin import (
@@ -73,7 +93,7 @@ from nekro_agent.services.identity_admin import (
     preset_display_name,
     preset_names,
 )
-from nekro_agent.services.identity_scope import ScopeDomain
+from nekro_agent.services.identity_scope import ScopeDomain, resolve_affection_domain, resolve_preset_id
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import InstanceRef, assert_instance_accessible, get_tenant_scope
@@ -121,6 +141,11 @@ class AffectionItem(BaseModel):
     # 在这一行上调分数不会有任何效果。不标出来的话管理员会对着一个
     # "改了也不动"的行反复调整（删掉别名它就会立刻复活）。
     merged_into: str = ""
+    # 这一行属于哪个人设（可读名字）。同一个人换过人设就有好几行，不标出来的话只差分数和描述，
+    # 运营会把重置点在一行没人用的旧人设上（现网真实发生过）。
+    preset_name: str = ""
+    # 本域里当前生效人设正是这一行人设的频道数；0 = 眼下没有任何频道在用这一份
+    in_use_channels: int = 0
 
 
 class AffectionListResponse(BaseModel):
@@ -142,6 +167,10 @@ class AffectionEventItem(BaseModel):
     # 没合并过的人这里恒等于本行的人标识（库里存空串表示"与人相同"，见 db_affection.py）。
     source_platform_userid: str = ""
     create_time: Optional[str] = None
+    # 理由被管理员删掉了：`reason` 恒为空串，只给删除痕迹（谁、什么时候）
+    deleted: bool = False
+    deleted_by: str = ""
+    deleted_at: Optional[str] = None
 
 
 class AffectionScopeInfo(BaseModel):
@@ -194,6 +223,17 @@ class AffectionAdjustRequest(BaseModel):
     reason: str = Field(default="", max_length=200)
 
 
+class AffectionNarrativeEditRequest(BaseModel):
+    """编辑印象请求
+
+    不在这里卡长度：超长按两列各自的上限截断（`store.edit_narrative`），而不是整条打回——
+    管理员贴一段稍长的文字时，截掉尾巴比报错再重填友好。
+    """
+
+    state_text: str = ""
+    last_event_text: str = ""
+
+
 class ActionResponse(BaseModel):
     ok: bool = True
 
@@ -240,10 +280,70 @@ async def _merged_into_map(records: Sequence[DBAffection]) -> Dict[Tuple[str, st
     return merged
 
 
-def _to_item(record: DBAffection, merged_into: Dict[Tuple[str, str], str] | None = None) -> AffectionItem:
+async def _in_use_channel_counts(records: Sequence[DBAffection]) -> Dict[Tuple[str, int], int]:
+    """每一行「本域里当前生效人设正是这一行人设」的频道数，键是 `(域, 人设)`
+
+    **只数这一行自己那个域里的频道**：租户作用域下整页都是同一个域（作用域换算出来的那个），
+    平台方全局视图里每一行各数各的域——别的域、别的租户的频道一个都不进来。
+
+    域里有哪些频道：组域取「好感域指向本组」的成员实例（`members_of_affection_group`），
+    自成一域就是那一个实例；每个实例再用唯一判据 `resolve_affection_domain` 复核一次它眼下
+    确实在这个域里（实例进组之后，它留在自成一域上的旧行就不该再算任何频道在用）。
+    每个频道的生效人设一律走 `resolve_preset_id`（即 `DBChatChannel.get_effective_preset_id`
+    那条回退链），不在这里另写一套——那正是本项目反复栽跟头的「同一判据的第二处实现」。
+
+    代价是每个频道最多三次主键点查；同一页里一个域只算一次。
+    """
+    domains: Dict[str, ScopeDomain] = {}
+    for record in records:
+        domain = _domain_of(record)
+        domains.setdefault(domain.domain_id, domain)
+
+    counts: Dict[Tuple[str, int], int] = {}
+    for domain_id, domain in domains.items():
+        if domain.is_group:
+            members = await DBInstanceDomainBinding.members_of_affection_group(domain.group_id)
+        else:
+            members = [(domain.adapter_key, domain.instance_key)]
+        per_preset: Counter[int] = Counter()
+        for adapter_key, instance_key in members:
+            if await resolve_affection_domain(adapter_key, instance_key) != domain:
+                continue
+            for channel in await DBChatChannel.filter(adapter_key=adapter_key, instance_key=instance_key):
+                per_preset[await resolve_preset_id(channel)] += 1
+        for preset_id, count in per_preset.items():
+            counts[(domain_id, preset_id)] = count
+    return counts
+
+
+async def _items_of(records: Sequence[DBAffection]) -> List[AffectionItem]:
+    """把一页记录转成接口条目：合并标记、人设名、在用频道数一并批量算好"""
+    merged = await _merged_into_map(records)
+    names = await preset_names(sorted({record.preset_id for record in records}))
+    in_use = await _in_use_channel_counts(records)
+    return [
+        _to_item(
+            record,
+            merged,
+            preset_name=preset_display_name(record.preset_id, names),
+            in_use_channels=in_use.get((_domain_of(record).domain_id, record.preset_id), 0),
+        )
+        for record in records
+    ]
+
+
+def _to_item(
+    record: DBAffection,
+    merged_into: Dict[Tuple[str, str], str] | None = None,
+    *,
+    preset_name: str = "",
+    in_use_channels: int = 0,
+) -> AffectionItem:
     stage = stage_of(record.score)
     return AffectionItem(
         merged_into=(merged_into or {}).get((_domain_of(record).domain_id, record.platform_userid), ""),
+        preset_name=preset_name,
+        in_use_channels=in_use_channels,
         id=record.id,
         adapter_key=record.adapter_key,
         instance_key=record.instance_key,
@@ -265,18 +365,23 @@ def _to_item(record: DBAffection, merged_into: Dict[Tuple[str, str], str] | None
 
 
 def _to_event(event: DBAffectionEvent) -> AffectionEventItem:
+    deleted = event.deleted_at is not None
     return AffectionEventItem(
         id=event.id,
         delta=event.delta,
         score_after=event.score_after,
         source=event.source,
-        reason=event.reason,
+        # 删过的条目不给理由：库里已经置空，这里再兜一层，免得哪天有人绕过删除入口直接改列
+        reason="" if deleted else event.reason,
         operator=event.operator,
         chat_key=event.chat_key,
         # 空串在库里表示"与 platform_userid 相同"（存量行与没合并过的人都是这个取值），
         # 展示时还原成具体账号，前端不必再写一次这条回落规则
         source_platform_userid=event.source_platform_userid or event.platform_userid,
         create_time=_format_dt(event.create_time),
+        deleted=deleted,
+        deleted_by=event.deleted_by if deleted else "",
+        deleted_at=_format_dt(event.deleted_at),
     )
 
 
@@ -362,11 +467,10 @@ async def get_affection_list(
         "interaction": "-interaction_count",
     }.get(sort_by, "-score")
     records = await query.order_by(order, "-id").offset((page - 1) * page_size).limit(page_size)
-    merged = await _merged_into_map(records)
 
     return AffectionListResponse(
         total=total,
-        items=[_to_item(record, merged) for record in records],
+        items=await _items_of(records),
         stages=[AffectionStageInfo(value=item.value, label=stage_label(item)) for item in all_stages()],
     )
 
@@ -410,7 +514,7 @@ async def get_affection_detail(
     # 流水按**人**取并集（合并过的副账号那些行也在里面），来源账号逐条标在 `_to_event` 上
     events = await list_events(key_of_record(record), limit=30)
     return AffectionDetail(
-        item=_to_item(record, await _merged_into_map([record])),
+        item=(await _items_of([record]))[0],
         events=[_to_event(event) for event in events],
         scope=await _scope_info(record),
     )
@@ -479,7 +583,7 @@ async def adjust_affection(
         f"好感度人工调整: operator={_current_user.username}, key={key}, score={snapshot.score}",
     )
     refreshed = await _get_visible_record(record_id, scope, adapter_key)
-    return _to_item(refreshed, await _merged_into_map([refreshed]))
+    return (await _items_of([refreshed]))[0]
 
 
 @router.post("/{record_id}/reset", summary="重置好感度", response_model=AffectionItem)
@@ -489,10 +593,9 @@ async def reset_affection(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionItem:
-    """把分数归零并清空 LLM 生成的描述
+    """把分数归零并清空两段描述
 
-    描述文本没有单独的编辑入口，出现不合适的内容时用重置抹掉，
-    下一轮评估会重新写一份。
+    只想抹掉不合适的描述、不想动分数时用 `clear-narrative`。
     """
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
     record = await _get_visible_record(record_id, scope, adapter_key)
@@ -506,7 +609,79 @@ async def reset_affection(
     )
     logger.info(f"好感度重置: operator={_current_user.username}, record_id={record_id}")
     refreshed = await _get_visible_record(record_id, scope, adapter_key)
-    return _to_item(refreshed, await _merged_into_map([refreshed]))
+    return (await _items_of([refreshed]))[0]
+
+
+@router.post("/{record_id}/clear-narrative", summary="只清印象（保留分数）", response_model=AffectionItem)
+@require_role(Role.Admin)
+async def clear_affection_narrative(
+    record_id: int,
+    instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> AffectionItem:
+    """清空两段描述（`state_text` / `last_event_text`），分数、阶段、互动次数都不动"""
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
+    await clear_narrative(
+        key_of_record(record),
+        source=AffectionEventSource.NARRATIVE_CLEAR,
+        reason=REASON_NARRATIVE_CLEAR,
+        operator=_current_user.username,
+    )
+    logger.info(f"好感度只清印象: operator={_current_user.username}, record_id={record_id}")
+    refreshed = await _get_visible_record(record_id, scope, adapter_key)
+    return (await _items_of([refreshed]))[0]
+
+
+@router.put("/{record_id}/narrative", summary="编辑印象", response_model=AffectionItem)
+@require_role(Role.Admin)
+async def edit_affection_narrative(
+    record_id: int,
+    body: AffectionNarrativeEditRequest,
+    instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> AffectionItem:
+    """改写两段描述，分数不动；流水只记宿主固定文案，不抄新旧文字（日志同样不打）"""
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
+    await edit_narrative(
+        key_of_record(record),
+        state_text=body.state_text,
+        last_event_text=body.last_event_text,
+        operator=_current_user.username,
+    )
+    logger.info(f"好感度编辑印象: operator={_current_user.username}, record_id={record_id}")
+    refreshed = await _get_visible_record(record_id, scope, adapter_key)
+    return (await _items_of([refreshed]))[0]
+
+
+@router.delete(
+    "/{record_id}/events/{event_id}",
+    summary="删除一条流水的理由（软删，分数不动）",
+    response_model=AffectionEventItem,
+)
+@require_role(Role.Admin)
+async def delete_affection_event_reason(
+    record_id: int,
+    event_id: int,
+    instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> AffectionEventItem:
+    """只删这一条的理由文字：`reason` 置空，留下删除时间与操作者；`delta` / `score_after` 与行都不动
+
+    **范围就是详情页时间线的范围**：先按作用域取到这一行（越权 404），再只在这一行对应的那个人
+    （同域、同人设、含合并过来的账号）的流水里按 `event_id` 找，找不到同样 404。
+    不能只凭 `event_id` 去删：流水编号是全表自增的，可以被枚举到别的租户、别的人头上。
+    """
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
+    event = await redact_event_reason(key_of_record(record), event_id, operator=_current_user.username)
+    if event is None:
+        raise NotFoundError(resource="好感度流水")
+    logger.info(
+        f"好感度流水理由已删除: operator={_current_user.username}, record_id={record_id}, event_id={event_id}",
+    )
+    return _to_event(event)
 
 
 AffectionSummary.model_rebuild()

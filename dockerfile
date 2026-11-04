@@ -34,7 +34,7 @@ RUN pnpm build
 FROM busybox:1.36 AS frontend-dist
 COPY --from=frontend-builder /app/frontend/dist /frontend-dist
 
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim-bookworm
 
 # 设置环境变量
 ENV DEBIAN_FRONTEND=noninteractive
@@ -43,38 +43,28 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo 'Asia/Shanghai' > /etc/timezone
 
-# Debian 11 (bullseye) 已 EOL：deb.debian.org / debian-security 上它的包已被撤走（pool 里 404），
-# 只剩 archive.debian.org。不改源的话下面第一条 `apt install` 就是 exit 100，镜像永远构建不出来。
-# archive 的 Release 早已过了 Valid-Until，所以同时关掉有效期检查（签名校验仍然开着）。
-# 长期出路是把基础镜像升到 bookworm（要同步处理包名差异），不在这次改动里。
-RUN printf '%s\n' \
-        'deb http://archive.debian.org/debian bullseye main' \
-        'deb http://archive.debian.org/debian bullseye-updates main' \
-        'deb http://archive.debian.org/debian-security bullseye-security main' \
-        > /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive-bullseye
-
-RUN apt update
-
-# 分批安装依赖以避免 QEMU 段错误
-RUN apt install -y ca-certificates curl
-RUN apt install -y gnupg git
-RUN apt install -y gcc libpq-dev libmagic-dev
+# 分批安装依赖以避免 QEMU 段错误；每批更新索引，避免复用过期的 apt 缓存层。
+RUN apt-get update && apt-get install -y ca-certificates curl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y gnupg git \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y gcc libpq-dev libmagic-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 # 中文字体：python:3.11-slim 基础镜像不带任何 CJK 字形，缺了它
 # nekro_agent/services/imagecard 渲染出来的每一个汉字都是豆腐块。
 # fonts-noto-cjk 是轮廓字体，任意字号可用；Symbola 作为 emoji/符号的兜底。
-RUN apt install -y fonts-noto-cjk fonts-noto-color-emoji fonts-symbola
-RUN apt install -y docker.io
+RUN apt-get update && apt-get install -y fonts-noto-cjk fonts-noto-color-emoji fonts-symbola \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y docker.io \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 # iptables 是 docker.io 的传递依赖，这里显式声明：NA 跑在容器里时，
 # 沙盒网络隔离会用本镜像起一个 `--network=host` 的临时容器来下宿主规则（见 services/sandbox/network_guard.py），
 # 缺了它整条防线会静默退化成告警
-RUN apt install -y iptables
-RUN apt install -y git
+RUN apt-get update && apt-get install -y iptables \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 # 视频分析插件（plugins/builtin/video_analysis）抽帧与抽音轨用的 ffmpeg / ffprobe
-RUN apt install -y --no-install-recommends ffmpeg
-
-# 清理缓存
-RUN apt clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
 WORKDIR /app
