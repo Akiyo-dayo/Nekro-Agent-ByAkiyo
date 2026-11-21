@@ -346,7 +346,7 @@ def contains_symlink(path: Path) -> bool:
     变成一份平台方私有技能的**真实副本**（不是软链，因此 `is_within` 这一层
     在读的时候已经无从判起），随后 `GET /skills/file` 逐字读得到、
     `sync_skills` 还会把它复制进这个租户的每一个工作区。
-    指向别的工作区 `.claude/settings.json` 时拿到的则是那个工作区的中继凭据。
+    指向别的工作区 `settings.json` / `.claude_home/settings.json` 时拿到的则是那个工作区的中继凭据。
 
     所以「技能库里不许出现软链」是一条**内容准入**规则，与路径解析是两件事。
     扫描不跟着软链往下走（先判 `is_symlink` 再判 `is_dir`），因此不会遇到环。

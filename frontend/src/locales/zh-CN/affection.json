@@ -47,10 +47,12 @@
   },
   "detail": {
     "title": "这段关系",
+    "loadFailed": "这一份好感看不到或已不存在（可能已被重置、或不属于当前实例）",
     "timeline": "都发生过什么",
     "timelineEmpty": "还没有留下记录",
     "source": {
       "llm": "自然变化",
+      "tool": "自主调整",
       "manual": "人工调整",
       "reset": "重置",
       "merge": "并入账号",
@@ -64,7 +66,24 @@
     "scopeLine": "这份好感属于：域 {{domain}} / 人设 {{preset}}",
     "presetDeleted": "该人设已被删除，这份数据保留成孤儿（不会级联删除，可在「总后台 → 身份与域」手动清理）",
     "mergedAccounts": "已并入这个人的账号：{{accounts}}",
-    "reasonDeleted": "理由已被 {{operator}} 于 {{time}} 删除"
+    "reasonDeleted": "理由已被 {{operator}} 于 {{time}} 删除",
+    "callNameLine": "称呼：{{name}}",
+    "milestones": "关系里程碑",
+    "milestonesHint": "自动记下的关系变化，属于长期记忆",
+    "milestonesEmpty": "还没有里程碑。关系发生变化时 Bot 会自动记下。",
+    "milestonesGone": "这条里程碑的记忆已被彻底删除，只剩这一行记录。",
+    "milestonesMoved": "写这条里程碑的实例已经划给了别的租户，记忆跟着实例走了，这里只剩这一行记录。",
+    "milestonesViewInMemory": "在记忆页查看",
+    "milestonesDelete": "删除这条里程碑",
+    "milestonesStatus": {
+      "active": "正常",
+      "quarantined": "已隔离",
+      "deleted": "已删除",
+      "pruned": "已清理",
+      "hard_deleted": "已彻底删除",
+      "moved": "已随实例划走"
+    },
+    "notesHint": "管理员写的备注，属于世界书"
   },
   "adjustDialog": {
     "title": "手动调整好感度",
@@ -77,17 +96,21 @@
   },
   "resetDialog": {
     "title": "重置好感度",
-    "description": "将把{{share}}好感归零，并清空 Bot 写下的印象。这个人在其他人设下的好感不受影响；下一次对话后会重新积累。",
+    "description": "将把{{share}}好感归零，并清空 Bot 写下的印象与称呼。这个人在其他人设下的好感不受影响；下一次对话后会重新积累。",
+    "alsoMilestones": "同时删除这一份好感的关系里程碑（软删，可在记忆页找回）",
     "submit": "确认重置"
   },
   "clearDialog": {
     "title": "只清印象",
-    "description": "将清空{{share}}的印象与近况，分数不变。下一次对话后 Bot 会重新写。",
+    "description": "将清空{{share}}的印象、近况与称呼，分数不变。下一次对话后 Bot 会重新写。",
     "submit": "确认清空"
   },
   "editDialog": {
     "title": "编辑印象",
     "description": "改写{{share}}的印象与近况，分数不变。之后的对话里 Bot 仍会在此基础上继续改写。",
+    "callName": "Bot 怎么称呼 TA",
+    "callNameHelper": "最多 {{max}} 个字，留空就是不称呼",
+    "callNameTooLong": "超过了 {{max}} 个字，删短一些才能保存",
     "stateText": "印象",
     "eventText": "近况",
     "lengthHelper": "最多 {{max}} 字，超出部分保存时会被截掉",
@@ -98,11 +121,17 @@
     "description": "只删掉这一条记录里的理由文字：分数与这条记录本身都保留，并留下删除痕迹。Bot 写下的印象与近况不受影响，要改它们请用「只清印象」或「编辑印象」。",
     "submit": "确认删除"
   },
+  "deleteMilestoneDialog": {
+    "title": "删除这条关系里程碑？",
+    "description": "软删：它会从提示词与检索里消失，但仍留在记忆页的「已删除」里，需要时可以找回。",
+    "submit": "确认删除"
+  },
   "messages": {
     "loadFailed": "好感度列表加载失败",
     "resetDone": "已重置",
     "clearDone": "已清空印象",
     "editDone": "已保存印象",
-    "reasonDeleted": "已删除这条理由"
+    "reasonDeleted": "已删除这条理由",
+    "milestoneDeleted": "已删除这条里程碑"
   }
 }

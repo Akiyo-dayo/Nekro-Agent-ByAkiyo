@@ -70,6 +70,7 @@ from nekro_agent.api import core, i18n
 from nekro_agent.api.plugin import ConfigBase, ExtraField, NekroPlugin, SandboxMethodType
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.schemas.chat_message import ChatMessage, ChatType
+from nekro_agent.services.plugin.scope import plugin_effective_in_chat
 
 # 正文落到卡片/消息之前的长度上限。模型偶尔会不受控地长篇大论，
 # 心声这个体裁本身就该是一两句话，超出的部分对读者没有价值。
@@ -354,10 +355,17 @@ async def settle_round(chat_key: str) -> None:
 
     无论模型有没有产出心声，本轮的布防都在这里解除：模型选择不说，
     就不该让这次布防一直挂着、在后面每一轮里反复披露这个方法。
+
+    分发这一环也要按频道判一次：布防之后到回合结束之间，租户可能已经把这个频道
+    上的心声插件关掉；此时连渲染都不必做，直接清掉状态收工。真正的发送前
+    （`render_and_send`）还会再判一次，防止渲染期间被关掉。
     """
     _armed.pop(chat_key, None)
     entry = _pending.pop(chat_key, None)
     if entry is None:
+        return
+    if not await plugin_effective_in_chat(plugin.key, chat_key):
+        core.logger.debug(f"[{chat_key}] 心声插件在该频道未生效，跳过本轮结算")
         return
     body, ctx = entry
     # 先记冷却再发：渲染或发送失败时也不该立刻又攒一次
@@ -527,6 +535,12 @@ async def on_user_message(_ctx: AgentCtx, _message: ChatMessage) -> None:
         if not chat_key:
             return None
 
+        # 事件订阅仍是全进程一份，但布防必须按频道判：这个频道所在作用域关掉了心声插件时，
+        # 不能因为它恰好还活着就继续给这个群布防。判不出来（多租户部署缺频道行）按不生效。
+        if not await plugin_effective_in_chat(plugin.key, chat_key):
+            core.logger.debug(f"[{chat_key}] 心声插件在该频道未生效，跳过布防")
+            return None
+
         is_group = resolve_is_group(_message.chat_type, _ctx.channel_type)
         if is_group is None:
             core.logger.debug("心声：事件缺少可判定的频道类型，跳过布防")
@@ -638,12 +652,17 @@ async def render_and_send(ctx: AgentCtx, body: str) -> None:
             # 因此必须挪出事件循环（Pillow 的 C 扩展会释放 GIL，to_thread 是有效的）。
             image = await asyncio.to_thread(render_inner_voice_card, body)
             sandbox_path = await ctx.fs.mixed_forward_file(image, file_name=f"inner_voice_{int(time.time())}.png")
-            await ctx.send_image(sandbox_path)
-            core.logger.info(f"[{chat_key}] 已发送心声卡片")
+            # 走插件推送方法：布防时开着、发送时被关掉的频道，在发送这一刻再判一次。
+            if await plugin.send_image(chat_key, sandbox_path, ctx):
+                core.logger.info(f"[{chat_key}] 已发送心声卡片")
+            else:
+                core.logger.debug(f"[{chat_key}] 心声插件在该频道未生效，卡片未发送")
             return
         # 降级：缺渲染能力或缺中文字体时，心声照样要能发出来，只是变成一条普通文本
-        await ctx.send_text(body)
-        core.logger.info(f"[{chat_key}] 已发送心声（文本降级）")
+        if await plugin.send_text(chat_key, body, ctx):
+            core.logger.info(f"[{chat_key}] 已发送心声（文本降级）")
+        else:
+            core.logger.debug(f"[{chat_key}] 心声插件在该频道未生效，文本未发送")
     except Exception as exc:  # noqa: BLE001 - 后台任务不允许把异常抛回事件循环
         core.logger.warning(f"[{chat_key}] 发送心声失败，本次跳过: {exc}")
 

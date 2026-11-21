@@ -20,6 +20,7 @@ import {
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
+import { Link as RouterLink } from 'react-router-dom'
 import BoltRoundedIcon from '@mui/icons-material/BoltRounded'
 import EditRoundedIcon from '@mui/icons-material/EditRounded'
 import HourglassEmptyRoundedIcon from '@mui/icons-material/HourglassEmptyRounded'
@@ -286,6 +287,14 @@ export default function InstanceQuotaPage() {
           {t('actions.batchEdit')}
         </ActionButton>
       </Box>
+
+      {/* 两层配额的分工只在这里讲一次：这一页是租户对自己群的自限（回复条数），
+          平台方给每个群的每日额度在「频道额度」页，两层都放行才回复 */}
+      <Alert severity="info">
+        {t('layerHint.text')}
+        <RouterLink to="/console/channel-quota">{t('layerHint.channelQuotaLink')}</RouterLink>
+        {t('layerHint.after')}
+      </Alert>
 
       {/* 失败时这一排整块不画。三张卡片各自 `?? 0`，403 之下会稳定地显示
           「全局并发上限 0 / 运行中 0 / 排队 0」——那是三句假话，而且是**看起来很像真的**

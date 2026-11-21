@@ -36,6 +36,7 @@ from nekro_agent.schemas.console import (
     InstanceMigrationResidueItem,
     InstanceMigrationResult,
     InstanceOptionListResponse,
+    InstancePurgePreview,
     InstanceUpdateRequest,
     UnclaimedInstanceItem,
     UnclaimedInstanceListResponse,
@@ -241,6 +242,30 @@ async def update_console_instance(
     return await describe_instance(updated)
 
 
+@router.get("/instances/{instance_key}/purge-preview", summary="彻底删除实例前的影响面")
+@require_role(Role.Super)
+async def preview_console_instance_purge(
+    instance_key: str,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> InstancePurgePreview:
+    """确认框用：本实例自己的邮箱、用户邮件偏好、收集库表情、有设置的插件与配置覆盖各有多少（只读，与删除同一档权限）"""
+    from nekro_agent.models.db_email_account import DBEmailAccount
+    from nekro_agent.models.db_email_user_pref import DBEmailUserPref
+    from nekro_agent.services.emotion_library import count_instance_emotions
+    from nekro_agent.services.instance_settings import count_instance_settings
+
+    instance = await assert_instance_accessible(_current_user, instance_key)
+    adapter_key, key = instance.adapter_key, instance.instance_key
+    settings = await count_instance_settings(adapter_key, key)
+    return InstancePurgePreview(
+        email_accounts=await DBEmailAccount.filter(owner_adapter_key=adapter_key, owner_instance_key=key).count(),
+        email_user_prefs=await DBEmailUserPref.filter(adapter_key=adapter_key, instance_key=key).count(),
+        collected_emotions=int((await count_instance_emotions(adapter_key, key)).get("items", 0)),
+        plugin_settings=settings.plugin_settings,
+        config_overrides=settings.config_overrides,
+    )
+
+
 @router.delete("/instances/{instance_key}", summary="删除实例")
 @require_role(Role.Super)
 async def delete_console_instance(
@@ -355,6 +380,15 @@ async def _build_claim_result(outcome: InstanceAdoptOutcome) -> InstanceClaimRes
         )
     else:
         message = f"已认领实例 '{outcome.target.instance_key}'"
+    # 凭据在实例级扫尾里删、插件设置与配置覆盖在搬任何会话之前删，部分会话失败时也已经删了：两种结果都要说
+    counts = outcome.migration.counts if outcome.migration else {}
+    deleted_credentials = counts.get("ssh_credential_deleted", 0)
+    if deleted_credentials:
+        message += f"；删除了 {deleted_credentials} 条用户登记的服务器凭据"
+    deleted_plugins = counts.get("plugin_settings_deleted", 0)
+    deleted_overrides = counts.get("config_overrides_deleted", 0)
+    if deleted_plugins or deleted_overrides:
+        message += f"；删除了 {deleted_plugins} 个插件的设置、{deleted_overrides} 个配置覆盖文件"
 
     return InstanceClaimResult(
         ok=not failed,
@@ -408,13 +442,23 @@ async def adopt_console_instance(
 
     需要回填源实例标识作二次确认，与历史归属迁移、彻底删除同一套形态。
     幂等：源实例已被认领（不再是 `unclaimed`）时返回 400，不会重复搬运。
+
+    两端归属不同时，源实例上用户登记的服务器凭据默认删除（`delete_ssh_credentials=false` 才跟过去），
+    与换实例对同一口径；条数由换实例对的预览接口给出。
     """
     target = await assert_instance_accessible(_current_user, instance_key)
     source = await assert_instance_accessible(_current_user, body.source_instance_key)
     if body.confirm_source_instance_key != source.instance_key:
         raise ValidationError(reason="并入协议端需要回填正确的待认领实例标识作为二次确认")
 
-    outcome = await adopt_unclaimed_instance(source, target)
+    outcome = await adopt_unclaimed_instance(
+        source,
+        target,
+        delete_ssh_credentials=body.delete_ssh_credentials,
+        delete_plugin_settings=body.delete_plugin_settings,
+        delete_config_overrides=body.delete_config_overrides,
+        actor=_current_user.username,
+    )
     return await _build_claim_result(outcome)
 
 
@@ -455,6 +499,7 @@ async def preview_console_instance_migration(
     """
     source, target = await _resolve_migration_pair(_current_user, instance_key, source_instance_key)
     plan = await plan_instance_migration(target.adapter_key, source.instance_key, target.instance_key)
+    cross_tenant = source.tenant_id != target.tenant_id
 
     warnings: List[str] = []
     if source.provider_account_id and source.provider_account_id == target.provider_account_id:
@@ -462,12 +507,17 @@ async def preview_console_instance_migration(
             f"两个实例绑定的是同一个账号 {source.provider_account_id}，"
             "消息路由在这种状态下不确定；迁移完成后请解绑或删除源实例",
         )
-    if source.tenant_id != target.tenant_id:
+    if cross_tenant:
         warnings.append(
             f"源实例归属租户 {source.tenant_id if source.tenant_id is not None else '平台方'}，"
             f"目标实例归属租户 {target.tenant_id if target.tenant_id is not None else '平台方'}；"
             "迁移会把这些会话与记忆一并交给另一方",
         )
+        if plan.plugin_settings or plan.config_overrides:
+            warnings.append(
+                f"源实例名下有 {plan.plugin_settings} 个插件的设置（可能含插件的 API Key）、"
+                f"{plan.config_overrides} 个配置覆盖文件；默认随迁移删除，取消勾选才交给另一方",
+            )
     if not plan.channels:
         warnings.append("源实例名下已经没有会话，执行迁移不会改动任何频道")
 
@@ -501,6 +551,10 @@ async def preview_console_instance_migration(
             if count
         ],
         warnings=warnings,
+        cross_tenant=cross_tenant,
+        ssh_credentials=plan.ssh_credentials,
+        plugin_settings=plan.plugin_settings,
+        config_overrides=plan.config_overrides,
     )
 
 
@@ -517,16 +571,36 @@ async def run_console_instance_migration(
     幂等：源实例名下已经没有会话时重复执行是一次空操作。
 
     权限同预览端点：平台方专属。
+
+    跨租户（两端归属不同）时，源实例上用户登记的服务器凭据、插件设置与配置覆盖默认删除，
+    `delete_ssh_credentials` / `delete_plugin_settings` / `delete_config_overrides` 为假才让它们跟到目标实例；
+    同一归属下的迁移总是跟过去，这几个开关不起作用。
     """
     source, target = await _resolve_migration_pair(_current_user, instance_key, body.source_instance_key)
     if body.confirm_source_instance_key != source.instance_key:
         raise ValidationError(reason="迁移历史归属需要回填正确的源实例标识作为二次确认")
 
-    outcome = await migrate_instance_ownership(target.adapter_key, source.instance_key, target.instance_key)
+    cross_tenant = source.tenant_id != target.tenant_id
+    outcome = await migrate_instance_ownership(
+        target.adapter_key,
+        source.instance_key,
+        target.instance_key,
+        delete_ssh_credentials=cross_tenant and body.delete_ssh_credentials,
+        delete_plugin_settings=cross_tenant and body.delete_plugin_settings,
+        delete_config_overrides=cross_tenant and body.delete_config_overrides,
+        actor=_current_user.username,
+    )
     message = (
         f"已迁移 {len(outcome.moved_channels)} 个会话、合并 {len(outcome.merged_channels)} 个会话"
         f"（{source.instance_key} -> {target.instance_key}）"
     )
+    deleted_credentials = outcome.counts.get("ssh_credential_deleted", 0)
+    if deleted_credentials:
+        message += f"；删除了 {deleted_credentials} 条用户登记的服务器凭据"
+    deleted_plugins = outcome.counts.get("plugin_settings_deleted", 0)
+    deleted_overrides = outcome.counts.get("config_overrides_deleted", 0)
+    if deleted_plugins or deleted_overrides:
+        message += f"；删除了 {deleted_plugins} 个插件的设置、{deleted_overrides} 个配置覆盖文件"
     if outcome.failed_channels:
         message += f"；{len(outcome.failed_channels)} 个会话迁移失败仍留在源实例，可重试本操作补齐"
 

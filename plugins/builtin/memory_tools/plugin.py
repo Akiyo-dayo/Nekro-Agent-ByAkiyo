@@ -3,6 +3,9 @@ from pydantic import Field
 from nekro_agent.api import i18n
 from nekro_agent.api.plugin import ConfigBase, ExtraField, NekroPlugin
 
+# `name`、`description`、`sleep_brief` 会进系统提示词（插件名与能力摘要），记忆域分区关着时
+# 必须与改造前逐字相同，所以这三项不动；闸开时的能力摘要由 `main.py` 里的 `brief_resolver` 给。
+# `i18n_*` 只在后台插件页显示，可以改成现在的说法。
 plugin = NekroPlugin(
     name="主动记忆工具",
     module_name="memory_tools",
@@ -11,12 +14,12 @@ plugin = NekroPlugin(
     author="KroMiose",
     url="https://github.com/KroMiose/nekro-agent",
     i18n_name=i18n.i18n_text(
-        zh_CN="主动记忆工具",
-        en_US="Active Memory Tools",
+        zh_CN="长期记忆",
+        en_US="Long-term Memory",
     ),
     i18n_description=i18n.i18n_text(
-        zh_CN="为主 Agent 提供工作区统一记忆系统的主动检索、详情查看和来源追溯能力",
-        en_US="Provides active workspace memory search, detail inspection, and origin tracing tools for the main Agent",
+        zh_CN="为主 Agent 提供长期记忆的主动检索、详情查看和来源追溯能力",
+        en_US="Provides active long-term memory search, detail inspection, and origin tracing tools for the main Agent",
     ),
     allow_sleep=False,
     sleep_brief="用于在工作区内主动搜索历史记忆、展开记忆详情和追溯记忆来源，适合处理“之前说过什么”“以前怎么解决过”“历史偏好/决策/经验”这类问题。",

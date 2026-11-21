@@ -1,9 +1,10 @@
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Literal, Optional, Set
+from typing import Any, ClassVar, Dict, FrozenSet, List, Literal, Optional, Set
 
 from pydantic import Field, PrivateAttr
 
 from nekro_agent.schemas.i18n import SupportedLang, i18n_text, set_system_lang
+from nekro_agent.services.tavern.assemble import DEFAULT_CARD_TEMPLATE
 
 from .core_utils import ConfigBase, ExtraField
 from .os_env import OsEnv
@@ -42,6 +43,11 @@ class ModelConfigGroup(ConfigBase):
         title="启用外置思维链",
         description="启用后会强制 AI 在回答前输出思考过程，可以在一定程度提高回复质量，如果模型原生支持思维链请关闭此选项",
     )
+    PREFILL_MODE: Literal["off", "assistant", "deepseek"] = Field(
+        default="off",
+        title="预填方式",
+        description="只有声明支持预填的服务才设成非 off；DeepSeek 前缀续写要把接口地址设成它的 beta 地址",
+    )
     TOKEN_INPUT_RATE: float = Field(default=1.0, title="输入 Token 倍率")
     TOKEN_COMPLETION_RATE: float = Field(default=1.0, title="补全 Token 倍率")
     MODEL_PRICE_RATE: float = Field(default=1.0, title="模型价格倍率")
@@ -74,6 +80,10 @@ def is_model_group_api_key_placeholder(value: str) -> bool:
 
 class CoreConfig(ConfigBase):
     """核心配置"""
+
+    # 导入时加载完立刻整份写回（本文件末尾那次 dump）：修正过非法值就先备份原文件，
+    # 免得被去掉的原值（以及文件里手写的凭据）随写回一起消失
+    _backup_original_on_repair: ClassVar[bool] = True
 
     SYSTEM_LANG: Literal["zh-CN", "en-US"] = Field(
         default="zh-CN",
@@ -295,6 +305,171 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    # 平台方专属：清理对全部租户的聊天图片同时生效，登记在 `routers/config.py` 的
+    # `PLATFORM_ONLY_SYSTEM_CONFIG_KEYS` 里（租户读不到也写不了）。不标 `overridable`，
+    # 实例 / 频道覆盖层里没有这一项；清理任务只读全局配置（`services/upload_retention.py`）。
+    UPLOADS_IMAGE_RETENTION_DAYS: int = Field(
+        default=0,
+        title="上传图片保留天数",
+        description=(
+            "聊天上传目录里的图片保留多少天，0 表示不清理（默认）。打开后每天清一次修改时间早于这个天数的图片"
+            "（jpg / png / gif / webp 等），视频、文档等其它类型不动，邮件附件不动；"
+            "清掉的图片在控制台聊天记录、网页会话里会显示不出来，沙盒里也读不到。只有平台方能改"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="基础设置",
+                en_US="Basic Settings",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="上传图片保留天数",
+                en_US="Uploaded Image Retention (Days)",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "聊天上传目录里的图片保留多少天，0 表示不清理（默认）。打开后每天清一次修改时间早于这个天数的图片"
+                    "（jpg / png / gif / webp 等），视频、文档等其它类型不动，邮件附件不动；"
+                    "清掉的图片在控制台聊天记录、网页会话里会显示不出来，沙盒里也读不到。只有平台方能改"
+                ),
+                en_US=(
+                    "How many days to keep images in the chat upload directory; 0 disables cleanup (default). "
+                    "When enabled, images (jpg / png / gif / webp, etc.) last modified more than this many days ago "
+                    "are deleted once a day. Videos, documents and other file types are left alone, and so are email "
+                    "attachments. Deleted images no longer show in console chat history or web chat sessions, and the "
+                    "sandbox can no longer read them. Platform operators only"
+                ),
+            ),
+        ).model_dump(),
+    )
+    # 平台方专属总闸，登记在 `routers/config.py` 的 `PLATFORM_ONLY_SYSTEM_CONFIG_KEYS` 里。
+    # 关掉之后实例自有邮箱既不入池也不轮询，后台管理页只剩只读：给平台方留一个能一键收回
+    # 这项能力的开关，而不必逐个实例去删账户。
+    EMAIL_INSTANCE_ACCOUNTS_ENABLED: bool = Field(
+        default=True,
+        title="实例自有邮箱",
+        description=(
+            "关掉时实例自有邮箱不轮询、不能用（读写都不给它账户），管理页只读；"
+            "平台方提供的邮箱不受影响。只有平台方能改"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="邮件",
+                en_US="Email",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="实例自有邮箱",
+                en_US="Instance-Owned Mailboxes",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "关掉时实例自有邮箱不轮询、不能用（读写都不给它账户），管理页只读；"
+                    "平台方提供的邮箱不受影响。只有平台方能改"
+                ),
+                en_US=(
+                    "When disabled, instance-owned mailboxes are not polled and cannot be used (no accounts are "
+                    "handed out for reading or sending), and the admin page is read-only. Platform-provided "
+                    "mailboxes are unaffected. Platform operators only"
+                ),
+            ),
+        ).model_dump(),
+    )
+    # 平台方专属：连接数的上限，不是发信上限；登记在 `routers/config.py` 的
+    # `PLATFORM_ONLY_SYSTEM_CONFIG_KEYS` 里（租户读不到也写不了），租户按实例看自己的用量。
+    # 0 表示一个实例自有邮箱都不许建（等于关掉这个能力）。
+    EMAIL_MAX_ACCOUNTS_PER_INSTANCE: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        title="每个实例的邮箱账户上限",
+        description=(
+            "每个实例最多能填几个自己的邮箱账户（默认 3，0 ~ 20）。这是连接数上限，不是发信上限；"
+            "平台方提供的邮箱不算在内。只有平台方能改"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="邮件",
+                en_US="Email",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="每个实例的邮箱账户上限",
+                en_US="Mailbox Accounts Per Instance",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "每个实例最多能填几个自己的邮箱账户（默认 3，0 ~ 20）。这是连接数上限，不是发信上限；"
+                    "平台方提供的邮箱不算在内。只有平台方能改"
+                ),
+                en_US=(
+                    "How many mailbox accounts an instance may add (default 3, range 0-20). This caps connections, "
+                    "not how many emails can be sent; platform-provided mailboxes are not counted. Platform operators only"
+                ),
+            ),
+        ).model_dump(),
+    )
+    EMAIL_OUTBOX_INTERVAL_SECONDS: int = Field(
+        default=5,
+        ge=1,
+        le=600,
+        title="节日邮件发信间隔（秒）",
+        description=(
+            "节日邮件队列里同一个发件邮箱两封之间的最小间隔（默认 5 秒，1 ~ 600）。"
+            "这是防被收件方当成垃圾邮件的节奏，不是数量上限；不同发件邮箱各走各的。只有平台方能改"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="邮件",
+                en_US="Email",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="节日邮件发信间隔（秒）",
+                en_US="Festival Mail Interval (Seconds)",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "节日邮件队列里同一个发件邮箱两封之间的最小间隔（默认 5 秒，1 ~ 600）。"
+                    "这是防被收件方当成垃圾邮件的节奏，不是数量上限；不同发件邮箱各走各的。只有平台方能改"
+                ),
+                en_US=(
+                    "Minimum gap between two festival emails from the same sender mailbox (default 5 seconds, "
+                    "range 1-600). This is a pacing setting to avoid being treated as spam, not a volume cap; "
+                    "different sender mailboxes are paced independently. Platform operators only"
+                ),
+            ),
+        ).model_dump(),
+    )
+    EMAIL_FESTIVAL_MAIL_ENABLED: bool = Field(
+        default=True,
+        title="节日祝福邮件",
+        description=(
+            "开着时节日到点会给「和本实例开过私聊的用户」与「在群里要过节日邮件的用户」发祝福邮件，"
+            "要求邮箱工具插件与节日祝福插件都在实例上启用、本实例有能用的发件邮箱；"
+            "关掉时只推群消息，已入队的作废。只有平台方能改"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="邮件",
+                en_US="Email",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="节日祝福邮件",
+                en_US="Festival Greeting Mail",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "开着时节日到点会给「和本实例开过私聊的用户」与「在群里要过节日邮件的用户」发祝福邮件，"
+                    "要求邮箱工具插件与节日祝福插件都在实例上启用、本实例有能用的发件邮箱；"
+                    "关掉时只推群消息，已入队的作废。只有平台方能改"
+                ),
+                en_US=(
+                    "When enabled, festival greetings are also emailed to users who have had a private chat with "
+                    "this instance and to users who asked for them in a group. Both the email utilities plugin and "
+                    "the festival greeting plugin must be enabled on the instance, and the instance needs a usable "
+                    "sender mailbox. When disabled, only group messages are pushed and queued mail is voided. "
+                    "Platform operators only"
+                ),
+            ),
+        ).model_dump(),
+    )
     ENABLE_COMMAND_UNAUTHORIZED_OUTPUT: bool = Field(
         default=False,
         title="启用未授权命令反馈",
@@ -378,16 +553,285 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    MEMORY_DOMAIN_SCOPE_ENABLED: bool = Field(
+        default=False,
+        title="启用记忆域分区",
+        description="长期记忆改按（域, 人设）分区、不再依赖工作区。关闭时与改造前完全相同。打开后频道还要「启用聊天记忆」生效才沉淀与注入。运行中切换不必重启；有记忆重建正在进行时请等它结束再切换",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="启用记忆域分区", en_US="Enable Memory Domain Partition"),
+            i18n_description=i18n_text(
+                zh_CN="长期记忆改按（域, 人设）分区、不再依赖工作区。关闭时与改造前完全相同。打开后频道还要「启用聊天记忆」生效才沉淀与注入。运行中切换不必重启；有记忆重建正在进行时请等它结束再切换",
+                en_US="Long-term memories are partitioned by (domain, preset) instead of requiring a workspace. When disabled, behavior is identical to before this change. When enabled, a channel also needs \"Enable Chat Memory\" in effect to consolidate and inject memories. It can be switched at runtime without a restart; if a memory rebuild is running, wait for it to finish before switching",
+            ),
+        ).model_dump(),
+    )
+    MEMORY_ENABLE_FOR_CHAT: bool = Field(
+        default=False,
+        title="启用聊天记忆",
+        description=(
+            "是否沉淀与注入聊天记忆。可在全局、实例、频道三层设置，下层覆盖上层，"
+            "最终按每个频道生效的值判断。需同时打开记忆总开关；"
+            "只在『记忆按域分区』打开时生效（关着时仍按旧规则：频道绑了工作区才有记忆）。"
+            "租户管理员只能关、不能开。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            tenant_may_only_lower=True,
+            i18n_title=i18n_text(zh_CN="启用聊天记忆", en_US="Enable Chat Memory"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "是否沉淀与注入聊天记忆。可在全局、实例、频道三层设置，下层覆盖上层，"
+                    "最终按每个频道生效的值判断。需同时打开记忆总开关；"
+                    "只在『记忆按域分区』打开时生效（关着时仍按旧规则：频道绑了工作区才有记忆）。"
+                    "租户管理员只能关、不能开。"
+                ),
+                en_US=(
+                    "Whether chat memories are consolidated and injected. It can be set at the global, "
+                    "instance and channel levels, each overriding the one above, and is decided by the value "
+                    "in effect for each channel. The memory master switch must also be on. Takes effect only "
+                    "when memory domain partitioning is enabled; while it is off the old rule still applies "
+                    "(a channel needs a bound workspace to have memories). Tenant administrators can only "
+                    "turn it off, never on."
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_RECALL_GROUP_TO_GROUP: Literal["off", "related", "all"] = Field(
+        default="off",
+        title="群聊记忆跨群召回",
+        description=(
+            "群聊记忆的跨群召回档位：关＝群里的记忆只在本群；"
+            "相关＝只在这条记忆涉及的人都是成员的群里召回；全部＝域内所有群。"
+            "只在记忆按域分区打开时生效；全局默认关。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="群聊记忆跨群召回", en_US="Group Memory Recall to Groups"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "群聊记忆的跨群召回档位：关＝群里的记忆只在本群；"
+                    "相关＝只在这条记忆涉及的人都是成员的群里召回；全部＝域内所有群。"
+                    "只在记忆按域分区打开时生效；全局默认关。"
+                ),
+                en_US=(
+                    "How group memories are recalled in other groups: off = only in the origin group; "
+                    "related = only in groups where every person mentioned by the memory is a member; "
+                    "all = every group in the domain. Takes effect only when memory domain partitioning "
+                    "is enabled; off by default globally."
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_RECALL_GROUP_TO_PRIVATE: Literal["off", "related", "all"] = Field(
+        default="off",
+        title="群聊记忆进入私聊",
+        description=(
+            "群聊记忆进入私聊的档位：关＝群记忆不进私聊；"
+            "相关＝只在涉及的人本人的私聊里召回；全部＝域内所有私聊。"
+            "只在记忆按域分区打开时生效；全局默认关。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="群聊记忆进入私聊", en_US="Group Memory Recall to Private Chats"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "群聊记忆进入私聊的档位：关＝群记忆不进私聊；"
+                    "相关＝只在涉及的人本人的私聊里召回；全部＝域内所有私聊。"
+                    "只在记忆按域分区打开时生效；全局默认关。"
+                ),
+                en_US=(
+                    "How group memories are recalled in private chats: off = never; "
+                    "related = only in the private chat of a person mentioned by the memory; "
+                    "all = every private chat in the domain. Takes effect only when memory domain "
+                    "partitioning is enabled; off by default globally."
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_RECALL_PRIVATE_TO_GROUP: Literal["off", "related", "all"] = Field(
+        default="off",
+        title="私聊记忆进入群聊",
+        description=(
+            "私聊记忆进入群聊的档位：关＝私聊记忆不进群；"
+            "相关＝只在私聊对象本人是成员的群里召回；全部＝域内所有群。"
+            "私聊记忆永远不会进别人的私聊。只在记忆按域分区打开时生效；全局默认关。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="私聊记忆进入群聊", en_US="Private Memory Recall to Groups"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "私聊记忆进入群聊的档位：关＝私聊记忆不进群；"
+                    "相关＝只在私聊对象本人是成员的群里召回；全部＝域内所有群。"
+                    "私聊记忆永远不会进别人的私聊。只在记忆按域分区打开时生效；全局默认关。"
+                ),
+                en_US=(
+                    "How private-chat memories are recalled in groups: off = never; "
+                    "related = only in groups where the private-chat counterpart is a member; "
+                    "all = every group in the domain. Private memories never enter someone else's "
+                    "private chat. Takes effect only when memory domain partitioning is enabled; "
+                    "off by default globally."
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_MEMBER_ACTIVE_DAYS: int = Field(
+        default=30,
+        ge=1,
+        title="群成员活跃天数",
+        description=(
+            "「相关」档判定群成员的天数：最近这么多天在这个群里发过言的人算成员。"
+            "只在记忆按域分区打开时生效。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="群成员活跃天数", en_US="Active Member Days"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "「相关」档判定群成员的天数：最近这么多天在这个群里发过言的人算成员。"
+                    "只在记忆按域分区打开时生效。"
+                ),
+                en_US=(
+                    "Number of days used to decide group membership for the related recall mode: "
+                    "anyone who spoke in the group within this many days counts as a member. "
+                    "Takes effect only when memory domain partitioning is enabled."
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_CONTEXT_MAX_ITEMS: int = Field(
+        default=8,
+        ge=1,
+        title="记忆上下文最大条数",
+        description="记忆系统注入到 Agent 提示词中的最大条数。只在记忆按域分区打开时生效；值越大，Agent 可参考的记忆越多",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="记忆上下文最大条数", en_US="Memory Context Max Items"),
+            i18n_description=i18n_text(
+                zh_CN="记忆系统注入到 Agent 提示词中的最大条数。只在记忆按域分区打开时生效；值越大，Agent 可参考的记忆越多",
+                en_US=(
+                    "Maximum number of memory items injected into the Agent prompt. Only takes effect when "
+                    "memory domain partitioning is enabled; larger values let the Agent reference more memories"
+                ),
+            ),
+        ).model_dump(),
+    )
     MEMORY_CONTEXT_MAX_LENGTH: int = Field(
         default=1200,
         title="记忆上下文最大长度",
         description="记忆系统注入到 Agent 提示词中的最大字符长度。值越大，Agent 可参考的记忆越多，但也会占用更多上下文窗口",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
             i18n_title=i18n_text(zh_CN="记忆上下文最大长度", en_US="Memory Context Max Length"),
             i18n_description=i18n_text(
                 zh_CN="记忆系统注入到 Agent 提示词中的最大字符长度。值越大，Agent 可参考的记忆越多，但也会占用更多上下文窗口",
                 en_US="Maximum character length of memory context injected into the Agent prompt. Larger values allow more memory context but consume more prompt window",
+            ),
+        ).model_dump(),
+    )
+    MEMORY_CHANNEL_SUMMARY_ENABLED: bool = Field(
+        default=True,
+        title="频道滚动摘要",
+        description=(
+            "可在全局、实例、频道三层设置，下层覆盖上层。只在记忆按域分区打开、且频道的「启用聊天记忆」"
+            "生效时起作用。关闭后不再更新也不再注入频道摘要，已经保存的历史版本保留"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="频道滚动摘要", en_US="Channel Rolling Summary"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "可在全局、实例、频道三层设置，下层覆盖上层。只在记忆按域分区打开、且频道的「启用聊天记忆」"
+                    "生效时起作用。关闭后不再更新也不再注入频道摘要，已经保存的历史版本保留"
+                ),
+                en_US=(
+                    "Can be set at the global, instance and channel levels, each overriding the one above. "
+                    "Takes effect only when memory domain partitioning is enabled and \"Enable Chat Memory\" "
+                    "is in effect for the channel. When disabled, the channel summary is no longer "
+                    "updated or injected; previously saved versions are kept"
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_CHANNEL_SUMMARY_MAX_CHARS: int = Field(
+        default=400,
+        ge=100,
+        le=2000,
+        title="频道摘要最大长度",
+        description="频道滚动摘要的最大字符数，超出部分在写入时截断。只影响摘要，不影响记忆段落",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="频道摘要最大长度", en_US="Channel Summary Max Length"),
+            i18n_description=i18n_text(
+                zh_CN="频道滚动摘要的最大字符数，超出部分在写入时截断。只影响摘要，不影响记忆段落",
+                en_US=(
+                    "Maximum character length of the rolling channel summary; longer content is "
+                    "truncated when written. Applies only to summaries, not memory paragraphs"
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_RECALL_COOLDOWN_ROUNDS: int = Field(
+        default=3,
+        ge=0,
+        title="记忆召回冷却轮数",
+        description=(
+            "同一段记忆被自动注入后，接下来这么多轮的自动注入里跳过它，第 N+1 轮恢复。"
+            "0 表示不冷却。只在记忆按域分区打开时生效；"
+            "memory_tools 主动搜索不受冷却限制。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="记忆召回冷却轮数", en_US="Memory Recall Cooldown Rounds"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "同一段记忆被自动注入后，接下来这么多轮的自动注入里跳过它，第 N+1 轮恢复。"
+                    "0 表示不冷却。只在记忆按域分区打开时生效；"
+                    "memory_tools 主动搜索不受冷却限制。"
+                ),
+                en_US=(
+                    "After a memory is injected automatically, skip it in automatic injection for this "
+                    "many following rounds and include it again from round N+1. 0 disables the cooldown. "
+                    "Takes effect only when memory domain partitioning is enabled; explicit searches "
+                    "through memory_tools are never cooled down."
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_RECALL_COOLDOWN_BYPASS_SIMILARITY: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        title="记忆召回冷却绕过相似度",
+        description=(
+            "本轮检索相似度达到这个值时视为「直接问到它」，即使它在冷却期内也照常注入。"
+            "只在记忆按域分区打开时生效；本项不可覆盖。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(
+                zh_CN="记忆召回冷却绕过相似度",
+                en_US="Memory Recall Cooldown Bypass Similarity",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "本轮检索相似度达到这个值时视为「直接问到它」，即使它在冷却期内也照常注入。"
+                    "只在记忆按域分区打开时生效；本项不可覆盖。"
+                ),
+                en_US=(
+                    "When this round's retrieval similarity reaches this value, the memory counts as "
+                    "directly asked for and is injected even during its cooldown. Takes effect only when "
+                    "memory domain partitioning is enabled; this item is not overridable."
+                ),
             ),
         ).model_dump(),
     )
@@ -438,6 +882,7 @@ class CoreConfig(ConfigBase):
         description="用于情景记忆沉淀提取的模型组名称。留空时回退到默认聊天模型组",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
             ref_model_groups=True,
             model_type="chat",
             i18n_title=i18n_text(zh_CN="情景沉淀模型组", en_US="Memory Consolidation Model Group"),
@@ -450,15 +895,26 @@ class CoreConfig(ConfigBase):
     MEMORY_CONSOLIDATION_FALLBACK_MODEL_GROUP: str = Field(
         default="",
         title="情景沉淀备用模型组",
-        description="当情景记忆沉淀在最后一次解析重试时，切换使用的备用模型组。留空时回退到情景沉淀主模型组",
+        description=(
+            "当情景沉淀主模型组因鉴权、限流、超时或服务端错误整轮失败时，"
+            "改用备用模型组把这一批完整重试一轮。留空时回退到情景沉淀主模型组"
+        ),
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
             ref_model_groups=True,
             model_type="chat",
             i18n_title=i18n_text(zh_CN="情景沉淀备用模型组", en_US="Memory Consolidation Fallback Model Group"),
             i18n_description=i18n_text(
-                zh_CN="当情景记忆沉淀在最后一次解析重试时，切换使用的备用模型组。留空时回退到情景沉淀主模型组",
-                en_US="Fallback model group used on the final parse retry of episodic memory consolidation. Falls back to the primary consolidation model group when empty",
+                zh_CN=(
+                    "当情景沉淀主模型组因鉴权、限流、超时或服务端错误整轮失败时，"
+                    "改用备用模型组把这一批完整重试一轮。留空时回退到情景沉淀主模型组"
+                ),
+                en_US=(
+                    "When the primary consolidation model group fails for a whole round because of "
+                    "authentication, rate limiting, timeout, or a server error, the fallback group "
+                    "retries the batch once in full. Falls back to the primary group when empty"
+                ),
             ),
             placeholder="例: api-nekro-pro-2.5",
         ).model_dump(),
@@ -782,6 +1238,28 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    MEMORY_CONSOLIDATION_DEDUP_SIMILARITY: float = Field(
+        default=0.92,
+        ge=0.0,
+        le=1.0,
+        title="沉淀近重复相似度",
+        description="沉淀写入新段落前，与同一频道、同一人设最近的段落比较向量相似度，达到这个值就当作重复、不再写入。"
+        "只在记忆按域分区打开时生效；0 表示不去重；本项不可覆盖。",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="沉淀近重复相似度", en_US="Consolidation Near-Duplicate Similarity"),
+            i18n_description=i18n_text(
+                zh_CN="沉淀写入新段落前，与同一频道、同一人设最近的段落比较向量相似度，达到这个值就当作重复、不再写入。"
+                "只在记忆按域分区打开时生效；0 表示不去重；本项不可覆盖。",
+                en_US=(
+                    "Before writing a new paragraph, consolidation compares its vector similarity with the most recent "
+                    "paragraphs of the same channel and preset; at or above this value the paragraph counts as a "
+                    "duplicate and is not written. Applies only when memory domain partitioning is enabled; "
+                    "0 disables deduplication. This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
     MEMORY_CONSOLIDATION_MSG_THRESHOLD: int = Field(
         default=50,
         title="沉淀消息阈值",
@@ -953,13 +1431,13 @@ class CoreConfig(ConfigBase):
     MEMORY_SCHEDULER_STAGGER_DELAY_SECONDS: int = Field(
         default=5,
         title="错峰调度延迟",
-        description="调度器为不同工作区任务增加的基础错峰延迟，用于降低多个沉淀任务同时抢占资源的概率",
+        description="调度器两次派发沉淀之间的最短间隔（秒），把多个频道的沉淀错开开跑；不随排队的频道数放大",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
             i18n_title=i18n_text(zh_CN="错峰调度延迟", en_US="Stagger Delay"),
             i18n_description=i18n_text(
-                zh_CN="调度器为不同工作区任务增加的基础错峰延迟，用于降低多个沉淀任务同时抢占资源的概率",
-                en_US="Base stagger delay added by the scheduler across workspace tasks to reduce simultaneous resource contention",
+                zh_CN="调度器两次派发沉淀之间的最短间隔（秒），把多个频道的沉淀错开开跑；不随排队的频道数放大",
+                en_US="Minimum gap in seconds between two consolidation dispatches, so channels start staggered; it does not grow with the number of queued channels",
             ),
         ).model_dump(),
     )
@@ -1099,8 +1577,8 @@ class CoreConfig(ConfigBase):
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
             i18n_title=i18n_text(zh_CN="启动时恢复历史沉淀任务", en_US="Recover Historical Consolidations On Startup"),
             i18n_description=i18n_text(
-                zh_CN="启用后会在启动时扫描工作区历史未沉淀消息并自动补跑，可能显著占用系统资源",
-                en_US="When enabled, scans and resumes historical unconsolidated messages on startup, which may significantly consume system resources",
+                zh_CN="启用后会在启动时扫描历史未沉淀消息，积压达到沉淀阈值的频道都自动补跑，可能显著占用系统资源。关闭时只兜底积压超过一批的频道，让换版重启后的积压能自己消化完",
+                en_US="When enabled, scans historical unconsolidated messages on startup and resumes every chat whose backlog reaches the consolidation threshold, which may significantly consume system resources. When disabled, only chats with more than one batch of backlog are resumed, so backlogs left by a restart still drain on their own",
             ),
         ).model_dump(),
     )
@@ -1139,6 +1617,376 @@ class CoreConfig(ConfigBase):
             i18n_description=i18n_text(
                 zh_CN="记忆强化日志在数据库中的默认保留天数。当前主要影响 reinforcement log 清理，不影响手动导出的其他故障日志文件",
                 en_US="Default retention days for memory reinforcement logs in the database. Currently affects reinforcement-log cleanup only, not other exported failure log files",
+            ),
+        ).model_dump(),
+    )
+    MEMORY_PROMPT_ROUNDS_KEEP: int = Field(
+        default=20,
+        ge=0,
+        title="提示词明细保留轮数",
+        description="每个频道保留最近多少轮提示词明细；0 表示不记录。本项不可覆盖",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="提示词明细保留轮数", en_US="Prompt Detail Rounds To Keep"),
+            i18n_description=i18n_text(
+                zh_CN="每个频道保留最近多少轮提示词明细；0 表示不记录。本项不可覆盖",
+                en_US=(
+                    "How many recent prompt-detail rounds to keep per channel; 0 means do not record. "
+                    "This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_PROMPT_ROUNDS_MAX_AGE_DAYS: int = Field(
+        default=30,
+        ge=1,
+        title="提示词明细最长保留天数",
+        description="提示词明细的最长保留天数，维护任务按它清理超龄记录。本项不可覆盖",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="提示词明细最长保留天数", en_US="Prompt Detail Max Age Days"),
+            i18n_description=i18n_text(
+                zh_CN="提示词明细的最长保留天数，维护任务按它清理超龄记录。本项不可覆盖",
+                en_US=(
+                    "Maximum age in days for prompt-detail rounds; the maintenance task removes older rows. "
+                    "This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
+    MEMORY_AUTO_QUARANTINE_BLOCKED_ROUNDS: int = Field(
+        default=3,
+        ge=0,
+        title="被拦轮次自动隔离阈值",
+        description="同一条记忆在多少个被拦轮次里被注入就自动隔离；0 表示只计数、不隔离。本项不可覆盖",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            i18n_title=i18n_text(zh_CN="被拦轮次自动隔离阈值", en_US="Auto Quarantine Blocked Rounds"),
+            i18n_description=i18n_text(
+                zh_CN="同一条记忆在多少个被拦轮次里被注入就自动隔离；0 表示只计数、不隔离。本项不可覆盖",
+                en_US=(
+                    "A memory is quarantined automatically after it has been injected in this many blocked rounds; "
+                    "0 means count only, never quarantine. This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
+
+    WORLDBOOK_ENABLED: bool = Field(
+        default=False,
+        title="启用世界书",
+        description=(
+            "是否注入世界书条目。可在全局、实例、频道三层设置，下层覆盖上层，最终按每个频道生效的值判断。"
+            "关着时运行时不查世界书、提示词与以前逐字相同；管理页照常可用（可以先写好再打开）。"
+            "平台方与租户管理员都能为自己的实例 / 频道打开或关闭。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="启用世界书", en_US="Enable Worldbook"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "是否注入世界书条目。可在全局、实例、频道三层设置，下层覆盖上层，最终按每个频道生效的值判断。"
+                    "关着时运行时不查世界书、提示词与以前逐字相同；管理页照常可用（可以先写好再打开）。"
+                    "平台方与租户管理员都能为自己的实例 / 频道打开或关闭。"
+                ),
+                en_US=(
+                    "Whether worldbook entries are injected. It can be set at the global, instance and "
+                    "channel levels, each overriding the one above, and is decided by the value in effect for "
+                    "each channel. While it is off the runtime never queries worldbook tables and the prompts "
+                    "stay byte-for-byte identical to before; the admin pages keep working, so entries can be "
+                    "prepared before turning it on. Both the platform and tenant administrators may turn it on "
+                    "or off for their own instances or channels."
+                ),
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_MAX_CHARS: int = Field(
+        default=3000,
+        ge=0,
+        le=20000,
+        title="世界书每轮正文字数上限",
+        description=(
+            "每轮注入的世界书正文总字数上限（不含说明文字与标签）；0 表示不注入。"
+            "可在全局、实例、频道三层设置，下层覆盖上层；上限由平台方定，租户管理员只能往下调。"
+            "单条正文比这个数还长时，那一条注入不进去（导入报告会提示）。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            overridable=True,
+            tenant_may_only_lower=True,
+            i18n_title=i18n_text(zh_CN="世界书每轮正文字数上限", en_US="Worldbook Max Chars per Round"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "每轮注入的世界书正文总字数上限（不含说明文字与标签）；0 表示不注入。"
+                    "可在全局、实例、频道三层设置，下层覆盖上层；上限由平台方定，租户管理员只能往下调。"
+                    "单条正文比这个数还长时，那一条注入不进去（导入报告会提示）。"
+                ),
+                en_US=(
+                    "Total characters of worldbook body text injected per round, excluding headers and "
+                    "tags; 0 means inject nothing. It can be set at the global, instance and channel levels, "
+                    "each overriding the one above; the platform sets the ceiling and tenant administrators "
+                    "may only lower it. An entry whose body is longer than this can never be injected (the "
+                    "import report points this out)."
+                ),
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_MAX_ENTRIES_PER_ROUND: int = Field(
+        default=32,
+        ge=1,
+        le=200,
+        title="世界书每轮条数上限",
+        description="每轮最多注入多少条世界书条目。本项不可覆盖",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            i18n_title=i18n_text(zh_CN="世界书每轮条数上限", en_US="Worldbook Max Entries per Round"),
+            i18n_description=i18n_text(
+                zh_CN="每轮最多注入多少条世界书条目。本项不可覆盖",
+                en_US="How many worldbook entries may be injected per round at most. This item is not overridable",
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_AUTO_QUARANTINE_BLOCKED_ROUNDS: int = Field(
+        default=3,
+        ge=0,
+        title="世界书被拦轮次自动隔离阈值",
+        description=(
+            "同一条世界书条目在多少个被拦轮次里被注入就自动隔离；0 表示只计数、不隔离。"
+            "常驻条目只计数、不自动隔离；一轮注入的关键词条目超过 5 条时，这一轮也只计数。本项不可覆盖"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            i18n_title=i18n_text(zh_CN="世界书被拦轮次自动隔离阈值", en_US="Worldbook Auto Quarantine Blocked Rounds"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "同一条世界书条目在多少个被拦轮次里被注入就自动隔离；0 表示只计数、不隔离。"
+                    "常驻条目只计数、不自动隔离；一轮注入的关键词条目超过 5 条时，这一轮也只计数。本项不可覆盖"
+                ),
+                en_US=(
+                    "A worldbook entry is quarantined automatically after it has been injected in this many "
+                    "blocked rounds; 0 means count only, never quarantine. Constant entries are only counted, "
+                    "never auto-quarantined, and a round that injected more than 5 keyword entries is only "
+                    "counted too. This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
+
+    TAVERN_CARD_TEMPLATE: str = Field(
+        default=DEFAULT_CARD_TEMPLATE,
+        title="酒馆人设卡拼装模板",
+        description=(
+            "导入酒馆卡时按这个模板把描述、性格、场景、示例对话、系统提示词拼成人设正文；"
+            "一段里引用的卡片字段都为空时整段去掉；其余 {{…}} 原样保留、运行时展开；"
+            "改模板不影响已导入的人设，要在人设的「酒馆扩展」里点重新拼装。"
+        ),
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            i18n_category=i18n_text(zh_CN="酒馆兼容", en_US="Tavern Compatibility"),
+            i18n_title=i18n_text(zh_CN="酒馆人设卡拼装模板", en_US="Tavern Card Assembly Template"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "导入酒馆卡时按这个模板把描述、性格、场景、示例对话、系统提示词拼成人设正文；"
+                    "一段里引用的卡片字段都为空时整段去掉；其余 {{…}} 原样保留、运行时展开；"
+                    "改模板不影响已导入的人设，要在人设的「酒馆扩展」里点重新拼装。"
+                ),
+                en_US=(
+                    "When importing a tavern card, assemble the description, personality, scenario, example dialogue "
+                    "and system prompt into the persona text with this template. A paragraph is dropped when every card "
+                    "field it references is empty. Other {{…}} placeholders are left as-is and expanded at runtime. "
+                    "Changing the template does not affect imported personas; click reassemble on the persona's "
+                    "Tavern Extension page to apply it."
+                ),
+            ),
+        ).model_dump(),
+    )
+
+    # 酒馆人设卡运行时（宏、深度注入、开场白、输出清理、高级槽位）的总闸。默认开：
+    # 没有卡片数据的人设与不含宏的世界书条目开着闸也逐字不变，出问题时一键关回改造前的行为。
+    TAVERN_COMPAT_ENABLED: bool = Field(
+        default=True,
+        title="启用酒馆人设卡运行时",
+        description=(
+            "酒馆人设卡运行时的回滚闸。关掉时运行时不读人设的酒馆扩展、不展开宏、不发开场白、"
+            "不做输出清理、不发高级槽位，提示词与以前逐字相同；导入导出与扩展页照常可用。本项不可覆盖"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="酒馆兼容", en_US="Tavern Compatibility"),
+            i18n_title=i18n_text(zh_CN="启用酒馆人设卡运行时", en_US="Enable Tavern Persona Runtime"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "酒馆人设卡运行时的回滚闸。关掉时运行时不读人设的酒馆扩展、不展开宏、不发开场白、"
+                    "不做输出清理、不发高级槽位，提示词与以前逐字相同；导入导出与扩展页照常可用。本项不可覆盖"
+                ),
+                en_US=(
+                    "Rollback gate for the tavern persona runtime. When it is off the runtime does not read the "
+                    "persona's tavern extension, does not expand macros, sends no greeting, applies no output "
+                    "cleanup and sends no advanced slot; the prompts stay byte-for-byte identical to before. "
+                    "Import/export and the extension page keep working. This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
+    PERSONA_GREETING_ENABLED: bool = Field(
+        default=True,
+        title="发送人设开场白",
+        description=(
+            "频道切到某个人设或执行 /reset 之后，下一次被叫到时先发这个人设的开场白，再照常回复。"
+            "平台方与租户管理员都能为自己的实例或频道开关"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            i18n_category=i18n_text(zh_CN="酒馆兼容", en_US="Tavern Compatibility"),
+            i18n_title=i18n_text(zh_CN="发送人设开场白", en_US="Send Persona Greeting"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "频道切到某个人设或执行 /reset 之后，下一次被叫到时先发这个人设的开场白，再照常回复。"
+                    "平台方与租户管理员都能为自己的实例或频道开关"
+                ),
+                en_US=(
+                    "After a channel switches to a persona or runs /reset, the next time it is called the persona's "
+                    "greeting is sent first and the normal reply follows. Both the platform and tenant "
+                    "administrators may turn it on or off for their own instances or channels."
+                ),
+            ),
+        ).model_dump(),
+    )
+    TAVERN_TRIAL_DAILY_LIMIT: int = Field(
+        default=100,
+        ge=0,
+        le=100000,
+        title="每实例每天试发次数上限",
+        description=(
+            "每个实例每天最多试发几次提示词；0 表示不限。用的是管理员自己的 Key，"
+            "这个上限只为挡住误操作与脚本刷，不为省钱。本项不可覆盖"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="酒馆兼容", en_US="Tavern Compatibility"),
+            i18n_title=i18n_text(zh_CN="每实例每天试发次数上限", en_US="Daily Prompt Trial Limit per Instance"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "每个实例每天最多试发几次提示词；0 表示不限。用的是管理员自己的 Key，"
+                    "这个上限只为挡住误操作与脚本刷，不为省钱。本项不可覆盖"
+                ),
+                en_US=(
+                    "How many prompt trials an instance may run per day; 0 means unlimited. Trials use the "
+                    "administrator's own key, so the limit only guards against mistakes and scripted abuse, not "
+                    "cost. This item is not overridable"
+                ),
+            ),
+        ).model_dump(),
+    )
+
+    # 三个高级提示词槽位出厂一律留空：NA 不内置任何破限文字，内容由管理员自己填。
+    # 标了审计，是因为这几个字段装的可能是敏感文字，改动要能追溯到人、又不能把原文再存一份。
+    PROMPT_ADVANCED_SLOTS_ENABLED: bool = Field(
+        default=False,
+        title="启用高级提示词槽位",
+        description=(
+            "打开后，这个实例会把后置指令、辅助提示词与预填发给模型。内容及其后果、对应 Key 的合规由管理员负责。"
+            "平台方与租户管理员都能为自己的实例或频道开关"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            audit_changes=True,
+            enable_confirm=i18n_text(
+                zh_CN="打开后，这个实例会把后置指令、辅助提示词与预填发给模型。内容及其后果、对应 Key 的合规由管理员负责。",
+                en_US=(
+                    "Once enabled, this instance sends post-history instructions, auxiliary instructions and prefill "
+                    "to the model. The administrator is responsible for the content, its consequences and the "
+                    "compliance of the corresponding key."
+                ),
+            ),
+            i18n_category=i18n_text(zh_CN="高级提示词槽位", en_US="Advanced Prompt Slots"),
+            i18n_title=i18n_text(zh_CN="启用高级提示词槽位", en_US="Enable Advanced Prompt Slots"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "打开后，这个实例会把后置指令、辅助提示词与预填发给模型。内容及其后果、对应 Key 的合规由管理员负责。"
+                    "平台方与租户管理员都能为自己的实例或频道开关"
+                ),
+                en_US=(
+                    "Once enabled, this instance sends post-history instructions, auxiliary instructions and prefill "
+                    "to the model. The administrator is responsible for the content, its consequences and the "
+                    "compliance of the corresponding key. Both the platform and tenant administrators may turn it on "
+                    "or off for their own instances or channels."
+                ),
+            ),
+        ).model_dump(),
+    )
+    PROMPT_POST_HISTORY: str = Field(
+        default="",
+        title="后置指令",
+        description=(
+            "放在聊天记录之后发给模型；支持 {{original}} 保留上一层的结果；"
+            "只在高级提示词槽位打开时发送"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            is_textarea=True,
+            audit_changes=True,
+            i18n_category=i18n_text(zh_CN="高级提示词槽位", en_US="Advanced Prompt Slots"),
+            i18n_title=i18n_text(zh_CN="后置指令", en_US="Post-History Instructions"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "放在聊天记录之后发给模型；支持 {{original}} 保留上一层的结果；"
+                    "只在高级提示词槽位打开时发送"
+                ),
+                en_US=(
+                    "Sent after the chat history; {{original}} keeps the value from the layer below; only sent when "
+                    "advanced prompt slots are enabled."
+                ),
+            ),
+        ).model_dump(),
+    )
+    PROMPT_AUXILIARY: str = Field(
+        default="",
+        title="辅助提示词",
+        description=(
+            "放在系统提示词里人设之后；支持 {{original}} 保留上一层的结果；"
+            "只在高级提示词槽位打开时发送"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            is_textarea=True,
+            audit_changes=True,
+            i18n_category=i18n_text(zh_CN="高级提示词槽位", en_US="Advanced Prompt Slots"),
+            i18n_title=i18n_text(zh_CN="辅助提示词", en_US="Auxiliary Instructions"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "放在系统提示词里人设之后；支持 {{original}} 保留上一层的结果；"
+                    "只在高级提示词槽位打开时发送"
+                ),
+                en_US=(
+                    "Placed in the system prompt after the persona text; {{original}} keeps the value from the layer "
+                    "below; only sent when advanced prompt slots are enabled."
+                ),
+            ),
+        ).model_dump(),
+    )
+    PROMPT_PREFILL: str = Field(
+        default="",
+        title="预填",
+        description=(
+            "作为回答的开头发给模型；支持 {{original}} 保留上一层的结果；"
+            "只对模型组「预填方式」不是关的组生效；全局层通常留空，按实例填"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            is_textarea=True,
+            audit_changes=True,
+            i18n_category=i18n_text(zh_CN="高级提示词槽位", en_US="Advanced Prompt Slots"),
+            i18n_title=i18n_text(zh_CN="预填", en_US="Assistant Prefill"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "作为回答的开头发给模型；支持 {{original}} 保留上一层的结果；"
+                    "只对模型组「预填方式」不是关的组生效；全局层通常留空，按实例填"
+                ),
+                en_US=(
+                    "Sent to the model as the beginning of the answer; {{original}} keeps the value from the layer "
+                    "below; only applies to model groups whose prefill mode is not off; the global layer is usually "
+                    "left empty and the value is filled per instance."
+                ),
             ),
         ).model_dump(),
     )
@@ -1353,6 +2201,148 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
         description="AI 对话上下文最大条数, 超出该条数会自动截断",
+    )
+    OUTPUT_FILTER_ENABLE: bool = Field(
+        default=False,
+        title="启用输出过滤",
+        description=(
+            "开启后 Bot 发出的文字先过词表和正则，命中的按下面的方式替换。"
+            "覆盖范围：Bot 回复、命令输出、插件经框架接口发送的消息；"
+            "OneBot V11 下插件直接调用发送类接口（send_msg / 合并转发等）的也会过滤。"
+            "过滤不到：插件绕过框架直接连协议端（自己发 HTTP / WebSocket）发出的消息，"
+            "以及非 OneBot 适配器上插件直接调平台 SDK 发出的消息。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="输出过滤", en_US="Output Filter"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="启用输出过滤", en_US="Enable Output Filter"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "开启后 Bot 发出的文字先过词表和正则，命中的按下面的方式替换。"
+                    "覆盖范围：Bot 回复、命令输出、插件经框架接口发送的消息；"
+                    "OneBot V11 下插件直接调用发送类接口（send_msg / 合并转发等）的也会过滤。"
+                    "过滤不到：插件绕过框架直接连协议端（自己发 HTTP / WebSocket）发出的消息，"
+                    "以及非 OneBot 适配器上插件直接调平台 SDK 发出的消息。"
+                ),
+                en_US=(
+                    "When enabled, text sent by the bot is matched against the word and regex lists before "
+                    "sending, and hits are replaced as configured below. Covers bot replies, command output, "
+                    "and messages plugins send through the framework; on OneBot V11 it also covers plugins "
+                    "calling send APIs directly (send_msg, forward messages, etc.). It cannot cover messages "
+                    "sent by plugins that bypass the framework and talk to the protocol endpoint directly "
+                    "(their own HTTP / WebSocket), nor messages sent by plugins through a platform SDK on "
+                    "non-OneBot adapters."
+                ),
+            ),
+        ).model_dump(),
+    )
+    OUTPUT_FILTER_MODE: Literal["fragment", "whole"] = Field(
+        default="fragment",
+        title="过滤方式",
+        description="fragment：只替换命中的片段；whole：整条消息换成替换文字",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="输出过滤", en_US="Output Filter"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="过滤方式", en_US="Filter Mode"),
+            i18n_description=i18n_text(
+                zh_CN="fragment：只替换命中的片段；whole：整条消息换成替换文字",
+                en_US="fragment: replace only the matched fragments; whole: replace the entire message with the replacement text",
+            ),
+        ).model_dump(),
+    )
+    OUTPUT_FILTER_REPLACEMENT: str = Field(
+        default="**Filter**",
+        title="替换文字",
+        description="命中片段或整条消息要换成的文字；留空按 **Filter** 处理",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="输出过滤", en_US="Output Filter"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="替换文字", en_US="Replacement Text"),
+            i18n_description=i18n_text(
+                zh_CN="命中片段或整条消息要换成的文字；留空按 **Filter** 处理",
+                en_US="Text used to replace matched fragments or the whole message; empty means **Filter**",
+            ),
+        ).model_dump(),
+    )
+    OUTPUT_FILTER_WORDS: str = Field(
+        default="",
+        title="过滤词",
+        description=(
+            "一行一个；空行和以 # 开头的行忽略；也可以整段粘贴一个 JSON 字符串数组。"
+            "匹配时不分全半角、大小写，忽略插在字之间的空白和零宽字符。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="输出过滤", en_US="Output Filter"),
+            overridable=True,
+            is_textarea=True,
+            i18n_title=i18n_text(zh_CN="过滤词", en_US="Filter Words"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "一行一个；空行和以 # 开头的行忽略；也可以整段粘贴一个 JSON 字符串数组。"
+                    "匹配时不分全半角、大小写，忽略插在字之间的空白和零宽字符。"
+                ),
+                en_US=(
+                    "One per line; blank lines and lines starting with # are ignored. A JSON string array "
+                    "pasted as a whole is also accepted. Matching is case-insensitive, normalizes full-width "
+                    "and half-width forms, and ignores whitespace and zero-width characters inserted between "
+                    "characters."
+                ),
+            ),
+        ).model_dump(),
+    )
+    OUTPUT_FILTER_REGEX: str = Field(
+        default="",
+        title="过滤正则",
+        description=(
+            "一行一条；空行和以 # 开头的行忽略。正则匹配的是归一化之后的文字（全角转半角、转小写、"
+            "去掉空白与零宽字符），所以不要在正则里写空白。太复杂的正则会被拒绝，原因见「命中统计」。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="输出过滤", en_US="Output Filter"),
+            overridable=True,
+            is_textarea=True,
+            i18n_title=i18n_text(zh_CN="过滤正则", en_US="Filter Regex"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "一行一条；空行和以 # 开头的行忽略。正则匹配的是归一化之后的文字（全角转半角、转小写、"
+                    "去掉空白与零宽字符），所以不要在正则里写空白。太复杂的正则会被拒绝，原因见「命中统计」。"
+                ),
+                en_US=(
+                    "One per line; blank lines and lines starting with # are ignored. Regexes run against "
+                    "normalized text (full-width folded to half-width, lowercased, whitespace and zero-width "
+                    "characters removed), so do not write whitespace in them. Overly complex regexes are "
+                    "rejected; see Hit Statistics for the reason."
+                ),
+            ),
+        ).model_dump(),
+    )
+    OUTPUT_FILTER_BEFORE_MEMORY: bool = Field(
+        default=False,
+        title="记忆沉淀前过滤",
+        description=(
+            "打开后（且输出过滤本身开着），长期记忆沉淀写入的段落、摘要、实体与关系先过一遍过滤："
+            "段落与摘要里命中的片段换成替换文字，命中的实体与关系直接丢弃。"
+            "只影响打开之后新写的记忆，不改已存的；不影响注入。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="输出过滤", en_US="Output Filter"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="记忆沉淀前过滤", en_US="Filter Before Memory"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "打开后（且输出过滤本身开着），长期记忆沉淀写入的段落、摘要、实体与关系先过一遍过滤："
+                    "段落与摘要里命中的片段换成替换文字，命中的实体与关系直接丢弃。"
+                    "只影响打开之后新写的记忆，不改已存的；不影响注入。"
+                ),
+                en_US=(
+                    "When enabled (and output filtering itself is on), paragraphs, summaries, entities and "
+                    "relations written by long-term memory consolidation are filtered first: matched fragments "
+                    "in paragraphs and summaries become the replacement text, and matched entities and relations "
+                    "are dropped. Only affects memories written after enabling; existing memories are unchanged, "
+                    "and injection is not filtered."
+                ),
+            ),
+        ).model_dump(),
     )
     AI_SCRIPT_MAX_RETRY_TIMES: int = Field(
         default=3,
@@ -1578,6 +2568,60 @@ class CoreConfig(ConfigBase):
             i18n_description=i18n_text(
                 zh_CN="启用后，SUPER_USERS 中的管理员发送的消息不受配额限制",
                 en_US="When enabled, messages from SUPER_USERS bypass quota limits",
+            ),
+        ).model_dump(),
+    )
+    # 频道每日额度只在全局出现的三项。策略本身（开关、单位、额度、超额动作、提示语）
+    # 存在 `channel_quota_policy` 表里，理由见 `models/db_channel_quota.py` 的模块文档：
+    # 平台方的承诺不能落在租户可写的覆盖层上。下面三项不标 `overridable`，同理。
+    CHANNEL_QUOTA_TIMEZONE: str = Field(
+        default="Asia/Shanghai",
+        title="频道额度日界时区",
+        description="频道每日额度按这个时区的零点换天，留空或时区名非法时回落 Asia/Shanghai",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="频道额度", en_US="Channel Quota"),
+            i18n_title=i18n_text(zh_CN="频道额度日界时区", en_US="Channel Quota Day Boundary Timezone"),
+            i18n_description=i18n_text(
+                zh_CN="频道每日额度按这个时区的零点换天，留空或时区名非法时回落 Asia/Shanghai",
+                en_US="Channel daily quota resets at midnight in this timezone; falls back to Asia/Shanghai",
+            ),
+        ).model_dump(),
+    )
+    CHANNEL_QUOTA_TOKEN_SCOPE: str = Field(
+        default="all",
+        title="频道额度 token 计入范围",
+        description=(
+            "all = 账本里记在该频道的全部调用都计入额度；"
+            "reply_only = 只计回复主链路与上下文规划（chat、history_plan），"
+            "其余调用照样记账、照样在后台按场景显示，但不计入额度、暂停时也不停"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="频道额度", en_US="Channel Quota"),
+            i18n_title=i18n_text(zh_CN="频道额度 token 计入范围", en_US="Channel Quota Token Scope"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "all = 账本里记在该频道的全部调用都计入额度；"
+                    "reply_only = 只计回复主链路与上下文规划（chat、history_plan），"
+                    "其余调用照样记账、照样在后台按场景显示，但不计入额度、暂停时也不停"
+                ),
+                en_US=(
+                    "all = every call booked to this channel counts toward the quota; "
+                    "reply_only = only the reply pipeline and history planning (chat, history_plan) count. "
+                    "Other calls are still booked and shown by scene, but do not count and keep running while paused"
+                ),
+            ),
+        ).model_dump(),
+    )
+    CHANNEL_QUOTA_ALERT_PERCENTS: List[int] = Field(
+        default=[80, 100],
+        title="频道额度告警阈值",
+        description="用量达到这些百分比时各告警一次（当天去重）",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="频道额度", en_US="Channel Quota"),
+            i18n_title=i18n_text(zh_CN="频道额度告警阈值", en_US="Channel Quota Alert Thresholds"),
+            i18n_description=i18n_text(
+                zh_CN="用量达到这些百分比时各告警一次（当天去重）",
+                en_US="Send one alert each time usage reaches these percentages (deduplicated per day)",
             ),
         ).model_dump(),
     )
@@ -1849,11 +2893,24 @@ class CoreConfig(ConfigBase):
                 en_US="Enable Stream Mode",
             ),
             i18n_description=i18n_text(
-                zh_CN="启用后 AI 会以流式请求方式返回响应，可能解决某些 LLM 请求异常的问题",
-                en_US="AI will use streaming mode for responses, may fix some LLM request issues",
+                zh_CN=(
+                    "启用后 AI 会以流式请求方式返回响应，可能解决某些 LLM 请求异常的问题。"
+                    "Token 统计依赖供应商支持 stream_options.include_usage：支持时与非流式一样准确；"
+                    "不支持时该次记为 0，按 Token 计的频道额度与用量费用会少算"
+                ),
+                en_US=(
+                    "AI will use streaming mode for responses, may fix some LLM request issues. "
+                    "Token counts depend on the provider supporting stream_options.include_usage: "
+                    "as accurate as non-stream mode if it does; recorded as 0 if it does not, "
+                    "so token-based chat quotas and usage costs are undercounted"
+                ),
             ),
         ).model_dump(),
-        description="启用后 AI 会以流式请求方式返回响应，再合并解析，这可能解决某些 LLM 请求异常的问题，但是会丢失准确的 Token 统计信息",
+        description=(
+            "启用后 AI 会以流式请求方式返回响应，再合并解析，这可能解决某些 LLM 请求异常的问题。"
+            "Token 统计依赖供应商支持 stream_options.include_usage：支持时与非流式一样准确；"
+            "不支持时该次记为 0，按 Token 计的频道额度与用量费用会少算"
+        ),
     )
     AI_STREAM_FIRST_TOKEN_TIMEOUT: int = Field(
         default=60,
@@ -1869,11 +2926,23 @@ class CoreConfig(ConfigBase):
                 en_US="Stream First Token Timeout (seconds)",
             ),
             i18n_description=i18n_text(
-                zh_CN="仅在启用流式请求时生效；若在指定时间内未收到首个有效流式片段，则判定本次请求失败并进入后续重试",
-                en_US="Only effective when stream mode is enabled; if no first valid stream chunk is received within this time, the request fails and enters subsequent retries",
+                zh_CN=(
+                    "仅在启用流式请求时生效；从发出请求起算（包括等待响应头的时间），"
+                    "若在指定时间内一个流式数据块都没收到（任何数据块都算，包括空块），"
+                    "则判定本次请求失败并进入后续重试"
+                ),
+                en_US=(
+                    "Only effective when stream mode is enabled; counted from when the request is sent "
+                    "(including the wait for response headers). If no stream chunk at all arrives within "
+                    "this time (any chunk counts, empty ones included), the request fails and enters subsequent retries"
+                ),
             ),
         ).model_dump(),
-        description="仅在启用流式请求时生效。若供应商在指定时间内未返回首个有效流式片段（空块不计入），则立即判定本次请求失败并进入后续重试，用于减少长时间无响应等待。",
+        description=(
+            "仅在启用流式请求时生效。从发出请求起算（包括等待响应头的时间），"
+            "若供应商在指定时间内一个流式数据块都没返回（任何数据块都算，包括空块），"
+            "则立即判定本次请求失败并进入后续重试，用于减少长时间无响应等待。"
+        ),
     )
 
     """聊天设置"""
@@ -2259,8 +3328,11 @@ class CoreConfig(ConfigBase):
     )
 
     """CC Workspace 配置"""
+    # 默认用本 fork 自建的 cc-sandbox 镜像（公开 fork Akiyo-dayo/nekro-cc-sandbox）：Claude Code、
+    # Node 与浏览器组件都钉了版本，tini 当 1 号进程。标签固定不变、从不发 latest；
+    # 回滚就改回上游的 `kromiose/nekro-cc-sandbox` / `0.1.14` 并重建容器
     CC_SANDBOX_IMAGE: str = Field(
-        default="kromiose/nekro-cc-sandbox",
+        default="ghcr.io/akiyo-dayo/nekro-cc-sandbox",
         title="CC 沙盒镜像名称",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
@@ -2271,7 +3343,7 @@ class CoreConfig(ConfigBase):
         ).model_dump(),
     )
     CC_SANDBOX_IMAGE_TAG: str = Field(
-        default="latest",
+        default="0.1.14-ak3-cc2.1.311",
         title="CC 沙盒镜像标签",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
@@ -2407,6 +3479,38 @@ class CoreConfig(ConfigBase):
                 en_US="Sandbox Configuration",
             ),
             i18n_title=i18n_text(zh_CN="CC 沙盒启动超时（秒）", en_US="CC Sandbox Startup Timeout (s)"),
+        ).model_dump(),
+    )
+    RESOURCE_PAYLOAD_AT_REST: Literal["encrypted", "plain"] = Field(
+        default="encrypted",
+        title="工作区资源敏感字段落库形态",
+        description=(
+            "工作区资源敏感字段的落库形态。默认 encrypted（密文）。"
+            "只有在要换回不支持加密的旧版本之前才改成 plain 并重启一次："
+            "启动时会把密文整批写回明文 JSON。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="沙盒配置",
+                en_US="Sandbox Configuration",
+            ),
+            i18n_title=i18n_text(
+                zh_CN="工作区资源敏感字段落库形态",
+                en_US="Workspace Resource Secret Payload Storage Format",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "工作区资源敏感字段的落库形态。默认 encrypted（密文）。"
+                    "只有在要换回不支持加密的旧版本之前才改成 plain 并重启一次："
+                    "启动时会把密文整批写回明文 JSON。"
+                ),
+                en_US=(
+                    "Storage format for workspace resource secrets. Defaults to encrypted. "
+                    "Only switch to plain and restart once before rolling back to an older "
+                    "version that cannot read envelopes: startup rewrites all ciphertext "
+                    "back to plaintext JSON."
+                ),
+            ),
         ).model_dump(),
     )
 
@@ -2726,33 +3830,6 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
-    OPS_BOT_DEEPLINK_TTL_SECONDS: int = Field(
-        default=300,
-        title="确认深链有效期（秒）",
-        description="写操作确认链接的有效期，取值会被夹到 30~3600 秒",
-        json_schema_extra=ExtraField(
-            i18n_category=i18n_text(zh_CN="运维 Bot", en_US="Ops Bot"),
-            i18n_title=i18n_text(zh_CN="确认深链有效期（秒）", en_US="Confirmation Link TTL (s)"),
-            i18n_description=i18n_text(
-                zh_CN="写操作确认链接的有效期，取值会被夹到 30~3600 秒",
-                en_US="TTL of the write-operation confirmation link; clamped to 30-3600 seconds.",
-            ),
-        ).model_dump(),
-    )
-    OPS_BOT_CONSOLE_BASE_URL: str = Field(
-        default="",
-        title="总后台访问地址",
-        description="用于拼出确认链接，如 https://console.example.com。留空则只给出相对路径",
-        json_schema_extra=ExtraField(
-            placeholder="https://console.example.com",
-            i18n_category=i18n_text(zh_CN="运维 Bot", en_US="Ops Bot"),
-            i18n_title=i18n_text(zh_CN="总后台访问地址", en_US="Console Base URL"),
-            i18n_description=i18n_text(
-                zh_CN="用于拼出确认链接，如 https://console.example.com。留空则只给出相对路径",
-                en_US="Used to build the confirmation link, e.g. https://console.example.com. Leave empty to emit a relative path only.",
-            ),
-        ).model_dump(),
-    )
     OPS_BOT_ALERT_ENABLED: bool = Field(
         default=False,
         title="掉线告警推送到运维频道",
@@ -2763,6 +3840,323 @@ class CoreConfig(ConfigBase):
             i18n_description=i18n_text(
                 zh_CN="启用后，实例掉线告警会作为第三条通道推送到运维频道（邮件 / Webhook 之外）",
                 en_US="When enabled, instance offline alerts are also pushed to the ops channel as a third notification channel besides email and webhook.",
+            ),
+        ).model_dump(),
+    )
+
+    """运维工具配置
+
+    与 `OPS_BOT_*` 同理，本组配置**全部不标记 `overridable`**：一旦允许频道级覆盖，
+    租户就能在自己的频道里把运维工具打开，等于绕过总后台的权限体系。
+    运维工具只认全局配置，且只在平台方实例的运维群 / 私聊里生效。
+    """
+    OPS_AGENT_TOOLS_ENABLED: bool = Field(
+        default=False,
+        title="启用运维工具",
+        description="启用后，运维人员在平台方实例的运维群或私聊里可以让 Bot 调用只读运维工具；关闭时模型完全看不到这些工具",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="运维工具", en_US="Ops Tools"),
+            i18n_title=i18n_text(zh_CN="启用运维工具", en_US="Enable Ops Tools"),
+            i18n_description=i18n_text(
+                zh_CN="启用后，运维人员在平台方实例的运维群或私聊里可以让 Bot 调用只读运维工具；关闭时模型完全看不到这些工具",
+                en_US="When enabled, operators can let the bot call read-only ops tools in an ops group or private chat on a platform-owned instance. When disabled the model never sees these tools at all.",
+            ),
+        ).model_dump(),
+    )
+    OPS_AGENT_OPERATORS: List[str] = Field(
+        default=[],
+        title="运维工具人员白名单",
+        description="填写账号（QQ 号），格式与超级用户名单相同。留空时沿用运维 Bot 的人员白名单，避免已配置的部署重配",
+        json_schema_extra=ExtraField(
+            sub_item_name="账号",
+            i18n_category=i18n_text(zh_CN="运维工具", en_US="Ops Tools"),
+            i18n_title=i18n_text(zh_CN="运维工具人员白名单", en_US="Ops Tool Operator Allowlist"),
+            i18n_description=i18n_text(
+                zh_CN="填写账号（QQ 号），格式与超级用户名单相同。留空时沿用运维 Bot 的人员白名单，避免已配置的部署重配",
+                en_US="Account IDs (QQ numbers) in the same format as the super user list. When empty, the ops bot operator allowlist is reused so existing deployments need no reconfiguration.",
+            ),
+        ).model_dump(),
+    )
+
+    """CC 工作区 SSH 网关配置
+
+    凭据本身不进容器，由 NA 内置的网关替 CC 登录服务器。默认关：网关的监听、
+    提示词与授权记账都不参与，存量 SSH 资源照旧注入。
+    """
+    SSH_GATEWAY_ENABLED: bool = Field(
+        default=False,
+        title="启用 SSH 网关",
+        description="SSH 网关总开关：让 CC 工作区经 NA 连服务器，凭据不进容器；后台打开或关掉 5 秒内生效，不用重启。默认关",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="启用 SSH 网关", en_US="Enable SSH Gateway"),
+            i18n_description=i18n_text(
+                zh_CN="SSH 网关总开关：让 CC 工作区经 NA 连服务器，凭据不进容器；后台打开或关掉 5 秒内生效，不用重启。默认关",
+                en_US=(
+                    "Master switch for the SSH gateway: let CC workspaces reach servers through NA "
+                    "without putting credentials inside the container. Changes take effect within "
+                    "5 seconds without a restart. Off by default."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_OWNER_ACCOUNTS: List[str] = Field(
+        default=[],
+        title="平台方服务器所有者名单",
+        description="能用平台方服务器的所有者本人，格式同超级用户名单；空 = 谁都不能用",
+        json_schema_extra=ExtraField(
+            sub_item_name="账号",
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="平台方服务器所有者名单", en_US="Platform Server Owner Allowlist"),
+            i18n_description=i18n_text(
+                zh_CN="能用平台方服务器的所有者本人，格式同超级用户名单；空 = 谁都不能用",
+                en_US=(
+                    "Platform owners who may use platform-owned servers, in the same format as the "
+                    "super user list. Empty means nobody can use them."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_USER_ACCOUNTS: List[str] = Field(
+        default=[],
+        title="用户服务器白名单",
+        description="能用自己服务器、能在聊天里登记服务器的用户白名单，格式同超级用户名单；空 = 用户服务器功能关",
+        json_schema_extra=ExtraField(
+            sub_item_name="账号",
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="用户服务器白名单", en_US="User Server Allowlist"),
+            i18n_description=i18n_text(
+                zh_CN="能用自己服务器、能在聊天里登记服务器的用户白名单，格式同超级用户名单；空 = 用户服务器功能关",
+                en_US=(
+                    "Users who may use their own servers and register servers in chat, in the same "
+                    "format as the super user list. Empty disables the user-server feature."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_LEASE_MAX_SECONDS: int = Field(
+        default=7200,
+        title="SSH 授权最长秒数",
+        description="一次 CC 任务对服务器的授权最长多久（秒）",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 授权最长秒数", en_US="SSH Lease Max Seconds"),
+            i18n_description=i18n_text(
+                zh_CN="一次 CC 任务对服务器的授权最长多久（秒）",
+                en_US="How long one CC task may keep its server authorization, in seconds.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_AUDIT_RETENTION_DAYS: int = Field(
+        default=180,
+        title="SSH 审计保留天数",
+        description="SSH 审计记录保留天数；0 = 不清理",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 审计保留天数", en_US="SSH Audit Retention Days"),
+            i18n_description=i18n_text(
+                zh_CN="SSH 审计记录保留天数；0 = 不清理",
+                en_US="How many days to keep SSH audit records; 0 disables cleanup.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_PORT: int = Field(
+        default=2222,
+        title="SSH 网关端口",
+        description="网关在工作区网桥上的监听端口",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 网关端口", en_US="SSH Gateway Port"),
+            i18n_description=i18n_text(
+                zh_CN="网关在工作区网桥上的监听端口",
+                en_US="The port the gateway listens on inside workspace bridge networks.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_MAX_CONNECTIONS: int = Field(
+        default=32,
+        title="SSH 网关连接数上限",
+        description="所有工作区同时在用的容器侧连接数上限",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 网关连接数上限", en_US="SSH Gateway Max Connections"),
+            i18n_description=i18n_text(
+                zh_CN="所有工作区同时在用的容器侧连接数上限",
+                en_US="Maximum number of concurrent container-side connections across all workspaces.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_MAX_CONNECTIONS_PER_WORKSPACE: int = Field(
+        default=8,
+        title="每工作区 SSH 连接数上限",
+        description="同一个工作区同时在用的容器侧连接数上限",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="每工作区 SSH 连接数上限", en_US="SSH Gateway Max Connections per Workspace"),
+            i18n_description=i18n_text(
+                zh_CN="同一个工作区同时在用的容器侧连接数上限",
+                en_US="Maximum number of concurrent container-side connections for one workspace.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_MAX_CHANNELS: int = Field(
+        default=10,
+        title="每连接 SSH 通道数上限",
+        description="每个容器侧连接最多同时开几个通道",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="每连接 SSH 通道数上限", en_US="SSH Gateway Max Channels per Connection"),
+            i18n_description=i18n_text(
+                zh_CN="每个容器侧连接最多同时开几个通道",
+                en_US="Maximum number of concurrent channels on one container-side connection.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_MAX_CHANNELS_TOTAL: int = Field(
+        default=64,
+        title="全局 SSH 通道数上限",
+        description="所有连接合计的通道数上限，决定网关内存上界",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="全局 SSH 通道数上限", en_US="SSH Gateway Max Total Channels"),
+            i18n_description=i18n_text(
+                zh_CN="所有连接合计的通道数上限，决定网关内存上界",
+                en_US="Maximum number of channels across all connections; this bounds gateway memory use.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_MAX_CHANNELS_PER_WORKSPACE: int = Field(
+        default=16,
+        title="每工作区 SSH 通道数上限",
+        description="同一个工作区所有连接合计同时开着的通道数上限，免得一个容器占满全局名额；0 表示不限",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="每工作区 SSH 通道数上限", en_US="SSH Gateway Max Channels per Workspace"),
+            i18n_description=i18n_text(
+                zh_CN="同一个工作区所有连接合计同时开着的通道数上限，免得一个容器占满全局名额；0 表示不限",
+                en_US=(
+                    "Maximum number of channels open at once across all connections of one workspace, "
+                    "so that one container cannot take every slot of the global limit; 0 means no limit."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_MAX_BYTES_PER_SEC: int = Field(
+        default=16777216,
+        title="SSH 网关带宽上限",
+        description="全局带宽上限（字节/秒），两个方向分别算；0 = 不限",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 网关带宽上限", en_US="SSH Gateway Bandwidth Limit"),
+            i18n_description=i18n_text(
+                zh_CN="全局带宽上限（字节/秒），两个方向分别算；0 = 不限",
+                en_US="Global bandwidth limit in bytes per second, applied separately per direction; 0 means unlimited.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_UPSTREAM_IDLE_SECONDS: int = Field(
+        default=60,
+        title="SSH 上游空闲关闭秒数",
+        description="复用的上游连接空闲多久后关闭（秒）",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 上游空闲关闭秒数", en_US="SSH Upstream Idle Seconds"),
+            i18n_description=i18n_text(
+                zh_CN="复用的上游连接空闲多久后关闭（秒）",
+                en_US="How many seconds a reused upstream connection may stay idle before it is closed.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_AUDIT_INPUT_BYTES: int = Field(
+        default=65536,
+        title="SSH 审计输入记录字节数",
+        description="每个通道记录容器到服务器方向的前多少字节输入；0 = 不记",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 审计输入记录字节数", en_US="SSH Audit Input Bytes"),
+            i18n_description=i18n_text(
+                zh_CN="每个通道记录容器到服务器方向的前多少字节输入；0 = 不记",
+                en_US="How many leading container-to-server bytes to record per channel; 0 disables recording.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_LOOP_LAG_MS: int = Field(
+        default=200,
+        title="SSH 网关让路阈值",
+        description="事件循环延迟超过多少毫秒时网关暂停转发让路",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="SSH 网关让路阈值", en_US="SSH Gateway Loop Lag Threshold"),
+            i18n_description=i18n_text(
+                zh_CN="事件循环延迟超过多少毫秒时网关暂停转发让路",
+                en_US="Event-loop lag in milliseconds above which the gateway pauses forwarding to yield.",
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_ALLOW_WITHOUT_ISOLATION: bool = Field(
+        default=False,
+        title="允许隔离未生效时使用网关",
+        description="只给开发机：工作区网络隔离没生效时也提供网关。默认关",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="允许隔离未生效时使用网关", en_US="Allow Gateway Without Isolation"),
+            i18n_description=i18n_text(
+                zh_CN="只给开发机：工作区网络隔离没生效时也提供网关。默认关",
+                en_US="Development machines only: serve the gateway even when workspace network isolation is off. Off by default.",
+            ),
+        ).model_dump(),
+    )
+
+    OPS_AGENT_GROUPS: List[str] = Field(
+        default=[],
+        title="运维工具群白名单",
+        description='填写完整的会话标识，如 "onebot_v11-inst1-group_123456"。留空时沿用运维 Bot 的运维频道（仅当该频道配置完整）',
+        json_schema_extra=ExtraField(
+            sub_item_name="会话标识",
+            i18n_category=i18n_text(zh_CN="运维工具", en_US="Ops Tools"),
+            i18n_title=i18n_text(zh_CN="运维工具群白名单", en_US="Ops Tool Group Allowlist"),
+            i18n_description=i18n_text(
+                zh_CN='填写完整的会话标识，如 "onebot_v11-inst1-group_123456"。留空时沿用运维 Bot 的运维频道（仅当该频道配置完整）',
+                en_US='Full chat keys such as "onebot_v11-inst1-group_123456". When empty, the ops bot channel is reused, but only if that channel configuration is complete.',
+            ),
+        ).model_dump(),
+    )
+    OPS_AGENT_PRIVATE_ENABLED: bool = Field(
+        default=True,
+        title="允许私聊使用运维工具",
+        description="私聊里只认白名单中的人；关闭后运维工具仅在运维群里生效",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="运维工具", en_US="Ops Tools"),
+            i18n_title=i18n_text(zh_CN="允许私聊使用运维工具", en_US="Allow Ops Tools in Private Chats"),
+            i18n_description=i18n_text(
+                zh_CN="私聊里只认白名单中的人；关闭后运维工具仅在运维群里生效",
+                en_US="Private chats are accepted only for allowlisted people. When disabled, ops tools work in ops groups only.",
+            ),
+        ).model_dump(),
+    )
+    OPS_AGENT_WRITE_LIMIT_PER_ROUND: int = Field(
+        default=5,
+        title="单轮写操作上限",
+        description="一个回合内允许执行的写操作次数，超出后本轮剩余的写调用一律拒绝",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="运维工具", en_US="Ops Tools"),
+            i18n_title=i18n_text(zh_CN="单轮写操作上限", en_US="Write Operations per Round"),
+            i18n_description=i18n_text(
+                zh_CN="一个回合内允许执行的写操作次数，超出后本轮剩余的写调用一律拒绝",
+                en_US="How many write operations one round may execute. Further write calls in that round are refused.",
+            ),
+        ).model_dump(),
+    )
+    OPS_AGENT_WRITE_LIMIT_PER_HOUR: int = Field(
+        default=30,
+        title="每小时写操作上限",
+        description="同一个人一小时内允许执行的写操作次数，防止一句话里被诱导做大批量改动",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="运维工具", en_US="Ops Tools"),
+            i18n_title=i18n_text(zh_CN="每小时写操作上限", en_US="Write Operations per Hour"),
+            i18n_description=i18n_text(
+                zh_CN="同一个人一小时内允许执行的写操作次数，防止一句话里被诱导做大批量改动",
+                en_US="How many write operations one person may execute within an hour, so a single sentence cannot be steered into a bulk change.",
             ),
         ).model_dump(),
     )
@@ -3153,11 +4547,86 @@ class CoreConfig(ConfigBase):
         ).model_dump(),
     )
 
+    AFFECTION_MILESTONE_ENABLED: bool = Field(
+        default=True,
+        title="关系里程碑",
+        description=(
+            "关系阶段跨过门槛时自动记一条长期记忆，并在好感信息里带上最近一条。可在全局、实例、频道三层设置，"
+            "下层覆盖上层；只在频道的「启用聊天记忆」也生效时写入"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            i18n_category=i18n_text(zh_CN="好感度系统", en_US="Affection System"),
+            i18n_title=i18n_text(zh_CN="关系里程碑", en_US="Relationship Milestones"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "关系阶段跨过门槛时自动记一条长期记忆，并在好感信息里带上最近一条。可在全局、实例、频道三层设置，"
+                    "下层覆盖上层；只在频道的「启用聊天记忆」也生效时写入"
+                ),
+                en_US=(
+                    "Write a long-term memory when the relationship crosses a stage threshold, and carry the latest one "
+                    "in the affection block. It can be set at the global, instance and channel levels, each overriding "
+                    "the one above; milestones are only written where \"Enable Chat Memory\" is also in effect"
+                ),
+            ),
+        ).model_dump(),
+    )
+    AFFECTION_MILESTONE_COOLDOWN_HOURS: int = Field(
+        default=24,
+        ge=1,
+        title="里程碑最短间隔（小时）",
+        description="同一个人在同一人设下两条关系里程碑之间至少隔多久",
+        json_schema_extra=ExtraField(
+            overridable=True,
+            i18n_category=i18n_text(zh_CN="好感度系统", en_US="Affection System"),
+            i18n_title=i18n_text(zh_CN="里程碑最短间隔（小时）", en_US="Milestone Cooldown (Hours)"),
+            i18n_description=i18n_text(
+                zh_CN="同一个人在同一人设下两条关系里程碑之间至少隔多久",
+                en_US="Minimum hours between two relationship milestones for the same person under the same preset",
+            ),
+        ).model_dump(),
+    )
+    AFFECTION_ABSENCE_HINT_DAYS: int = Field(
+        default=7,
+        ge=0,
+        title="久别提示（天）",
+        description=(
+            "一个人隔了这么多天再出现时，好感信息里带上多久没见。按最近一次有好感记录的互动算"
+            "（后台评估或模型自己调分时更新），不是最近一次说话；0 表示不带"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            i18n_category=i18n_text(zh_CN="好感度系统", en_US="Affection System"),
+            i18n_title=i18n_text(zh_CN="久别提示（天）", en_US="Absence Hint (Days)"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "一个人隔了这么多天再出现时，好感信息里带上多久没见。按最近一次有好感记录的互动算"
+                    "（后台评估或模型自己调分时更新），不是最近一次说话；0 表示不带"
+                ),
+                en_US=(
+                    "When someone shows up again after this many days, the affection block says how long it has "
+                    "been. It counts from the last interaction that left an affection record (updated by a "
+                    "background evaluation or by the model adjusting the score itself), not from the last time "
+                    "they spoke; 0 turns the line off"
+                ),
+            ),
+        ).model_dump(),
+    )
+
     """插件配置"""
     PLUGIN_ENABLED: List[str] = Field(
         default=["KroMiose.basic", "KroMiose.plugin_activation"],
         title="启用插件",
         description="启用插件 key 列表",
+        json_schema_extra=ExtraField(is_hidden=True).model_dump(),
+    )
+    # 配置文件是整份落盘的，改上面 `PLUGIN_ENABLED` 的默认值只对全新安装有效。要「默认启用」的新内置插件
+    # 在启动时由 `services/plugin/default_on.py` 加进 `PLUGIN_ENABLED` 一次，并记在这里：
+    # 平台方之后关掉它，不会在下次启动时又被打开
+    PLUGIN_DEFAULT_ON_APPLIED: List[str] = Field(
+        default=[],
+        title="已按默认启用过的插件",
+        description="新内置插件「默认启用」只生效一次的记录；平台方之后关掉的插件不会被再次打开",
         json_schema_extra=ExtraField(is_hidden=True).model_dump(),
     )
     PLUGIN_ACTIVATION_STRATEGIES: Dict[str, Literal["auto", "allow_sleep", "forbid_sleep"]] = Field(
@@ -3383,6 +4852,15 @@ class CoreConfig(ConfigBase):
             super().dump_config(file_path)
         finally:
             self._mask_model_group_secrets = previous
+
+
+# 写入侧对「租户只能调低」的字段按类型分两支比较前后两档生效值：bool 比的是「开 / 关」，
+# int 比的是数值大小。标记一旦落到别的类型上（字符串、字面量枚举……），比较会失去意义、
+# 判据会静默失效，因此在这里直接让模块导入失败，而不是等运行时才发现。
+for _field_name, _field in CoreConfig.model_fields.items():
+    _extra = _field.json_schema_extra
+    if isinstance(_extra, dict) and _extra.get("tenant_may_only_lower") and _field.annotation not in (bool, int):
+        raise TypeError(f"配置项 {_field_name} 标了 tenant_may_only_lower，但类型既不是 bool 也不是 int")
 
 
 # 设置配置键和文件路径

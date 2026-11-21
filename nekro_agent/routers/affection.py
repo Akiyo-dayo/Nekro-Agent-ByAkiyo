@@ -36,9 +36,9 @@
 
 ## 后台能做什么
 
-- 调分（`adjust`）与重置（`reset`，分数归零 + 清两段描述）；
-- 只清印象（`clear-narrative`）：清两段描述，分数不动；
-- 编辑印象（`narrative`）：改写两段描述，去 NUL、按上限截断，注入时照旧按不可信块包裹；
+- 调分（`adjust`）与重置（`reset`，分数归零 + 清两段描述与称呼）；
+- 只清印象（`clear-narrative`）：清两段描述与称呼，分数不动；
+- 编辑印象（`narrative`）：改写两段描述与称呼，去 NUL、按上限截断，注入时照旧按不可信块包裹；
 - 删一条流水的理由（`events/{event_id}`）：软删，只删文字、留删除痕迹，分数与 `score_after` 不动。
   只在这一行那个人的流水里找（同域、同人设、含合并过来的账号），与详情页时间线同一个范围。
 
@@ -64,9 +64,12 @@ from nekro_agent.models.db_affection import DBAffection, DBAffectionEvent
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_identity import DBIdentityAlias
 from nekro_agent.models.db_instance_group import SELF_DOMAIN_GROUP_ID, DBInstanceDomainBinding
+from nekro_agent.models.db_mem_paragraph import DBMemParagraph
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.errors import NotFoundError, ValidationError
+from nekro_agent.services.affection.key import AffectionKey
 from nekro_agent.services.affection.merge import list_person_accounts
+from nekro_agent.services.affection.milestones import clear_for_reset, paragraph_ids_in_domain
 from nekro_agent.services.affection.stage import (
     AFFECTION_MAX_SCORE,
     AFFECTION_MIN_SCORE,
@@ -82,8 +85,10 @@ from nekro_agent.services.affection.store import (
     apply_delta,
     clear_narrative,
     edit_narrative,
+    invalidate_cache,
     key_of_record,
     list_events,
+    list_milestone_events,
     redact_event_reason,
     set_score,
 )
@@ -93,7 +98,12 @@ from nekro_agent.services.identity_admin import (
     preset_display_name,
     preset_names,
 )
-from nekro_agent.services.identity_scope import ScopeDomain, resolve_affection_domain, resolve_preset_id
+from nekro_agent.services.identity_scope import (
+    ScopeDomain,
+    resolve_affection_domain,
+    resolve_person_uid,
+    resolve_preset_id,
+)
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import InstanceRef, assert_instance_accessible, get_tenant_scope
@@ -132,6 +142,8 @@ class AffectionItem(BaseModel):
     stage_label: str
     state_text: str
     last_event_text: str
+    # 模型自己记下的称呼（不可信内容）。空串 = 不特别称呼；前端下一轮才会显示它
+    call_name: str = ""
     interaction_count: int
     last_chat_key: str
     last_interact_at: Optional[str] = None
@@ -193,10 +205,36 @@ class AffectionScopeInfo(BaseModel):
     alias_accounts: List[str] = Field(default_factory=list)
 
 
+class AffectionMilestoneItem(BaseModel):
+    """一条关系里程碑：好感详情页的「关系里程碑」一栏
+
+    它同时是记忆段落（`origin_kind = affection`），因此带 `status`——管理员可能已经在
+    记忆页把它软删或隔离了，那时候好感块里也不会再显示它，但后台仍要看得出「这里本来有一条」。
+    """
+
+    paragraph_id: int
+    event_id: int
+    content: str
+    summary: str
+    event_time: Optional[str] = None
+    status: str = "active"
+
+
+class AffectionMilestoneRecordResponse(BaseModel):
+    """「这段里程碑属于哪一份好感」的答案
+
+    前端从记忆页拿到的是一个段落 ID，而好感页的详情与删除都按好感记录 ID 走，
+    因此这里只回一个 `record_id`，让前端自己再走 `GET /affection/{record_id}`。
+    """
+
+    record_id: int
+
+
 class AffectionDetail(BaseModel):
     item: AffectionItem
     events: List[AffectionEventItem]
     scope: AffectionScopeInfo
+    milestones: List[AffectionMilestoneItem] = Field(default_factory=list)
 
 
 class AffectionSummary(BaseModel):
@@ -232,6 +270,8 @@ class AffectionNarrativeEditRequest(BaseModel):
 
     state_text: str = ""
     last_event_text: str = ""
+    # None = 不改称呼：前端下一轮才会传这一栏，不传时不能把模型记下的称呼顺手清掉
+    call_name: Optional[str] = None
 
 
 class ActionResponse(BaseModel):
@@ -357,6 +397,7 @@ def _to_item(
         stage_label=stage_label(stage),
         state_text=record.state_text,
         last_event_text=record.last_event_text,
+        call_name=record.call_name,
         interaction_count=record.interaction_count,
         last_chat_key=record.last_chat_key,
         last_interact_at=_format_dt(record.last_interact_at),
@@ -502,6 +543,51 @@ async def get_affection_summary(
     )
 
 
+@router.get(
+    "/milestones/{paragraph_id}/record",
+    summary="查一条关系里程碑属于哪一份好感",
+    response_model=AffectionMilestoneRecordResponse,
+)
+@require_role(Role.Admin)
+async def get_milestone_record(
+    paragraph_id: int,
+    instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> AffectionMilestoneRecordResponse:
+    """从段落编号反查它属于哪一份好感（前端从记忆页跳回好感页要用）
+
+    定义在 `GET /{record_id}` 之前：路由按声明顺序匹配，眼下 `/{record_id}` 只吃一段路径，
+    碰不到这条三段的路径；放在前面是防以后有人在 `/{record_id}` 下面加子路径时，
+    字面量 `milestones` 被当成记录编号去解析。
+
+    归属判据是「有一条流水生成过它」，与删除里程碑同一份：只凭段落编号就去找好感行，
+    等于让任何编号都能换出别人的记录标识。找不到流水、找不到对应好感行、以及这一行对
+    当前作用域不可见，三种情况一律 404。
+    """
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    event = await DBAffectionEvent.filter(memory_paragraph_id=paragraph_id).first()
+    if event is None:
+        raise NotFoundError(resource="关系里程碑")
+    # 隔离键逐列取自这条流水本身，再交给 `AffectionKey.as_columns()` 拼条件：
+    # 少一列会串到别人 / 别的人设的那一份，多一列则永远查不到自己写过的行。
+    # 流水上的 `platform_userid` 是写它时那个账号；这个账号后来被并进别人名下时，
+    # 它自己那一行是休眠数据，详情要落到合并后的那个人身上，所以先按别名表换成人。
+    event_key = AffectionKey(
+        adapter_key=event.adapter_key,
+        instance_key=event.instance_key,
+        domain_group_id=event.domain_group_id,
+        person_uid=event.platform_userid,
+        preset_id=event.preset_id,
+    )
+    person_uid = await resolve_person_uid(event_key.domain, event.platform_userid)
+    key = event_key._replace(person_uid=person_uid)
+    row = await DBAffection.filter(**key.as_columns()).first()
+    if row is None:
+        raise NotFoundError(resource="关系里程碑")
+    visible = await _get_visible_record(row.id, scope, adapter_key)
+    return AffectionMilestoneRecordResponse(record_id=visible.id)
+
+
 @router.get("/{record_id}", summary="获取好感度详情", response_model=AffectionDetail)
 @require_role(Role.Admin)
 async def get_affection_detail(
@@ -511,13 +597,75 @@ async def get_affection_detail(
 ) -> AffectionDetail:
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
     record = await _get_visible_record(record_id, scope, adapter_key)
+    key = key_of_record(record)
     # 流水按**人**取并集（合并过的副账号那些行也在里面），来源账号逐条标在 `_to_event` 上
-    events = await list_events(key_of_record(record), limit=30)
+    events = await list_events(key, limit=30)
     return AffectionDetail(
         item=(await _items_of([record]))[0],
         events=[_to_event(event) for event in events],
         scope=await _scope_info(record),
+        milestones=await _milestone_items(key),
     )
+
+
+async def _milestone_items(key: AffectionKey) -> List[AffectionMilestoneItem]:
+    """这一份好感下的关系里程碑，新的在前；段落一次查回，状态走记忆管理那一份判据
+
+    段落可能已经被管理员在记忆页软删、隔离或清理掉，这时仍然列出来：后台要看得出
+    「这里本来有一条」，而不是让它在详情页上凭空消失。状态取 `paragraph_status`，
+    与记忆页逐字相同——同一个段落在两个页面上显示两种状态，排查时只会更糊涂。
+    """
+    from nekro_agent.services.memory import admin_service
+
+    events = await list_milestone_events(key)
+    if not events:
+        return []
+    paragraph_ids = sorted({int(event.memory_paragraph_id) for event in events if event.memory_paragraph_id is not None})
+    rows = {int(row.id): row for row in await DBMemParagraph.filter(id__in=paragraph_ids)}
+    in_domain = await paragraph_ids_in_domain(key.domain, paragraph_ids)
+    items: List[AffectionMilestoneItem] = []
+    for event in events:
+        paragraph_id = int(event.memory_paragraph_id) if event.memory_paragraph_id is not None else 0
+        row = rows.get(paragraph_id)
+        if row is not None and paragraph_id not in in_domain:
+            # 写它的实例已被单独划给别的租户，段落跟着实例走了：留一行说明「这里本来有一条」，
+            # 但正文已经是别人的数据，不给看，也不给删（见 `milestones.paragraph_ids_in_domain`）。
+            items.append(
+                AffectionMilestoneItem(
+                    paragraph_id=paragraph_id,
+                    event_id=event.id,
+                    content="",
+                    summary="",
+                    event_time=_format_dt(event.create_time),
+                    status="moved",
+                ),
+            )
+            continue
+        if row is None:
+            # 段落被真删了（维护任务清理、实例彻底删除）：仍留一行，正文为空，
+            # 否则时间线上会出现一条「生成过里程碑」的流水却看不到任何痕迹。
+            items.append(
+                AffectionMilestoneItem(
+                    paragraph_id=paragraph_id,
+                    event_id=event.id,
+                    content="",
+                    summary="",
+                    event_time=_format_dt(event.create_time),
+                    status="hard_deleted",
+                ),
+            )
+            continue
+        items.append(
+            AffectionMilestoneItem(
+                paragraph_id=paragraph_id,
+                event_id=event.id,
+                content=row.content,
+                summary=row.summary or "",
+                event_time=_format_dt(row.event_time),
+                status=admin_service.paragraph_status(row),
+            ),
+        )
+    return items
 
 
 async def _scope_info(record: DBAffection) -> AffectionScopeInfo:
@@ -593,20 +741,28 @@ async def reset_affection(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionItem:
-    """把分数归零并清空两段描述
+    """把分数归零并清空两段描述与称呼
 
     只想抹掉不合适的描述、不想动分数时用 `clear-narrative`。
+
+    关系里程碑**连带软删**（M8 定的 A）：重置之后 `memory_tools` 仍能搜到旧关系的话，
+    Bot 会说出「我们以前很要好」，而运营刚刚把这段关系清掉了。软删而不是真删——
+    误点重置还得能找回来。判据里的「上一条里程碑」也跟着回到「没有」，重置以后
+    第一次跃迁重新按第一条写。
     """
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
     record = await _get_visible_record(record_id, scope, adapter_key)
+    key = key_of_record(record)
     await set_score(
-        key_of_record(record),
+        key,
         score=0,
         reason="管理员重置",
         source=AffectionEventSource.RESET,
         operator=_current_user.username,
         clear_state_text=True,
     )
+    # 放在 `set_score` 之后：它要按流水找这一份好感下的里程碑，而重置自己那条流水不生成里程碑。
+    await clear_for_reset(key)
     logger.info(f"好感度重置: operator={_current_user.username}, record_id={record_id}")
     refreshed = await _get_visible_record(record_id, scope, adapter_key)
     return (await _items_of([refreshed]))[0]
@@ -619,7 +775,10 @@ async def clear_affection_narrative(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionItem:
-    """清空两段描述（`state_text` / `last_event_text`），分数、阶段、互动次数都不动"""
+    """清空两段描述（`state_text` / `last_event_text`）与称呼，分数、阶段、互动次数都不动
+
+    称呼一并清掉：它也是模型写的字，只清描述留着称呼，等于「描述清空了，还是那样叫他」。
+    """
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
     record = await _get_visible_record(record_id, scope, adapter_key)
     await clear_narrative(
@@ -627,6 +786,7 @@ async def clear_affection_narrative(
         source=AffectionEventSource.NARRATIVE_CLEAR,
         reason=REASON_NARRATIVE_CLEAR,
         operator=_current_user.username,
+        clear_call_name=True,
     )
     logger.info(f"好感度只清印象: operator={_current_user.username}, record_id={record_id}")
     refreshed = await _get_visible_record(record_id, scope, adapter_key)
@@ -641,7 +801,7 @@ async def edit_affection_narrative(
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionItem:
-    """改写两段描述，分数不动；流水只记宿主固定文案，不抄新旧文字（日志同样不打）"""
+    """改写两段描述与称呼，分数不动；流水只记宿主固定文案，不抄新旧文字（日志同样不打）"""
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
     record = await _get_visible_record(record_id, scope, adapter_key)
     await edit_narrative(
@@ -649,6 +809,7 @@ async def edit_affection_narrative(
         state_text=body.state_text,
         last_event_text=body.last_event_text,
         operator=_current_user.username,
+        call_name=body.call_name,
     )
     logger.info(f"好感度编辑印象: operator={_current_user.username}, record_id={record_id}")
     refreshed = await _get_visible_record(record_id, scope, adapter_key)
@@ -682,6 +843,48 @@ async def delete_affection_event_reason(
         f"好感度流水理由已删除: operator={_current_user.username}, record_id={record_id}, event_id={event_id}",
     )
     return _to_event(event)
+
+
+@router.delete(
+    "/{record_id}/milestones/{paragraph_id}",
+    summary="删除一条关系里程碑（软删，分数不动）",
+    response_model=ActionResponse,
+)
+@require_role(Role.Admin)
+async def delete_affection_milestone(
+    record_id: int,
+    paragraph_id: int,
+    instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ActionResponse:
+    """软删一条关系里程碑段落：分数、流水、`milestone_refs` 都不动
+
+    **归属判据是「这一行的某条流水生成过它」**，不是「它在某个人的 `milestone_refs` 里」：
+    引用只留最近几条，更早的里程碑仍然属于这个人，后台照样该能删；而只凭段落编号就删，
+    就能拿别人的编号删到别的域、别的人设、别的人头上（段落编号是全表自增的）。
+
+    软删而不是真删：段落是记忆，删错了要能在记忆页恢复；而且 `milestone_refs` 不改，
+    好感块下一次按 ID 取不到有效段落，自然就不再显示它。
+    """
+    from nekro_agent.services.memory import admin_service
+
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    record = await _get_visible_record(record_id, scope, adapter_key)
+    key = key_of_record(record)
+    events = await list_milestone_events(key, limit=500)
+    if not any(event.memory_paragraph_id == paragraph_id for event in events):
+        raise NotFoundError(resource="关系里程碑")
+    row = await DBMemParagraph.filter(id=paragraph_id).first()
+    # 段落已随实例划走时同样按不存在处理：那是新主人的记忆，这一侧不该动
+    if row is None or paragraph_id not in await paragraph_ids_in_domain(key.domain, [paragraph_id]):
+        raise NotFoundError(resource="关系里程碑")
+    await admin_service.soft_delete("paragraph", row)
+    invalidate_cache(key)
+    logger.info(
+        f"关系里程碑已删除: operator={_current_user.username}, record_id={record_id}, "
+        f"paragraph_id={paragraph_id}",
+    )
+    return ActionResponse()
 
 
 AffectionSummary.model_rebuild()

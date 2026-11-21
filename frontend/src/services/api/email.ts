@@ -1,9 +1,15 @@
 import axios from './axios'
 
-export type EmailProvider = 'QQ邮箱' | '163邮箱' | 'Gmail' | 'Outlook' | '自定义'
+/**
+ * 服务商预设键：清单以服务端为准（`GET /instance-email/providers`），这里只列页面上要特殊处理的几个。
+ * `string & {}` 让其余预设键（126、腾讯企业邮……）也能放进来，同时保留这几个字面量的补全。
+ */
+export type EmailProvider = 'QQ邮箱' | '163邮箱' | 'Gmail' | 'Outlook' | '自定义' | (string & {})
 export type EmailAuthType = 'password' | 'oauth2'
 export type EmailTransportType = 'imap_smtp' | 'gmail_api' | 'microsoft_graph'
 export type EmailOAuthProvider = '' | 'google' | 'microsoft'
+/** 平台方邮箱共享给哪些租户实例发信：所有实例 / 只给列出的 / 不共享（平台方实例不受限制） */
+export type EmailSendShare = 'all_instances' | 'listed' | 'none'
 
 export interface EmailAccount {
   index?: number
@@ -36,6 +42,11 @@ export interface EmailAccount {
   LAST_TEST_TIME?: number
   SEND_ENABLED: boolean
   IS_DEFAULT_SENDER: boolean
+  SEND_SHARE?: EmailSendShare
+  /** 每项 `<adapter_key>:<instance_key>`，只在 `SEND_SHARE` 为 `listed` 时用 */
+  SEND_SHARE_INSTANCES?: string[]
+  /** 内部标记（从实例转回的账户），页面不显示也不改，保存时原样带回 */
+  TENANT_SUPPLIED_HOSTS?: string
 }
 
 export interface EmailAccountsResponse {
@@ -104,6 +115,24 @@ export const emailApi = {
 
   deleteAccount: async (index: number): Promise<{ success: boolean }> => {
     const response = await axios.delete<{ success: boolean }>(`/adapters/email/accounts/${index}`)
+    return response.data
+  },
+
+  /**
+   * 把平台方的一个账户转为某个实例自有（只支持授权码方式）
+   *
+   * `expectedUsername` 是页面上看到的那个地址：账户按数组下标定位，列表加载之后别人加删过账户时同一个下标
+   * 就是别的邮箱，服务端对不上地址会回 409，不会把别的邮箱转出去。
+   */
+  transferToInstance: async (
+    index: number,
+    expectedUsername: string,
+    target: { adapter_key: string; instance_key: string }
+  ): Promise<{ success: boolean; id: number }> => {
+    const response = await axios.post<{ success: boolean; id: number }>(
+      `/adapters/email/accounts/${index}/to-instance`,
+      { ...target, expected_username: expectedUsername }
+    )
     return response.data
   },
 

@@ -33,23 +33,29 @@ chat_key 覆盖均为空，解析结果恒等于全局开关，行为与改造�
 
 - 实例级插件配置：`{DATA_DIR}/plugin_data/{plugin_key}/instances/{instance_key}/config.yaml`，
   只写入与全局配置**取值不同**的字段，其余字段永远跟随全局。
+
+这几样按实例 / 频道存的东西在彻底删除、划转、换会话标识、实例迁移时怎么处理，见
+`scope_lifecycle.py`；本模块只提供按键删、按键并的底层操作。
 """
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Literal, Optional, Set, Tuple, Type
 
 import yaml
 from pydantic import BaseModel
 
-from nekro_agent.core.core_utils import ConfigBase
+from nekro_agent.core.core_utils import ConfigBase, validate_config_data
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import OsEnv
+from nekro_agent.tools.fs_links import is_link, unlink_link
 
 if TYPE_CHECKING:
     from nekro_agent.adapters.onebot_v11.core.instance import InstanceContext
@@ -205,7 +211,7 @@ def set_scope_override(scope: OverrideScope, scope_key: str, plugin_key: str, en
     if not scope_key:
         raise ValueError("作用域标识不能为空")
 
-    data = _load_scope_overrides(scope)
+    data = _copy_scope_overrides(scope)
     entries = data.setdefault(scope_key, {})
     if enabled is None:
         entries.pop(plugin_key, None)
@@ -213,14 +219,80 @@ def set_scope_override(scope: OverrideScope, scope_key: str, plugin_key: str, en
         entries[plugin_key] = enabled
     if not entries:
         data.pop(scope_key, None)
+    _write_scope_overrides(scope, data)
 
+
+def _copy_scope_overrides(scope: OverrideScope) -> Dict[str, Dict[str, bool]]:
+    """缓存的一份深拷贝：先改拷贝、写盘成功再换缓存，写不进去时内存与文件仍是同一份"""
+    return {scope_key: dict(entries) for scope_key, entries in _load_scope_overrides(scope).items()}
+
+
+def _write_scope_overrides(scope: OverrideScope, data: Dict[str, Dict[str, bool]]) -> None:
+    """整份写回（先写临时文件再替换），成功后才更新缓存"""
     path = _scope_override_path(scope)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(
         yaml.dump(data, default_flow_style=False, sort_keys=True, allow_unicode=True),
         encoding="utf-8",
     )
+    os.replace(temp_path, path)
     _scope_override_cache[scope] = data
+
+
+def scope_keys_matching(scope: OverrideScope, keys: Iterable[str] = (), prefixes: Iterable[str] = ()) -> List[str]:
+    """这一层里有覆盖的键中，等于 `keys` 之一或以 `prefixes` 之一开头的那些（排序后返回）"""
+    wanted = {key for key in keys if key}
+    prefix_tuple = tuple(prefix for prefix in prefixes if prefix)
+    return sorted(
+        scope_key
+        for scope_key in _load_scope_overrides(scope)
+        if scope_key in wanted or (prefix_tuple and scope_key.startswith(prefix_tuple))
+    )
+
+
+def drop_scope_keys(scope: OverrideScope, keys: Iterable[str]) -> int:
+    """删掉这些作用域键下的全部启停覆盖，返回删掉的条目数（键 × 插件）
+
+    整份一次写回：逐条调 `set_scope_override` 会把同一个文件写 N 遍，中途失败还会留下半删的状态。
+    """
+    data = _copy_scope_overrides(scope)
+    removed = 0
+    changed = False
+    for scope_key in {key for key in keys if key}:
+        entries = data.pop(scope_key, None)
+        if entries is None:
+            continue
+        changed = True
+        removed += len(entries)
+    if changed:
+        _write_scope_overrides(scope, data)
+    return removed
+
+
+def move_scope_key(scope: OverrideScope, old_key: str, new_key: str) -> int:
+    """把 `old_key` 下的覆盖并到 `new_key` 上并删掉 `old_key`，返回真正搬过去的条目数
+
+    只补空缺：`new_key` 上已经有的插件条目保留不动（那是新标识下更晚的设置），与频道合并时
+    「幸存行上的值不覆盖」同一口径。`old_key` 一律删掉——留着的话，这个旧标识将来被别的
+    实例 / 频道重新用上时会直接继承这份开关。
+    """
+    if not old_key or not new_key or old_key == new_key:
+        return 0
+    data = _copy_scope_overrides(scope)
+    entries = data.pop(old_key, None)
+    if entries is None:
+        return 0
+    target = data.setdefault(new_key, {})
+    moved = 0
+    for plugin_key, value in entries.items():
+        if plugin_key not in target:
+            target[plugin_key] = value
+            moved += 1
+    if not target:
+        data.pop(new_key, None)
+    _write_scope_overrides(scope, data)
+    return moved
 
 
 def is_enabled_in_any_scope(plugin_key: str) -> bool:
@@ -417,7 +489,16 @@ def resolve_scoped_config(
     merged: Optional[ConfigBase] = None
     if overrides:
         try:
-            merged = config_cls.model_validate({**global_config.model_dump(), **overrides})
+            # 某个覆盖值不合法时只修正那一项（越界截到边界、其余回到全局配置的值）并记 ERROR，
+            # 其余覆盖照常生效；以前是整份回落到全局，这个实例的全部覆盖悄悄失效。
+            # `fallback` 不能省：合并后去掉一项会回到插件类的代码默认值，而不是全局配置里的值
+            global_values = global_config.model_dump()
+            merged = validate_config_data(
+                config_cls,
+                {**global_values, **overrides},
+                source=f"{instance_config_path(plugin_key, instance_key)}（与全局配置合并后）",
+                fallback=global_values,
+            )
             # 指向实例文件，避免误调用 dump_config() 时把实例值写回全局配置
             merged.set_instance_config_file_path(instance_config_path(plugin_key, instance_key))
         except Exception:
@@ -426,3 +507,189 @@ def resolve_scoped_config(
 
     _scoped_config_cache[cache_key] = merged
     return merged if merged is not None else global_config
+
+
+class PluginDataLinkError(OSError):
+    """插件数据目录的上两级（`<插件>/`、`instances/`）是链接，按路径删、搬都不安全"""
+
+
+def instance_config_dirs(instance_key: str) -> List[Tuple[str, Path]]:
+    """哪些插件在这个实例下有实例级配置目录：`[(plugin_key, plugin_data/<插件>/instances/<实例>/)]`
+
+    标识不合法时返回空列表：写入侧（`instance_config_path`）同样拒绝这种标识，不可能有目录。
+    以下划线开头的是 `_overrides` 这类内部目录，不是插件。
+
+    目录本身是链接（符号链接或目录联接）的也列出来：读配置的那一侧（`load_instance_config_overrides`）
+    会顺着链接读，删、搬的时候就必须看得见它，否则同名的新实例照样读得到链接后面的那份。
+    """
+    if not instance_key or not _SAFE_PATH_KEY_PATTERN.match(instance_key) or not PLUGIN_DATA_DIR.is_dir():
+        return []
+    found: List[Tuple[str, Path]] = []
+    for plugin_dir in sorted(PLUGIN_DATA_DIR.iterdir()):
+        if plugin_dir.name.startswith("_") or not _SAFE_PATH_KEY_PATTERN.match(plugin_dir.name):
+            continue
+        directory = plugin_dir / "instances" / instance_key
+        if is_link(directory) or directory.is_dir():
+            found.append((plugin_dir.name, directory))
+    return found
+
+
+def _refuse_linked_parents(plugin_key: str, directory: Path) -> None:
+    """`<插件>/` 或 `instances/` 是链接时拒绝按路径删、搬
+
+    这两级是这个插件所有实例共用的：删、搬穿过它们会落到链接指向的地方，而只删链接本身又会把
+    别的实例的配置一并带走。是谁、为什么这么链的只有部署方知道，所以报错让操作停下，由人处理。
+    """
+    instances_dir = directory.parent
+    if is_link(instances_dir.parent) or is_link(instances_dir):
+        raise PluginDataLinkError(f"插件 {plugin_key} 的数据目录（或其 instances/）是链接，不按路径删除或搬动，请人工处理")
+
+
+def invalidate_instance_scoped_configs(instance_key: str) -> None:
+    """让某个实例标识在全部插件下的合并缓存失效（实例删除、重新认领前用）"""
+    for cache_key in [key for key in _scoped_config_cache if key[1] == instance_key]:
+        _scoped_config_cache.pop(cache_key, None)
+
+
+def drop_instance_config_dirs(instance_key: str) -> List[str]:
+    """删掉这个实例在各插件下的实例级配置目录，返回涉及的插件键
+
+    出错直接抛出（调用方决定是中止还是记警告）；已经删掉的那几个不回滚，重跑会接着删。
+    目录本身是链接时只删链接，不进入链接指向的目录；上两级是链接时报错（见 `_refuse_linked_parents`）。
+    """
+    dropped: List[str] = []
+    for plugin_key, directory in instance_config_dirs(instance_key):
+        _refuse_linked_parents(plugin_key, directory)
+        if is_link(directory):
+            unlink_link(directory)
+        else:
+            shutil.rmtree(directory)
+        invalidate_scoped_config(plugin_key, instance_key)
+        dropped.append(plugin_key)
+    invalidate_instance_scoped_configs(instance_key)
+    return dropped
+
+
+def move_instance_config_dirs(source_instance_key: str, target_instance_key: str) -> List[str]:
+    """把源实例的实例级配置目录改名到目标实例，返回涉及的插件键
+
+    目标下已经有同一个插件的目录时合并：`config.yaml` 按「只补空缺」并（目标已有的字段保留），
+    其余文件目标没有的搬过去、有的保留目标那份，最后删掉源目录。源目录一律不留——同名的新实例
+    将来被重新认领时不该读到它。
+    """
+    if not _SAFE_PATH_KEY_PATTERN.match(target_instance_key or ""):
+        raise ValueError(f"非法的实例标识: {target_instance_key}")
+    if source_instance_key == target_instance_key:
+        return []
+    moved: List[str] = []
+    for plugin_key, source_dir in instance_config_dirs(source_instance_key):
+        _refuse_linked_parents(plugin_key, source_dir)
+        target_dir = source_dir.parent / target_instance_key
+        if not target_dir.exists() and not is_link(target_dir):
+            # 源目录是链接时改名的也是链接本身（指向不变），不进入它
+            source_dir.rename(target_dir)
+        elif is_link(source_dir):
+            # 目标已经有了：以目标为准，源那个链接只删链接本身
+            unlink_link(source_dir)
+        else:
+            merged = {
+                **load_instance_config_overrides(plugin_key, source_instance_key),
+                **load_instance_config_overrides(plugin_key, target_instance_key),
+            }
+            for entry in sorted(source_dir.iterdir()):
+                if entry.name == "config.yaml":
+                    continue
+                if (target_dir / entry.name).exists():
+                    logger.warning(f"实例迁移时目标已有同名文件，保留目标那份: {plugin_key} / {entry.name}")
+                    continue
+                entry.rename(target_dir / entry.name)
+            save_instance_config_overrides(plugin_key, target_instance_key, merged)
+            shutil.rmtree(source_dir)
+        invalidate_scoped_config(plugin_key, source_instance_key)
+        invalidate_scoped_config(plugin_key, target_instance_key)
+        moved.append(plugin_key)
+    invalidate_instance_scoped_configs(source_instance_key)
+    return moved
+
+
+def plugins_with_overrides(scope: OverrideScope, keys: Iterable[str]) -> Set[str]:
+    """这些作用域键下出现过的插件键（并集）"""
+    data = _load_scope_overrides(scope)
+    return {plugin_key for scope_key in keys for plugin_key in data.get(scope_key, {})}
+
+
+# ============================================================
+# 后台行为的作用域判据
+# ============================================================
+
+
+async def resolve_chat_plugin_instance(chat_key: str) -> Optional[str]:
+    """查出这个频道属于哪个适配器实例
+
+    后台推送、消息钩子、命令、定时提醒只知道目标 `chat_key`，判「插件在这个频道开没开」
+    之前必须先把它落到实例上，再走 会话 > 实例 > 全局 的配置解析。
+
+    Args:
+        chat_key: 频道标识；空串直接判不出来
+
+    Returns:
+        实例标识（频道行的 `instance_key` 为空时返回空串，按「无实例 / 单实例」处理）；
+        判不出来时返回 `None`。
+
+    频道行查不到时按部署形态分两档：
+
+    - **单租户部署**（没有任何实例挂在租户名下）：没有租户边界，按全局开关 + 会话覆盖走，
+      返回空串，与改造前的行为一致；
+    - **多租户部署**：频道行缺失可能意味着这个标识根本不属于任何租户，无法证明它属于谁，
+      按「判不出来」返回 `None`。调用方必须把它当不生效（fail-closed），
+      否则一个任意构造的 `chat_key` 就能绕开租户自己的开关。
+    """
+    if not chat_key:
+        return None
+
+    from nekro_agent.models.db_chat_channel import DBChatChannel
+
+    channel = await DBChatChannel.filter(chat_key=chat_key).order_by("id").first()
+    if channel is not None:
+        return channel.instance_key or ""
+
+    from nekro_agent.services.plugin.scope_guard import deployment_has_tenants
+
+    return None if await deployment_has_tenants() else ""
+
+
+def plugin_effective_with_instance(plugin_key: str, instance_key: Optional[str], chat_key: str) -> bool:
+    """用已经解析好的实例标识判断插件在某个频道是否生效（同步）
+
+    `instance_key is None` 表示上游判不出这个频道属于谁（多租户部署里频道行缺失、
+    或 `chat_key` 为空）：一律按不生效处理，宁可少推一条，也不把消息送进一个无法归属的频道。
+
+    异步调用方先用 :func:`resolve_chat_plugin_instance` 把实例算好再传进来；
+    不方便查库的同步代码用这个函数，不要在这里再发起查询。
+    """
+    if instance_key is None:
+        return False
+    return is_plugin_active(plugin_key, instance_key, chat_key)
+
+
+async def plugin_effective_in_chat(plugin_key: str, chat_key: str) -> bool:
+    """判断插件在某个频道是否生效（异步便捷入口）
+
+    组合 :func:`resolve_chat_plugin_instance` 与 :func:`plugin_effective_with_instance`。
+    后台推送、消息钩子、命令与定时提醒在「往这个频道做事」之前都先过它。
+    判不出频道归属时同样按不生效处理（多租户部署 fail-closed）。
+    """
+    instance_key = await resolve_chat_plugin_instance(chat_key)
+    return plugin_effective_with_instance(plugin_key, instance_key, chat_key)
+
+
+def plugin_effective_on_instance(plugin_key: str, adapter_key: str, instance_key: str) -> bool:
+    """判断插件在某个适配器实例上是否生效（同步）
+
+    用于没有单个目标频道、只按实例判的后台行为（插件路由、节日邮件等）。
+    目前实例级覆盖只按 `instance_key` 存，`adapter_key` 留在签名里是为了让调用方
+    显式带上它、将来若改成按 `(adapter_key, instance_key)` 存时不用改调用点；
+    本函数当前不读它。
+    """
+    del adapter_key  # 实例级覆盖目前只按 instance_key 存，见 docstring
+    return is_plugin_active(plugin_key, instance_key)

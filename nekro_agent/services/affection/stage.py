@@ -22,7 +22,7 @@
 - **滚动窗口预算**（:func:`limit_delta`）—— 一天/一周内累计能涨多少是有限的。
   这一层才是真正堵死刷分的那道墙，递减收益只负责让曲线好看。
 
-两层都**只作用于自动评估**。人工调整与重置是运营手段，走各自的入口，不经过这里。
+两层都**只作用于模型写的分**（后台评估与主模型自主调整）。人工调整与重置是运营手段，走各自的入口，不经过这里。
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ _REPLY_EAGERNESS_BANDS: tuple[_GainBand, ...] = (
 class AffectionEventSource(StrEnum):
     """好感度变化来源
 
-    速率约束只认 `LLM`：其余几种都是管理员在后台修数据或系统在维护一次账号合并，
+    速率约束只认模型写的分（`LLM` / `TOOL`）：其余几种都是管理员在后台修数据或系统在维护一次账号合并，
     既不该被"今天已经涨够了"挡住，也不该占用或退还用户的窗口额度。
 
     `MERGE` / `UNMERGE` 是账号合并留下的补偿事件，见 :mod:`.merge`：
@@ -127,6 +127,10 @@ class AffectionEventSource(StrEnum):
 
     `DOMAIN_MERGE` 是实例入域并入存量好感留下的折叠补偿，见
     `services/identity_admin.py:merge_self_domain_into_group`。
+
+    `TOOL` 是主模型在对话里通过「好感自主调整」插件写下的流水：调分，以及改称呼那条
+    `delta = 0` 的流水。它与 `LLM` 一样是模型自己写的字，只是入口从后台评估换成了
+    主模型当场表态。
 
     下面三种都是 `delta=0` 的「只动描述」事件，分数与阶段一律不变：
 
@@ -142,6 +146,7 @@ class AffectionEventSource(StrEnum):
     """
 
     LLM = "llm"
+    TOOL = "tool"
     MANUAL = "manual"
     RESET = "reset"
     MERGE = "merge"
@@ -161,6 +166,14 @@ ADMIN_WRITE_SOURCES: frozenset[AffectionEventSource] = frozenset(
         AffectionEventSource.NARRATIVE_EDIT,
     },
 )
+
+# 模型写的分：只有这些来源会触发关系里程碑。
+# `LLM`（后台评估）与 `TOOL`（主模型自己调分）都是模型写的分，共用一份日 / 周额度，
+# 也都可能跨过门槛产生里程碑。
+# 人工调分、重置、账号合并与撤销、入域并入、清印象 / 编辑印象都是运营动作，不是关系里
+# 发生的事——把它们记成里程碑，后台时间线里就会出现「管理员改了分数，于是关系升温了」
+# 这种假叙事。想给人工动作留痕用世界书的「记一笔」。
+MODEL_SOURCES: frozenset[AffectionEventSource] = frozenset({AffectionEventSource.LLM, AffectionEventSource.TOOL})
 
 
 class AffectionRateLimits(NamedTuple):

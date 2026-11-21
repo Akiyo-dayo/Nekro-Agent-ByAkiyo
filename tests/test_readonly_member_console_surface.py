@@ -292,6 +292,8 @@ ADMIN_ONLY_READ_ENDPOINTS: Tuple[Tuple[str, str, str, str], ...] = (
     ("/chat-channel/management", "chat_channel", "GET", "/chat-channel/list"),
     ("/chat-channel/announcement", "chat_channel", "GET", "/chat-channel/announcement/instances"),
     ("/affection", "affection", "GET", "/affection/list"),
+    ("/memory", "memory_admin", "GET", "/memory/paragraphs"),
+    ("/worldbook", "worldbook", "GET", "/worldbook/books"),
     ("/presets", "presets", "GET", "/presets/list"),
     ("/plugins/management", "plugins", "GET", "/plugins/list"),
     ("/workspace", "workspaces", "GET", "/workspaces/list"),

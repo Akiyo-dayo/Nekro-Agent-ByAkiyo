@@ -1,8 +1,9 @@
 import json
+import time
 from enum import StrEnum
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from tortoise import fields
 from tortoise.exceptions import IntegrityError
 from tortoise.models import Model
@@ -29,12 +30,84 @@ if TYPE_CHECKING:
 INSTANCE_METADATA_DEFAULT_PRESET_ID = "default_preset_id"
 
 
+async def get_instance_default_preset(adapter_key: str, instance_key: str) -> Optional[DBPreset]:
+    """按 `(adapter_key, instance_key)` 取实例配置的默认人设
+
+    从 `DBChatChannel._get_instance_default_preset` 抽出来放在模块级：节日邮件的正文按
+    「实例 → 系统默认 → 内置」选人设，它手上没有频道（一个实例可能有很多频道，也可能一个都没有），
+    只有实例对。两处共用同一段读元数据的逻辑，回退链才不会各自漂移。
+
+    Returns:
+        实例默认人设；未配置实例、未设默认人设或人设已删除时返回 None
+    """
+    if not adapter_key or not instance_key:
+        return None
+    from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+
+    instance = await DBAdapterInstance.get_or_none(adapter_key=adapter_key, instance_key=instance_key)
+    if instance is None or not instance.metadata_json:
+        return None
+    try:
+        metadata = json.loads(instance.metadata_json)
+    except json.JSONDecodeError:
+        return None
+    preset_id = metadata.get(INSTANCE_METADATA_DEFAULT_PRESET_ID) if isinstance(metadata, dict) else None
+    if not isinstance(preset_id, int):
+        return None
+    return await DBPreset.get_or_none(id=preset_id)
+
+
 class ChannelStatus(StrEnum):
     """频道状态枚举"""
 
     ACTIVE = "active"
     OBSERVE = "observe"
     DISABLED = "disabled"
+
+
+# 频道 `data` 里记「这个频道是被系统自动停用的」的键。和管理员手动停用的区别只靠它：
+# 有这个标记的停用，条件消失后系统会自己恢复；手动停用永远不会被自动恢复
+CHANNEL_DATA_AUTO_DISABLE_KEY = "auto_disable"
+
+
+class ChannelAutoDisableReason(StrEnum):
+    """频道被系统自动停用的原因"""
+
+    BOT_LEFT_GROUP = "bot_left_group"  # Bot 被移出群或自己退群
+
+
+class ChannelAutoDisableInfo(BaseModel):
+    """自动停用标记的内容
+
+    `previous_status` 是恢复时要回到的状态：启用还是旁观。手动停用的频道不会被打上这个标记，
+    所以恢复逻辑只看得到系统自己停掉的那些。
+    """
+
+    reason: ChannelAutoDisableReason
+    detail: str = ""
+    disabled_at: int  # Unix 秒
+    previous_status: ChannelStatus = ChannelStatus.ACTIVE
+
+
+# 频道 `data` 里记「最近一次确认 Bot 在不在这个群」的键。只是标记：不会因此停用或启用频道
+CHANNEL_DATA_BOT_MEMBERSHIP_KEY = "bot_membership"
+
+
+class BotMembershipStatus(StrEnum):
+    IN_GROUP = "in_group"
+    NOT_IN_GROUP = "not_in_group"
+
+
+class BotMembershipSource(StrEnum):
+    CHECK = "check"      # 定期核对或后台手动核对：拿协议端的群列表比对出来的
+    INBOUND = "inbound"  # 这个群又来了入站消息、或收到 Bot 自己入群的通知
+
+
+class BotMembershipInfo(BaseModel):
+    status: BotMembershipStatus
+    checked_at: int  # Unix 秒
+    source: BotMembershipSource
+    account_id: str = ""  # 核对时实例绑定的账号；入站来源时留空
 
 
 class DefaultPreset(BaseModel):
@@ -301,16 +374,185 @@ class DBChatChannel(Model):
         # 该列随后会被当作 `create_time__gte` 的比较值去筛消息（见 routers/chat_channel.py），
         # 必须与 ORM 写 `create_time` 时用的时区表示一致，否则边界含义取决于底层驱动
         self.conversation_start_time = db_now()  # 重置对话起始时间
+        # `/reset` 之后下一次被叫到要重发开场白：把记录写成 `-1` 而不是删键。删掉的话，
+        # 有过 Bot 消息的频道会被当成升级前的老频道，只记不发。读改写 `data` 保住其它键
+        # （自定义频道名、自动停用标记），随下面这一次整行 `save()` 一起写库。
+        from nekro_agent.services.tavern.greeting import GREETED_KEY, RESET_MARK
+
+        data = self._load_data()
+        data[GREETED_KEY] = RESET_MARK
+        self.data = json.dumps(data, ensure_ascii=False)
         await self.save()
 
         # 执行重置回调
         await plugin_collector.chat_channel_on_reset(await AgentCtx.create_by_chat_key(chat_key=self.chat_key))
 
+    def _load_data(self) -> dict[str, Any]:
+        """把 `data` 解析成字典；坏 JSON 或不是对象时返回空字典，不让脏数据打断调用链"""
+        try:
+            data = json.loads(self.data or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def get_auto_disable_info(self) -> Optional[ChannelAutoDisableInfo]:
+        """读取自动停用标记；没有标记或标记内容不合法时返回 None"""
+        raw = self._load_data().get(CHANNEL_DATA_AUTO_DISABLE_KEY)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return ChannelAutoDisableInfo.model_validate(raw)
+        except ValidationError:
+            return None
+
+    async def auto_disable(self, reason: ChannelAutoDisableReason, detail: str = "") -> bool:
+        """系统按确定性原因自动停用频道
+
+        只停此刻**启用着**（含旁观）的频道。已经停用的（不论手动还是自动）直接返回 False、
+        什么都不写——手动停用的频道不会被打上标记，也就永远不会被自动恢复。
+        人的意图优先：后台 / 聊天命令的启停会清掉这个标记，之后不再属于「自动停用」。
+
+        Returns:
+            是否真的把频道停用了
+        """
+        if not self.is_active:
+            return False
+
+        data = self._load_data()
+        info = ChannelAutoDisableInfo(
+            reason=reason,
+            detail=detail[:200],
+            disabled_at=int(time.time()),
+            previous_status=self.channel_status,
+        )
+        data[CHANNEL_DATA_AUTO_DISABLE_KEY] = info.model_dump(mode="json")
+        self.data = json.dumps(data, ensure_ascii=False)
+        self.is_active = False
+        self.observe_mode = False
+        await self.save(update_fields=["is_active", "observe_mode", "data", "update_time"])
+        return True
+
+    async def restore_auto_disabled(self, reason: ChannelAutoDisableReason) -> bool:
+        """按自动停用标记恢复频道；只恢复标记原因匹配的那些
+
+        `previous_status` 决定回到启用还是旁观。频道此刻已经启用（标记残留）时只清标记并返回 False，
+        不把管理员的启用状态改回旧值。
+
+        Returns:
+            是否真的从停用恢复成启用 / 旁观
+        """
+        info = self.get_auto_disable_info()
+        if info is None or info.reason != reason:
+            return False
+
+        data = self._load_data()
+        data.pop(CHANNEL_DATA_AUTO_DISABLE_KEY, None)
+        self.data = json.dumps(data, ensure_ascii=False)
+        if self.is_active:
+            await self.save(update_fields=["data", "update_time"])
+            return False
+
+        self.is_active = True
+        self.observe_mode = info.previous_status == ChannelStatus.OBSERVE
+        await self.save(update_fields=["is_active", "observe_mode", "data", "update_time"])
+        return True
+
+    def _clear_auto_disable_marker(self) -> None:
+        """从内存里的 `data` 去掉自动停用标记，随调用方原来的 `save()` 一起写库
+
+        后台接口和聊天命令（`/na_on` 之类）都是人的明确操作：手动启用或手动停用之后，
+        这个频道就不再属于「自动停用」，条件消失时也不该被系统改回旧状态。
+        """
+        data = self._load_data()
+        if CHANNEL_DATA_AUTO_DISABLE_KEY not in data:
+            return
+        data.pop(CHANNEL_DATA_AUTO_DISABLE_KEY, None)
+        self.data = json.dumps(data, ensure_ascii=False)
+
+    def get_bot_membership_info(self) -> Optional[BotMembershipInfo]:
+        """读取「Bot 在不在群」标记；没有标记或标记内容不合法时返回 None"""
+        raw = self._load_data().get(CHANNEL_DATA_BOT_MEMBERSHIP_KEY)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return BotMembershipInfo.model_validate(raw)
+        except ValidationError:
+            return None
+
+    def is_bot_marked_not_in_group(self) -> bool:
+        """最近一次结论是不是「Bot 不在这个群里」
+
+        只读标记、不查协议端：宿主替插件做的推送（节日祝福、定时提醒、插件后台推送）
+        在开回合、发消息之前用它挡掉注定被 QQ 拒绝的频道。标记缺失或内容不合法时按「在群」
+        处理——标记只在有确切证据时才写，读不出来不能当成证据。
+        """
+        info = self.get_bot_membership_info()
+        return info is not None and info.status is BotMembershipStatus.NOT_IN_GROUP
+
+    async def record_bot_membership(
+        self,
+        status: BotMembershipStatus,
+        source: BotMembershipSource,
+        *,
+        account_id: str = "",
+        now: Optional[int] = None,
+    ) -> Optional[BotMembershipStatus]:
+        """记录一次「Bot 在不在群」的结论，返回写入前的状态（没有记录时为 None）
+
+        调用方据返回值统计「新标」与「清除」。
+
+        只写 `data` 一列，**刻意不把 `update_time` 放进 `update_fields`**：核对每轮都会重写
+        所有群频道的标记，如果顺手刷新 `update_time`，频道目录（按它排序）就会每 6 小时整体
+        跳一次，把真正的活跃时间淹掉。这个标记不是活跃信号。
+
+        不动 `is_active` / `observe_mode`，也不碰 `auto_disable`：核对只做标记，
+        停用与启用始终由人决定。
+        """
+        previous = self.get_bot_membership_info()
+        info = BotMembershipInfo(
+            status=status,
+            checked_at=now if now is not None else int(time.time()),
+            source=source,
+            account_id=account_id,
+        )
+        data = self._load_data()
+        data[CHANNEL_DATA_BOT_MEMBERSHIP_KEY] = info.model_dump(mode="json")
+        self.data = json.dumps(data, ensure_ascii=False)
+        await self.save(update_fields=["data"])
+        return previous.status if previous is not None else None
+
+    async def clear_bot_not_in_group(self, source: BotMembershipSource = BotMembershipSource.INBOUND) -> bool:
+        """入站事件证明 Bot 还在群里：把「Bot 不在群」标记改回「在群」
+
+        只有当前标记是 `NOT_IN_GROUP` 时才写库并返回 True。它在每条入站群消息上都会被调用，
+        所以没有标记、标记已经是 `IN_GROUP`、或 `data` 坏掉时必须零写库。
+
+        `source` 由调用方给：入站消息与 Bot 自己入群的通知都算「入站证据」，
+        与定期核对的结论分开记录，后台能看出这个结论是怎么来的。
+        """
+        info = self.get_bot_membership_info()
+        if info is None or info.status is not BotMembershipStatus.NOT_IN_GROUP:
+            return False
+        data = self._load_data()
+        data[CHANNEL_DATA_BOT_MEMBERSHIP_KEY] = BotMembershipInfo(
+            status=BotMembershipStatus.IN_GROUP,
+            checked_at=int(time.time()),
+            source=source,
+        ).model_dump(mode="json")
+        self.data = json.dumps(data, ensure_ascii=False)
+        await self.save(update_fields=["data"])
+        return True
+
     async def set_active(self, is_active: bool):
-        """设置频道是否激活"""
+        """设置频道是否激活
+
+        这是人的明确操作，保存前清掉自动停用标记：手动启用或手动停用之后，
+        这个频道就不再属于「自动停用」，条件消失时系统也不该再改回来。
+        """
         self.is_active = is_active
         if not is_active:
             self.observe_mode = False
+        self._clear_auto_disable_marker()
         await self.save()
 
     @property
@@ -324,6 +566,9 @@ class DBChatChannel(Model):
 
     async def set_channel_status(self, status: ChannelStatus | str):
         """设置频道状态
+
+        这是人的明确操作，保存前清掉自动停用标记：手动启用或手动停用之后，
+        这个频道就不再属于「自动停用」，条件消失时系统也不该再改回来。
 
         Args:
             status: ChannelStatus 枚举值或字符串
@@ -340,6 +585,7 @@ class DBChatChannel(Model):
             self.observe_mode = False
         else:
             raise ValueError(f"无效的频道状态: {status}")
+        self._clear_auto_disable_marker()
         await self.save()
 
     @property
@@ -410,24 +656,13 @@ class DBChatChannel(Model):
     async def _get_instance_default_preset(self) -> Optional[DBPreset]:
         """获取所属实例配置的默认人设
 
+        读元数据那一段已提到模块级的 `get_instance_default_preset`（节日邮件也要用，
+        它手上只有实例对、没有频道）。这里只负责「本频道没有实例段」那一档。
+
         Returns:
             实例默认人设；未配置实例、未设默认人设或人设已删除时返回 None
         """
-        if not self.instance_key:
-            return None
-        from nekro_agent.models.db_adapter_instance import DBAdapterInstance
-
-        instance = await DBAdapterInstance.get_or_none(adapter_key=self.adapter_key, instance_key=self.instance_key)
-        if instance is None or not instance.metadata_json:
-            return None
-        try:
-            metadata = json.loads(instance.metadata_json)
-        except json.JSONDecodeError:
-            return None
-        preset_id = metadata.get(INSTANCE_METADATA_DEFAULT_PRESET_ID) if isinstance(metadata, dict) else None
-        if not isinstance(preset_id, int):
-            return None
-        return await DBPreset.get_or_none(id=preset_id)
+        return await get_instance_default_preset(self.adapter_key, self.instance_key)
 
     async def get_effective_config(self) -> "CoreConfig":
         """获取本频道的有效配置（四层合并：会话 > 实例 > 适配器 > 全局）
@@ -488,3 +723,22 @@ class DBChatChannel(Model):
 
 # channel_name / chat_key 等文本列在 PG 上不收 NUL；写入前统一剔除
 pre_save(DBChatChannel)(strip_nul_before_save)
+
+
+async def is_chat_key_marked_bot_not_in_group(chat_key: str) -> bool:
+    """按 `chat_key` 查频道行，判它是不是被标成了「Bot 不在群」
+
+    给手上只有 `chat_key` 的推送入口用（调度回合、插件推送）。判据只有
+    :meth:`DBChatChannel.is_bot_marked_not_in_group` 一处。
+
+    频道行不存在、查库出错一律按「在群」返回 False：这道判断只是为了少撞一次注定失败的发送，
+    它自己出错时不能把正常频道的推送也挡掉。
+    """
+    if not chat_key:
+        return False
+    try:
+        channel = await DBChatChannel.filter(chat_key=chat_key).order_by("id").first()
+    except Exception as e:  # noqa: BLE001 - 判定失败一律放行，不能让这道判断自己变成故障点
+        logger.warning(f"读取「Bot 在不在群」标记失败，按在群处理: chat_key={chat_key} | {e}")
+        return False
+    return channel is not None and channel.is_bot_marked_not_in_group()

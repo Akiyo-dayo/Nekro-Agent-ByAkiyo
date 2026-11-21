@@ -54,11 +54,21 @@ def make_parsed() -> ParsedEmail:
     )
 
 
-def make_adapter(enabled: bool = True, chat_key: str = NOTIFY_CHAT_KEY) -> EmailAdapter:
+def make_adapter(enabled: bool = True, chat_key: str = NOTIFY_CHAT_KEY, monkeypatch=None) -> EmailAdapter:
     """绕过构造函数：只塞 `_notify_new_email` 与 `_email_id_text` 会读到的配置
 
     `config` 是只读属性，实际读的是 `_config`；`_Configs` 一起给上，`get_config` 才会直接返回它。
+
+    通知现在还要求 `email_utils` 在那个频道生效（频道关了邮件插件就不该被邮件打扰），
+    所以在全局启用名单里补上它；不补的话这里测到的是「插件没开」那条跳过，而不是正文的形态。
     """
+    if monkeypatch is not None:
+        from nekro_agent.core.config import config as core_config
+
+        plugin_key = "liugu.email_utils"
+        if plugin_key not in core_config.PLUGIN_ENABLED:
+            monkeypatch.setattr(core_config, "PLUGIN_ENABLED", [*core_config.PLUGIN_ENABLED, plugin_key])
+
     adapter = object.__new__(EmailAdapter)
     adapter._Configs = EmailConfig
     adapter._config = SimpleNamespace(  # type: ignore[assignment]
@@ -69,8 +79,8 @@ def make_adapter(enabled: bool = True, chat_key: str = NOTIFY_CHAT_KEY) -> Email
 
 
 class TestEmailNotice:
-    async def test_the_sender_subject_and_attachment_are_untrusted(self, db, triggers):  # noqa: F811
-        await make_adapter()._notify_new_email(ACCOUNT, CHAT_ID, EMAIL_ID, make_parsed())
+    async def test_the_sender_subject_and_attachment_are_untrusted(self, db, triggers, monkeypatch: pytest.MonkeyPatch):  # noqa: F811
+        await make_adapter(monkeypatch=monkeypatch)._notify_new_email(ACCOUNT, CHAT_ID, EMAIL_ID, make_parsed())
 
         row = await assert_one_untrusted_row()
         assert INJECTION not in row.content_text
@@ -79,8 +89,8 @@ class TestEmailNotice:
         assert "get_email_content" in row.content_text
         assert triggers.scheduled == [NOTIFY_CHAT_KEY]
 
-    async def test_the_attachment_count_is_on_the_opening_tag(self, db, triggers):  # noqa: F811
-        await make_adapter()._notify_new_email(ACCOUNT, CHAT_ID, EMAIL_ID, make_parsed())
+    async def test_the_attachment_count_is_on_the_opening_tag(self, db, triggers, monkeypatch: pytest.MonkeyPatch):  # noqa: F811
+        await make_adapter(monkeypatch=monkeypatch)._notify_new_email(ACCOUNT, CHAT_ID, EMAIL_ID, make_parsed())
 
         row = await assert_one_untrusted_row()
         prompt = row.parse_chat_history_prompt(TOKEN, RENDER_CONFIG)  # type: ignore[arg-type]
@@ -93,8 +103,12 @@ class TestEmailNotice:
         [(False, NOTIFY_CHAT_KEY), (True, "")],
         ids=["disabled", "no-channel"],
     )
-    async def test_switched_off_stores_and_triggers_nothing(self, db, triggers, enabled: bool, chat_key: str):  # noqa: F811
-        await make_adapter(enabled=enabled, chat_key=chat_key)._notify_new_email(ACCOUNT, CHAT_ID, EMAIL_ID, make_parsed())
+    async def test_switched_off_stores_and_triggers_nothing(
+        self, db, triggers, enabled: bool, chat_key: str, monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+    ):
+        await make_adapter(enabled=enabled, chat_key=chat_key, monkeypatch=monkeypatch)._notify_new_email(
+            ACCOUNT, CHAT_ID, EMAIL_ID, make_parsed(),
+        )
 
         assert await stored_rows() == []
         assert triggers.scheduled == [] and triggers.hooked == []

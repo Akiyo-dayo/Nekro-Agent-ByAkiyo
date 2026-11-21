@@ -1,7 +1,8 @@
 import base64
 import json
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Query, UploadFile
 from pydantic import BaseModel
@@ -9,10 +10,12 @@ from pydantic import ValidationError as PydanticValidationError
 from tortoise.expressions import Q
 from tortoise.queryset import QuerySet
 
+from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
 from nekro_agent.models.db_chat_channel import INSTANCE_METADATA_DEFAULT_PRESET_ID
 from nekro_agent.models.db_preset import GLOBAL_PRESET_OWNER, DBPreset
+from nekro_agent.models.db_preset_card import DBPresetCard
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.errors import (
     CloudServiceError,
@@ -20,7 +23,14 @@ from nekro_agent.schemas.errors import (
     PermissionDeniedError,
     ValidationError,
 )
+from nekro_agent.schemas.tavern import CardImportOptions
 from nekro_agent.services.identity_admin import PRESET_SWITCH_REVERSIBLE_NOTE, preview_preset_switch
+from nekro_agent.services.tavern import audit
+from nekro_agent.services.tavern.card_format import CardFileRejected, parse_card_object
+from nekro_agent.services.tavern.cloud import Envelope, build_envelope, cloud_content_field, parse_envelope
+from nekro_agent.services.tavern.exporter import build_card_object
+from nekro_agent.services.tavern.importer import CardExtras, prepare_card_columns
+from nekro_agent.services.tavern.visibility import visible_preset_books
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import (
@@ -60,6 +70,12 @@ class TagInfo(BaseModel):
 
 
 class PresetSummary(BaseModel):
+    """人设列表 / 详情的一行
+
+    `has_card` 与 `card_spec` 来自酒馆扩展行：列表页要据此显示「酒馆卡」标记并决定
+    共享确认框里加不加那段出站提示，`card_spec` 为空表示这行是 NA 原生人设建的扩展行。
+    """
+
     id: int
     remote_id: str | None
     on_shared: bool
@@ -74,6 +90,8 @@ class PresetSummary(BaseModel):
     is_remote: bool
     create_time: str
     update_time: str
+    has_card: bool = False
+    card_spec: str = ""
 
 
 class PresetDetail(PresetSummary):
@@ -87,6 +105,17 @@ class PresetListResponse(BaseModel):
 
 class ActionResponse(BaseModel):
     ok: bool = True
+
+
+class PresetSyncResponse(BaseModel):
+    """同步云端人设的结果
+
+    同步可能还原不了信封里的卡片，也可能只还原了人设与扩展行而没动人设书；`note`
+    把这些差异告诉前端，`ok` 仍表示请求本身成功。
+    """
+
+    ok: bool = True
+    note: str = ""
 
 
 class ShareResponse(BaseModel):
@@ -138,7 +167,22 @@ class InstanceDefaultPresetImpact(BaseModel):
     reversible_note: str
 
 
-def _preset_summary(preset: DBPreset) -> PresetSummary:
+class CardMark(NamedTuple):
+    """扩展行的两个只读标记，够列表页显示「酒馆卡」与导出菜单用"""
+
+    preset_id: int
+    card_spec: str
+
+
+def _preset_summary(preset: DBPreset, card: Optional[CardMark] = None) -> PresetSummary:
+    """把一行人设拼成摘要
+
+    `card` 是这一行的扩展行标记；不传时 `has_card` / `card_spec` 留默认值。只有列表与
+    两个详情端点需要标记，其余调用点（实例默认人设）用不上——那里多查一次库是为了
+    一个界面上不显示的字段，不值得。列表用一次批量查询把标记带进来，见
+    `_card_marks`。
+    """
+    has_card = card is not None
     return PresetSummary(
         id=preset.id,
         remote_id=preset.remote_id,
@@ -154,12 +198,35 @@ def _preset_summary(preset: DBPreset) -> PresetSummary:
         is_remote=preset.remote_id is not None,
         create_time=preset.create_time.strftime("%Y-%m-%d %H:%M:%S"),
         update_time=preset.update_time.strftime("%Y-%m-%d %H:%M:%S"),
+        has_card=has_card,
+        card_spec=(card.card_spec if card is not None else ""),
     )
 
 
-def _preset_detail(preset: DBPreset) -> PresetDetail:
-    base = _preset_summary(preset)
+def _preset_detail(preset: DBPreset, card: Optional[CardMark] = None) -> PresetDetail:
+    base = _preset_summary(preset, card)
     return PresetDetail(**base.model_dump(), content=preset.content)
+
+
+async def _card_marks(preset_ids: list[int]) -> dict[int, CardMark]:
+    """一次批量取这些人设的扩展行标记
+
+    列表页有几十行，逐条 `get_or_none` 就是几十次往返；这里只查两列。`card_spec`
+    为空串也算有行——NA 原生人设建扩展行时正是空串，标记照样要显示。
+    """
+    if not preset_ids:
+        return {}
+    rows = await DBPresetCard.filter(preset_id__in=preset_ids).values("preset_id", "card_spec")
+    return {
+        int(row["preset_id"]): CardMark(preset_id=int(row["preset_id"]), card_spec=str(row.get("card_spec") or ""))
+        for row in rows
+    }
+
+
+async def _card_mark(preset_id: int) -> Optional[CardMark]:
+    """单个人设的扩展行标记；详情端点用"""
+    marks = await _card_marks([preset_id])
+    return marks.get(preset_id)
 
 
 def visible_presets(instance_key: str) -> QuerySet[DBPreset]:
@@ -313,7 +380,9 @@ async def get_preset_list(
 
     presets = await query
 
-    return PresetListResponse(total=total, items=[_preset_summary(p) for p in presets])
+    # 一次批量取扩展行标记：逐条查会变成「列表页几十次往返」，而这个字段只是个小徽标。
+    marks = await _card_marks([preset.id for preset in presets])
+    return PresetListResponse(total=total, items=[_preset_summary(p, marks.get(p.id)) for p in presets])
 
 
 @router.get("/instance/{instance_key}/default", summary="获取实例默认人设", response_model=InstanceDefaultPresetResponse)
@@ -491,7 +560,7 @@ async def get_preset_detail(
 ) -> PresetDetail:
     preset = await get_visible_preset(preset_id, await resolve_instance_scope(_current_user, instance_key))
 
-    return _preset_detail(preset)
+    return _preset_detail(preset, await _card_mark(preset.id))
 
 
 @router.get("/by-remote/{remote_id}", summary="通过远程ID获取本地人设详情", response_model=PresetDetail)
@@ -509,7 +578,7 @@ async def get_preset_detail_by_remote_id(
     if not preset:
         raise NotFoundError(resource="人设")
 
-    return _preset_detail(preset)
+    return _preset_detail(preset, await _card_mark(preset.id))
 
 
 @router.post("", summary="创建人设", response_model=ActionResponse)
@@ -635,13 +704,56 @@ async def delete_preset(
     return ActionResponse(ok=True)
 
 
-@router.post("/{preset_id}/sync", summary="同步云端人设", response_model=ActionResponse)
+_SYNC_BAD_CARD_NOTE = "附带的酒馆卡数据无法还原"
+_SYNC_BOOK_NOTE = "知识书没有随同步更新"
+
+
+async def _audit_sync_slot(
+    user: DBUser,
+    preset: DBPreset,
+    field: str,
+    old_value: str,
+    new_value: str,
+) -> None:
+    """同步改了人设层槽位时照扩展页的规则写一行审计，不带原文"""
+    await audit.record_change(
+        user=user,
+        layer="preset",
+        field=f"preset.{field}",
+        old=old_value,
+        new=new_value,
+        instance_key=preset.owner_instance_key,
+        preset_id=preset.id,
+    )
+
+
+async def _synced_card_columns(envelope: Envelope) -> dict[str, Any]:
+    """把信封里的卡按默认导入选项算成扩展行的列；算不出来返回 `None`
+
+    同步只重写扩展行，不建人设书；清理规则与停用状态仍按导入规则判，卡里
+    `disabled: true` 的保持停用。
+    """
+    parsed = parse_card_object(envelope.card, source_format="cloud")
+    columns, _assembled, _notes = prepare_card_columns(
+        parsed,
+        CardImportOptions(),
+        template=config.TAVERN_CARD_TEMPLATE,
+        extra=CardExtras(
+            prefill=envelope.prefill,
+            macros_enabled=envelope.macros_enabled,
+            greeting_pick=envelope.greeting_pick,
+        ),
+    )
+    return columns
+
+
+@router.post("/{preset_id}/sync", summary="同步云端人设", response_model=PresetSyncResponse)
 @require_role(Role.Admin)
 async def sync_preset(
     preset_id: int,
     instance_key: str = Query("", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
-) -> ActionResponse:
+) -> PresetSyncResponse:
     preset = await get_writable_preset(preset_id, await resolve_instance_scope(_current_user, instance_key))
 
     if not preset.remote_id:
@@ -651,16 +763,51 @@ async def sync_preset(
     if not response.success or not response.data:
         raise CloudServiceError(reason=str(response.message))
 
-    preset.name = response.data.name
-    preset.title = response.data.title
-    preset.avatar = response.data.avatar
-    preset.content = response.data.content
-    preset.description = response.data.description
-    preset.tags = response.data.tags
-    preset.author = response.data.author
+    cloud = response.data
+    envelope, reason = parse_envelope(cloud.ext_data)
+    columns: dict[str, Any] | None = None
+    note = ""
+    if envelope is None:
+        if reason:
+            logger.warning(f"云端人设的扩展数据不是可用的信封: remote_id={preset.remote_id}, reason={reason}")
+            note = _SYNC_BAD_CARD_NOTE
+    else:
+        try:
+            columns = await _synced_card_columns(envelope)
+        except CardFileRejected as exc:
+            logger.warning(f"云端人设的卡片无法还原: remote_id={preset.remote_id}, reason={exc}")
+            note = _SYNC_BAD_CARD_NOTE
+        except Exception as exc:  # noqa: BLE001 - 任何还原失败都退回只更新人设，不把原文带进日志
+            logger.warning(f"云端人设的卡片无法还原: remote_id={preset.remote_id}, reason={type(exc).__name__}")
+            note = _SYNC_BAD_CARD_NOTE
+
+    preset.name = cloud.name
+    preset.title = cloud.title
+    preset.avatar = cloud.avatar
+    # 信封能解析就用信封里的完整正文，哪怕卡片列还原失败：云端的 `content` 栏在共享时被截到
+    # 5000 字以内（`cloud_content_field`），拿它回写会静默丢掉长正文的尾部。卡片列还原失败
+    # 只影响扩展行，不该连累正文。
+    preset.content = envelope.content if envelope is not None else cloud.content
+    preset.description = cloud.description
+    preset.tags = cloud.tags
+    preset.author = cloud.author
     await preset.save()
 
-    return ActionResponse(ok=True)
+    if envelope is not None and columns is not None:
+        card = await DBPresetCard.get_or_none(preset_id=preset.id)
+        if card is None:
+            card = await DBPresetCard.create(preset=preset, **columns)
+            old_values = {"post_history": "", "prefill": ""}
+        else:
+            old_values = {"post_history": card.post_history, "prefill": card.prefill}
+            for field, value in columns.items():
+                setattr(card, field, value)
+            await card.save()
+        for field in ("post_history", "prefill"):
+            await _audit_sync_slot(_current_user, preset, field, old_values[field], getattr(card, field))
+        note = _SYNC_BOOK_NOTE
+
+    return PresetSyncResponse(ok=True, note=note)
 
 
 @router.post("/upload-avatar", summary="上传头像", response_model=AvatarUploadResponse)
@@ -680,6 +827,28 @@ async def upload_avatar(
     processed_data_url = await process_image_data_url(data_url)
 
     return AvatarUploadResponse(avatar=processed_data_url)
+
+
+async def _cloud_preset_payload(user: DBUser, preset: DBPreset) -> tuple[str, Any]:
+    """算出上传给云端的人设正文与扩展字段
+
+    没有酒馆扩展行时原样返回，请求体与改造前逐字相同；有扩展行时把共享人看得到的
+    整张卡、完整正文与 NA 三项打包进信封，云端 `content` 栏按 5000 字截断。
+    """
+    card = await DBPresetCard.get_or_none(preset_id=preset.id)
+    if card is None:
+        return preset.content, preset.ext_data or ""
+    books = await visible_preset_books(user, preset.id)
+    card_obj = build_card_object(preset, card, books, spec="v3", now=datetime.now(timezone.utc))
+    envelope = build_envelope(
+        card_obj,
+        content=preset.content,
+        prefill=card.prefill,
+        macros_enabled=card.macros_enabled,
+        greeting_pick=card.greeting_pick,
+        prev_ext_data=preset.ext_data,
+    )
+    return cloud_content_field(preset.content), envelope
 
 
 @router.post("/{preset_id}/share", summary="共享人设到云端", response_model=ShareResponse)
@@ -710,17 +879,18 @@ async def share_preset(
         raise ValidationError(reason="人设描述不能为空，请先编辑人设添加描述")
 
     instance_id = generate_instance_id()
+    content, ext_data = await _cloud_preset_payload(_current_user, preset)
 
     try:
         preset_data = PresetCreate(
             name=preset.name,
             title=preset.title or preset.name,
             avatar=preset.avatar,
-            content=preset.content,
+            content=content,
             description=preset.description,
             tags=preset.tags,
             author=preset.author,
-            ext_data=preset.ext_data or "",
+            ext_data=ext_data,
             is_sfw=is_sfw,
             instance_id=instance_id,
         )
@@ -791,16 +961,17 @@ async def sync_to_cloud(
         raise ValidationError(reason="人设描述不能为空，请先编辑人设添加描述")
 
     instance_id = generate_instance_id()
+    content, ext_data = await _cloud_preset_payload(_current_user, preset)
     try:
         preset_data = PresetUpdate(
             name=preset.name,
             title=preset.title or preset.name,
             avatar=preset.avatar,
-            content=preset.content,
+            content=content,
             description=preset.description,
             tags=preset.tags,
             author=preset.author,
-            ext_data=preset.ext_data or "",
+            ext_data=ext_data,
             is_sfw=is_sfw,
             instance_id=instance_id,
         )

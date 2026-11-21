@@ -18,7 +18,7 @@
 """
 
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 from httpx import AsyncClient
 from pydantic import Field
@@ -117,8 +117,10 @@ class GoogleSearchConfig(ConfigBase):
 # 获取配置
 config: GoogleSearchConfig = plugin.get_config(GoogleSearchConfig)
 
-_last_keyword = None
-_last_call_time = 0
+# 节流状态按频道分开：同一个进程服务多个群时，A 群刚搜过的关键词不该让 B 群的同一关键词被拒。
+# 键是发起搜索的 chat_key；写入时顺手清掉超过节流窗口的旧条目，避免长期运行越积越多。
+_last_keyword: Dict[str, str] = {}
+_last_call_time: Dict[str, float] = {}
 
 
 @plugin.mount_sandbox_method(
@@ -137,8 +139,11 @@ async def google_search(_ctx: AgentCtx, keyword: str) -> UntrustedToolResult | s
     """
     global _last_keyword, _last_call_time
 
-    # 防止重复搜索和频繁调用
-    if keyword == _last_keyword and time.time() - _last_call_time < config.THROTTLE_TIME:
+    chat_key = _ctx.chat_key
+
+    # 防止重复搜索和频繁调用（只针对同一个频道）
+    last_call_time = _last_call_time.get(chat_key, 0.0)
+    if keyword == _last_keyword.get(chat_key) and time.time() - last_call_time < config.THROTTLE_TIME:
         return "[错误] 禁止频繁搜索相同内容，结果无变化"
 
     proxy = core.config.DEFAULT_PROXY
@@ -173,8 +178,14 @@ async def google_search(_ctx: AgentCtx, keyword: str) -> UntrustedToolResult | s
         # 这句话会落成 SYSTEM 消息，搜索词是模型传入的：压成单行再回显
         return f"[Google] 未找到关于 {echo_inline(keyword)} 的信息"
 
-    _last_keyword = keyword
-    _last_call_time = time.time()
+    now = time.time()
+    _last_keyword[chat_key] = keyword
+    _last_call_time[chat_key] = now
+    # 只保留还在节流窗口内的条目；当前条目刚写入，用严格大于避免窗口为 0 时误删
+    stale_keys = [key for key, called_at in _last_call_time.items() if now - called_at > config.THROTTLE_TIME]
+    for stale_key in stale_keys:
+        _last_call_time.pop(stale_key, None)
+        _last_keyword.pop(stale_key, None)
 
     # 标题、摘要、链接都是网页作者写的，不能走会被模型当作"系统说的话"的 SYSTEM 消息；
     # 宿主自己的引导语放进可信摘要，搜索结果只放进不可信正文
@@ -190,5 +201,5 @@ async def google_search(_ctx: AgentCtx, keyword: str) -> UntrustedToolResult | s
 async def clean_up():
     """清理插件"""
     global _last_keyword, _last_call_time
-    _last_keyword = None
-    _last_call_time = 0
+    _last_keyword.clear()
+    _last_call_time.clear()

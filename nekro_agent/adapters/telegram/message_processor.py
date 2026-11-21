@@ -17,6 +17,7 @@ from telegram.ext import ContextTypes
 if TYPE_CHECKING:
     from nekro_agent.adapters.telegram.adapter import TelegramAdapter
 
+from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
 from nekro_agent.adapters.interface.schemas.platform import (
     PlatformChannel,
     PlatformMessage,
@@ -96,11 +97,26 @@ class MessageProcessor:
             sender_nickname=user_nickname,
             is_self=message.from_user.id == context.bot.id if context and context.bot else False,
             is_tome=self._is_mentioned(message, context),
+            ext_data=PlatformMessageExt(forwarded=self._is_forwarded_message(message)),
         )
 
         # 收集消息
         from nekro_agent.adapters.interface.collector import collect_message
         await collect_message(self.adapter, platform_channel, platform_user, platform_message)
+
+    def _is_forwarded_message(self, message: Message) -> bool:
+        """这条消息是不是转发来的：正文不是发送者本人写的
+
+        新版 python-telegram-bot 有 `forward_origin`；旧版用 `forward_date` /
+        `forward_from` / `forward_from_chat` / `forward_sender_name`。一律用 getattr 读，
+        缺字段的旧版对象与测试替身不会抛 AttributeError。只标记，不改变文字入库与给模型看。
+        """
+        if getattr(message, "forward_origin", None) is not None:
+            return True
+        for name in ("forward_date", "forward_from", "forward_from_chat", "forward_sender_name"):
+            if getattr(message, name, None) is not None:
+                return True
+        return False
 
     async def _handle_edited_message(self, message: Message, context: ContextTypes.DEFAULT_TYPE = None) -> None:
         """处理编辑消息"""

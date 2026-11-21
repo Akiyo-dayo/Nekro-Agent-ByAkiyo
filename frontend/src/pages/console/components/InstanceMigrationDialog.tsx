@@ -13,9 +13,11 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Box,
+  Checkbox,
   Chip,
   CircularProgress,
   Divider,
+  FormControlLabel,
   SxProps,
   Table,
   TableBody,
@@ -34,6 +36,7 @@ import NekroDialog from '../../../components/common/NekroDialog'
 import { useNotification } from '../../../hooks/useNotification'
 import { UNIFIED_TABLE_STYLES } from '../../../theme/variants'
 import { consoleApi, type InstanceInfo } from '../../../services/api/console'
+import CrossTenantSettingsChoice from './CrossTenantSettingsChoice'
 
 interface InstanceMigrationDialogProps {
   open: boolean
@@ -54,12 +57,20 @@ export default function InstanceMigrationDialog({
 
   const [sourceKey, setSourceKey] = useState('')
   const [confirmKey, setConfirmKey] = useState('')
+  // 跨租户时默认删除用户登记的服务器凭据（与租户划转同一条取舍），取消勾选才跟到目标实例
+  const [deleteSshCredentials, setDeleteSshCredentials] = useState(true)
+  // 插件设置与配置覆盖同一条取舍：跨租户时默认删除
+  const [deletePluginSettings, setDeletePluginSettings] = useState(true)
+  const [deleteConfigOverrides, setDeleteConfigOverrides] = useState(true)
 
   // 每次重新打开都从"还没选源实例"开始：迁移不可逆，不能让上一次的选择残留成默认值
   useEffect(() => {
     if (open) {
       setSourceKey('')
       setConfirmKey('')
+      setDeleteSshCredentials(true)
+      setDeletePluginSettings(true)
+      setDeleteConfigOverrides(true)
     }
   }, [open])
 
@@ -98,6 +109,9 @@ export default function InstanceMigrationDialog({
       consoleApi.migrateInstanceHistory(target.instance_key, {
         source_instance_key: sourceKey,
         confirm_source_instance_key: confirmKey.trim(),
+        delete_ssh_credentials: deleteSshCredentials,
+        delete_plugin_settings: deletePluginSettings,
+        delete_config_overrides: deleteConfigOverrides,
       }),
     onSuccess: result => {
       // 部分失败也是"已经改了库"，必须刷新列表，并且用告警而不是成功提示
@@ -122,6 +136,8 @@ export default function InstanceMigrationDialog({
     Boolean(preview) && confirmKey.trim() === sourceKey && !migrateMutation.isPending
 
   const countEntries = Object.entries(preview?.counts ?? {}).filter(([, count]) => count > 0)
+  const sshCredentialCount = preview?.ssh_credentials ?? 0
+  const showSshCredentialChoice = Boolean(preview?.cross_tenant) && sshCredentialCount > 0
 
   return (
     <NekroDialog
@@ -156,6 +172,7 @@ export default function InstanceMigrationDialog({
           onChange={value => {
             setSourceKey(value)
             setConfirmKey('')
+            setDeleteSshCredentials(true)
           }}
         />
 
@@ -291,6 +308,46 @@ export default function InstanceMigrationDialog({
                   </Typography>
                 ))}
               </Box>
+            )}
+
+            {showSshCredentialChoice && (
+              <Box>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={deleteSshCredentials}
+                      disabled={migrateMutation.isPending}
+                      onChange={event => setDeleteSshCredentials(event.target.checked)}
+                    />
+                  }
+                  label={
+                    <Typography variant="body2">
+                      {t('migrationDialog.deleteSshCredentialsLabel', {
+                        count: sshCredentialCount,
+                      })}
+                    </Typography>
+                  }
+                />
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: 'block', ml: 4 }}
+                >
+                  {t('migrationDialog.deleteSshCredentialsHint')}
+                </Typography>
+              </Box>
+            )}
+
+            {Boolean(preview?.cross_tenant) && (
+              <CrossTenantSettingsChoice
+                pluginSettings={preview?.plugin_settings ?? 0}
+                configOverrides={preview?.config_overrides ?? 0}
+                deletePluginSettings={deletePluginSettings}
+                deleteConfigOverrides={deleteConfigOverrides}
+                onDeletePluginSettingsChange={setDeletePluginSettings}
+                onDeleteConfigOverridesChange={setDeleteConfigOverrides}
+                disabled={migrateMutation.isPending}
+              />
             )}
 
             <TextField

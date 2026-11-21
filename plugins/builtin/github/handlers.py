@@ -6,7 +6,6 @@ from typing import Dict
 from nekro_agent.api import core
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core.logger import logger
-from nekro_agent.services.message_service import message_service
 from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text, sanitize_inline_text
 
 from .models import ChatSubscriptions
@@ -743,8 +742,11 @@ async def send_to_subscribers(repo_name: str, event_type: str, message: str):
         chat_subs = ChatSubscriptions.model_validate_json(data)
         if chat_subs.is_subscribed(repo_name, event_type):
             try:
-                # 发送消息并触发AI响应
-                await message_service.push_untrusted_message(chat_key=chat_key, result=result, trigger_agent=True)
+                # 走插件推送方法：订阅还在、但频道所在实例已关掉插件时不推。
+                pushed = await plugin.push_untrusted_message(chat_key=chat_key, result=result, trigger_agent=True)
+                if not pushed:
+                    core.logger.info(f"频道 {chat_key} 所在作用域未启用 github 插件，跳过 {repo_name} 的 {event_type} 事件")
+                    continue
                 sent_count += 1
                 core.logger.info(f"已向频道 {chat_key} 推送 {repo_name} 的 {event_type} 事件")
             except Exception as e:

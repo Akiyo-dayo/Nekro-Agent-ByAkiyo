@@ -15,7 +15,9 @@ from .ops import (
     GithubStarsCheckCommand,
     InstanceIdCommand,
     LogErrListCommand,
+    MemoryBackfillPayloadCommand,
     MemoryPruneCommand,
+    MemoryRebuildChannelCommand,
     MemoryRebuildCommand,
     MemoryReindexCommand,
     ShCommand,
@@ -68,7 +70,9 @@ def register_built_in_commands() -> None:
         LogErrListCommand(),
         MemoryPruneCommand(),
         MemoryRebuildCommand(),
+        MemoryRebuildChannelCommand(),
         MemoryReindexCommand(),
+        MemoryBackfillPayloadCommand(),
         # 运维 Bot（默认关闭；鉴权见 services/ops_bot/policy.py，不走通用命令权限层）
         OpsBotCommand(),
         # 配额类

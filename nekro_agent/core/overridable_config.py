@@ -1,6 +1,6 @@
 import copy
 from pathlib import Path
-from typing import Any, Optional, Type
+from typing import Any, ClassVar, Optional, Type
 
 import yaml
 from pydantic import Field, create_model, model_validator
@@ -26,7 +26,13 @@ class OverridableConfigBase(ConfigBase):
     读侧的回落让**存量文件**不需要任何迁移就立刻停止生效——真正启用的覆盖项一个都不受影响，
     被丢弃的只有从来没被采用过的冻结值。文件本身会在下一次保存时自然瘦身；
     缺字段的旧文件也能照常加载，pydantic 会用字段默认值补齐。
+
+    文件里某个启用中的覆盖值不合法（类型不对、枚举外……）时，加载会把它的 `enable_X` 一并关掉
+    （`_is_override_layer`，见 `core_utils.validate_config_data`）：这一项改为继承上一层，
+    而不是带着开关把代码默认值当成覆盖值生效。
     """
+
+    _is_override_layer: ClassVar[bool] = True
 
     @model_validator(mode="after")
     def _drop_inactive_override_values(self) -> "OverridableConfigBase":

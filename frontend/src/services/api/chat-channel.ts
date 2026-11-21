@@ -141,6 +141,55 @@ export interface ChatChannel {
   create_time: string
   update_time: string
   last_message_time: string | null
+  bot_membership?: ChatChannelBotMembership | null
+}
+
+export interface ChatChannelBotMembership {
+  status: 'in_group' | 'not_in_group'
+  checked_at: number
+  source: 'check' | 'inbound'
+}
+
+export type BotMembershipCheckOutcome =
+  | 'checked'
+  | 'offline'
+  | 'call_failed'
+  | 'empty'
+  | 'malformed'
+  | 'incomplete'
+
+export interface BotMembershipCheckResult {
+  adapter_key: string
+  instance_key: string
+  outcome: BotMembershipCheckOutcome
+  checked_at: number
+  account_id: string
+  group_count: number
+  channel_count: number
+  not_in_group_count: number
+  newly_marked: number
+  cleared: number
+  skipped_non_numeric: number
+  message: string
+}
+
+export interface BotMembershipDisablePreviewItem {
+  chat_key: string
+  channel_name: string | null
+  custom_channel_name: string | null
+  status: string
+  checked_at: number
+}
+
+export interface BotMembershipDisablePreview {
+  count: number
+  items: BotMembershipDisablePreviewItem[]
+}
+
+export interface BotMembershipDisableResponse {
+  disabled: number
+  skipped: number
+  disabled_chat_keys: string[]
 }
 
 export interface ChannelDirectoryEntry {
@@ -153,12 +202,27 @@ export interface ChannelDirectoryEntry {
   chat_type: string
 }
 
+export interface ChatChannelAutoDisable {
+  reason: string
+  detail: string
+  disabled_at: number
+}
+
 export interface ChatChannelDetail extends ChatChannel {
   unique_users: number
   conversation_start_time: string
   preset_id?: number | null
   can_send?: boolean
   ai_always_include_msg_id?: boolean
+  auto_disable?: ChatChannelAutoDisable | null
+  /**
+   * 频道所属实例（存量单实例频道为空串）
+   *
+   * 频道详情里的「记忆」标签必须用频道自己的实例，不能用顶栏的实例切换器：
+   * 频道属于哪个实例是确定的，租户缺了这个作用域会被后端 400。
+   */
+  adapter_key: string
+  instance_key: string
 }
 
 export interface ChatMessageSegment {
@@ -301,8 +365,29 @@ export const chatChannelApi = {
     chat_type?: string
     status?: 'active' | 'observe' | 'disabled'
     is_active?: boolean
+    bot_membership?: 'not_in_group'
   }): Promise<ChatChannelListResponse> => {
     const response = await axios.get<ChatChannelListResponse>('/chat-channel/list', { params })
+    return response.data
+  },
+
+  checkBotMembership: async (payload: { instance_key: string; adapter_key?: string }): Promise<BotMembershipCheckResult> => {
+    const response = await axios.post<BotMembershipCheckResult>('/chat-channel/bot-membership/check', payload)
+    return response.data
+  },
+
+  getBotMembershipDisablePreview: async (params?: {
+    instance_key?: string
+    adapter_key?: string
+  }): Promise<BotMembershipDisablePreview> => {
+    const response = await axios.get<BotMembershipDisablePreview>('/chat-channel/bot-membership/disable-preview', { params })
+    return response.data
+  },
+
+  disableNotInGroupChannels: async (chatKeys: string[]): Promise<BotMembershipDisableResponse> => {
+    const response = await axios.post<BotMembershipDisableResponse>('/chat-channel/bot-membership/disable', {
+      chat_keys: chatKeys,
+    })
     return response.data
   },
 

@@ -31,6 +31,7 @@ import {
   Add as AddIcon,
   CloudDownload as PullIcon,
   Delete as DeleteIcon,
+  DriveFileMove as TransferIcon,
   Edit as EditIcon,
   OpenInNew as OpenInNewIcon,
   Refresh as RefreshIcon,
@@ -40,9 +41,22 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { CARD_VARIANTS } from '../../../theme/variants'
 import { useNotification } from '../../../hooks/useNotification'
-import { EmailAccount, EmailProvider, EmailPullResult, EmailTransportType, emailApi } from '../../../services/api/email'
+import { INSTANCE_SCOPE_QUERY_KEY } from '../../../hooks/useInstanceScope'
+import { ApiError } from '../../../services/api/axios'
+import { consoleApi } from '../../../services/api/console'
+import {
+  EmailAccount,
+  EmailProvider,
+  EmailPullResult,
+  EmailSendShare,
+  EmailTransportType,
+  emailApi,
+} from '../../../services/api/email'
+import { mailboxApi } from '../../../services/api/mailbox'
 
-const providers: EmailProvider[] = ['QQ邮箱', '163邮箱', 'Gmail', 'Outlook', '自定义']
+// 服务端的预设表取不到时的兜底（与改造前的五项相同）
+const FALLBACK_PROVIDERS: EmailProvider[] = ['QQ邮箱', '163邮箱', 'Gmail', 'Outlook', '自定义']
+const SEND_SHARE_OPTIONS: EmailSendShare[] = ['all_instances', 'listed', 'none']
 
 /** 各提供商支持的收发信方式；未列出的提供商仅支持 IMAP/SMTP */
 const providerTransportOptions: Partial<Record<EmailProvider, EmailTransportType[]>> = {
@@ -99,6 +113,8 @@ const defaultAccount: EmailAccount = {
   PASSWORD: '',
   SEND_ENABLED: false,
   IS_DEFAULT_SENDER: false,
+  SEND_SHARE: 'all_instances',
+  SEND_SHARE_INSTANCES: [],
 }
 
 function buildPayload(form: EmailAccount, editing: boolean): Partial<EmailAccount> {
@@ -132,11 +148,35 @@ export default function EmailAccountsPage() {
   const [callbackDialogOpen, setCallbackDialogOpen] = useState(false)
   const [callbackText, setCallbackText] = useState('')
   const [pullResult, setPullResult] = useState<EmailPullResult | null>(null)
+  const [transferAccount, setTransferAccount] = useState<EmailAccount | null>(null)
+  const [transferTarget, setTransferTarget] = useState('')
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['email-accounts'],
     queryFn: emailApi.getAccounts,
   })
+  // 服务商下拉以服务端的预设表为准（含 126、腾讯企业邮、阿里云等），页面不再写死
+  const { data: providerPresets } = useQuery({
+    queryKey: ['mailbox', 'providers'],
+    queryFn: mailboxApi.listProviders,
+    staleTime: 10 * 60_000,
+  })
+  // 共享发信的「指定实例」与「转为实例自有」都要实例清单；与顶栏切换器同一个查询
+  const { data: instanceOptionsData } = useQuery({
+    queryKey: INSTANCE_SCOPE_QUERY_KEY,
+    queryFn: () => consoleApi.listInstanceOptions(),
+    staleTime: 60_000,
+  })
+  const providers: EmailProvider[] = providerPresets?.length
+    ? providerPresets.map(preset => preset.key)
+    : FALLBACK_PROVIDERS
+  const instanceOptions = (instanceOptionsData?.items ?? [])
+    .filter(instance => instance.status !== 'archived')
+    .map(instance => ({
+      value: `${instance.adapter_key}:${instance.instance_key}`,
+      label: `${instance.display_name || instance.instance_key} (${instance.adapter_key}:${instance.instance_key})`,
+    }))
+  const instanceLabel = new Map(instanceOptions.map(option => [option.value, option.label]))
 
   const invalidateAccounts = async () => {
     await queryClient.invalidateQueries({ queryKey: ['email-accounts'] })
@@ -184,6 +224,27 @@ export default function EmailAccountsPage() {
       await invalidateAccounts()
     },
     onError: (err: Error) => notification.error(err.message || t('emailAccounts.testFailed')),
+  })
+
+  const transferMutation = useMutation({
+    mutationFn: ({ index, username, target }: { index: number; username: string; target: string }) => {
+      const [adapterKey, ...rest] = target.split(':')
+      return emailApi.transferToInstance(index, username, { adapter_key: adapterKey, instance_key: rest.join(':') })
+    },
+    onSuccess: async () => {
+      notification.success(t('emailAccounts.transfer.done'))
+      setTransferAccount(null)
+      setTransferTarget('')
+      await invalidateAccounts()
+    },
+    onError: async (err: Error) => {
+      notification.error(err.message || t('emailAccounts.saveFailed'))
+      // 409 = 列表在别处变过：刷新列表，免得再点一次还是对不上
+      if (err instanceof ApiError && err.status === 409) {
+        setTransferAccount(null)
+        await invalidateAccounts()
+      }
+    },
   })
 
   const pullMutation = useMutation({
@@ -376,6 +437,7 @@ export default function EmailAccountsPage() {
               <TableCell>{t('emailAccounts.connectionStatus')}</TableCell>
               <TableCell>{t('emailAccounts.sendEnabled')}</TableCell>
               <TableCell>{t('emailAccounts.defaultSender')}</TableCell>
+              <TableCell>{t('emailAccounts.share.column')}</TableCell>
               <TableCell align="right">{t('emailAccounts.actions')}</TableCell>
             </TableRow>
           </TableHead>
@@ -407,6 +469,11 @@ export default function EmailAccountsPage() {
                 </TableCell>
                 <TableCell>{account.SEND_ENABLED ? t('emailAccounts.yes') : t('emailAccounts.no')}</TableCell>
                 <TableCell>{account.IS_DEFAULT_SENDER ? t('emailAccounts.yes') : t('emailAccounts.no')}</TableCell>
+                <TableCell>
+                  {account.SEND_SHARE === 'listed'
+                    ? t('emailAccounts.share.listedCount', { count: account.SEND_SHARE_INSTANCES?.length ?? 0 })
+                    : t(`emailAccounts.share.options.${account.SEND_SHARE ?? 'all_instances'}`)}
+                </TableCell>
                 <TableCell align="right">
                   <IconButton
                     size="small"
@@ -432,6 +499,17 @@ export default function EmailAccountsPage() {
                   <IconButton size="small" onClick={() => openEditDialog(account)}>
                     <EditIcon fontSize="small" />
                   </IconButton>
+                  <IconButton
+                    size="small"
+                    onClick={() => {
+                      setTransferAccount(account)
+                      setTransferTarget('')
+                    }}
+                    disabled={account.index === undefined}
+                    title={t('emailAccounts.transfer.action')}
+                  >
+                    <TransferIcon fontSize="small" />
+                  </IconButton>
                   <IconButton size="small" color="error" onClick={() => setDeleteIndex(account.index ?? null)}>
                     <DeleteIcon fontSize="small" />
                   </IconButton>
@@ -440,7 +518,7 @@ export default function EmailAccountsPage() {
               )
             }) : (
               <TableRow>
-                <TableCell colSpan={11} align="center">
+                <TableCell colSpan={12} align="center">
                   <Typography color="text.secondary">{t('emailAccounts.empty')}</Typography>
                 </TableCell>
               </TableRow>
@@ -530,6 +608,11 @@ export default function EmailAccountsPage() {
                   <MenuItem key={provider} value={provider}>{provider}</MenuItem>
                 ))}
               </Select>
+              {providerPresets?.find(preset => preset.key === form.EMAIL_ACCOUNT)?.note && (
+                <FormHelperText>
+                  {providerPresets.find(preset => preset.key === form.EMAIL_ACCOUNT)?.note}
+                </FormHelperText>
+              )}
             </FormControl>
             <TextField
               label={t('emailAccounts.displayName')}
@@ -709,6 +792,47 @@ export default function EmailAccountsPage() {
                 />
               </Stack>
             )}
+
+            <Stack spacing={1.5}>
+              <Typography variant="subtitle2">{t('emailAccounts.share.title')}</Typography>
+              <FormControl fullWidth size="small">
+                <InputLabel>{t('emailAccounts.share.scope')}</InputLabel>
+                <Select
+                  label={t('emailAccounts.share.scope')}
+                  value={form.SEND_SHARE ?? 'all_instances'}
+                  onChange={event => updateForm('SEND_SHARE', event.target.value as EmailSendShare)}
+                >
+                  {SEND_SHARE_OPTIONS.map(option => (
+                    <MenuItem key={option} value={option}>
+                      {t(`emailAccounts.share.options.${option}`)}
+                    </MenuItem>
+                  ))}
+                </Select>
+                <FormHelperText>{t('emailAccounts.share.hint')}</FormHelperText>
+              </FormControl>
+              {form.SEND_SHARE === 'listed' && (
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('emailAccounts.share.instances')}</InputLabel>
+                  <Select<string[]>
+                    multiple
+                    label={t('emailAccounts.share.instances')}
+                    value={form.SEND_SHARE_INSTANCES ?? []}
+                    onChange={event => {
+                      const value = event.target.value
+                      updateForm('SEND_SHARE_INSTANCES', typeof value === 'string' ? value.split(',') : value)
+                    }}
+                    renderValue={selected => selected.map(item => instanceLabel.get(item) ?? item).join('、')}
+                  >
+                    {instanceOptions.map(option => (
+                      <MenuItem key={option.value} value={option.value}>
+                        {option.label}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                  <FormHelperText>{t('emailAccounts.share.instancesHint')}</FormHelperText>
+                </FormControl>
+              )}
+            </Stack>
           </Stack>
         </DialogContent>
         <DialogActions>
@@ -738,6 +862,60 @@ export default function EmailAccountsPage() {
           <Button onClick={() => setCallbackDialogOpen(false)}>{t('emailAccounts.cancel')}</Button>
           <Button onClick={handleManualOAuthCallback} variant="contained" disabled={!callbackText.trim()}>
             {t('emailAccounts.completeAuthorize')}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={transferAccount !== null} onClose={() => setTransferAccount(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>{t('emailAccounts.transfer.title')}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            {transferAccount && (transferAccount.AUTH_TYPE !== 'password' || transferAccount.TRANSPORT_TYPE !== 'imap_smtp') ? (
+              <Alert severity="warning">{t('emailAccounts.transfer.oauthOnly')}</Alert>
+            ) : (
+              <>
+                <Typography variant="body2">
+                  {t('emailAccounts.transfer.description', { address: transferAccount?.USERNAME ?? '' })}
+                </Typography>
+                <FormControl fullWidth size="small">
+                  <InputLabel>{t('emailAccounts.transfer.instance')}</InputLabel>
+                  <Select
+                    label={t('emailAccounts.transfer.instance')}
+                    value={transferTarget}
+                    onChange={event => setTransferTarget(event.target.value)}
+                  >
+                    {instanceOptions.map(option => (
+                      <MenuItem key={option.value} value={option.value}>
+                        {option.label}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </>
+            )}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTransferAccount(null)}>{t('emailAccounts.cancel')}</Button>
+          <Button
+            variant="contained"
+            disabled={
+              !transferTarget
+              || transferMutation.isPending
+              || transferAccount?.index === undefined
+              || transferAccount.AUTH_TYPE !== 'password'
+              || transferAccount.TRANSPORT_TYPE !== 'imap_smtp'
+            }
+            onClick={() =>
+              transferAccount?.index !== undefined
+              && transferMutation.mutate({
+                index: transferAccount.index,
+                username: transferAccount.USERNAME,
+                target: transferTarget,
+              })
+            }
+          >
+            {t('emailAccounts.transfer.confirm')}
           </Button>
         </DialogActions>
       </Dialog>

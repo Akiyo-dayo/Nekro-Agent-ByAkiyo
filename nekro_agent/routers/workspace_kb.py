@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 from pathlib import Path
+from typing import Iterator
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 
@@ -47,6 +49,7 @@ from nekro_agent.schemas.kb import (
     KBUpdateReferenceBody,
     KBZipImportResponse,
 )
+from nekro_agent.services.kb import kb_files
 from nekro_agent.services.kb.batch_ops import aggregate_batch_results, normalize_batch_ids, run_batched_ids
 from nekro_agent.services.kb.config_guard import ensure_kb_embedding_configured
 from nekro_agent.services.kb.constants import KB_BATCH_CONCURRENCY, KB_BATCH_MAX_SIZE
@@ -534,10 +537,40 @@ async def get_workspace_kb_raw_file(
     _current_user: DBUser = Depends(get_current_active_user),
 ):
     document = await _get_document_or_404(_current_user, workspace_id, document_id)
-    source_file = WorkspaceService.resolve_kb_source_path(workspace_id, document.source_path)
-    if not source_file.exists():
-        raise NotFoundError(resource=f"知识库源文件 {document.source_path}")
-    return FileResponse(source_file, media_type=document.mime_type, filename=document.file_name)
+    # 源文件在容器可写的工作区里：不按路径交给 FileResponse（它会跟着链接把宿主文件发出去），
+    # 而是逐级不跟随链接地打开，再流式发出去。真正打开放在发送时：先判一次给 404，发送时
+    # 再按同样的规则打开一次（中间被换成链接的话打开失败、连接中断，不会读到链接那头）
+    source_path = document.source_path
+    try:
+        found = await asyncio.to_thread(kb_files.exists, workspace_id, kb_files.SOURCE, source_path)
+    except ValueError:
+        found = False
+    if not found:
+        raise NotFoundError(resource=f"知识库源文件 {source_path}")
+
+    def _iter_chunks() -> Iterator[bytes]:
+        with kb_files.open_read(workspace_id, kb_files.SOURCE, source_path) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _iter_chunks(),
+        media_type=document.mime_type or "application/octet-stream",
+        headers={"Content-Disposition": _content_disposition(document.file_name)},
+    )
+
+
+def _content_disposition(file_name: str) -> str:
+    """与 `FileResponse(filename=...)` 同一种写法：ASCII 名字直接写，否则用 RFC 5987 编码"""
+    from urllib.parse import quote
+
+    encoded = quote(file_name or "download")
+    if encoded != (file_name or "download"):
+        return f"attachment; filename*=utf-8''{encoded}"
+    return f'attachment; filename="{file_name}"'
 
 
 @router.get(

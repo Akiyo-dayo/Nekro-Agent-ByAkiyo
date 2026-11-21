@@ -194,6 +194,7 @@ async def test_affection_write_timestamps_match_orm_representation(
 
 PARAGRAPH_MODELS = [
     "nekro_agent.models.db_mem_paragraph",
+    "nekro_agent.models.db_mem_paragraph_person",
     "nekro_agent.models.db_mem_entity",
     "nekro_agent.models.db_mem_relation",
     "nekro_agent.models.db_chat_message",
@@ -219,7 +220,7 @@ def memory_writer_env(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(app_config, "MEMORY_ENABLE_SYSTEM", True)
 
-    async def fake_embed(_text: str):
+    async def fake_embed(_text: str, **_kwargs: object):
         return [0.0, 0.0, 0.0]
 
     async def fake_upsert(**_kwargs) -> bool:

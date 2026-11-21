@@ -11,6 +11,7 @@ export default function WorkspaceStatusChip({ status }: { status: string }) {
     stopped: { label: t('status.stopped'), color: theme.palette.text.secondary as string },
     failed: { label: t('status.failed'), color: theme.palette.error.main },
     deleting: { label: t('status.deleting'), color: theme.palette.warning.main },
+    transitioning: { label: t('status.transitioning'), color: theme.palette.warning.main },
   }
   const config = statusConfig[status] ?? { label: status, color: theme.palette.text.secondary as string }
   const isActive = status === 'active'

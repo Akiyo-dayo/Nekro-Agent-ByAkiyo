@@ -1,7 +1,7 @@
 from contextlib import suppress
-from typing import Any, Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from nekro_agent.adapters.interface.base import BaseAdapterConfig
 from nekro_agent.core.core_utils import ExtraField
@@ -9,6 +9,12 @@ from nekro_agent.schemas.i18n import i18n_text
 
 
 class EmailAccount(BaseModel):
+    # 不落盘的运行时标记：这个账户连的是**租户填的**服务器（实例自有、自定义服务商）。
+    # 客户端据此只解析一次主机名、直接连校验过的地址，并在连上之后、登录之前再核对一次实际对端
+    # （见 `is_tenant_host()`）。私有属性不进 `model_dump()`：实例自有账户每次从表里现转，不需要落盘；
+    # 转回平台方之后靠下面的 `TENANT_SUPPLIED_HOSTS` 记住这件事
+    _tenant_endpoint: bool = PrivateAttr(default=False)
+
     DISPLAY_NAME: str = Field(
         default="",
         title="账户显示名称",
@@ -233,6 +239,111 @@ class EmailAccount(BaseModel):
             ),
         ).model_dump(),
     )
+    # 下面两个字段只对平台方账户有意义（实例自有账户没有「共享给谁」这回事：它本来就
+    # 只归一个实例）。共享设置只管租户实例；平台方实例本来就是平台方自己的，不受它限制。
+    #
+    # 默认 `all_instances`：旧配置文件里没有这两个字段时按默认值读，于是升级后存量邮箱
+    # 默认对所有实例开放发信——与现状的发信能力相同（改造前所有会话都能用平台方邮箱发信），
+    # 只是租户读不到它的收件箱了。
+    SEND_SHARE: Literal["all_instances", "listed", "none"] = Field(
+        default="all_instances",
+        title="共享发信范围",
+        description=(
+            "只对平台方账户有意义：决定哪些租户实例的会话能用它发信。"
+            "all_instances = 所有实例（默认）；listed = 只给下面列出的实例；none = 不共享。"
+            "平台方实例不受此限制"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="共享发信", en_US="Shared Sending"),
+            i18n_title=i18n_text(zh_CN="共享发信范围", en_US="Shared Sending Scope"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "只对平台方账户有意义：决定哪些租户实例的会话能用它发信。"
+                    "all_instances = 所有实例（默认）；listed = 只给下面列出的实例；none = 不共享。"
+                    "平台方实例不受此限制"
+                ),
+                en_US=(
+                    "Only meaningful for platform accounts: which tenant instances may use it to send mail. "
+                    "all_instances = every instance (default); listed = only the instances listed below; "
+                    "none = not shared. Platform instances are not restricted by this setting."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SEND_SHARE_INSTANCES: List[str] = Field(
+        default_factory=list,
+        title="共享发信的实例",
+        description="每项写 <adapter_key>:<instance_key>，仅在共享范围为 listed 时使用",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="共享发信", en_US="Shared Sending"),
+            i18n_title=i18n_text(zh_CN="共享发信的实例", en_US="Instances Allowed to Send"),
+            i18n_description=i18n_text(
+                zh_CN="每项写 <adapter_key>:<instance_key>，仅在共享范围为 listed 时使用",
+                en_US="Each entry is <adapter_key>:<instance_key>; only used when the scope is listed.",
+            ),
+        ).model_dump(),
+    )
+    # 从实例「转回平台方」的账户：服务器是租户当初填的，域名的 DNS 可能仍在租户手里。转回来之后
+    # 它变成平台方账户，平台方账户本来不做连接前校验与对端核对（平台方可以用内网邮件服务器），
+    # 不记住这件事的话，租户改一条 DNS 就能让平台方的轮询替它连内网。所以转回时记下当时的两台主机
+    # （规范成小写、去掉末尾的点，逗号分隔），**按主机分开判**：要连的这台主机在标记里，就仍按租户填的
+    # 服务器对待。平台方只把 IMAP 主机换成自己的，没动过的 SMTP 主机仍受保护；换掉的那台自然不在标记里了
+    # （不用另外清）。比对前同样规范化，`imap.example.com.` 这种末尾带点的写法绕不过去。
+    TENANT_SUPPLIED_HOSTS: str = Field(
+        default="",
+        title="租户填写的服务器",
+        description="内部标记：转回平台方时记下的租户服务器；平台方改过服务器后自动失效",
+        json_schema_extra=ExtraField(
+            is_hidden=True,
+            i18n_category=i18n_text(zh_CN="兼容", en_US="Compatibility"),
+            i18n_title=i18n_text(zh_CN="租户填写的服务器", en_US="Tenant-supplied Servers"),
+            i18n_description=i18n_text(
+                zh_CN="内部标记：转回平台方时记下的租户服务器；平台方改过服务器后自动失效",
+                en_US="Internal marker recorded when a tenant mailbox is moved back to the platform; it stops applying once the platform changes the servers.",
+            ),
+        ).model_dump(),
+    )
+
+    def tenant_hosts_marker(self) -> str:
+        """当前两台主机规范化后的标记值（转回平台方时写进 `TENANT_SUPPLIED_HOSTS`）"""
+        hosts = [normalize_mail_host(self.CUSTOM_IMAP_HOST), normalize_mail_host(self.CUSTOM_SMTP_HOST)]
+        return ",".join(dict.fromkeys(host for host in hosts if host))
+
+    def is_tenant_host(self, host: str) -> bool:
+        """要连的这台主机是不是**租户填的**
+
+        两种来源：实例自有账户的运行时标记（`_tenant_endpoint`，整个账户都是租户的），或转回平台方时记下的
+        主机（`TENANT_SUPPLIED_HOSTS`，按主机判）。是的话客户端只解析一次主机名、拒 Fake-IP 段、直接连校验过的
+        地址，连上之后登录之前再核对一次对端。
+        """
+        if self._tenant_endpoint:
+            return True
+        target = normalize_mail_host(host)
+        if not target:
+            return False
+        marked = {item for item in (normalize_mail_host(part) for part in str(self.TENANT_SUPPLIED_HOSTS or "").split(",")) if item}
+        return target in marked
+
+    def is_tenant_endpoint(self) -> bool:
+        """这个账户的两台主机里有没有租户填的（转回平台方、状态邮件等按整个账户判的地方用）"""
+        return self.is_tenant_host(self.CUSTOM_IMAP_HOST) or self.is_tenant_host(self.CUSTOM_SMTP_HOST)
+
+
+def normalize_mail_host(host: object) -> str:
+    """主机名的比较口径：与连接时解析主机名的口径一致
+
+    去空白；含非 ASCII 字符的按标准库 `idna` 编码——`socket.getaddrinfo` 拿到这种 str 主机名时也是这么编的：
+    全角 / 中文句点（`。` `．` `｡`）当标签分隔符，nameprep 做大小写与全角半角折叠，Unicode 标签编成 `xn--`。
+    否则平台方把带标记的主机改写成 Unicode 形式或全角句点形式，连的还是同一台，标记却对不上。编不出来的
+    （标签过长等，连接时同样解析不了）按原样比。最后转小写、去掉末尾的点（`a.example.` 与 `a.example` 是同一台）。
+    """
+    text = str(host or "").strip()
+    if text and not text.isascii():
+        try:
+            text = text.encode("idna").decode("ascii")
+        except UnicodeError:
+            pass
+    return text.lower().rstrip(".")
 
 
 class StatusMailRecipient(BaseModel):

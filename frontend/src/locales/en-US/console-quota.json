@@ -1,6 +1,11 @@
 {
   "title": "Instance Quota",
   "subtitle": "Review and set the per-channel daily AI reply limit for each instance, alongside live sandbox concurrency usage.",
+  "layerHint": {
+    "text": "This page is the tenant's own reply quota (a self-limit, counted in replies). The platform's daily allowance per group / private chat lives on the ",
+    "channelQuotaLink": "Channel Quota",
+    "after": " page; both must allow a reply."
+  },
   "stats": {
     "globalCapacity": "Global Capacity",
     "globalActive": "In Use",

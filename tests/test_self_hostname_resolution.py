@@ -32,6 +32,7 @@ import contextlib
 import datetime
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -197,9 +198,14 @@ class TestLegacyAdapterFileUrlHost:
         monkeypatch.setattr(onebot_routers.adapter_utils, "get_typed_adapter", lambda *_a, **_k: _FakeAdapter())
         monkeypatch.setattr(onebot_routers, "get_container", _fake_container)
         monkeypatch.setattr(onebot_routers, "NAPCAT_ONEBOT_ADAPTER_DIR", str(config_dir))
-        # 账号不在库里：resolve_expected_token 查库失败按部署级令牌回落（异常不外抛），
-        # 这里只关心 URL host，令牌值与本文件无关，固定住即可
+        # 这里只关心 URL host，令牌值与本文件无关，固定住即可。令牌解析本身要查库：本文件不建库，
+        # 之前的用例留下的数据库配置会让它现开一个 sqlite 连接、没人关，所以连解析一起换掉
         monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "irrelevant-to-hostname")
+
+        async def _fixed_token(_self_id: str) -> SimpleNamespace:
+            return SimpleNamespace(token="irrelevant-to-hostname")
+
+        monkeypatch.setattr(onebot_routers, "resolve_expected_token", _fixed_token)
         return config_dir / f"onebot11_{bot_qq}.json"
 
     @staticmethod

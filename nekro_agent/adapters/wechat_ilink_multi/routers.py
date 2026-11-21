@@ -1,3 +1,4 @@
+import re
 from typing import cast
 
 from fastapi import APIRouter, Depends, Response
@@ -27,6 +28,16 @@ from .schemas import (
 )
 
 ADAPTER_KEY = "wechat_ilink_multi"
+
+# 新建实例时标识的形态：与核心配置实例层覆盖的路径段同一条（`config_service._SAFE_IDENTIFIER_PATTERN`）。
+# 标识会拼进插件设置、配置覆盖的目录名：带尾随空格或点的名字在 Windows 上与去掉它们的名字落到同一个目录，
+# `..` 之类更是路径片段——两个实例共用一份设置就是跨租户读写
+_NEW_INSTANCE_KEY_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _assert_new_instance_key(instance_key: str) -> None:
+    if not _NEW_INSTANCE_KEY_PATTERN.fullmatch(instance_key):
+        raise ValidationError(reason="instance_key 只能由字母、数字、下划线和连字符组成，长度 1~128")
 
 
 async def _assert_tenant_owns(user: DBUser, instance_key: str) -> None:
@@ -108,6 +119,9 @@ def create_router() -> APIRouter:
         """创建实例（幂等）"""
         if not body.instance_key:
             raise ValidationError(reason="instance_key 不能为空")
+        if len(body.instance_key) > 128:
+            # 超过列宽的标识不可能有已存在的行；不先拦的话下面按它查库就是一个 500
+            _assert_new_instance_key(body.instance_key)
 
         existing = await adapter_instance_service.get_instance(
             adapter_key=ADAPTER_KEY,
@@ -124,6 +138,9 @@ def create_router() -> APIRouter:
                 existing=True,
             )
 
+        # 已有的行（含早先用别的字符建的）照旧幂等返回、可复活；只有新标识才按形态校验
+        if existing is None:
+            _assert_new_instance_key(body.instance_key)
         instance = await adapter_instance_service.create_instance(
             adapter_key=ADAPTER_KEY,
             instance_key=body.instance_key,

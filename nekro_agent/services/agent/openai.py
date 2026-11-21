@@ -2,11 +2,13 @@ import asyncio
 import contextlib
 import json
 import time
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import (
     Any,
     AsyncGenerator,
+    Awaitable,
     Callable,
     Coroutine,
     Dict,
@@ -16,6 +18,7 @@ from typing import (
     NamedTuple,
     Optional,
     Tuple,
+    TypeVar,
     Union,
 )
 
@@ -38,6 +41,44 @@ from .upstream_redaction import (
 )
 
 _OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+_T = TypeVar("_T")
+
+# 当前请求属于哪个频道。提示词日志在 `save_log` 内部落盘，而那个函数不能改签名，
+# 所以用 ContextVar 把 chat_key 带进去；默认空串表示不做额外替换。
+_LOG_PENDING_CHAT_KEY: ContextVar[str] = ContextVar("llm_log_pending_chat_key", default="")
+
+
+def set_log_pending_chat_key(chat_key: str) -> Any:
+    """在发请求前登记当前频道的 chat_key，返回一个供复位用的 token"""
+    return _LOG_PENDING_CHAT_KEY.set(str(chat_key or ""))
+
+
+def reset_log_pending_chat_key(token: Any) -> None:
+    """请求结束后复位，避免同一任务里的后续调用误用上一个频道的片段"""
+    _LOG_PENDING_CHAT_KEY.reset(token)
+
+
+@contextlib.contextmanager
+def log_pending_chat_key(chat_key: str):
+    """请求期间把 chat_key 带给 `save_log`，退出时一定复位"""
+    token = set_log_pending_chat_key(chat_key)
+    try:
+        yield
+    finally:
+        reset_log_pending_chat_key(token)
+
+
+def _note_prompt_log(chat_key: str, path: Path) -> None:
+    """记下这个提示词日志文件属于哪个频道：聊天登记服务器后的原文清理只碰本频道的文件"""
+    if not chat_key:
+        return
+    try:
+        from nekro_agent.services.ssh_gateway.scrub import note_prompt_log
+
+        note_prompt_log(chat_key, path)
+    except Exception:  # noqa: BLE001 - 记不下来只影响之后的清理范围，不影响日志本身
+        pass
 
 
 class EmptyLLMResponseError(ValueError):
@@ -401,6 +442,8 @@ class OpenAIResponse(BaseModel):
         if log_style == "auto":
             log_style = "json" if path.suffix == ".json" else "text"
 
+        pending_chat_key = _LOG_PENDING_CHAT_KEY.get()
+
         if log_style == "json":
             log_data = self._generate_json_log(
                 messages,
@@ -412,15 +455,21 @@ class OpenAIResponse(BaseModel):
                 max_tokens,
                 stop_words,
             )
-            async with aiofiles.open(path, "w", encoding="utf-8") as f:
-                await f.write(
-                    json.dumps(
-                        log_data,
-                        ensure_ascii=False,
-                        default=lambda o: str(o) if not isinstance(o, (dict, list, str, int, float, bool, type(None))) else o,
-                    )
-                    + "\n",
+            payload = (
+                json.dumps(
+                    log_data,
+                    ensure_ascii=False,
+                    default=lambda o: str(o) if not isinstance(o, (dict, list, str, int, float, bool, type(None))) else o,
                 )
+                + "\n"
+            )
+            if pending_chat_key:
+                from nekro_agent.services.ssh_gateway.scrub import apply_pending
+
+                payload = apply_pending(pending_chat_key, payload)
+            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                await f.write(payload)
+            _note_prompt_log(pending_chat_key, path)
         else:
             log_text = self._generate_text_log(
                 messages,
@@ -431,8 +480,13 @@ class OpenAIResponse(BaseModel):
                 top_p,
                 max_tokens,
             )
+            if pending_chat_key:
+                from nekro_agent.services.ssh_gateway.scrub import apply_pending
+
+                log_text = apply_pending(pending_chat_key, log_text)
             async with aiofiles.open(path, "w", encoding="utf-8") as f:
                 await f.write(log_text)
+            _note_prompt_log(pending_chat_key, path)
 
         return True
 
@@ -824,10 +878,29 @@ async def gen_openai_chat_response(
             return True
         return False
 
-    async def _get_first_stream_chunk(
-        stream: AsyncStream[ChatCompletionChunk],
-        timeout_seconds: Optional[int],
-    ) -> Optional[ChatCompletionChunk]:
+    # 首 Token 时限从**发出请求**算起，等响应头与等首个数据块共用这一个截止时刻。
+    # `create(stream=True)` 要等上游回了响应头才返回，上游排队、或中转站等它的上游回头之后
+    # 才回头时，这一段可以很长；只给「等首块」计时的话，这一段只受读超时约束，
+    # 首 Token 时限形同虚设。两段各给一整份时限也不对，最坏要等两倍。
+    first_token_deadline: Optional[float] = (
+        asyncio.get_running_loop().time() + first_token_timeout
+        if stream_mode and first_token_timeout and first_token_timeout > 0
+        else None
+    )
+
+    async def _before_first_token_deadline(awaitable: Awaitable[_T]) -> _T:
+        """在首 Token 截止时刻之前等完 `awaitable`；没设时限（或非流式）时就是普通的 await"""
+        timer = asyncio.timeout_at(first_token_deadline)
+        try:
+            async with timer:
+                return await awaitable
+        except TimeoutError as exc:
+            # 只翻译这道时限自己到点的那一种，里面冒出来的别的 TimeoutError 原样抛
+            if not timer.expired():
+                raise
+            raise TimeoutError(f"等待流式响应首个数据块超时，已超过 {first_token_timeout} 秒") from exc
+
+    async def _get_first_stream_chunk(stream: AsyncStream[ChatCompletionChunk]) -> ChatCompletionChunk:
         stream_iter = stream.__aiter__()
 
         async def wait_first_chunk() -> ChatCompletionChunk:
@@ -839,13 +912,7 @@ async def gen_openai_chat_response(
                 # 会按上游是「直接关流」还是「发空块后关流」给出两种分类与两种用户回执。
                 raise EmptyLLMResponseError("流式响应在返回首个数据块前已结束，API 供应商返回了空流") from exc
 
-        if timeout_seconds and timeout_seconds > 0:
-            try:
-                async with asyncio.timeout(timeout_seconds):
-                    return await wait_first_chunk()
-            except TimeoutError as exc:
-                raise TimeoutError(f"等待流式响应首个数据块超时，已超过 {timeout_seconds} 秒") from exc
-        return await wait_first_chunk()
+        return await _before_first_token_deadline(wait_first_chunk())
 
     # http_client 由本模块的连接池持有，因此既不能用 async with 托管它，
     # 也不能用 async with 托管 AsyncOpenAI —— 后者退出时会连带关闭传入的 http_client
@@ -865,17 +932,19 @@ async def gen_openai_chat_response(
         )
 
         if stream_mode:
-            res_stream: AsyncStream[ChatCompletionChunk] = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **gen_kwargs,
-                stream=True,
-                stream_options={"include_usage": True},
+            res_stream: AsyncStream[ChatCompletionChunk] = await _before_first_token_deadline(
+                client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    **gen_kwargs,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                ),
             )
             # 连接池是共享的，提前 break 时必须显式关闭响应把连接还回池中，
             # 否则该连接会一直被占用直到超时
             async with res_stream:
-                first_chunk = await _get_first_stream_chunk(res_stream, first_token_timeout)
+                first_chunk = await _get_first_stream_chunk(res_stream)
                 if first_chunk and not first_token_time:
                     first_token_time = time.time()
                 if first_chunk and await _apply_stream_chunk(first_chunk):

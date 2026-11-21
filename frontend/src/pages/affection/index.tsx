@@ -13,10 +13,11 @@
  * 每个改动对话框都写明改的是哪个人设那一份——否则重置很容易落在一行没人用的旧人设上。
  */
 
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Box,
+  Card,
   Chip,
   CircularProgress,
   Divider,
@@ -35,6 +36,7 @@ import {
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import AutoFixHighRoundedIcon from '@mui/icons-material/AutoFixHighRounded'
 import CleaningServicesRoundedIcon from '@mui/icons-material/CleaningServicesRounded'
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded'
@@ -49,17 +51,23 @@ import IconActionButton from '../../components/common/IconActionButton'
 import InstanceScopeBanner from '../../components/common/InstanceScopeBanner'
 import NekroDialog from '../../components/common/NekroDialog'
 import PaginationStyled from '../../components/common/PaginationStyled'
+import QueryErrorState from '../../components/common/QueryErrorState'
 import SearchField from '../../components/common/SearchField'
 import { SimpleTooltip } from '../../components/common/ThemedTooltip'
+import PersonNotesSection from '../../components/worldbook/PersonNotesSection'
+import { useDeepLinkInstance, withDeepLinkInstance } from '../../hooks/useDeepLinkInstance'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 import { useNotification } from '../../hooks/useNotification'
-import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
+import { CHIP_VARIANTS, CARD_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 import {
   affectionApi,
   type AffectionItem,
+  type AffectionMilestoneItem,
+  type AffectionMilestoneStatus,
   type AffectionSortBy,
   type AffectionStageValue,
 } from '../../services/api/affection'
+import { isNotFoundError } from '../../services/api/axios'
 
 const PAGE_SIZE = 20
 
@@ -68,6 +76,33 @@ const SORT_OPTIONS: AffectionSortBy[] = ['score_desc', 'score_asc', 'recent', 'i
 // 两段描述的长度上限，只用于输入框提示；真正的截断在服务端（`store.MAX_*_LENGTH`）
 const STATE_TEXT_MAX = 300
 const EVENT_TEXT_MAX = 160
+// 称呼的上限同样由服务端定（`store.MAX_CALL_NAME_LENGTH`），这里只做即时提示
+const CALL_NAME_MAX = 24
+
+/**
+ * 里程碑状态标签
+ *
+ * `active` 不画标签：一屏里绝大多数都是正常的，给每一条都挂一个「正常」只是噪音。
+ * 其余几种都是「这条已经不在检索里了」，隔离给警告色，其余给灰或红。
+ */
+function MilestoneStatusChip({ status }: { status: AffectionMilestoneStatus }) {
+  const theme = useTheme()
+  const { t } = useTranslation('affection')
+  if (status === 'active') return null
+  const color =
+    status === 'quarantined'
+      ? theme.palette.warning.main
+      : status === 'deleted'
+        ? theme.palette.error.main
+        : theme.palette.text.disabled
+  return (
+    <Chip
+      size="small"
+      label={t(`detail.milestonesStatus.${status}`)}
+      sx={CHIP_VARIANTS.getCustomColorChip(color, true)}
+    />
+  )
+}
 
 function formatDateTime(value: string | null, fallback: string): string {
   if (!value) return fallback
@@ -107,9 +142,21 @@ export default function AffectionPage() {
   const theme = useTheme()
   const notification = useNotification()
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const { t } = useTranslation('affection')
   const { t: tCommon } = useTranslation('common')
   const { currentInstanceKey, isScopeReady } = useInstanceScope()
+  // 跳进来的链接带着 `instance` 时先切到那一份所在的实例（规则见 hook 的注释）
+  useDeepLinkInstance()
+
+  // `?record=<编号>`：从记忆页「打开好感详情」跳过来时直接展开那一份
+  const recordParam = searchParams.get('record')
+  const recordFromUrl = useMemo(() => {
+    if (!recordParam) return null
+    const parsed = Number(recordParam)
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+  }, [recordParam])
 
   const [page, setPage] = useState(1)
   const [search, setSearch] = useState('')
@@ -124,9 +171,53 @@ export default function AffectionPage() {
   const [editTarget, setEditTarget] = useState<AffectionItem | null>(null)
   const [editStateText, setEditStateText] = useState('')
   const [editEventText, setEditEventText] = useState('')
+  const [editCallName, setEditCallName] = useState('')
   const [deleteReasonEventId, setDeleteReasonEventId] = useState<number | null>(null)
+  const [deleteMilestoneTarget, setDeleteMilestoneTarget] =
+    useState<AffectionMilestoneItem | null>(null)
   // 展开了「其他人设」的人，键与 `groupByPerson` 的分组键相同
   const [expandedPeople, setExpandedPeople] = useState<Set<string>>(() => new Set())
+
+  // 地址栏里的 `record` 就是「这一份正开着」：进页面、刷新、前进后退都靠它恢复
+  useEffect(() => {
+    if (recordFromUrl === null) return
+    setDetailId(recordFromUrl)
+  }, [recordFromUrl])
+
+  /** 关掉详情时把 `record` 一起去掉，其它参数（比如筛选）原样留着 */
+  const closeDetail = () => {
+    setDetailId(null)
+    if (recordFromUrl === null) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('record')
+    setSearchParams(next, { replace: true })
+  }
+
+  /**
+   * 从列表打开某一份的详情
+   *
+   * 地址里带着 `record` 时（从记忆页跳进来的）要把它换成眼前这一份：留着旧编号，
+   * 刷新回来看到的还是跳进来那一份，而不是手上这一份。没有这个参数就不写 ——
+   * 列表里点开详情不该无端改动地址栏。
+   */
+  const openDetail = (id: number) => {
+    setDetailId(id)
+    if (recordFromUrl === null || recordFromUrl === id) return
+    const next = new URLSearchParams(searchParams)
+    next.set('record', String(id))
+    setSearchParams(next, { replace: true })
+  }
+
+  /**
+   * 跳去记忆页看这条里程碑
+   *
+   * 带上这份好感所属的实例：作用域是顶栏切换器的本地状态，链接被复制到别处、
+   * 或当前停在别的实例视图里时，不带就会显示「看不到」（见 `useDeepLinkInstance`）。
+   * 实例组的好感行没有单一实例，不带，沿用当前作用域。
+   */
+  const openMilestoneInMemory = (milestone: AffectionMilestoneItem, instanceKey: string) => {
+    navigate(withDeepLinkInstance(`/memory/items?item=${milestone.paragraph_id}`, instanceKey))
+  }
 
   // 作用域是这些接口的必填参数（租户身份下服务端直接 400），因此必须等它确定后再发请求
   const scopeParam = currentInstanceKey ?? undefined
@@ -209,15 +300,37 @@ export default function AffectionPage() {
   })
 
   const editMutation = useMutation({
-    mutationFn: (payload: { id: number; state_text: string; last_event_text: string }) =>
+    mutationFn: (payload: {
+      id: number
+      state_text: string
+      last_event_text: string
+      call_name?: string
+    }) =>
       affectionApi.editNarrative(
         payload.id,
-        { state_text: payload.state_text, last_event_text: payload.last_event_text },
+        {
+          state_text: payload.state_text,
+          last_event_text: payload.last_event_text,
+          call_name: payload.call_name,
+        },
         scopeParam
       ),
     onSuccess: () => {
       notification.success(t('messages.editDone'))
       setEditTarget(null)
+      invalidate()
+    },
+    onError: (error: Error) => notification.error(error.message),
+  })
+
+  const deleteMilestoneMutation = useMutation({
+    mutationFn: (payload: { recordId: number; paragraphId: number }) =>
+      affectionApi.deleteMilestone(payload.recordId, payload.paragraphId, scopeParam),
+    onSuccess: () => {
+      notification.success(t('messages.milestoneDeleted'))
+      setDeleteMilestoneTarget(null)
+      // 详情里的里程碑列表跟着变，列表页的「互动」不受影响但一并刷新更省心
+      void queryClient.invalidateQueries({ queryKey: ['affection', 'detail'] })
       invalidate()
     },
     onError: (error: Error) => notification.error(error.message),
@@ -264,7 +377,11 @@ export default function AffectionPage() {
     setEditTarget(item)
     setEditStateText(item.state_text)
     setEditEventText(item.last_event_text)
+    setEditCallName(item.call_name ?? '')
   }
+
+  // 按码点数，与后端 `len()` 一致：`.length` 数的是 UTF-16 单元，带表情时两边对不上
+  const isCallNameTooLong = Array.from(editCallName).length > CALL_NAME_MAX
 
   const listItems = listQuery.data?.items
   const items = listItems ?? []
@@ -565,7 +682,7 @@ export default function AffectionPage() {
                                     <IconActionButton
                                       size="small"
                                       tone="primary"
-                                      onClick={() => setDetailId(item.id)}
+                                      onClick={() => openDetail(item.id)}
                                     >
                                       <TimelineRoundedIcon fontSize="small" />
                                     </IconActionButton>
@@ -640,17 +757,33 @@ export default function AffectionPage() {
 
       <NekroDialog
         open={detailId !== null}
-        onClose={() => setDetailId(null)}
+        onClose={closeDetail}
         title={t('detail.title')}
         titleStartIcon={<FavoriteRoundedIcon fontSize="small" />}
-        maxWidth="sm"
+        // 里程碑与备注两张卡要并排放，`sm`（600px）里每列只剩二百来像素，按钮会折成好几行
+        maxWidth="md"
         actions={
-          <ActionButton tone="ghost" onClick={() => setDetailId(null)}>
+          <ActionButton tone="ghost" onClick={closeDetail}>
             {tCommon('actions.close')}
           </ActionButton>
         }
       >
-        {detailQuery.isLoading || !detailQuery.data ? (
+        {detailQuery.isError ? (
+          isNotFoundError(detailQuery.error) ? (
+            // 深链接（`?record=`）指向别人实例的那一份、或已被删掉时是 404：
+            // 一直转圈会让人以为只是慢，这里直接说清「看不到」
+            <Alert severity="warning" variant="outlined" sx={{ mt: 1 }}>
+              {t('detail.loadFailed')}
+            </Alert>
+          ) : (
+            // 别的错误（服务端出错、断网）不能说成「看不到」，给原因和重试
+            <QueryErrorState
+              error={detailQuery.error}
+              onRetry={() => void detailQuery.refetch()}
+              compact
+            />
+          )
+        ) : detailQuery.isLoading || !detailQuery.data ? (
           <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
             <CircularProgress size={24} />
           </Box>
@@ -660,13 +793,18 @@ export default function AffectionPage() {
               <Typography variant="subtitle1" fontWeight={700}>
                 {detailQuery.data.item.nickname || detailQuery.data.item.platform_userid}
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" color="text.secondary" display="block">
                 {detailQuery.data.item.platform_userid}
                 {detailQuery.data.item.instance_key
                   ? ` · ${detailQuery.data.item.instance_key}`
                   : ''}
                 {' · '}
                 {detailQuery.data.item.stage_label} ({detailQuery.data.item.score})
+              </Typography>
+              <Typography variant="caption" color="text.secondary" display="block">
+                {t('detail.callNameLine', {
+                  name: detailQuery.data.item.call_name || '—',
+                })}
               </Typography>
             </Box>
             <Typography variant="body2">
@@ -697,6 +835,120 @@ export default function AffectionPage() {
                 </Typography>
               )}
             </Alert>
+
+            {/* 这两块说的是同一件事的两面，所以并排放，各自第一句先交代「它是什么」：
+                里程碑是 Bot 自己写进长期记忆的，备注是管理员写进世界书的 ——
+                不写明的话，两边看起来都只是「关于这个人的一段字」。 */}
+            <Box
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                gap: 1.5,
+                alignItems: 'start',
+              }}
+            >
+              <Card
+                sx={{
+                  ...(CARD_VARIANTS.default.styles as object),
+                  p: 1.5,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 1,
+                }}
+              >
+                <Typography variant="subtitle2" fontWeight={700}>
+                  {t('detail.milestones')}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {t('detail.milestonesHint')}
+                </Typography>
+                {detailQuery.data.milestones.length === 0 ? (
+                  <Typography variant="caption" color="text.secondary">
+                    {t('detail.milestonesEmpty')}
+                  </Typography>
+                ) : (
+                  <Stack spacing={1}>
+                    {detailQuery.data.milestones.map(milestone => {
+                      // 已经删掉的（含彻底删除）不再给删除按钮：那里没有可删的东西了
+                      // 段落行已被彻底删除，或者已随实例划给了别的租户：没有正文可显示，
+                      // 记忆页那边也打不开（划走的那段已经是别人的数据），更没有可删的东西
+                      const isGone = milestone.status === 'hard_deleted' || milestone.status === 'moved'
+                      const canDelete =
+                        !isGone && milestone.status !== 'deleted' && milestone.status !== 'pruned'
+                      return (
+                        // 键用流水编号：历史数据里可能有两条流水指向同一段，段落编号会撞
+                        <Box
+                          key={milestone.event_id}
+                          sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}
+                        >
+                          <Typography
+                            variant="body2"
+                            color={isGone ? 'text.secondary' : undefined}
+                            sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+                          >
+                            {milestone.status === 'moved'
+                              ? t('detail.milestonesMoved')
+                              : isGone
+                                ? t('detail.milestonesGone')
+                                : milestone.content}
+                          </Typography>
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            sx={{ alignItems: 'center', flexWrap: 'wrap' }}
+                          >
+                            <MilestoneStatusChip status={milestone.status} />
+                            <Typography variant="caption" color="text.secondary">
+                              {formatDateTime(milestone.event_time, '—')}
+                            </Typography>
+                            {!isGone && (
+                              <ActionButton
+                                tone="ghost"
+                                size="small"
+                                onClick={() =>
+                                  openMilestoneInMemory(milestone, detailQuery.data?.item.instance_key ?? '')
+                                }
+                              >
+                                {t('detail.milestonesViewInMemory')}
+                              </ActionButton>
+                            )}
+                            {canDelete && (
+                              <ActionButton
+                                tone="ghost"
+                                size="small"
+                                onClick={() => setDeleteMilestoneTarget(milestone)}
+                              >
+                                {t('detail.milestonesDelete')}
+                              </ActionButton>
+                            )}
+                          </Stack>
+                        </Box>
+                      )
+                    })}
+                  </Stack>
+                )}
+              </Card>
+
+              <Card
+                sx={{
+                  ...(CARD_VARIANTS.default.styles as object),
+                  p: 1.5,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 1,
+                }}
+              >
+                <PersonNotesSection
+                  personAccount={detailQuery.data.item.platform_userid}
+                  displayName={
+                    detailQuery.data.item.nickname ||
+                    detailQuery.data.item.platform_userid
+                  }
+                  onCloseDetail={closeDetail}
+                  description={t('detail.notesHint')}
+                />
+              </Card>
+            </Box>
 
             <Divider />
             <Typography variant="subtitle2" fontWeight={700}>
@@ -848,6 +1100,9 @@ export default function AffectionPage() {
           <Typography variant="body2">
             {t('resetDialog.description', { share: shareOf(resetTarget) })}
           </Typography>
+          <Typography variant="body2" color="warning.main">
+            {t('resetDialog.alsoMilestones')}
+          </Typography>
           {notInUseWarning(resetTarget)}
         </Box>
       </NekroDialog>
@@ -895,13 +1150,16 @@ export default function AffectionPage() {
             </ActionButton>
             <ActionButton
               tone="primary"
-              disabled={editMutation.isPending}
+              disabled={editMutation.isPending || isCallNameTooLong}
               onClick={() => {
                 if (!editTarget) return
                 editMutation.mutate({
                   id: editTarget.id,
                   state_text: editStateText,
                   last_event_text: editEventText,
+                  // 只在改过时才带：对话框开着的这段时间里模型可能刚用 `set_call_name`
+                  // 改了称呼，总是带上打开时的旧值就会把它改回去。清空也算改过（空串照样提交）
+                  call_name: editCallName !== (editTarget.call_name ?? '') ? editCallName : undefined,
                 })
               }}
             >
@@ -915,6 +1173,19 @@ export default function AffectionPage() {
             {t('editDialog.description', { share: shareOf(editTarget) })}
           </Typography>
           {notInUseWarning(editTarget)}
+          <TextField
+            size="small"
+            fullWidth
+            label={t('editDialog.callName')}
+            value={editCallName}
+            error={isCallNameTooLong}
+            helperText={
+              isCallNameTooLong
+                ? t('editDialog.callNameTooLong', { max: CALL_NAME_MAX })
+                : t('editDialog.callNameHelper', { max: CALL_NAME_MAX })
+            }
+            onChange={event => setEditCallName(event.target.value)}
+          />
           <TextField
             size="small"
             fullWidth
@@ -964,6 +1235,42 @@ export default function AffectionPage() {
         <Typography variant="body2" sx={{ pt: 1 }}>
           {t('deleteReasonDialog.description')}
         </Typography>
+      </NekroDialog>
+
+      <NekroDialog
+        open={deleteMilestoneTarget !== null}
+        onClose={() => setDeleteMilestoneTarget(null)}
+        title={t('deleteMilestoneDialog.title')}
+        maxWidth="xs"
+        actions={
+          <>
+            <ActionButton tone="ghost" onClick={() => setDeleteMilestoneTarget(null)}>
+              {tCommon('actions.cancel')}
+            </ActionButton>
+            <ActionButton
+              tone="danger"
+              disabled={deleteMilestoneMutation.isPending}
+              onClick={() => {
+                if (detailId === null || !deleteMilestoneTarget) return
+                deleteMilestoneMutation.mutate({
+                  recordId: detailId,
+                  paragraphId: deleteMilestoneTarget.paragraph_id,
+                })
+              }}
+            >
+              {t('deleteMilestoneDialog.submit')}
+            </ActionButton>
+          </>
+        }
+      >
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, pt: 1 }}>
+          <Typography variant="body2">{t('deleteMilestoneDialog.description')}</Typography>
+          {deleteMilestoneTarget && (
+            <Typography variant="body2" color="text.secondary">
+              {deleteMilestoneTarget.content}
+            </Typography>
+          )}
+        </Box>
       </NekroDialog>
     </Box>
   )

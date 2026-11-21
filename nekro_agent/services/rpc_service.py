@@ -272,12 +272,23 @@ async def decode_rpc_request_off_loop(raw_body: bytes, container_key: Optional[s
     return outcome
 
 
-async def execute_rpc_method(method: Any, args: list[Any], kwargs: dict[str, Any]) -> Tuple[Any, str]:
+async def execute_rpc_method_detailed(method: Any, args: list[Any], kwargs: dict[str, Any]) -> Tuple[Any, str, str]:
+    """执行方法，连同「异常类名」一起返回
+
+    审计只记类名：异常原文里可能有上游返回、路径与凭据。返回给沙盒的内容仍是
+    `(结果, 错误文本)` 两段，由 :func:`execute_rpc_method` 丢掉第三项，既有调用方
+    的行为逐字不变。
+    """
     try:
         if asyncio.iscoroutinefunction(method):
             result = await method(*args, **kwargs)
         else:
             result = method(*args, **kwargs)
-        return result, ""
+        return result, "", ""
     except Exception as e:
-        return None, str(e)
+        return None, str(e), type(e).__name__
+
+
+async def execute_rpc_method(method: Any, args: list[Any], kwargs: dict[str, Any]) -> Tuple[Any, str]:
+    result, error_message, _error_type = await execute_rpc_method_detailed(method, args, kwargs)
+    return result, error_message

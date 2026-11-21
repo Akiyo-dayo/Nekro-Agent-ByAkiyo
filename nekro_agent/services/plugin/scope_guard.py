@@ -99,6 +99,11 @@ async def _deployment_has_tenants() -> bool:
     return await DBAdapterInstance.filter(tenant_id__not_isnull=True).exists()
 
 
+async def deployment_has_tenants() -> bool:
+    """部署里是否有任何实例挂在租户名下（公开版，供其他模块复用同一判据）"""
+    return await _deployment_has_tenants()
+
+
 async def require_same_tenant_chat_key(ctx: Any, chat_key: Any) -> str:
     """目标频道必须在当前会话所属的租户之内，否则按"频道不存在"拒绝
 

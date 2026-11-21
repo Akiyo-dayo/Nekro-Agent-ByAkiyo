@@ -3,7 +3,6 @@ import {
   Box,
   Typography,
   Grid,
-  Avatar,
   Chip,
   Button,
   Dialog,
@@ -18,6 +17,7 @@ import { CloudPreset } from '../../services/api/cloud/presets_market'
 import { favoritesApi } from '../../services/api/cloud/favorites'
 import { formatLastActiveTimeFromInput } from '../../utils/time'
 import { CARD_VARIANTS, CHIP_VARIANTS } from '../../theme/variants'
+import PresetAvatar from '../common/PresetAvatar'
 
 interface PresetDetailDialogProps {
   open: boolean
@@ -117,9 +117,9 @@ export default function PresetDetailDialog({
         <Grid container spacing={3}>
           <Grid item xs={12} sm={4} md={3}>
             <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2.5 }}>
-              <Avatar
+              <PresetAvatar
                 src={preset.avatar}
-                alt={preset.name}
+                name={preset.name}
                 variant="rounded"
                 sx={{
                   width: '100%',

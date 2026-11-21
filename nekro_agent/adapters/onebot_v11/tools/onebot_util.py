@@ -183,8 +183,13 @@ def _resolve_channel_body(
         event = cast(MessageEvent, event)
         return f"private_{event.user_id}", ChatType.PRIVATE
     if raw_chat_type == "group":
-        event = cast(GroupMessageEvent, event)
-        return f"group_{event.group_id}", ChatType.GROUP
+        # 通知事件一律按群解析，但不是每种通知都带群号：协议端自己的 `notice.bot_status.*`、
+        # 好友消息撤回这些根本没有 `group_id`。直接读属性会抛 AttributeError，调用方按
+        # 「定位不到频道」接的是 ValueError，接不住
+        group_id = getattr(event, "group_id", None)
+        if group_id is None:
+            raise ValueError(f"事件不带群号，定位不到群频道: {type(event).__name__}")
+        return f"group_{group_id}", ChatType.GROUP
     raise ValueError("未知的消息类型")
 
 

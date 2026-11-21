@@ -1,17 +1,24 @@
+import copy
 import json
 import os
 import re
 import shutil
 import sys
 import uuid
+from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
     Any,
     Callable,
     ClassVar,
     Dict,
+    List,
     Literal,
+    Mapping,
     Optional,
+    Tuple,
     Type,
     TypeVar,
     Union,
@@ -21,9 +28,15 @@ from urllib.parse import quote_plus
 import nonebot
 import yaml
 from fastapi.encoders import jsonable_encoder
+from loguru import logger as _loguru_logger
 from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import ValidationError as PydanticValidationError
 
 from nekro_agent.schemas.i18n import I18nDict
+from nekro_agent.tools.private_file import (
+    describe_private_file_protection,
+    write_private_file,
+)
 
 
 def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
@@ -194,12 +207,45 @@ class ExtraField(BaseModel):
             "仅对 is_secret 项有意义，见 routers/config.py:_assert_tenant_may_write"
         ),
     )
+    platform_only: bool = Field(
+        default=False,
+        title="平台方专属",
+        description=(
+            "设置为True时，租户写实例覆盖时不能改它的取值；读照常返回、前端显示为只读。"
+            "平台方与未启用多租户的部署不受此限。"
+        ),
+    )
+    tenant_may_only_lower: bool = Field(
+        default=False,
+        title="租户只能调低",
+        description=(
+            "设置为True时，租户身份只能把该字段的生效值往低处调；任何让写入后生效值高于写入前的提交都会被拒。"
+            "bool 字段的「低」是关，int 字段的「低」是数值小；平台方与未启用多租户的部署不受此限。"
+            "见 routers/config.py:_assert_tenant_may_not_raise_only_field"
+        ),
+    )
     is_outbound_url: bool = Field(
         default=False,
         title="出网目标地址",
         description=(
             "设置为True时，该项的取值会让服务端主动发起出站请求，写入前必须过 SSRF 校验"
             "（租户提交的地址强制公网，见 model_group_service.assert_outbound_urls_allowed）"
+        ),
+    )
+    audit_changes: bool = Field(
+        default=False,
+        title="改动写审计",
+        description=(
+            "设置为True时，这一项的每次改动都写进配置变更审计；文字只记长度与摘要，不记原文。"
+            "见 services/tavern/audit.py 与 routers/config.py:audited_fields"
+        ),
+    )
+    enable_confirm: Optional[I18nDict] = Field(
+        default=None,
+        title="打开时的确认文案",
+        description=(
+            "布尔项从关切到开时，前端先弹这段多语言确认文字；为空则不弹。"
+            "只用于需要管理员明确知情的高风险开关。"
         ),
     )
     sub_item_name: str = Field(
@@ -313,12 +359,377 @@ class ConfigManager:
 
 
 T_ConfigBase = TypeVar("T_ConfigBase", bound="ConfigBase")
+T_Model = TypeVar("T_Model", bound=BaseModel)
+
+
+# =============================================================================
+# 配置文件里的非法值：逐项修正，不让一个字段拖垮整份配置
+# =============================================================================
+#
+# 以前读配置一律 `model_validate`：任何一个字段越界、类型不对，整份配置抛异常。全局配置在
+# 模块导入时加载，失败就 `exit(1)`（NA 起不来）；实例 / 频道覆盖文件失败时整份被丢掉（那一层
+# 所有覆盖项悄悄失效）；插件的实例覆盖同样整份回落到全局。现在先照常校验，失败时按报错位置
+# 逐项修正：越界的截到边界，超长的截到上限，其余（类型不对、枚举外的值……）去掉这一项、回到
+# 默认值；每修一处记一条 ERROR，写明文件、字段、原值与改用的值。修不动的（模型级的错、顶层
+# 不是映射）照旧抛出——宁可起不来，也不拿默认值整份覆盖掉用户的配置文件。
+#
+# 覆盖层（压在另一层配置之上的那一层）里去掉一项时，回到的应当是**上一层**的值，不是代码默认值：
+# 插件的实例覆盖是「全局值 + 覆盖」合并后校验，调用方把全局值作为 `fallback` 传进来，顶层某项
+# 去掉时改用 `fallback` 里的值；核心配置的实例 / 频道覆盖文件是带 `enable_<字段>` 开关的覆盖模型
+# （`_is_override_layer`），去掉一项时连同开关一起关掉，生效值由解析器从上一层继承。只在顶层
+# 回落；越界、超长仍是截到边界（截完的值本来就落在合法范围内，不涉及回到哪一层）。
+#
+# 全局配置在导入时修正后会立刻整份写回（`core/config.py` 末尾那次 dump），被去掉的原值就从文件
+# 里消失了，而文件里还可能有手写的明文凭据。所以声明了 `_backup_original_on_repair` 的配置类
+# （目前只有 `CoreConfig`）在这次加载确实做过修正时，先把原文件逐字节备份成仅属主可访问的
+# `<文件名>.pre-repair-<时间>`，ERROR 日志里写出备份路径。
+
+# 一份配置最多修几轮：去掉一项后可能露出「必填缺失」这类新错，需要再修一轮
+_MAX_REPAIR_PASSES = 10
+# 记下的修正保留多少条（启动后补记到日志、测试读取用）
+_MAX_RECORDED_REPAIRS = 200
+# 字段名里带这些字样的，日志里不写原值
+_SECRET_NAME_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+_BOUND_ERRORS = {
+    "less_than_equal": "le",
+    "greater_than_equal": "ge",
+    "less_than": "lt",
+    "greater_than": "gt",
+}
+_LENGTH_ERRORS = ("string_too_long", "too_long")
+
+
+@dataclass(frozen=True)
+class ConfigRepair:
+    """一处被修正的非法配置值"""
+
+    source: str
+    location: str
+    original: str
+    replacement: str
+    reason: str
+    # 写回前备份原文件的结果（备份到了哪 / 没备份成）；不备份的配置类为空
+    backup_note: str = ""
+
+    def describe(self) -> str:
+        text = (
+            f"配置文件 {self.source} 的 {self.location} 取值不合法：{self.original}（{self.reason}），"
+            f"已改用 {self.replacement}；其他配置项照常加载"
+        )
+        return f"{text}；{self.backup_note}" if self.backup_note else text
+
+
+_recorded_repairs: List[ConfigRepair] = []
+
+
+def recorded_config_repairs() -> List[ConfigRepair]:
+    """本进程里做过的配置修正（按发生顺序，最多保留最近的若干条）"""
+    return list(_recorded_repairs)
+
+
+def _is_secret_location(cls: Type[BaseModel], loc: Tuple[Any, ...]) -> bool:
+    first = loc[0] if loc else None
+    if isinstance(first, str):
+        field = cls.model_fields.get(first)
+        extra = getattr(field, "json_schema_extra", None) if field is not None else None
+        if isinstance(extra, dict) and extra.get("is_secret"):
+            return True
+    return any(isinstance(part, str) and any(hint in part.upper() for hint in _SECRET_NAME_HINTS) for part in loc)
+
+
+def _brief(value: Any, secret: bool) -> str:
+    if secret:
+        return "（凭据，不记原值）"
+    text = repr(value)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def _dotted(loc: Tuple[Any, ...]) -> str:
+    return ".".join(str(part) for part in loc) if loc else "（整份配置）"
+
+
+def _locate(data: Any, loc: Tuple[Any, ...]) -> Tuple[Any, Any, int]:
+    """沿 `loc` 在数据里走到最深处，返回 (所在容器, 键, 走过的层数)
+
+    `loc` 里数据中不存在的尾巴（联合类型的分支标签等）忽略；一层都走不进去时容器为 None。
+    """
+    container: Any = None
+    key: Any = None
+    depth = 0
+    current = data
+    for part in loc:
+        if isinstance(current, dict) and part in current:
+            container, key, current = current, part, current[part]
+        elif isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            container, key, current = current, part, current[part]
+        else:
+            break
+        depth += 1
+    return container, key, depth
+
+
+def _nearest_value(error_type: str, ctx: Dict[str, Any], value: Any) -> Tuple[bool, Any]:
+    """越界、超长时给出就近的合法值；给不出时返回 (False, None)，由调用方回落默认值"""
+    if error_type in _BOUND_ERRORS:
+        bound = ctx.get(_BOUND_ERRORS[error_type])
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+            return False, None
+        if error_type in ("less_than_equal", "greater_than_equal"):
+            return True, bound
+        # 开区间：整数取边界内最近的整数；小数没有「最近」，回落默认值
+        if isinstance(bound, int) and not isinstance(value, float):
+            return True, bound - 1 if error_type == "less_than" else bound + 1
+        return False, None
+    if error_type in _LENGTH_ERRORS:
+        limit = ctx.get("max_length")
+        if isinstance(limit, int) and isinstance(value, (str, list)):
+            return True, value[:limit]
+    return False, None
+
+
+def _value_at(instance: Any, loc: Tuple[Any, ...]) -> Tuple[bool, Any]:
+    current = instance
+    for part in loc:
+        if isinstance(current, BaseModel) and isinstance(part, str) and hasattr(current, part):
+            current = getattr(current, part)
+        elif isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+        else:
+            return False, None
+    return True, current
+
+
+def validate_config_data(
+    cls: Type[T_Model],
+    data: Any,
+    source: str,
+    fallback: Optional[Mapping[str, Any]] = None,
+) -> T_Model:
+    """校验一份配置数据；单个字段不合法时就近修正、记 ERROR，其余字段照常加载
+
+    Args:
+        cls: 配置模型类
+        data: 从文件读出来的数据（`None` 视为空映射：空文件就是「全部取默认值」）
+        source: 写进日志的来源（通常是文件路径）
+        fallback: 上一层配置的取值。顶层某项要去掉时，这里有就改用这里的值，而不是代码默认值
+
+    Raises:
+        pydantic.ValidationError: 顶层不是映射、模型级校验失败等无法逐项修正的情形
+    """
+    instance, repairs = _repair_config_data(cls, data, source, fallback)
+    _report_config_repairs(repairs)
+    return instance
+
+
+def _report_config_repairs(repairs: List[ConfigRepair]) -> None:
+    for record in repairs:
+        _recorded_repairs.append(record)
+        del _recorded_repairs[:-_MAX_RECORDED_REPAIRS]
+        _loguru_logger.error(record.describe())
+
+
+def _override_toggle(cls: Type[BaseModel], name: Any) -> Optional[str]:
+    """覆盖模型里 `name` 对应的 `enable_<name>` 开关字段名；不是覆盖模型或没有开关时为 None"""
+    if not getattr(cls, "_is_override_layer", False) or not isinstance(name, str):
+        return None
+    toggle = f"enable_{name}"
+    return toggle if toggle in cls.model_fields and name in cls.model_fields else None
+
+
+def _repair_config_data(
+    cls: Type[T_Model],
+    data: Any,
+    source: str,
+    fallback: Optional[Mapping[str, Any]] = None,
+) -> Tuple[T_Model, List[ConfigRepair]]:
+    """`validate_config_data` 的修正部分：返回校验通过的实例与做过的修正，**不记日志**
+
+    分开是为了让加载文件的调用方在记日志前先做点别的（比如先备份原文件，再把备份路径写进日志）。
+    修不动时照旧记 ERROR 并抛出。
+    """
+    working: Any = {} if data is None else copy.deepcopy(data)
+    # 每条待补的「改用了什么值」：(记录在列表里的位置, 修正位置)；默认值要等校验通过后才知道
+    pending: List[Tuple[int, Tuple[Any, ...]]] = []
+    repairs: List[Dict[str, Any]] = []
+    # 截到边界过一次的位置：截完仍不合法（比如还有别的约束）就不再截，改为回落默认值
+    clamped: set = set()
+    # 改用过上一层取值的位置：上一层的值本身也过不了校验（不该发生）时不再循环，改为去掉
+    fell_back: set = set()
+    last_error: Optional[PydanticValidationError] = None
+
+    for _ in range(_MAX_REPAIR_PASSES):
+        try:
+            instance = cls.model_validate(working)
+        except PydanticValidationError as exc:
+            last_error = exc
+        else:
+            for index, loc in pending:
+                found, value = _value_at(instance, loc)
+                repairs[index]["replacement"] = (
+                    _brief(value, _is_secret_location(cls, loc)) if found else "默认值（这一项已移除）"
+                )
+            return instance, [ConfigRepair(**item) for item in repairs]
+
+        if not isinstance(working, dict):
+            break
+        # 先改值、后删项；同一个列表里的删除从后往前删，免得下标错位
+        to_set: List[Tuple[Any, Any, Any]] = []
+        to_delete: List[Tuple[Any, Any]] = []
+        for err in last_error.errors(include_url=False):
+            loc = tuple(err.get("loc") or ())
+            if not loc:
+                continue
+            error_type = str(err.get("type", ""))
+            container, key, depth = _locate(working, loc)
+            if error_type == "missing":
+                # 去掉一项后必填项缺了：连这一条（字典里的一个条目、列表里的一项）一起去掉
+                parent_loc = loc[:-1]
+                container, key, depth = _locate(working, parent_loc)
+                if not parent_loc or depth != len(parent_loc) or container is None:
+                    continue
+                path = parent_loc
+                original = container[key]
+                to_delete.append((container, key))
+                # 这一条里早先修过、还等着回读「改用了什么值」的项，随这一条一起没了
+                for index, pending_loc in list(pending):
+                    if pending_loc[: len(path)] == path:
+                        repairs[index]["replacement"] = "（随所在条目一起移除）"
+                        pending.remove((index, pending_loc))
+                repairs.append(
+                    {
+                        "source": source,
+                        "location": _dotted(path),
+                        "original": _brief(original, _is_secret_location(cls, path)),
+                        "replacement": "（整条移除）",
+                        "reason": f"{_dotted(loc)} 缺失：{err.get('msg', '')}",
+                    }
+                )
+                continue
+            if container is None:
+                continue
+            path = loc[:depth]
+            original = container[key]
+            secret = _is_secret_location(cls, path)
+            reason = str(err.get("msg", error_type))
+            ok, nearest = _nearest_value(error_type, err.get("ctx") or {}, original)
+            if ok and path not in clamped:
+                clamped.add(path)
+                to_set.append((container, key, nearest))
+                repairs.append(
+                    {
+                        "source": source,
+                        "location": _dotted(path),
+                        "original": _brief(original, secret),
+                        "replacement": _brief(nearest, secret),
+                        "reason": reason,
+                    }
+                )
+                continue
+            if len(path) == 1 and fallback is not None and key in fallback and path not in fell_back:
+                # 顶层这一项回到上一层的取值
+                fell_back.add(path)
+                upper = copy.deepcopy(fallback[key])
+                to_set.append((container, key, upper))
+                repairs.append(
+                    {
+                        "source": source,
+                        "location": _dotted(path),
+                        "original": _brief(original, secret),
+                        "replacement": f"上一层的值 {_brief(upper, secret)}",
+                        "reason": reason,
+                    }
+                )
+                continue
+            toggle = _override_toggle(cls, key) if len(path) == 1 else None
+            if toggle is not None and container.get(toggle) not in (None, False):
+                # 覆盖层：这一项的覆盖整个停用（开关关掉、取值去掉），生效值由解析器从上一层继承
+                to_set.append((container, toggle, False))
+                to_delete.append((container, key))
+                repairs.append(
+                    {
+                        "source": source,
+                        "location": _dotted(path),
+                        "original": _brief(original, secret),
+                        "replacement": f"上一层的值（{toggle} 已关闭，这一项不再覆盖、改为继承上一层）",
+                        "reason": reason,
+                    }
+                )
+                continue
+            to_delete.append((container, key))
+            if isinstance(container, list):
+                # 列表里的一项整项去掉：后面的项会挪上来，按下标回读会读到别的项
+                replacement = "（这一项已移除）"
+            else:
+                replacement = "默认值"
+                pending.append((len(repairs), path))
+            repairs.append(
+                {
+                    "source": source,
+                    "location": _dotted(path),
+                    "original": _brief(original, secret),
+                    "replacement": replacement,
+                    "reason": reason,
+                }
+            )
+
+        if not to_set and not to_delete:
+            break
+        for container, key, value in to_set:
+            container[key] = value
+        seen_deletes: set = set()
+        dict_deletes: List[Tuple[Any, Any]] = []
+        list_deletes: List[Tuple[Any, Any]] = []
+        for container, key in to_delete:
+            marker = (id(container), key)
+            if marker in seen_deletes:
+                continue
+            seen_deletes.add(marker)
+            (list_deletes if isinstance(container, list) else dict_deletes).append((container, key))
+        for container, key in dict_deletes:
+            container.pop(key, None)
+        for container, key in sorted(list_deletes, key=lambda item: (id(item[0]), item[1]), reverse=True):
+            if 0 <= key < len(container):
+                del container[key]
+
+    assert last_error is not None
+    _loguru_logger.error(f"配置文件 {source} 有无法逐项修正的错误，未加载：{last_error}")
+    raise last_error
+
+
+# 修正前的原文件备份：`<原文件名>.pre-repair-<UTC 时间>`，与原文件同目录
+PRE_REPAIR_BACKUP_INFIX = ".pre-repair-"
+
+
+def _backup_original_before_rewrite(path: Path) -> str:
+    """把修正前的原文件逐字节备份成仅属主可访问的新文件，返回写进 ERROR 日志的那半句
+
+    备份失败不抛：启动照常进行（写回那一步多半也会因同样的原因失败，原文件就还在），日志里如实说明。
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}{PRE_REPAIR_BACKUP_INFIX}{stamp}")
+    try:
+        owner_only = write_private_file(backup, path.read_bytes())
+    except OSError as exc:
+        return (
+            f"修正前的原文件没能备份（{type(exc).__name__}: {exc}），"
+            "写回后被修正项的原值只剩日志里的记录（凭据项不记原值）"
+        )
+    return (
+        f"修正前的原文件已备份到 {backup}（{describe_private_file_protection(owner_only)}；"
+        "内容与修正前逐字节一致，可能含明文凭据，核对完请删除）"
+    )
 
 
 class ConfigBase(BaseModel):
     # 类变量用于存储配置元数据
     _config_key: ClassVar[Optional[str]] = None
     _config_file_path_class: ClassVar[Optional[Path]] = None
+    # 加载时修正过非法值，就先把原文件备份一份（加载后会立刻整份写回的配置才需要，见 `load_from_path`）
+    _backup_original_on_repair: ClassVar[bool] = False
+    # 覆盖层模型（字段成对出现：`enable_<字段>` 开关 + 取值）：非法值去掉时连同开关一起关掉，继承上一层
+    _is_override_layer: ClassVar[bool] = False
 
     # 实例变量，用于动态配置
     _config_file_path: Optional[Path] = PrivateAttr(default=None)
@@ -393,11 +804,17 @@ class ConfigBase(BaseModel):
         else:
             content: str = path.read_text(encoding="utf-8")
             if path.suffix == ".json":
-                instance = cls.model_validate_json(content)
+                data = json.loads(content)
             elif path.suffix in [".yaml", ".yml"]:
-                instance = cls.model_validate(yaml.safe_load(content))
+                data = yaml.safe_load(content)
             else:
                 raise ValueError(f"Unsupported file type: {path}")
+            # 单个字段不合法时就近修正并记 ERROR，不让它拖垮整份配置（见 `validate_config_data`）
+            instance, repairs = _repair_config_data(cls, data, source=str(path))
+            if repairs and cls._backup_original_on_repair:
+                note = _backup_original_before_rewrite(path)
+                repairs = [dataclass_replace(record, backup_note=note) for record in repairs]
+            _report_config_repairs(repairs)
 
         instance.set_instance_config_file_path(path)  # 存储路径
         return instance

@@ -80,6 +80,7 @@ function useStatusColor(status: string) {
     stopped: theme.palette.text.secondary as string,
     failed: theme.palette.error.main,
     deleting: theme.palette.warning.main,
+    transitioning: theme.palette.warning.main,
   }
   return map[status] ?? (theme.palette.text.secondary as string)
 }
@@ -97,7 +98,7 @@ function usePolicyColor(policy: WorkspaceSummary['runtime_policy']) {
 function StatusChip({ status, ccActive = false }: { status: string; ccActive?: boolean }) {
   const { t } = useTranslation('workspace')
   const color = useStatusColor(status)
-  const knownStatuses = ['active', 'stopped', 'failed', 'deleting']
+  const knownStatuses = ['active', 'stopped', 'failed', 'deleting', 'transitioning']
   const label = knownStatuses.includes(status) ? t(`status.${status}`) : status
   const isActiveWithCC = status === 'active' && ccActive
 

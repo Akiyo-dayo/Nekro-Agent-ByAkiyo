@@ -54,7 +54,6 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, AsyncIterator, Deque, Dict, List, Optional
 
 from nekro_agent.core.config import config
@@ -401,11 +400,11 @@ def _override_layers(adapter_key: str, instance_key: str) -> List[Any]:
     顺手把文件建出来，而实例覆盖目录一旦存在，`config_resolver` 就认为"该适配器有实例层"，
     给所有频道的配置解析都加上一次反查。为读一个配额把整套解析开销打开是不划算的。
     """
-    from nekro_agent.core.os_env import OsEnv
     from nekro_agent.core.overridable_config import OverridableConfig
     from nekro_agent.services.config_service import (
         ADAPTER_OVERRIDE_KEY_PREFIX,
         UnifiedConfigService,
+        adapter_override_config_path,
         instance_override_config_key,
         instance_override_config_path,
     )
@@ -422,7 +421,7 @@ def _override_layers(adapter_key: str, instance_key: str) -> List[Any]:
             if isinstance(overrides, OverridableConfig):
                 layers.append(overrides)
 
-    adapter_path = Path(OsEnv.DATA_DIR) / "configs" / adapter_key / "overrides.yaml"
+    adapter_path = adapter_override_config_path(adapter_key)
     if adapter_path.is_file():
         adapter_overrides = UnifiedConfigService._get_config_instance(f"{ADAPTER_OVERRIDE_KEY_PREFIX}{adapter_key}")  # noqa: SLF001
         if isinstance(adapter_overrides, OverridableConfig):

@@ -296,6 +296,7 @@ class _StopAgent(RuntimeError):
 
 
 async def test_run_agent_sets_the_channel_instance_scope(onebot_instance: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nekro_agent.services.agent import round_prompt as round_prompt_module
     from nekro_agent.services.agent import run_agent as run_agent_module
 
     seen: List[str] = []
@@ -328,8 +329,13 @@ async def test_run_agent_sets_the_channel_instance_scope(onebot_instance: Any, m
     )
     ctx = SimpleNamespace(db_chat_channel=channel, adapter=adapter)
 
-    monkeypatch.setattr(run_agent_module, "resolve_active_plugins", _spy_resolve_active_plugins)
-    monkeypatch.setattr(run_agent_module, "enforce_channel_model_group_scope", _no_op)
+    # 插件集合与模型组归属的解析在提示词组装的抽取之后位于 `round_prompt`，
+    # 这一条钉的是「调用它们时实例上下文已经设好」，所以替身要装在真正调用的模块上。
+    monkeypatch.setattr(round_prompt_module, "resolve_active_plugins", _spy_resolve_active_plugins)
+    monkeypatch.setattr(round_prompt_module, "enforce_channel_model_group_scope", _no_op)
+    # 回合首尾的频道额度计数要查消息表，这条用例不建库（理由见 `test_agent_round_control._Harness.install`）
+    monkeypatch.setattr(run_agent_module, "_channel_message_marker", _no_op)
+    monkeypatch.setattr(run_agent_module, "_record_round_reply", _no_op)
 
     try:
         with pytest.raises(_StopAgent):

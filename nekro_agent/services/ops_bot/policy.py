@@ -1,7 +1,8 @@
 """运维 Bot 的受理判定
 
 本模块是整个运维通道**唯一**的准入闸门，且刻意写成不依赖数据库、不依赖 IO 的纯函数，
-这样每一条拒绝理由都能被表驱动测试覆盖。
+这样每一条拒绝理由都能被表驱动测试覆盖。读写指令共用这一套准入：受理之后读指令直接
+回结果，写指令直接执行并在本频道回执（见 `services/ops_agent/writes.py` 与 `receipt.py`）。
 
 ## 四道闸门缺一不可
 
@@ -72,8 +73,6 @@ class OpsBotPolicy:
     instance_key: str
     channel_id: str
     operators: FrozenSet[str]
-    deeplink_ttl_seconds: int
-    console_base_url: str
 
     @classmethod
     def from_config(cls, config: "CoreConfig") -> "OpsBotPolicy":
@@ -84,8 +83,6 @@ class OpsBotPolicy:
             instance_key=config.OPS_BOT_INSTANCE_KEY.strip(),
             channel_id=config.OPS_BOT_CHANNEL_ID.strip(),
             operators=frozenset(str(item).strip() for item in config.OPS_BOT_OPERATORS if str(item).strip()),
-            deeplink_ttl_seconds=int(config.OPS_BOT_DEEPLINK_TTL_SECONDS),
-            console_base_url=config.OPS_BOT_CONSOLE_BASE_URL.strip().rstrip("/"),
         )
 
     @property

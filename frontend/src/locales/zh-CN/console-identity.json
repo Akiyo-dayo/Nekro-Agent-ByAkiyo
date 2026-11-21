@@ -56,6 +56,8 @@
     "joinTitle": "加入域",
     "joinLine": "「{{instance}}」将加入域「{{domain}}」。",
     "joinConfirm": "确认加入",
+    "joinMemoryLine": "入组后，这个实例以前的 {{paragraphs}} 条记忆立刻对组内其他实例可见（跨频道召回仍受三个开关约束）；{{summaries}} 份频道摘要只在各自频道注入，不受影响。",
+    "joinMemoryQuarantined": "另有 {{count}} 条在隔离区，放回之前不会被召回。",
     "migrateLabel": "并入该实例自成一域时期的存量好感、事件流水与合并关系",
     "deleteTitle": "删除域",
     "deleteWarning": "删除域「{{name}}」后，其中 {{count}} 个实例回到自成一域（互相不再互通）。已有的好感与记忆不会被删除，但它们此前落在组域上，回到自成一域后需要重新配回同一个组才能再看到。",

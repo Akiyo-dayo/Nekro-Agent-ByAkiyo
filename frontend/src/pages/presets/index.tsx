@@ -12,7 +12,6 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
-  Avatar,
   InputAdornment,
   Divider,
   Tooltip,
@@ -21,6 +20,11 @@ import {
   FormControlLabel,
   Checkbox,
   Link,
+  Menu,
+  MenuItem,
+  ListItemIcon,
+  ListItemText,
+  Tab,
   useTheme,
   useMediaQuery,
 } from '@mui/material'
@@ -42,9 +46,18 @@ import {
   Clear as ClearIcon,
   Star as StarIcon,
   StarBorder as StarBorderIcon,
+  Download as DownloadIcon,
+  FilePresent as FilePresentIcon,
+  Image as ImageIcon,
+  DataObject as DataObjectIcon,
+  MenuBook as MenuBookIcon,
 } from '@mui/icons-material'
 import { ApiError } from '../../services/api/axios'
 import { Preset, PresetDetail, presetsApi, TagInfo } from '../../services/api/presets'
+import { tavernApi, type TavernScope } from '../../services/api/tavern'
+import CardImportDialog from '../../components/tavern/CardImportDialog'
+import TavernExtensionPanel from '../../components/tavern/TavernExtensionPanel'
+import { InlineTabs } from '../../components/common/NekroTabs'
 import type { PresetSwitchImpact } from '../../services/api/types'
 import { presetsMarketApi } from '../../services/api/cloud/presets_market'
 import { useSnackbar } from 'notistack'
@@ -60,6 +73,7 @@ import ActionButton from '../../components/common/ActionButton'
 import IconActionButton from '../../components/common/IconActionButton'
 import InstanceScopeBanner from '../../components/common/InstanceScopeBanner'
 import PresetSwitchConfirmDialog from '../../components/common/PresetSwitchConfirmDialog'
+import PresetAvatar from '../../components/common/PresetAvatar'
 import { useIdentity } from '../../hooks/useIdentity'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 
@@ -81,12 +95,15 @@ const PresetEditDialog = ({
   onClose,
   preset,
   onSave,
+  scope,
   isNew = false,
 }: {
   open: boolean
   onClose: () => void
   preset?: PresetDetail
   onSave: (data: PresetFormData) => Promise<void>
+  /** 作用域与页面当前实例同一份：面板读写扩展行时要用 */
+  scope: TavernScope
   isNew?: boolean
 }) => {
   const [loading, setLoading] = useState(false)
@@ -102,9 +119,19 @@ const PresetEditDialog = ({
   })
   const [confirmDialog, setConfirmDialog] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
+  // 编辑已有人设才分标签；新建时还没有 ID，扩展面板无从读取
+  const [activeTab, setActiveTab] = useState<'basic' | 'tavern'>('basic')
+  // 面板的未保存状态：关闭对话框前据此决定要不要确认
+  const [tavernDirty, setTavernDirty] = useState(false)
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const { enqueueSnackbar } = useSnackbar()
   const { t } = useTranslation('presets')
+  const { t: tTavern } = useTranslation('tavern')
+  const editingExisting = !isNew && Boolean(preset)
+  // 新建人设没有扩展标签；其余「当前是否在酒馆扩展页」都由它收口，避免出现
+  // 「标签没渲染、activeTab 却停在 tavern」这种看不见表单也看不见保存的状态
+  const onTavernTab = editingExisting && activeTab === 'tavern'
 
   useEffect(() => {
     if (preset) {
@@ -132,7 +159,24 @@ const PresetEditDialog = ({
     }
     // 重置错误状态
     setErrors({})
+    setActiveTab('basic')
+    setTavernDirty(false)
+    setCloseConfirmOpen(false)
   }, [preset, open])
+
+  /**
+   * 关闭前先问有没有未保存的扩展改动
+   *
+   * 标签切换不会丢输入（两边都保持挂载），所以只有真正关闭才需要确认；背景点击与
+   * Esc 也走这一个出口。
+   */
+  const handleRequestClose = () => {
+    if (tavernDirty) {
+      setCloseConfirmOpen(true)
+      return
+    }
+    onClose()
+  }
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     const { name, value } = e.target
@@ -264,7 +308,7 @@ const PresetEditDialog = ({
         // 如果是自己上传的云端人设(on_shared为true)，则不解除关联
         remove_remote: preset?.remote_id && !preset?.on_shared ? true : false,
       })
-      onClose()
+      handleRequestClose()
     } catch (error) {
       // 显示通用错误
       setErrors(prev => ({
@@ -286,7 +330,7 @@ const PresetEditDialog = ({
           ...formData,
           remove_remote: true,
         })
-        onClose()
+        handleRequestClose()
       } catch (error) {
         // 显示通用错误
         setErrors(prev => ({
@@ -303,7 +347,7 @@ const PresetEditDialog = ({
     <>
       <Dialog
         open={open}
-        onClose={onClose}
+        onClose={handleRequestClose}
         maxWidth="md"
         fullWidth
         scroll="paper"
@@ -327,7 +371,25 @@ const PresetEditDialog = ({
           {isNew ? t('dialog.createTitle') : t('dialog.editTitle')}
         </DialogTitle>
         <DialogContent dividers sx={{ p: 3 }}>
-          <Box component="form" noValidate sx={{ mt: 1 }} className="space-y-4" autoComplete="off">
+          {/* 编辑已有人设才分标签：新建时没有 ID，扩展面板没有可读的行 */}
+          {editingExisting ? (
+            <InlineTabs
+              value={activeTab}
+              onChange={(_event, value: 'basic' | 'tavern') => setActiveTab(value)}
+              sx={{ mb: 2 }}
+            >
+              <Tab value="basic" label={tTavern('extension.tab.basic')} />
+              <Tab value="tavern" label={tTavern('extension.tab.tavern')} />
+            </InlineTabs>
+          ) : null}
+          {/* 两个标签都保持挂载：切换标签不能丢两边各自未保存的输入 */}
+          <Box
+            component="form"
+            noValidate
+            sx={{ mt: 1, display: onTavernTab ? 'none' : 'block' }}
+            className="space-y-4"
+            autoComplete="off"
+          >
             {preset?.remote_id && preset?.on_shared && (
               <Alert severity="info" sx={{ mb: 2 }}>
                 {t('cloud.sharedInfo')}
@@ -526,13 +588,74 @@ const PresetEditDialog = ({
               </Grid>
             </Grid>
           </Box>
+          {editingExisting && preset ? (
+            <Box sx={{ display: onTavernTab ? 'block' : 'none', mt: 1 }}>
+              <TavernExtensionPanel
+                presetId={preset.id}
+                scope={scope}
+                readOnly={false}
+                onContentReassembled={content =>
+                  // 重新拼装已经改了服务端的正文；把「基本」表单的同一份也换掉，
+                  // 否则回到那边点保存会用旧正文把结果盖回去
+                  setFormData(previous => ({ ...previous, content }))
+                }
+                onDirtyChange={setTavernDirty}
+              />
+            </Box>
+          ) : null}
         </DialogContent>
         <DialogActions sx={{ px: 3, py: 2 }}>
-          <ActionButton tone="secondary" onClick={onClose} disabled={loading}>
-            {t('dialog.cancel')}
+          {/* 「酒馆扩展」下底部只留关闭：保存扩展是面板自己的按钮，两个保存并排会分不清 */}
+          {onTavernTab ? (
+            <ActionButton tone="secondary" onClick={handleRequestClose}>
+              {tTavern('extension.close')}
+            </ActionButton>
+          ) : (
+            <>
+              <ActionButton tone="secondary" onClick={handleRequestClose} disabled={loading}>
+                {t('dialog.cancel')}
+              </ActionButton>
+              <ActionButton tone="primary" onClick={handleSave} disabled={loading}>
+                {loading ? <CircularProgress size={24} /> : t('dialog.save')}
+              </ActionButton>
+            </>
+          )}
+        </DialogActions>
+      </Dialog>
+
+      {/* 关闭前的未保存确认：只针对酒馆扩展，基本表单的保存仍按原流程 */}
+      <Dialog
+        open={closeConfirmOpen}
+        onClose={() => setCloseConfirmOpen(false)}
+        PaperProps={{ sx: CARD_VARIANTS.default.styles }}
+      >
+        <DialogTitle
+          sx={{
+            px: 3,
+            py: 2,
+            background: theme =>
+              theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.02)',
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+          }}
+        >
+          {tTavern('extension.closeConfirmTitle')}
+        </DialogTitle>
+        <DialogContent sx={{ p: 3 }}>
+          <Typography>{tTavern('extension.closeConfirm')}</Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <ActionButton tone="secondary" onClick={() => setCloseConfirmOpen(false)}>
+            {tTavern('extension.cancel')}
           </ActionButton>
-          <ActionButton tone="primary" onClick={handleSave} disabled={loading}>
-            {loading ? <CircularProgress size={24} /> : t('dialog.save')}
+          <ActionButton
+            tone="danger"
+            onClick={() => {
+              setCloseConfirmOpen(false)
+              onClose()
+            }}
+          >
+            {tTavern('extension.close')}
           </ActionButton>
         </DialogActions>
       </Dialog>
@@ -590,6 +713,7 @@ const PresetCard = ({
   isMobile,
   isSmall,
   scopeInstanceKey,
+  scopeAdapterKey,
   isInstanceDefault,
   onToggleInstanceDefault,
 }: {
@@ -606,6 +730,8 @@ const PresetCard = ({
   isSmall?: boolean
   /** 当前实例作用域；null 表示全局视图 */
   scopeInstanceKey: string | null
+  /** 当前实例的适配器标识；只用于扩展面板按实例取闸状态 */
+  scopeAdapterKey?: string
   /** 是否为当前实例的默认人设 */
   isInstanceDefault: boolean
   /** 设置/取消「本实例默认人设」 */
@@ -616,6 +742,8 @@ const PresetCard = ({
   const [preset, setPreset] = useState(initialPreset)
   const [loading, setLoading] = useState(false)
   const [detailData, setDetailData] = useState<PresetDetail | null>(null)
+  // 全局人设在实例视图下编辑按钮是禁用的；它的扩展面板仍可只读查看
+  const [showExtensionDialog, setShowExtensionDialog] = useState(false)
   const [showShareDialog, setShowShareDialog] = useState(false)
   const [showUnshareDialog, setShowUnshareDialog] = useState(false)
   const [showSyncToCloudDialog, setShowSyncToCloudDialog] = useState(false)
@@ -623,6 +751,9 @@ const PresetCard = ({
   const [agreeToTerms, setAgreeToTerms] = useState(false)
   const [shareLoading, setShareLoading] = useState(false)
   const [syncLoading, setSyncLoading] = useState(false)
+  // 导出菜单的锚点与进行中的导出格式：卡片上有两个导出项，共用一个按钮
+  const [exportAnchor, setExportAnchor] = useState<HTMLElement | null>(null)
+  const [exportingFormat, setExportingFormat] = useState<'png' | 'json' | null>(null)
   const theme = useTheme()
   const isGridLayout = useMediaQuery(theme.breakpoints.up('md'))
 
@@ -714,6 +845,28 @@ const PresetCard = ({
   }
 
   const tagsArray = preset.tags.split(',').filter(tag => tag.trim())
+  const { t: tTavern } = useTranslation('tavern')
+
+  /**
+   * 导出一张卡
+   *
+   * 谁能看到这条人设谁就能导出（后端用 `get_visible_preset`），所以租户看到的全局人设
+   * 也能导；作用域取页面当前实例，导出的知识书只含导出人看得到的书。
+   */
+  const handleExport = async (format: 'png' | 'json') => {
+    setExportAnchor(null)
+    setExportingFormat(format)
+    try {
+      await tavernApi.exportCard(preset.id, format, {
+        instance_key: scopeInstanceKey ?? undefined,
+      })
+    } catch (error) {
+      const message = error instanceof Error && error.message ? error.message : ''
+      showError(`${tTavern('errors.exportFailed')}${message ? `: ${message}` : ''}`)
+    } finally {
+      setExportingFormat(null)
+    }
+  }
 
   // 决定显示哪个共享按钮
   const renderShareButtons = () => {
@@ -846,15 +999,15 @@ const PresetCard = ({
               mb: isMobile && isSmall && !isGridLayout ? 2 : 0,
             }}
           >
-            <Avatar
+            <PresetAvatar
               src={preset.avatar}
-              alt={preset.name}
+              name={preset.name}
               sx={{
                 width: '100%',
                 height: isGridLayout ? '100%' : 'auto',
                 aspectRatio: '1/1',
                 borderRadius: 2,
-                boxShadow: '0 3px 10px rgba(0,0,0,0.1)',
+                boxShadow: theme.shadows[2],
               }}
               variant="rounded"
             />
@@ -896,6 +1049,25 @@ const PresetCard = ({
               >
                 {preset.title}
               </Typography>
+
+              {/* 来源标识：`card_spec` 非空才是酒馆卡；NA 原生的扩展行（空串）不挂这个标 */}
+              {preset.card_spec ? (
+                <Box sx={{ display: 'flex', gap: 0.75, flexWrap: 'wrap', mb: 1 }}>
+                  <Tooltip
+                    title={tTavern('badge.cardTooltip', {
+                      // 库里存的是 v1 / v2 / v3，界面上按设计稿写成 V2 这种大写形态
+                      spec: preset.card_spec.toUpperCase(),
+                    })}
+                  >
+                    <Chip
+                      size="small"
+                      icon={<FilePresentIcon />}
+                      label={tTavern('badge.card')}
+                      sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.info.main, isSmall)}
+                    />
+                  </Tooltip>
+                </Box>
+              ) : null}
 
               {/* 归属与默认标识：实例作用域下必须一眼看出这条人设是全局共享还是本实例私有 */}
               {scopeInstanceKey && (
@@ -1071,6 +1243,18 @@ const PresetCard = ({
               </IconActionButton>
             </span>
           </Tooltip>
+          {/* 全局人设在实例视图下不能编辑，但扩展面板要能只读查看 */}
+          {scopeInstanceKey && preset.is_global && preset.has_card ? (
+            <Tooltip title={tTavern('extension.open')}>
+              <IconActionButton
+                size="small"
+                onClick={() => setShowExtensionDialog(true)}
+                aria-label={tTavern('extension.open')}
+              >
+                <MenuBookIcon />
+              </IconActionButton>
+            </Tooltip>
+          ) : null}
           {preset.remote_id && preset.on_shared && (
             <Tooltip title={t('cloud.syncFromCloud')}>
               <IconActionButton
@@ -1090,6 +1274,39 @@ const PresetCard = ({
             </Tooltip>
           )}
           {renderShareButtons()}
+          {/* 导出对「看得到这条人设」的人开放（含租户看到的全局人设），所以按钮不做权限收窄 */}
+          <Tooltip title={tTavern('export.open')}>
+            <span>
+              <IconActionButton
+                size="small"
+                onClick={event => setExportAnchor(event.currentTarget)}
+                disabled={exportingFormat !== null}
+                aria-label={tTavern('export.open')}
+              >
+                {exportingFormat ? <CircularProgress size={24} /> : <DownloadIcon />}
+              </IconActionButton>
+            </span>
+          </Tooltip>
+          <Menu
+            anchorEl={exportAnchor}
+            open={Boolean(exportAnchor)}
+            onClose={() => setExportAnchor(null)}
+            anchorOrigin={{ vertical: 'top', horizontal: 'right' }}
+            transformOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+          >
+            <MenuItem onClick={() => void handleExport('png')}>
+              <ListItemIcon>
+                <ImageIcon fontSize="small" />
+              </ListItemIcon>
+              <ListItemText>{tTavern('export.png')}</ListItemText>
+            </MenuItem>
+            <MenuItem onClick={() => void handleExport('json')}>
+              <ListItemIcon>
+                <DataObjectIcon fontSize="small" />
+              </ListItemIcon>
+              <ListItemText>{tTavern('export.json')}</ListItemText>
+            </MenuItem>
+          </Menu>
           <Tooltip title={t('card.delete')}>
             <IconActionButton size="small" onClick={onDelete}>
               <DeleteIcon />
@@ -1097,6 +1314,65 @@ const PresetCard = ({
           </Tooltip>
         </Box>
       </CardActions>
+
+      {/* 全局人设的酒馆扩展：实例视图下只读查看，窄屏全屏 */}
+      <Dialog
+        open={showExtensionDialog}
+        onClose={() => setShowExtensionDialog(false)}
+        maxWidth="md"
+        fullWidth
+        fullScreen={isSmall}
+        scroll="paper"
+        PaperProps={{
+          sx: {
+            // 全屏时也保持 NA 原生的毛玻璃卡片底色（与其它对话框一致），不另换成不透明底
+            ...CARD_VARIANTS.default.styles,
+            ...(isSmall ? {} : { maxHeight: '88vh' }),
+          },
+        }}
+      >
+        <DialogTitle
+          sx={{
+            px: 3,
+            py: 2,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 1,
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+            bgcolor: 'action.hover',
+          }}
+        >
+          <Box sx={{ flex: 1, minWidth: 0 }}>
+            <Typography variant="h6" component="span">
+              {tTavern('extension.title')}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+              {preset.title}
+            </Typography>
+          </Box>
+          <IconActionButton
+            size="small"
+            onClick={() => setShowExtensionDialog(false)}
+            edge="end"
+            aria-label={tTavern('extension.close')}
+          >
+            <CloseIcon />
+          </IconActionButton>
+        </DialogTitle>
+        <DialogContent dividers sx={{ p: 2.5 }}>
+          <TavernExtensionPanel
+            presetId={preset.id}
+            scope={{ instance_key: scopeInstanceKey ?? undefined, adapter_key: scopeAdapterKey }}
+            readOnly
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 3, py: 2 }}>
+          <ActionButton tone="secondary" onClick={() => setShowExtensionDialog(false)}>
+            {tTavern('extension.close')}
+          </ActionButton>
+        </DialogActions>
+      </Dialog>
 
       {/* 使用MUI Dialog组件实现展开内容 */}
       <Dialog
@@ -1130,8 +1406,9 @@ const PresetCard = ({
             gap: 1,
           }}
         >
-          <Avatar
+          <PresetAvatar
             src={preset.avatar}
+            name={preset.name}
             sx={{ width: 36, height: 36, borderRadius: 1 }}
             variant="rounded"
           />
@@ -1153,9 +1430,9 @@ const PresetCard = ({
                 <Box
                   sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2.5 }}
                 >
-                  <Avatar
+                  <PresetAvatar
                     src={preset.avatar}
-                    alt={preset.name}
+                    name={preset.name}
                     variant="rounded"
                     sx={{
                       width: '100%',
@@ -1294,6 +1571,12 @@ const PresetCard = ({
           <Alert severity="info" sx={{ mb: 2 }}>
             {t('cloud.shareInfo')}
           </Alert>
+          {/* 有卡片数据时多一条：共享会把卡片原文与改过的槽位一起上传，这一段必须在上传前说 */}
+          {preset.has_card ? (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {tTavern('share.cardWarning')}
+            </Alert>
+          ) : null}
           <Box sx={{ display: 'flex', flexDirection: 'column' }}>
             <FormControlLabel
               control={<Checkbox checked={isSfw} onChange={e => setIsSfw(e.target.checked)} />}
@@ -1405,6 +1688,11 @@ const PresetCard = ({
           <Alert severity="info" sx={{ mb: 2 }}>
             {t('cloud.syncWarning')}
           </Alert>
+          {preset.has_card ? (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {tTavern('share.cardWarning')}
+            </Alert>
+          ) : null}
           <Box sx={{ display: 'flex', flexDirection: 'column' }}>
             <FormControlLabel
               control={<Checkbox checked={isSfw} onChange={e => setIsSfw(e.target.checked)} />}
@@ -1467,8 +1755,9 @@ export default function PresetsPage() {
   const [confirmDelete, setConfirmDelete] = useState<number | null>(null)
   const { enqueueSnackbar } = useSnackbar()
   const [refreshingShared, setRefreshingShared] = useState(false)
+  const [importDialogOpen, setImportDialogOpen] = useState(false)
   // 作用域是人设接口的必填参数（租户身份下服务端直接 400），必须等它确定后再发请求
-  const { currentInstanceKey, isScopeReady } = useInstanceScope()
+  const { currentInstanceKey, currentInstance, isScopeReady } = useInstanceScope()
   const { isTenantScoped } = useIdentity()
   const [instanceDefaultPresetId, setInstanceDefaultPresetId] = useState<number | null>(null)
   // 换实例默认人设的二次确认。`undefined` = 没有待确认的改动；`null` = 待确认「清除默认」
@@ -1485,6 +1774,7 @@ export default function PresetsPage() {
   const isLargeScreen = useMediaQuery(theme.breakpoints.up('lg'))
   const isExtraLargeScreen = useMediaQuery(theme.breakpoints.up('xl'))
   const { t } = useTranslation('presets')
+  const { t: tTavern } = useTranslation('tavern')
 
   // 统一使用 notistack 的通知系统
   const showError = useCallback(
@@ -1498,6 +1788,14 @@ export default function PresetsPage() {
   const showSuccess = useCallback(
     (message: string) => {
       enqueueSnackbar(message, { variant: 'success', autoHideDuration: 3000 })
+    },
+    [enqueueSnackbar]
+  )
+
+  // 云端回话用的那一条：比成功提示停留更久，免得一眼没看到就滑走了
+  const showWarning = useCallback(
+    (message: string) => {
+      enqueueSnackbar(message, { variant: 'warning', autoHideDuration: 8000 })
     },
     [enqueueSnackbar]
   )
@@ -1677,7 +1975,8 @@ export default function PresetsPage() {
             throw error
           }
 
-          await presetsMarketApi.downloadPreset(remoteId)
+          const downloadResult = await presetsMarketApi.downloadPreset(remoteId)
+          if (downloadResult.note) showWarning(downloadResult.note)
           detailData = await presetsApi.getDetailByRemoteId(remoteId, currentInstanceKey ?? undefined)
         }
 
@@ -1692,7 +1991,7 @@ export default function PresetsPage() {
         clearEditRemoteId()
       }
     },
-    [clearEditRemoteId, fetchAvailableTags, fetchData, showError, showSuccess, t, currentInstanceKey]
+    [clearEditRemoteId, fetchAvailableTags, fetchData, showError, showSuccess, showWarning, t, currentInstanceKey]
   )
 
   useEffect(() => {
@@ -1750,8 +2049,13 @@ export default function PresetsPage() {
 
   const handleSyncClick = async (id: number): Promise<void> => {
     try {
-      await presetsApi.sync(id, currentInstanceKey ?? undefined)
+      const response = await presetsApi.sync(id, currentInstanceKey ?? undefined)
       showSuccess(t('cloud.syncSuccess'))
+      // 云端在同步时可能会改写内容并回一句说明（例如卡片字段被压平），单独用 warning 弹出来：
+      // 混在成功提示里会被当成一句废话划过去
+      if (response.note) {
+        showWarning(response.note)
+      }
       await fetchData()
       if (expandedId === id) {
         setExpandedId(null)
@@ -1802,6 +2106,7 @@ export default function PresetsPage() {
       isMobile={isMobile}
       isSmall={isSmall}
       scopeInstanceKey={currentInstanceKey}
+      scopeAdapterKey={currentInstance?.adapter_key}
       isInstanceDefault={instanceDefaultPresetId === preset.id}
       onToggleInstanceDefault={handleToggleInstanceDefault}
     />
@@ -1858,6 +2163,27 @@ export default function PresetsPage() {
               )}
             </ActionButton>
           )}
+          {/* 「导入酒馆卡」与「新建」并列：两者都是「往列表里加一条人设」的入口。
+              窄屏只留图标（无障碍标签照给），否则一行放不下会横向溢出。 */}
+          <ActionButton
+            variant="outlined"
+            startIcon={<FilePresentIcon />}
+            onClick={() => setImportDialogOpen(true)}
+            size={isSmall ? 'small' : 'medium'}
+            aria-label={tTavern('import.open')}
+            sx={
+              isSmall
+                ? {
+                    minWidth: 0,
+                    px: 1,
+                    // 只剩图标时 MUI 仍给 startIcon 留右外边距，去掉它按钮才不会偏
+                    '& .MuiButton-startIcon': { mr: 0 },
+                  }
+                : undefined
+            }
+          >
+            {isSmall ? null : tTavern('import.open')}
+          </ActionButton>
           <ActionButton
             variant="contained"
             startIcon={<AddIcon />}
@@ -2027,6 +2353,10 @@ export default function PresetsPage() {
         onClose={() => setEditDialog(false)}
         preset={editingPreset}
         onSave={handleSave}
+        scope={{
+          instance_key: currentInstanceKey ?? undefined,
+          adapter_key: currentInstance?.adapter_key,
+        }}
         isNew={!editingPreset}
       />
 
@@ -2074,6 +2404,27 @@ export default function PresetsPage() {
           if (pendingDefaultPresetId !== undefined) {
             void applyInstanceDefault(pendingDefaultPresetId, true)
           }
+        }}
+      />
+
+      {/* 导入酒馆卡。作用域跟着页面当前实例走：`adapter_key` 只用来让后端定位实例、取两个闸
+          的生效值，归属仍是 `instance_key`；全局视图下两者都为空，导入成人人可见的全局人设。 */}
+      <CardImportDialog
+        open={importDialogOpen}
+        onClose={() => setImportDialogOpen(false)}
+        scope={{
+          instance_key: currentInstanceKey ?? undefined,
+          adapter_key: currentInstance?.adapter_key ?? undefined,
+        }}
+        scopeLabel={currentInstance?.display_name ?? ''}
+        onImported={presetName => {
+          void fetchData()
+          void fetchAvailableTags()
+          showSuccess(
+            presetName
+              ? tTavern('import.importedName', { name: presetName })
+              : tTavern('import.imported')
+          )
         }}
       />
     </Box>

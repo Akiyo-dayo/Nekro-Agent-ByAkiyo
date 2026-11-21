@@ -76,15 +76,10 @@
 import asyncio
 import base64
 import email
-import imaplib
 import json
 import os
-import re
-import time
 from datetime import timedelta
 from email.header import decode_header
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
@@ -95,38 +90,38 @@ from pydantic import Field
 from tortoise.timezone import now as db_now
 
 from nekro_agent.adapters.email.adapter import EmailAdapter, decode_mime_words
-from nekro_agent.adapters.email.config import EmailAccount
-from nekro_agent.adapters.interface.schemas.platform import (
-    PlatformSendRequest,
-    PlatformSendSegment,
-    PlatformSendSegmentType,
-)
 from nekro_agent.adapters.utils import adapter_utils
 from nekro_agent.api.schemas import AgentCtx
-from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
-from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text
 from nekro_agent.core import logger
 from nekro_agent.core.config import config as core_config
 from nekro_agent.core.core_utils import ExtraField
 from nekro_agent.core.os_env import USER_UPLOAD_DIR, OsEnv
-from nekro_agent.tools.path_convertor import sanitize_chat_key_for_path
+from nekro_agent.models.db_email_user_pref import DBEmailUserPref
+from nekro_agent.services import email_accounts as mail
 from nekro_agent.services.agent.openai import gen_openai_chat_response
-from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
 from nekro_agent.services.plugin.base import ConfigBase, NekroPlugin
 from nekro_agent.services.plugin.schema import SandboxMethodType
+from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND, require_same_tenant_chat_key
+from nekro_agent.services.resource_scope import resolve_session_owner
+from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
+from nekro_agent.tools.path_convertor import convert_filename_to_sandbox_upload_path, sanitize_chat_key_for_path
+from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text
 
 # 创建插件实例
 plugin = NekroPlugin(
     name="Email适配器工具插件",
     module_name="email_utils",
-    description="邮箱工具插件，提供获取邮箱账户、发送邮件和总结邮件功能",
+    description="邮箱工具插件，提供获取邮箱账户、发送邮件、总结邮件，以及记下用户自己的收件地址、订阅或退订节日邮件",
     version="1.0.0",
     author="liugu",
     url="https://github.com/nekro-agent/nekro-agent",
     # support_adapter=["email", "onebot_v11"],
     is_builtin=True,
     allow_sleep=True,
-    sleep_brief="提供邮箱账户查询、邮件发送、附件转发和邮件总结能力。仅在任务明确涉及邮件时激活。",
+    sleep_brief=(
+        "提供邮箱账户查询、邮件发送、附件转发和邮件总结能力，也能记下用户自己的收件地址、"
+        "订阅或退订节日邮件。仅在任务明确涉及邮件时激活。"
+    ),
 )
 
 
@@ -171,6 +166,41 @@ def _trim_text(text: Optional[str], limit: int = _SUMMARY_CONTENT_LIMIT) -> str:
     return text[:limit] + "..."
 
 
+def _clamp_summary_count(count: Optional[int]) -> int:
+    """把模型给的总结条数夹进配置允许的区间
+
+    模型可以给任意值：0 或负数会让 `LIMIT` 变成"不限条数"（SQLite 与 PG 都接受负数），
+    超大值则一次把上下文窗口与配额掏空。所以这里不信任入参，一律夹到
+    `[1, MAX_EMAILS_FOR_SUMMARY]`；转不成整数（含 None）时取配置值。
+    所有会话共用同一份夹法，不因归属而不同——这条只是防呆，不是权限。
+    """
+    max_count = max(1, int(config.MAX_EMAILS_FOR_SUMMARY))
+    if count is None:
+        return max_count
+    try:
+        value = int(count)
+    except (TypeError, ValueError):
+        return max_count
+    return min(max(value, 1), max_count)
+
+
+async def _model_group_visible_for_tenant(name: str, tenant_id: int) -> bool:
+    """租户会话能不能用这个模型组
+
+    判据与接口层、`video_analysis` 的运行时兜底同源（`can_view_group`）：平台方的 `private`
+    组与别的租户自建的组都算不可见。分组名由模型填，接口层那道"写入时校验"拦不住，
+    所以取用前必须再判一次。
+    """
+    from nekro_agent.schemas.errors import ModelGroupNotFoundError
+    from nekro_agent.services.model_group_service import get_visible_group, runtime_identity
+
+    try:
+        await get_visible_group(name, runtime_identity(tenant_id))
+    except ModelGroupNotFoundError:
+        return False
+    return True
+
+
 def _decode_header_value(value: str) -> str:
     """解码邮件头部值（处理MIME编码）
 
@@ -206,14 +236,46 @@ def _build_onebot_path(host_path: Path) -> Optional[str]:
         return None
 
 
-def _ensure_attachment_path(account_username: str, email_id: str, attachment_filename: str) -> Path:
-    """构造并校验附件在宿主机的路径，防止路径穿越"""
+def _owner_snapshot(view: mail.AccountView) -> Dict[str, str]:
+    """缓存行要匹配的归属快照条件
+
+    `DBEmail` 上的 `owner_adapter_key` / `owner_instance_key` 是**入库时**那个账户归谁。
+    只按地址查会把「地址换了主人之前收的信」也读出来——新主人不该看到旧主人的邮件。
+    平台方账户的两个快照列都是空串，与存量口径一致。
+
+    判据本身在服务层（`mail.owner_snapshot`）；这里留着是为了既有调用点与用例的名字不变。
+    """
+    return mail.owner_snapshot(view)
+
+
+def _ensure_attachment_path(root_dir: str, email_id: str, attachment_filename: str) -> Path:
+    """构造并校验附件在宿主机的路径，防止路径穿越
+
+    `root_dir` 是**账户的附件根目录名**（平台方账户是地址，实例自有账户是表里的
+    `attachment_dir`），由服务层按账户给出，不是模型填的那个账户名。
+
+    三层逐层确认父子关系（账户目录 → 邮件目录 → 文件），而不只是「落在附件总目录里」：
+    `email_id` 与文件名都是模型填的，`../<别的账户>/<UID>` 这种写法仍落在总目录里，却已经
+    走进了别的账户的目录——租户用自己的邮箱就能读到平台方邮箱的附件。
+
+    文件名的清洗与写入那边（适配器 `_download_attachment` → 服务层 `attachment_file_path`）一致：
+    换掉非法字符之后再去首尾空白。少了这一步，首尾带空格的附件名写进去和读出来就是两个名字。
+    """
     if not attachment_filename:
         raise ValueError("附件文件名不能为空")
-    safe_filename = _sanitize_filename(attachment_filename)
+    safe_filename = _sanitize_filename(attachment_filename).strip()
+    uid = str(email_id or "").strip()
+    if not uid or uid in {".", ".."} or Path(uid).name != uid or "/" in uid or "\\" in uid:
+        raise ValueError("非法的附件访问路径")
+    if not safe_filename or safe_filename in {".", ".."}:
+        raise ValueError("非法的附件访问路径")
     base_dir = ATTACHMENT_BASE_DIR.resolve()
-    candidate = (ATTACHMENT_BASE_DIR / account_username / email_id / safe_filename).resolve()
-    if candidate == base_dir or base_dir not in candidate.parents:
+    account_dir = (ATTACHMENT_BASE_DIR / root_dir).resolve()
+    if account_dir.parent != base_dir:
+        raise ValueError("非法的附件访问路径")
+    mail_dir = (account_dir / uid).resolve()
+    candidate = (mail_dir / safe_filename).resolve()
+    if mail_dir.parent != account_dir or candidate.parent != mail_dir:
         raise ValueError("非法的附件访问路径")
     return candidate
 
@@ -255,26 +317,50 @@ async def send_email_attachment(
     """
     # `chat_key` 是模型自由填写的参数：同一租户内允许跨频道，跨租户一律拒绝
     chat_key = await require_same_tenant_chat_key(_ctx, chat_key)
+    # 账户先过可读集合：租户会话读不到平台方邮箱、也读不到别的实例的账户。附件属于邮件内容，
+    # 按"这个账户不存在"回答，且必须在碰文件、调适配器之前挡住——否则报错文案会暴露
+    # 邮箱是不是平台方的
+    accounts = await mail.session_accounts(_ctx)
+    try:
+        view = mail.resolve_readable(accounts, account_username)
+        root_dir = await mail.attachment_root_for(view)
+    except ValueError:
+        return {
+            "success": False,
+            "message": f"发送邮件附件失败: 账户 {account_username} 未连接或不存在",
+            "filename": attachment_filename,
+        }
+
+    # 这封信必须在这个账户的缓存里、附件名也必须在那封信的附件清单里，才去碰文件：
+    # 只按「目录里有没有这个文件」判，等于让模型拿任意 UID / 文件名在账户目录里探测
+    not_found = {
+        "success": False,
+        "message": "发送邮件附件失败: 找不到这封邮件或这个附件",
+        "filename": attachment_filename,
+    }
+    cached = await (await mail.cache_rows_for(view)).get_or_none(email_uid=str(email_id))
+    if cached is None:
+        return not_found
+    try:
+        listed_names = json.loads(cached.attachment_names) if cached.attachment_names else []
+    except (TypeError, ValueError):
+        listed_names = []
+    if attachment_filename not in {str(name) for name in listed_names}:
+        return not_found
 
     def _raise_if_not_exists(path: Path) -> None:
         if not path.exists():
-            raise FileNotFoundError(f"附件文件不存在: {path}")
-
-    def _raise_if_no_adapter_key(key: Optional[str]) -> None:
-        if not key:
-            raise Exception("适配器键未设置")
-
-    def _raise_if_send_failed(resp) -> None:
-        if not resp.success:
-            raise Exception(f"适配器发送失败: {resp.error_message}")
+            # 不带宿主路径：报错原样回给模型
+            raise FileNotFoundError("附件文件不存在（可能还没下载完成）")
 
     try:
-        host_path = _ensure_attachment_path(account_username, email_id, attachment_filename)
+        host_path = _ensure_attachment_path(root_dir, email_id, attachment_filename)
 
         _raise_if_not_exists(host_path)
 
-        # 使用原始文件名（已经经过 _sanitize_filename 清理）
-        safe_filename = attachment_filename
+        # 落盘文件名走与宿主路径同一套清洗：`attachment_filename` 由模型给，直接拼进 `upload_dir`
+        # 能越出上传目录（`../../evil`）；带分隔符的名字还会让下面的沙盒路径还原不回来。
+        safe_filename = _sanitize_filename(attachment_filename).strip()
 
         # 复制文件到目标聊天的上传目录
         # chat_key 由 AI 传入，直接拼进路径可越出上传目录：`../../../../tmp/evil` 配合下面的
@@ -300,29 +386,6 @@ async def send_email_attachment(
             file_data = await f.read()
             mime_type = magic.from_buffer(file_data, mime=True)
             is_image = mime_type.startswith("image/")
-
-        # 构造发送请求
-        data_dir = Path(OsEnv.DATA_DIR).resolve()
-        relative_path = Path(data_dir.name) / target_path.relative_to(data_dir)
-
-        segment_type = PlatformSendSegmentType.IMAGE if is_image else PlatformSendSegmentType.FILE
-        request = PlatformSendRequest(
-            chat_key=chat_key,
-            segments=[
-                PlatformSendSegment(
-                    type=segment_type,
-                    file_path=str(relative_path),  # 使用相对路径
-                ),
-            ],
-        )
-
-        # 获取适配器并发送
-        _raise_if_no_adapter_key(_ctx.adapter_key)
-        assert _ctx.adapter_key is not None  # Type narrowing for Pylance
-        adapter = adapter_utils.get_adapter(_ctx.adapter_key)
-        response = await adapter.forward_message(request)
-
-        _raise_if_send_failed(response)
     except Exception as e:
         logger.error(f"发送邮件附件失败: {e}")
         return {
@@ -330,12 +393,67 @@ async def send_email_attachment(
             "message": f"发送邮件附件失败: {e!s}",
             "filename": attachment_filename,
         }
-    else:
+
+    # 投递走插件推送方法：目标频道上 email_utils 不生效时它返回 False，此时按「频道不存在」处理，
+    # 与跨频道越权的口径一致（回一个"发送失败"会让模型以为重试就能成）。
+    # 文件的沙盒路径由 target_path 反推（`/app/uploads/<文件名>`），下游会再还原成同一个宿主机路径。
+    sandbox_path = str(convert_filename_to_sandbox_upload_path(target_path))
+    sent = False
+    send_error: Optional[str] = None
+    try:
+        if is_image:
+            sent = await plugin.send_image(chat_key, sandbox_path, _ctx, record=False)
+        else:
+            sent = await plugin.send_file(chat_key, sandbox_path, _ctx, record=False)
+    except Exception as e:
+        # 下游发送失败仍是原来的"失败字典"，不改变模型看到的错误形态
+        send_error = str(e)
+
+    if send_error is not None:
+        logger.error(f"发送邮件附件失败: {send_error}")
         return {
-            "success": True,
-            "message": f"附件已发送: {attachment_filename}",
+            "success": False,
+            "message": f"发送邮件附件失败: {send_error}",
             "filename": attachment_filename,
         }
+    if not sent:
+        raise ValueError(CHANNEL_NOT_FOUND)
+    return {
+        "success": True,
+        "message": f"附件已发送: {attachment_filename}",
+        "filename": attachment_filename,
+    }
+
+
+def _account_item(view: mail.AccountView, *, tenant_viewer: bool) -> Dict[str, Any]:
+    """一个账户在清单里的一项
+
+    租户会话里的平台方账户只给显示名与引用：地址与服务商是平台方的授权，租户没有；
+    `readable` 恒为假，读邮件的方法对它一律按"不存在"回答。
+    """
+    if tenant_viewer and view.kind == mail.KIND_PLATFORM:
+        return {
+            "display_label": mail.visible_label_for(view, tenant_viewer=True),
+            "account_ref": view.ref,
+            "send_enabled": view.send_enabled,
+            "readable": False,
+            "is_default_sender": view.is_default_sender,
+        }
+    # `display_label` 在没填显示名时退成了地址；`display_name` 字段要与改造前一样给原样的显示名（没填就空）
+    display_name = (view.display_label or "").strip()
+    if display_name == view.username:
+        display_name = ""
+    label = f"{display_name} ({view.username})" if display_name and view.username else (display_name or view.username)
+    return {
+        "display_name": display_name,
+        "display_label": label,
+        "email_address": view.username,
+        "provider": view.provider,
+        "send_enabled": view.send_enabled,
+        "is_default_sender": view.is_default_sender,
+        "readable": view.readable,
+        "account_ref": view.ref,
+    }
 
 
 @plugin.mount_sandbox_method(
@@ -345,61 +463,44 @@ async def send_email_attachment(
 )
 async def get_email_accounts(_ctx: AgentCtx) -> List[Dict[str, Any]]:
     """
-    获取当前系统配置的所有邮箱账户信息。
+    获取这次会话能用到的邮箱账户（能读的与能发信的合起来，按账户去重）。
 
-    此方法返回所有已启用的邮箱账户列表，包括账户的基本信息和状态。
-    可用于查看当前有哪些可用的邮箱账户，以及哪些账户可以用于发送邮件。
+    每一项里的 `account_ref` 可以原样填进 `send_email` 的 `from_account`（也能填地址）；
+    `readable` 为假的账户**只能用来发信**：读邮件、总结、转发附件都用不了它。
 
     注意:
-        - 只返回已启用的邮箱账户（ENABLED=True）
-        - 未启用的账户不会出现在返回列表中
+        - 只返回已启用的账户
+        - 租户实例的会话里，平台方提供的邮箱只给显示名与 `account_ref`，不含地址与服务商；
+          这类账户 `readable` 为假，读邮件的方法对它一律按"不存在"回答
+        - 本实例自己的邮箱（地址、服务商照给）在列表前面
 
     返回:
-        List[Dict[str, Any]]: 邮箱账户列表，每个账户包含以下字段:
+        List[Dict[str, Any]]: 账户列表。本实例的账户与平台方实例看到的账户包含：
             - display_name (str): 用户配置的账户显示名称
             - display_label (str): 展示用账户标签
             - email_address (str): 邮箱地址
             - provider (str): 邮箱服务商名称（如 "QQ邮箱"、"163邮箱"）
             - send_enabled (bool): 是否启用发信功能
-            - is_default_sender (bool): 是否为默认发件人
+            - is_default_sender (bool): 是不是这次会话的默认发件人
+            - readable (bool): 能不能读它的收件箱
+            - account_ref (str): 不透明引用，可填进 `send_email` 的 `from_account`
+
+        租户实例的会话里，平台方提供的邮箱只有
+        `display_label` / `account_ref` / `send_enabled` / `readable` / `is_default_sender`，
+        `display_label` 只是个能让人挑的显示名，不含地址与服务商。
     """
-    def _raise_if_no_adapter(adapter) -> None:
-        if not adapter:
-            raise Exception("邮箱适配器未启用或未找到")
+    accounts = await mail.session_accounts(_ctx)
+    tenant_viewer = not accounts.is_platform_instance
 
-    def _build_display_label(account: EmailAccount) -> str:
-        display_name = account.DISPLAY_NAME.strip()
-        if display_name and account.USERNAME:
-            return f"{display_name} ({account.USERNAME})"
-        return display_name or account.USERNAME or account.EMAIL_ACCOUNT
-
-    try:
-        # 获取邮箱适配器
-        email_adapter = adapter_utils.get_adapter("email")
-        _raise_if_no_adapter(email_adapter)
-
-        # 获取配置
-        config = email_adapter.config
-    except Exception as e:
-        logger.error(f"获取邮箱账户信息失败: {e}")
-        raise
-    else:
-        # 返回账户信息
-        accounts = []
-        for account in config.RECEIVE_ACCOUNTS:
-            if account.ENABLED:
-                accounts.append(
-                    {
-                        "display_name": account.DISPLAY_NAME,
-                        "display_label": _build_display_label(account),
-                        "email_address": account.USERNAME,
-                        "provider": account.EMAIL_ACCOUNT,
-                        "send_enabled": account.SEND_ENABLED,
-                        "is_default_sender": account.IS_DEFAULT_SENDER,
-                    },
-                )
-
-        return accounts
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    # 顺序：自有（可读的）在前，其次平台方共享的；同一账户只出现一次
+    for view in [*accounts.readable, *accounts.sendable]:
+        if view.ref in seen:
+            continue
+        seen.add(view.ref)
+        items.append(_account_item(view, tenant_viewer=tenant_viewer))
+    return items
 
 
 @plugin.mount_sandbox_method(
@@ -412,99 +513,134 @@ async def send_email(
     to_address: str,
     subject: str,
     content: str,
+    reason: str,
     from_account: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     使用指定或默认的发件人账户发送邮件。
 
-    此方法通过 SMTP 协议发送邮件，支持自动选择发件人账户。如果不指定发件人，
-    系统会按以下顺序查找：默认发件人 > 第一个启用发信的账户。
+    此方法通过 SMTP 协议发送邮件。不指定发件人时：本实例有自己的发信邮箱就用它（默认发件人
+    优先），没有就用平台方共享给本实例的邮箱（默认发件人优先）。
+
+    **发信理由（`reason`）是必填的**：写清「为什么这个人需要收到这封信」（谁提出的、为了什么事）。
+    理由会原样写进发信记录，平台方在后台看得到——它是事后判断「该不该发」的唯一依据。
+
+    遇到下面这些情况应当拒绝发送，并把拒绝的原因告诉提出要求的人：
+        - 群发广告、推销，或同一内容批量发给很多地址；
+        - 骚扰、辱骂、恐吓，或对方明确说过不想再收到；
+        - 冒充平台方、冒充别人（包括冒充提出要求的人以外的群友）；
+        - 发给没有主动要过邮件的陌生地址（地址不是收件人本人在对话里给出的，或来路不明）；
+        - 内容涉及别人的隐私（别人的联系方式、住址、聊天记录、照片等）。
 
     注意:
-        - 发件人账户必须启用发信功能（SEND_ENABLED=True）
+        - 发件人账户必须启用发信功能；`from_account` 可以是地址，也可以是 `get_email_accounts`
+          给出的 `account_ref`
         - 邮件内容为纯文本格式，不支持 HTML
-        - 系统会自动尝试使用 SSL 或 TLS 连接
-        - 确保发件人账户的密码/授权码正确配置
+        - 每次发送（成功或失败）都会留下一条发信记录
 
     参数:
         to_address (str): 收件人邮箱地址，必须是有效的邮箱格式
         subject (str): 邮件主题，不能为空
         content (str): 邮件正文内容，纯文本格式
-        from_account (str, 可选): 发件人邮箱地址，不指定则使用默认发件人
+        reason (str): 发信理由，1 ~ 200 字，必填
+        from_account (str, 可选): 发件人地址或 `account_ref`，不指定则使用默认发件人
 
     返回:
         Dict[str, Any]: 包含以下字段的字典:
             - success (bool): 发送是否成功
             - message (str): 操作结果描述
-            - from (str): 实际使用的发件人地址
+            - from (str): 实际使用的发件人（平台方邮箱在租户会话里是显示名，不含地址）
             - to (str): 收件人地址
             - subject (str): 邮件主题
     """
-    def _raise_if_no_adapter(adapter) -> None:
-        if not adapter:
-            raise Exception("邮箱适配器未启用或未找到")
-
-    def _raise_if_no_sender(sender) -> None:
-        if not sender:
-            raise Exception("没有找到可用的发件人账户")
-
-    try:
-        # 获取邮箱适配器
-        email_adapter = adapter_utils.get_adapter("email")
-        _raise_if_no_adapter(email_adapter)
-
-        # 获取配置
-        email_config = email_adapter.config
-
-        # 查找发件人账户
-        sender_account: Optional[EmailAccount] = None
-        if from_account:
-            for account in email_config.RECEIVE_ACCOUNTS:
-                if from_account == account.USERNAME and account.SEND_ENABLED:
-                    sender_account = account
-                    break
-        else:
-            # 查找默认发件人
-            for account in email_config.RECEIVE_ACCOUNTS:
-                if account.SEND_ENABLED and account.IS_DEFAULT_SENDER:
-                    sender_account = account
-                    break
-            # 如果没有默认发件人，则使用第一个启用发信的账户
-            if not sender_account:
-                for account in email_config.RECEIVE_ACCOUNTS:
-                    if account.SEND_ENABLED:
-                        sender_account = account
-                        break
-
-        _raise_if_no_sender(sender_account)
-        assert sender_account is not None  # Type narrowing for Pylance
-
-        # 创建邮件
-        msg = MIMEMultipart()
-        msg["From"] = sender_account.USERNAME
-        msg["To"] = to_address
-        msg["Subject"] = subject
-        msg.attach(MIMEText(content, "plain", "utf-8"))
-
-        client = email_adapter.email_clients.get(sender_account.USERNAME) or email_adapter._create_email_client(sender_account)
-        await client.send_message(msg)
-    except Exception as e:
-        logger.error(f"发送邮件失败: {e}")
+    # 理由先判、且不碰 SMTP、不写记录：被拒的这次尝试没有发生过任何对外动作
+    clean_reason = str(reason or "").strip()
+    if not clean_reason:
         return {
             "success": False,
-            "message": f"邮件发送失败: {e!s}",
+            "message": "请写明发信理由",
             "from": from_account or "unknown",
             "to": to_address,
             "subject": subject,
         }
-    else:
+    if len(clean_reason) > 200:
         return {
-            "success": True,
-            "message": "邮件发送成功",
-            "from": sender_account.USERNAME,
+            "success": False,
+            "message": "发信理由请控制在 200 字以内",
+            "from": from_account or "unknown",
             "to": to_address,
             "subject": subject,
         }
+
+    accounts = await mail.session_accounts(_ctx)
+    owner = await resolve_session_owner(_ctx)
+    tenant_viewer = not accounts.is_platform_instance
+
+    # 发件人不在可发集合里与「一个能用的都没有」逐字相同：模型分不出"没有"和"不是你的"
+    try:
+        sender = mail.resolve_sendable(accounts, from_account)
+    except ValueError as e:
+        # 「邮件发送失败: 」前缀与改造前逐字相同（那时找不到发件人也是抛进同一个 except）
+        return {
+            "success": False,
+            "message": f"邮件发送失败: {e}",
+            "from": from_account or "unknown",
+            "to": to_address,
+            "subject": subject,
+        }
+
+    # 回显用的发件人：租户会话看平台方邮箱只给显示名，否则返回值就是第二条泄漏地址的路；
+    # 其余情形与改造前相同，回地址
+    sender_label = (
+        mail.visible_label_for(sender, tenant_viewer=True)
+        if tenant_viewer and sender.kind == mail.KIND_PLATFORM
+        else sender.username
+    )
+
+    ok = False
+    error_text = ""
+    try:
+        await mail.send_via_account(sender, to_address=to_address, subject=subject, content=content)
+    except Exception as e:  # noqa: BLE001 - 失败也要留记录，文案按调用方身份给
+        # 实例自有邮箱（服务器可能是租户填的）：模型与发信记录里都只留归类后的一句，原始异常只进日志——
+        # 「拒绝连接」与「超时」、对端核对报出的地址，都能拿来探测 NA 所在的内网。
+        # 平台方邮箱的记录照旧存原文（租户看那几行时由后台接口清空，见 `instance_email.list_send_logs`）
+        error_text = mail.public_mail_failure(e) if sender.kind == mail.KIND_INSTANCE else str(e)
+        logger.error(f"发送邮件失败: account={sender.ref}, to={to_address} | {type(e).__name__}: {e}")
+    else:
+        ok = True
+
+    await mail.record_send(
+        account=sender,
+        adapter_key=accounts.adapter_key,
+        instance_key=accounts.instance_key,
+        chat_key=owner.chat_key,
+        tenant_id=owner.tenant_id,
+        purpose=mail.PURPOSE_SEND_EMAIL,
+        to_address=to_address,
+        subject=subject,
+        reason=clean_reason,
+        ok=ok,
+        error=error_text,
+    )
+
+    if ok:
+        return {
+            "success": True,
+            "message": "邮件发送成功",
+            "from": sender_label,
+            "to": to_address,
+            "subject": subject,
+        }
+    # 平台方邮箱的 SMTP 报错里可能带平台方的服务器与地址：租户会话只给一句能转告的话
+    message = "邮件发送失败，请稍后再试或联系平台方" if tenant_viewer and sender.kind == mail.KIND_PLATFORM else f"邮件发送失败: {error_text}"
+    return {
+        "success": False,
+        "message": message,
+        "from": sender_label,
+        "to": to_address,
+        "subject": subject,
+    }
 
 
 @plugin.mount_sandbox_method(
@@ -554,25 +690,39 @@ async def summarize_recent_emails(
             raise Exception("没有找到符合条件的邮箱账户")
 
     try:
+        # 模型给的条数不可信：夹进配置区间（所有会话共用这一份夹法）
+        count = _clamp_summary_count(count)
+
+        # 这次调用是不是在租户实例的会话里：账户、模型组都按它决定给不给
+        owner = await resolve_session_owner(_ctx)
+
+        # 模型组名是模型填的，接口层"写入时校验"拦不住：只有调用方显式指定时才判归属，
+        # 默认值来自插件配置（配置写入时已经过一次同源校验）。
+        # 不可见与不存在必须同文，否则调用方能拿报错差异探测平台方配了哪些组。
+        if model_group is not None and not owner.platform:
+            visible = owner.tenant_id is not None and await _model_group_visible_for_tenant(model_group, owner.tenant_id)
+            if not visible:
+                raise Exception(f"模型组 '{model_group}' 未找到，请检查配置")
+
         # 使用插件配置中的默认值
         if model_group is None:
             model_group = config.DEFAULT_SUMMARY_MODEL_GROUP
-        if count is None:
-            count = config.MAX_EMAILS_FOR_SUMMARY
 
         # 获取邮箱适配器
         base_adapter = adapter_utils.get_adapter("email")
         _raise_if_no_adapter(base_adapter)
         email_adapter = cast(EmailAdapter, base_adapter)
 
-        # 获取配置
-        email_config = email_adapter.config
-
-        # 筛选账户
-        accounts_to_check = []
-        for account in email_config.RECEIVE_ACCOUNTS:
-            if account.ENABLED and (account_filter is None or account_filter == account.USERNAME):
-                accounts_to_check.append(account)
+        # 账户只在这次会话的**可读**集合里挑：`account_filter` 可以是地址、`account_ref`
+        # 或显示名；不在里面与填了一个不存在的账户逐字相同——模型分不出"没有"和"不是你的"
+        session = await mail.session_accounts(_ctx)
+        if account_filter is None or not str(account_filter).strip():
+            accounts_to_check = list(session.readable)
+        else:
+            try:
+                accounts_to_check = [mail.resolve_readable(session, str(account_filter))]
+            except ValueError:
+                accounts_to_check = []
 
         _raise_if_no_accounts(accounts_to_check)
 
@@ -586,13 +736,10 @@ async def summarize_recent_emails(
         # 优先从本地缓存查询
         cache_hit = False
         try:
-            from nekro_agent.models.db_email import DBEmail
-
-            for account in accounts_to_check:
-                cached = await DBEmail.filter(
-                    account_username=account.USERNAME,
-                    date__gte=one_day_ago,
-                ).order_by("-date").limit(count)
+            for view in accounts_to_check:
+                # 归属条件只从服务层取（`cache_rows_for`）：插件与后台各拼一份条件时，
+                # 只要有一边漏了一列，租户就能读到别人的缓存
+                cached = await (await mail.cache_rows_for(view)).filter(date__gte=one_day_ago).order_by("-date").limit(count)
                 for c in cached:
                     import json
 
@@ -611,10 +758,12 @@ async def summarize_recent_emails(
         except Exception as cache_err:
             logger.debug(f"缓存查询失败，回退到 IMAP: {cache_err}")
 
-        # 缓存未命中时走原有 IMAP 逻辑
+        # 缓存未命中时走 IMAP。**只对这次会话可读集合里的账户**走这条路，且账户必须已经在
+        # 适配器的收信连接池里（平台方账户与实例自有账户共用那个池）：不在池里就只查缓存，
+        # 否则会拿别人的连接去读这个地址的信
         if not cache_hit:
-            for account in accounts_to_check:
-                account_username = account.USERNAME
+            for view in accounts_to_check:
+                account_username = view.username
                 if account_username in email_adapter.imap_connections:
                     # 获取该账户的锁，确保IMAP操作的线程安全
                     lock = email_adapter.imap_locks.get(account_username)
@@ -750,6 +899,10 @@ def _email_summary_result(summary_text: str, email_count: int) -> UntrustedToolR
     )
 
 
+class _ContentLookupError(Exception):
+    """`get_email_content` 自己判出来的失败（账户不存在、没连上、数据不对）：文案原样交给模型"""
+
+
 def _sanitize_filename(filename: str) -> str:
     illegal_chars = '<>:"/\\|?*'
     for ch in illegal_chars:
@@ -856,25 +1009,10 @@ async def _fetch_email_content(_ctx: AgentCtx, conn, account_username, email_id,
                                 for part, encoding in decoded_parts
                             ],
                         )
-                        # email_id 应该是 bytes 类型，需要解码为字符串
-                        email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
-                        host_path = _ensure_attachment_path(account_username, email_id_str, filename)
-                        onebot_server_path = None
-                        if core_config.SANDBOX_ONEBOT_SERVER_MOUNT_DIR:
-                            try:
-                                data_dir = Path(OsEnv.DATA_DIR).resolve()
-                                rel = os.path.relpath(str(host_path), str(data_dir))
-                                onebot_server_path = str(Path(core_config.SANDBOX_ONEBOT_SERVER_MOUNT_DIR) / rel)
-                            except Exception:
-                                onebot_server_path = None
-
-                        attachments.append(
-                            {
-                                "filename": filename,
-                                "host_path": str(host_path),
-                                "onebot_server_path": onebot_server_path,
-                            },
-                        )
+                        # 总结只用得到文件名（与走缓存那条路同形）。这里原先拿**地址**拼附件路径：
+                        # 实例自有账户的附件目录是表里的 `attachment_dir`（`_i<id>`），拼出来的是错路径，
+                        # 还把宿主路径带进了返回值。附件路径由 `get_email_content` 按账户的目录给
+                        attachments.append({"filename": filename})
 
         # email_id 应该是 bytes 类型，需要解码为字符串
         email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
@@ -939,29 +1077,37 @@ async def get_email_content(_ctx: AgentCtx, account_username: str, email_id: str
     """
     def _raise_if_no_adapter(adapter) -> None:
         if not adapter:
-            raise Exception("邮箱适配器未启用或未找到")
+            raise _ContentLookupError("邮箱适配器未启用或未找到")
 
     def _raise_if_account_not_connected(username: str, clients: dict) -> None:
         if username not in clients:
-            raise Exception(f"账户 {username} 未连接或不存在")
+            raise _ContentLookupError(f"账户 {username} 未连接或不存在")
 
     def _raise_if_invalid_type(raw: Any, eid: str) -> None:
         if not isinstance(raw, bytes) or not raw:
-            raise TypeError(f"邮件 {eid} 数据类型错误")
+            raise _ContentLookupError(f"邮件 {eid} 数据类型错误")
 
     try:
+        # 账户先过这次会话的**可读**集合：租户会话读不到平台方邮箱、也读不到别的实例的账户。
+        # 必须在查缓存之前——缓存里有邮件正文，先读缓存再判归属等于给了另一条读的口子；
+        # 文案与平台方会话查一个不存在、也没缓存的账户逐字相同，模型分不出"没有"和"不是你的"
+        session = await mail.session_accounts(_ctx)
+        try:
+            view = mail.resolve_readable(session, account_username)
+        except ValueError:
+            raise _ContentLookupError(f"账户 {account_username} 未连接或不存在") from None
+        root_dir = await mail.attachment_root_for(view)
+
         # 优先查询本地缓存
         try:
-            from nekro_agent.models.db_email import DBEmail
-
-            cache = await DBEmail.get_or_none(account_username=account_username, email_uid=email_id)
+            cache = await (await mail.cache_rows_for(view)).get_or_none(email_uid=email_id)
             if cache:
                 import json
 
                 attachment_names_cached: list = json.loads(cache.attachment_names) if cache.attachment_names else []
                 attachments_list = []
                 for fname in attachment_names_cached:
-                    host_path = _ensure_attachment_path(account_username, email_id, fname)
+                    host_path = _ensure_attachment_path(root_dir, email_id, fname)
                     onebot_server_path = _build_onebot_path(host_path)
                     attachments_list.append({"filename": fname, "onebot_server_path": onebot_server_path})
 
@@ -983,24 +1129,25 @@ async def get_email_content(_ctx: AgentCtx, account_username: str, email_id: str
         except Exception as cache_err:
             logger.debug(f"缓存查询失败，回退到 IMAP: {cache_err}")
 
-        # 获取邮箱适配器
+        # 缓存里没有：回退到 IMAP。走适配器的收信连接池（平台方账户与实例自有账户共用），
+        # 账户不在池里就没得回退——那与「查了一个不存在的账户」回同一句，模型分不出区别
         base_adapter = adapter_utils.get_adapter("email")
         _raise_if_no_adapter(base_adapter)
         email_adapter = cast(EmailAdapter, base_adapter)
 
         # 检查账户是否存在且已连接
-        _raise_if_account_not_connected(account_username, email_adapter.email_clients)
+        _raise_if_account_not_connected(view.username, email_adapter.email_clients)
 
         # 获取该账户的锁，确保邮件客户端操作的线程安全
-        lock = email_adapter.imap_locks.get(account_username)
+        lock = email_adapter.imap_locks.get(view.username)
         if not lock:
             # 如果锁不存在，这是初始化/重连的不一致状态，按需创建避免静默降级
-            logger.error(f"账户 {account_username} 的锁不存在，将为该账户创建新的锁（可能存在初始化/重连不一致）")
+            logger.error(f"账户 {view.username} 的锁不存在，将为该账户创建新的锁（可能存在初始化/重连不一致）")
             lock = asyncio.Lock()
-            email_adapter.imap_locks[account_username] = lock
+            email_adapter.imap_locks[view.username] = lock
 
         async with lock:
-            raw_content = await email_adapter.email_clients[account_username].get_raw_email_content(email_id)
+            raw_content = await email_adapter.email_clients[view.username].get_raw_email_content(email_id)
             raw_email = base64.b64decode(raw_content.raw_email_base64) if raw_content.raw_email_base64 else b""
             _raise_if_invalid_type(raw_email, email_id)
 
@@ -1115,7 +1262,7 @@ async def get_email_content(_ctx: AgentCtx, account_username: str, email_id: str
                             ],
                         )
                         attachment_names.append(filename)
-                        host_path = _ensure_attachment_path(account_username, email_id, filename)
+                        host_path = _ensure_attachment_path(root_dir, email_id, filename)
                         onebot_server_path = None
                         if core_config.SANDBOX_ONEBOT_SERVER_MOUNT_DIR:
                             try:
@@ -1146,5 +1293,199 @@ async def get_email_content(_ctx: AgentCtx, account_username: str, email_id: str
             "attachments": attachments,
         })
     except Exception as e:
-        logger.error(f"获取邮件内容失败: {e}")
-        raise Exception(f"获取邮件内容失败: {e!s}") from e
+        logger.error(f"获取邮件内容失败: {type(e).__name__}: {e}")
+        # 自己判出来的（账户不存在、没连上、数据不对）原样说；收信服务器那边的错误（实例自有邮箱的服务器
+        # 可能是租户填的）只给归类后的一句——原始报错里有对端回的内容，分得出连接被拒与超时
+        detail = str(e) if isinstance(e, _ContentLookupError) else mail.public_mail_failure(e)
+        raise Exception(f"获取邮件内容失败: {detail}") from e
+
+
+# ===== 用户自己的邮件偏好 =====
+#
+# 这三个方法都**没有用户 ID 参数**：身份一律取宿主记下的「本轮发言人」（`session_speaker`），
+# 会话取 `resolve_session_owner` 解析出来的那一个。模型填的任何用户 ID 都不认——否则群友能让
+# Bot 把别人的祝福改投到自己的邮箱、或者替别人退订。
+
+
+def _pref_failure(message: str) -> Dict[str, Any]:
+    return {"success": False, "message": message}
+
+
+@plugin.mount_sandbox_method(
+    method_type=SandboxMethodType.TOOL,
+    name="set_my_mail_preference",
+    description="记下正在说话的这个人自己的收件地址、订阅或退订节日邮件",
+)
+async def set_my_mail_preference(
+    _ctx: AgentCtx,
+    email: Optional[str] = None,
+    festival: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    记下**正在说话的这个人自己**的收件地址、订阅或退订节日祝福邮件。
+
+    这些方法只改正在说话的这个人自己的设置，不能替别人改。只有用户在这一轮里明确要求重新订阅时
+    才能传 `subscribe`，不得因为别的原因、也不得替别人改回。
+
+    参数:
+        email (str, 可选): 收件地址；传空串表示清掉已记下的地址（回到默认地址）
+        festival (str, 可选): `subscribe` 表示订阅节日邮件，`unsubscribe` 表示退订
+
+    返回:
+        Dict[str, Any]: `success` 与 `message`
+    """
+    if email is None and festival is None:
+        return _pref_failure("请至少说明要改地址还是订阅 / 退订")
+
+    try:
+        speaker = await mail.session_speaker(_ctx)
+    except ValueError as e:
+        return _pref_failure(str(e))
+
+    new_email: Optional[str] = None
+    if email is not None:
+        if str(email).strip():
+            try:
+                new_email = mail.validate_mail_address(str(email))
+            except ValueError as e:
+                return _pref_failure(str(e))
+        else:
+            new_email = ""
+
+    action: Optional[str] = None
+    if festival is not None:
+        action = str(festival).strip().lower()
+        if action not in ("subscribe", "unsubscribe"):
+            return _pref_failure("节日邮件只能订阅或退订")
+
+    pref = await DBEmailUserPref.get_or_none(
+        adapter_key=speaker.adapter_key,
+        instance_key=speaker.instance_key,
+        platform_userid=speaker.platform_userid,
+    )
+    if pref is None:
+        pref = DBEmailUserPref(
+            adapter_key=speaker.adapter_key,
+            instance_key=speaker.instance_key,
+            platform_userid=speaker.platform_userid,
+        )
+
+    if new_email is not None:
+        pref.email = new_email
+    if action == "subscribe":
+        pref.festival_subscribed = True
+        pref.unsubscribed = False
+        pref.unsubscribed_at = None
+    elif action == "unsubscribe":
+        pref.festival_subscribed = False
+        pref.unsubscribed = True
+        pref.unsubscribed_at = db_now()
+    pref.set_in_chat_key = speaker.chat_key
+    await pref.save()
+
+    if action is not None:
+        logger.info(
+            f"用户邮件偏好：{action} 节日邮件 | 实例={speaker.adapter_key}/{speaker.instance_key} | "
+            f"账号={speaker.platform_userid} | 频道={speaker.chat_key}",
+        )
+
+    parts: List[str] = []
+    if new_email is not None:
+        if new_email:
+            parts.append(f"记下了你的收件地址：{mail.mask_email_address(new_email)}")
+        else:
+            parts.append("清掉了你记下的收件地址")
+    if action == "subscribe":
+        parts.append("已订阅节日邮件")
+    elif action == "unsubscribe":
+        parts.append("已退订节日邮件，之后不会再给你发")
+    return {"success": True, "message": "；".join(parts)}
+
+
+def _shown_address(address: str, *, is_private: bool) -> str:
+    """地址的显示形式：私聊里给完整的，群里只给遮掩后的
+
+    这一行字会落成 SYSTEM 消息、群友看得到，所以群里一律遮掩——不遮掩等于把本人的邮箱
+    念给整个群听。
+    """
+    if is_private:
+        return address
+    return mail.mask_email_address(address)
+
+
+@plugin.mount_sandbox_method(
+    method_type=SandboxMethodType.AGENT,
+    name="get_my_mail_preference",
+    description="查看正在说话的这个人自己的邮件偏好",
+)
+async def get_my_mail_preference(_ctx: AgentCtx) -> str:
+    """
+    查看**正在说话的这个人自己**的邮件偏好：收件地址、有没有订阅节日邮件、有没有退订。
+
+    私聊里回显完整地址；群里只回遮掩后的地址（群里其他人不该从这行字里拿到别人的邮箱）。
+    没有记过地址时会说明节日邮件会发到哪个默认地址，或者说明没有可用的收件地址。
+    """
+    try:
+        speaker = await mail.session_speaker(_ctx)
+    except ValueError as e:
+        return str(e)
+
+    pref = await DBEmailUserPref.get_or_none(
+        adapter_key=speaker.adapter_key,
+        instance_key=speaker.instance_key,
+        platform_userid=speaker.platform_userid,
+    )
+
+    saved = str(pref.email or "").strip() if pref is not None else ""
+    if saved:
+        address_line = f"你记下的收件地址是 {_shown_address(saved, is_private=speaker.is_private)}"
+    else:
+        fallback = mail.default_festival_address(speaker.adapter_key, speaker.platform_userid)
+        address_line = (
+            f"你没有记下收件地址，节日邮件会发到默认地址 {_shown_address(fallback, is_private=speaker.is_private)}"
+            if fallback
+            else "没有可用的收件地址，收不到节日邮件"
+        )
+
+    if pref is not None and pref.unsubscribed:
+        state_line = "你已经退订了节日邮件，现在不会给你发"
+    elif pref is not None and pref.festival_subscribed:
+        state_line = "你订阅了节日邮件"
+    else:
+        state_line = "你没有订阅节日邮件"
+    return f"{address_line}；{state_line}。"
+
+
+@plugin.mount_sandbox_method(
+    method_type=SandboxMethodType.TOOL,
+    name="forget_my_mail_preference",
+    description="忘掉正在说话的这个人自己的邮件偏好",
+)
+async def forget_my_mail_preference(_ctx: AgentCtx) -> Dict[str, Any]:
+    """
+    忘掉**正在说话的这个人自己**的邮件偏好。
+
+    退订过的人只清掉地址与订阅，退订标记保留：删一次偏好不能等于把他重新订阅回来。
+    """
+    try:
+        speaker = await mail.session_speaker(_ctx)
+    except ValueError as e:
+        return _pref_failure(str(e))
+
+    pref = await DBEmailUserPref.get_or_none(
+        adapter_key=speaker.adapter_key,
+        instance_key=speaker.instance_key,
+        platform_userid=speaker.platform_userid,
+    )
+    if pref is None:
+        return {"success": True, "message": "没有记下过你的邮件偏好"}
+
+    if pref.unsubscribed:
+        pref.email = ""
+        pref.festival_subscribed = False
+        pref.set_in_chat_key = speaker.chat_key
+        await pref.save(update_fields=["email", "festival_subscribed", "set_in_chat_key", "update_time"])
+        return {"success": True, "message": "忘掉了你记下的地址与订阅；退订状态保留，之后不会再给你发节日邮件"}
+
+    await pref.delete()
+    return {"success": True, "message": "忘掉了你的邮件偏好"}

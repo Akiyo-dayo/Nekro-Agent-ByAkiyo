@@ -18,6 +18,8 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import ChatChannelList from './components/ChatChannelList'
 import ChatChannelDetail from './components/ChatChannelDetail'
+import BotMembershipCheckDialog from './components/BotMembershipCheckDialog'
+import BotMembershipDisableDialog from './components/BotMembershipDisableDialog'
 import { CARD_VARIANTS } from '../../theme/variants'
 import { useTranslation } from 'react-i18next'
 import SearchField from '../../components/common/SearchField'
@@ -57,19 +59,34 @@ export default function ChatChannelPage() {
   const [search, setSearch] = useState(() => sessionStorage.getItem('chatChannel.search') ?? '')
   const [chatType, setChatType] = useState(() => sessionStorage.getItem('chatChannel.chatType') ?? '')
   const [status, setStatus] = useState(() => sessionStorage.getItem('chatChannel.status') ?? '')
+  const [botMembershipFilter, setBotMembershipFilter] = useState(
+    () => sessionStorage.getItem('chatChannel.botMembership') ?? '',
+  )
+  const [checkDialogOpen, setCheckDialogOpen] = useState(false)
+  const [disableDialogOpen, setDisableDialogOpen] = useState(false)
 
   useEffect(() => { sessionStorage.setItem('chatChannel.search', search) }, [search])
   useEffect(() => { sessionStorage.setItem('chatChannel.chatType', chatType) }, [chatType])
   useEffect(() => { sessionStorage.setItem('chatChannel.status', status) }, [status])
+  useEffect(() => {
+    sessionStorage.setItem('chatChannel.botMembership', botMembershipFilter)
+  }, [botMembershipFilter])
 
   // 延迟搜索值，避免每次按键都触发请求
   const deferredSearch = useDeferredValue(search)
 
-  const { currentInstanceKey, instances } = useInstanceScope()
-  const { isPlatformOwner } = useIdentity()
+  const { currentInstanceKey, currentInstance, instances } = useInstanceScope()
+  const { isPlatformOwner, isReadOnly } = useIdentity()
+
+  const onebotInstances = useMemo(
+    () => instances.filter(instance => instance.adapter_key === 'onebot_v11'),
+    [instances],
+  )
+  const canCheckMembership = onebotInstances.length > 0 && !isReadOnly
+  const canDisableNotInGroup = botMembershipFilter === 'not_in_group' && !isReadOnly
 
   const { data, isLoading } = useQuery({
-    queryKey: [CHAT_CHANNEL_LIST_KEY, deferredSearch, chatType, status, currentInstanceKey],
+    queryKey: [CHAT_CHANNEL_LIST_KEY, deferredSearch, chatType, status, botMembershipFilter, currentInstanceKey],
     queryFn: () =>
       chatChannelApi.getList({
         page: 1,
@@ -77,6 +94,7 @@ export default function ChatChannelPage() {
         search: deferredSearch || undefined,
         chat_type: chatType || undefined,
         status: status === '' ? undefined : status as ChatChannel['status'],
+        bot_membership: botMembershipFilter === 'not_in_group' ? 'not_in_group' : undefined,
       }),
     staleTime: 30_000,
   })
@@ -224,7 +242,33 @@ export default function ChatChannelPage() {
                 { value: 'disabled', label: t('filters.inactive') },
               ]}
             />
+            <FilterSelect
+              label={t('filters.botMembership')}
+              value={botMembershipFilter}
+              onChange={setBotMembershipFilter}
+              sx={{ minWidth: 0, flex: 1 }}
+              options={[
+                { value: '', label: t('filters.all') },
+                { value: 'not_in_group', label: t('filters.botNotInGroup') },
+              ]}
+            />
           </Stack>
+
+          {/* 核对与批量停用：窄屏时按钮换行，不把筛选区撑破 */}
+          {(canCheckMembership || canDisableNotInGroup) && (
+            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              {canCheckMembership && (
+                <ActionButton size="small" onClick={() => setCheckDialogOpen(true)}>
+                  {t('botMembership.check.button')}
+                </ActionButton>
+              )}
+              {canDisableNotInGroup && (
+                <ActionButton size="small" tone="danger" onClick={() => setDisableDialogOpen(true)}>
+                  {t('botMembership.disable.button')}
+                </ActionButton>
+              )}
+            </Stack>
+          )}
         </Stack>
       </Box>
 
@@ -421,6 +465,18 @@ export default function ChatChannelPage() {
           </Card>
         </>
       )}
+
+      <BotMembershipCheckDialog
+        open={checkDialogOpen}
+        onClose={() => setCheckDialogOpen(false)}
+        instances={onebotInstances}
+        currentInstanceKey={currentInstanceKey}
+      />
+      <BotMembershipDisableDialog
+        open={disableDialogOpen}
+        onClose={() => setDisableDialogOpen(false)}
+        currentInstance={currentInstance}
+      />
     </Box>
   )
 }

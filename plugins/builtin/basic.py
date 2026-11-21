@@ -42,11 +42,12 @@
   - **注意: 此工具仅在 `onebot_v11` 适配器下可用。**
 """
 
+import asyncio
+import hashlib
 import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-import aiofiles
 import magic
 from pydantic import Field
 
@@ -62,10 +63,8 @@ from nekro_agent.api.plugin import (
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.api.signal import MsgSignal
 from nekro_agent.schemas.agent_message import AgentMessageSegment, AgentMessageSegmentType
-from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
-from nekro_agent.services.message_service import message_service
+from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND, require_same_tenant_chat_key
 from nekro_agent.tools.common_util import (
-    calculate_file_md5,
     calculate_text_similarity,
     download_file,
 )
@@ -77,6 +76,7 @@ from nekro_agent.tools.path_convertor import (
     convert_to_host_path,
     is_url_path,
 )
+from nekro_agent.tools.sandbox_shared_files import host_file_is_regular, read_host_file_bytes
 
 plugin = NekroPlugin(
     name="基础交互插件",
@@ -334,11 +334,13 @@ async def send_msg_text(_ctx: AgentCtx, chat_key: str, message_text: str, ref_ms
                 raise Exception(
                     "Error: Identical message has been sent recently. Carefully read the recent chat history whether it has sent duplicate messages. Please generate more interesting replies. If you COMPLETELY DETERMINED that it is necessary, resend it. SPAM IS NOT ALLOWED!",
                 )
-            await message_service.push_system_message(
+            if not await plugin.push_system_message(
                 chat_key=chat_key,
                 agent_messages="System Alert: Identical message has been sent recently. Auto Skip this message. Carefully read the recent chat history whether it has sent duplicate messages. If you COMPLETELY DETERMINED that it is necessary, resend it. SPAM IS NOT ALLOWED!",
                 trigger_agent=False,
-            )
+            ):
+                # 目标频道上关掉了 basic 插件：按「频道不存在」处理，与跨频道越权同口径
+                raise ValueError(CHANNEL_NOT_FOUND)
             return
 
         # 检查相似度（仅对超过限定字符的消息进行检查）
@@ -347,20 +349,23 @@ async def send_msg_text(_ctx: AgentCtx, chat_key: str, message_text: str, ref_ms
             if similarity > config.SIMILARITY_THRESHOLD:
                 # 发送系统消息提示避免类似内容
                 core.logger.warning(f"[{chat_key}] 检测到相似度过高的消息: {similarity:.2f}")
-                await message_service.push_system_message(
+                if not await plugin.push_system_message(
                     chat_key=chat_key,
                     agent_messages="System Alert: You have sent a message that is too similar to a recently sent message! You should KEEP YOUR RESPONSE USEFUL and not redundant and cumbersome!",
                     trigger_agent=False,
-                )
+                ):
+                    raise ValueError(CHANNEL_NOT_FOUND)
                 break
 
     try:
-        await _ctx.ms.send_text(chat_key, message_text, _ctx, ref_msg_id=ref_msg_id)
+        sent = await plugin.send_text(chat_key, message_text, _ctx, ref_msg_id=ref_msg_id)
     except Exception as e:
         core.logger.exception(f"发送消息失败: {e}")
         raise Exception(
             "Error sending text message to chat: make sure the chat key is valid, you have permission to speak, and the message is not too long.",
         ) from e
+    if not sent:
+        raise ValueError(CHANNEL_NOT_FOUND)
 
     # 更新消息缓存
     SEND_MSG_CACHE[chat_key].append(message_text)
@@ -401,7 +406,8 @@ async def send_msg_file(_ctx: AgentCtx, chat_key: str, file_path: str, ref_msg_i
         file_host_path = str(
             convert_to_host_path(Path(file_container_path), _ctx.chat_key, container_key=_ctx.container_key),
         )
-        if not Path(file_host_path).exists():
+        # 共享目录在沙盒里可写：不跟随链接地判「是不是普通文件」，读也走同一套（见 sandbox_shared_files）
+        if not await asyncio.to_thread(host_file_is_regular, Path(file_host_path)):
             raise FileNotFoundError(
                 f"The file `{file_container_path}` does not exist! Attention: The file you generated in previous conversation may not be persistence in sandbox environment, please check it.",
             )
@@ -409,8 +415,9 @@ async def send_msg_file(_ctx: AgentCtx, chat_key: str, file_path: str, ref_msg_i
     if chat_key not in SEND_FILE_CACHE:
         SEND_FILE_CACHE[chat_key] = []
 
+    file_data = await asyncio.to_thread(read_host_file_bytes, Path(file_host_path))
     # 计算文件 MD5
-    file_md5 = await calculate_file_md5(file_host_path)
+    file_md5 = hashlib.md5(file_data).hexdigest()
 
     # 过滤重复文件
     if config.SIMILARITY_MESSAGE_FILTER and file_md5 in SEND_FILE_CACHE[chat_key]:
@@ -419,24 +426,27 @@ async def send_msg_file(_ctx: AgentCtx, chat_key: str, file_path: str, ref_msg_i
             raise Exception(
                 "Error: Identical file has been sent recently. Please check if this file is really needed to be sent again. Please generate more interesting replies. SPAM IS NOT ALLOWED!",
             )
-        await message_service.push_system_message(
+        if not await plugin.push_system_message(
             chat_key=chat_key,
             agent_messages="System Alert: Identical file has been sent recently. Auto Skip this file. Please check if this file is really needed to be sent again. Please generate more interesting replies. SPAM IS NOT ALLOWED!",
             trigger_agent=False,
-        )
+        ):
+            raise ValueError(CHANNEL_NOT_FOUND)
         return
 
     try:
         # 使用magic库检测文件MIME类型
-        async with aiofiles.open(file_host_path, "rb") as f:
-            file_data = await f.read()
-            mime_type = magic.from_buffer(file_data, mime=True)
-            is_image = mime_type.startswith("image/")
+        mime_type = magic.from_buffer(file_data, mime=True)
+        is_image = mime_type.startswith("image/")
 
         if is_image:
-            await _ctx.ms.send_image(chat_key, file_container_path, _ctx, ref_msg_id=ref_msg_id)
+            sent = await plugin.send_image(chat_key, file_container_path, _ctx, ref_msg_id=ref_msg_id)
         else:
-            await _ctx.ms.send_file(chat_key, file_container_path, _ctx, ref_msg_id=ref_msg_id)
+            sent = await plugin.send_file(chat_key, file_container_path, _ctx, ref_msg_id=ref_msg_id)
+
+        if not sent:
+            # 目标频道上关掉了 basic 插件：按「频道不存在」处理，与跨频道越权同口径
+            raise ValueError(CHANNEL_NOT_FOUND)
 
         # 更新文件缓存
         SEND_FILE_CACHE[chat_key].append(file_md5)
@@ -496,17 +506,17 @@ async def resolve_mixed_segments(
             file_host_path = str(
                 convert_to_host_path(Path(file_container_path), _ctx.chat_key, container_key=_ctx.container_key),
             )
-            if not Path(file_host_path).exists():
+            if not await asyncio.to_thread(host_file_is_regular, Path(file_host_path)):
                 raise FileNotFoundError(
                     f"The file `{content}` does not exist! Attention: The file you generated in previous conversation may not be persistence in sandbox environment, please check it.",
                 )
 
-        async with aiofiles.open(file_host_path, "rb") as f:
-            mime_type = magic.from_buffer(await f.read(), mime=True)
+        file_data = await asyncio.to_thread(read_host_file_bytes, Path(file_host_path))
+        mime_type = magic.from_buffer(file_data, mime=True)
         resolved_type = AgentMessageSegmentType.IMAGE if mime_type.startswith("image/") else AgentMessageSegmentType.FILE
 
         agent_segments.append(AgentMessageSegment(type=resolved_type, content=file_container_path))
-        fingerprint_parts.append(f"{resolved_type.value}:{await calculate_file_md5(file_host_path)}")
+        fingerprint_parts.append(f"{resolved_type.value}:{hashlib.md5(file_data).hexdigest()}")
 
     return agent_segments, "\n".join(fingerprint_parts)
 
@@ -568,20 +578,23 @@ async def send_msg_mixed(
             raise Exception(
                 "Error: Identical message has been sent recently. Carefully read the recent chat history whether it has sent duplicate messages. SPAM IS NOT ALLOWED!",
             )
-        await message_service.push_system_message(
+        if not await plugin.push_system_message(
             chat_key=chat_key,
             agent_messages="System Alert: Identical mixed message has been sent recently. Auto Skip this message. SPAM IS NOT ALLOWED!",
             trigger_agent=False,
-        )
+        ):
+            raise ValueError(CHANNEL_NOT_FOUND)
         return
 
     try:
-        await _ctx.ms.send_segments(chat_key, agent_segments, _ctx, ref_msg_id=ref_msg_id)
+        sent = await plugin.send_segments(chat_key, agent_segments, _ctx, ref_msg_id=ref_msg_id)
     except Exception as e:
         core.logger.exception(f"发送图文混合消息失败: {e}")
         raise Exception(
             f"Error sending mixed message to chat: {e}, make sure every file path is valid(in shared directory or uploads directory).",
         ) from e
+    if not sent:
+        raise ValueError(CHANNEL_NOT_FOUND)
 
     SEND_MIXED_CACHE[chat_key].append(fingerprint)
     SEND_MIXED_CACHE[chat_key] = SEND_MIXED_CACHE[chat_key][-10:]

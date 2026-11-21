@@ -53,6 +53,7 @@
     "plugin": "Plugin call",
     "plugin_generate": "Plugin code generation",
     "model_test": "Connectivity test",
+    "prompt_trial": "Prompt trial",
     "command": "Chat command",
     "unattributed": "Unattributed"
   },

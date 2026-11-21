@@ -62,6 +62,8 @@ def _function_source(script: str, name: str) -> str:
 
 
 ENV_FILE_NAME = ".env"
+# 邮箱账户引用的密钥（`services/email_accounts.ACCOUNT_REF_KEY_FILE`）：同样不能被放成 777
+REF_KEY_FILE_NAME = "email_account_ref.key"
 
 
 def _run_open_permissions(
@@ -71,6 +73,7 @@ def _run_open_permissions(
     key_exists: bool,
     env_exists: bool = True,
     via_symlink: bool = False,
+    ref_key_exists: bool = False,
 ) -> List[str]:
     """用假 sudo / chmod（每次调用记一行 `模式 路径...`）与真 find 跑放开权限函数，返回 chmod 调用记录
 
@@ -85,6 +88,8 @@ def _run_open_permissions(
         (data / KEY_FILE_NAME).write_text("material", encoding="utf-8")
     if env_exists:
         (data / ENV_FILE_NAME).write_text("NEKRO_ADMIN_PASSWORD=x\n", encoding="utf-8")
+    if ref_key_exists:
+        (data / REF_KEY_FILE_NAME).write_text("material", encoding="utf-8")
     target = data
     if via_symlink:
         link = tmp_path / "data-link"
@@ -166,6 +171,16 @@ class TestInstallScriptsKeepTheKeyFileClosed:
         calls = _run_open_permissions(script, tmp_path, key_exists=True, env_exists=False)
 
         assert not _calls_on_file(calls, ENV_FILE_NAME)
+
+    def test_the_mail_reference_key_is_never_opened_and_is_tightened(self, script: str, tmp_path: Path) -> None:
+        """`email_account_ref.key` 与主密钥同一条：不放成 777，已存在的收紧回 600"""
+        calls = _run_open_permissions(script, tmp_path, key_exists=True, ref_key_exists=True)
+
+        opening = [call for call in calls if call.split()[0] == "777"]
+        assert opening
+        assert not _calls_on_file(opening, REF_KEY_FILE_NAME), f"邮箱引用密钥被放开了权限: {opening}"
+        touching = _calls_on_file(calls, REF_KEY_FILE_NAME)
+        assert len(touching) == 1 and touching[0].split()[0] == "600", calls
 
     def test_a_symlinked_data_dir_is_still_walked(self, script: str, tmp_path: Path) -> None:
         """`NEKRO_DATA_DIR` 本身是符号链接时，`find 链接` 不会进去（chmod 0 次），要写成 `find 链接/`"""
@@ -369,3 +384,9 @@ def test_call_site_exists_in_the_key_file_reader() -> None:
     reader = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_read_key_file")
     calls = [n for n in ast.walk(reader) if isinstance(n, ast.Call) and "permission" in ast.unparse(n.func)]
     assert calls, "_read_key_file 里没有调用权限检查"
+
+
+def test_the_mail_reference_key_name_matches_the_service() -> None:
+    from nekro_agent.services.email_accounts import ACCOUNT_REF_KEY_FILE
+
+    assert ACCOUNT_REF_KEY_FILE == REF_KEY_FILE_NAME

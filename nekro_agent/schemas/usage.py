@@ -46,6 +46,9 @@ class LLMUsageScene(str, Enum):
     PLUGIN = "plugin"  # 插件自行发起
     PLUGIN_GENERATE = "plugin_generate"  # WebUI 插件代码生成
     MODEL_TEST = "model_test"  # 模型组连通性测试
+    # 后台提示词试发：归属到实例与模型组、**不挂任何频道**，所以不占频道每日额度
+    # （账本只在有 chat_key 时才累加按群计数）。回复只给发起的管理员看。
+    PROMPT_TRIAL = "prompt_trial"
     COMMAND = "command"  # 聊天命令触发的调试请求
     # 没有任何调用方声明归属。**不是丢弃**：钱照样烧了，只是算不到人头上。
     # 它在平台方的用量页上是一个独立分档，涨起来就说明有一条链路没接上记账。

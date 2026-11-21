@@ -114,13 +114,17 @@ SELECT_CASES: List[Tuple[str, Optional[Type[Exception]]]] = [
     ("", None),
 ]
 
-# 四个 `overridable=True` 且引用模型组的字段。这份名单**只用于断言枚举结果**，
+# 六个 `overridable=True` 且引用模型组的字段。这份名单**只用于断言枚举结果**，
 # 判定本身一个字段名都不写死（见 `TestRefMarkerDrivesEverything`）。
+# 记忆沉淀的两个模型组改为可按实例覆盖后，租户指到自己的模型组就是租户自付，
+# 指到别人的私有组必须和其他引用字段一样被挡住，所以一并进入下面的参数化用例。
 OVERRIDABLE_REF_FIELDS = (
     "USE_MODEL_GROUP",
     "DEBUG_MIGRATION_MODEL_GROUP",
     "FALLBACK_MODEL_GROUP",
     "AFFECTION_MODEL_GROUP",
+    "MEMORY_CONSOLIDATION_MODEL_GROUP",
+    "MEMORY_CONSOLIDATION_FALLBACK_MODEL_GROUP",
 )
 
 
@@ -542,12 +546,14 @@ class TestRefMarkerDrivesEverything:
 
 
 def _run_agent_body() -> ast.AsyncFunctionDef:
-    # `run_agent` 只解析频道、设好实例上下文，正文在它调用的这个函数里
-    source = Path(inspect.getsourcefile(run_agent_module) or "").read_text(encoding="utf-8")
+    # `run_agent` 只解析频道、设好实例上下文；守卫与取模型组都在组装函数里
+    from nekro_agent.services.agent import round_prompt as round_prompt_module
+
+    source = Path(inspect.getsourcefile(round_prompt_module) or "").read_text(encoding="utf-8")
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_agent_in_instance_scope":
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_build_round_prompt":
             return node
-    raise AssertionError("_run_agent_in_instance_scope 不见了")
+    raise AssertionError("_build_round_prompt 不见了")
 
 
 class TestTheGuardsAreActuallyWiredIn:

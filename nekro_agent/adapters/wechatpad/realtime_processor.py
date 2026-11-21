@@ -357,6 +357,17 @@ class WeChatRealtimeProcessor:
             logger.error(f"解析消息失败: {e}, 原始数据: {raw_data}")
             return None
 
+    @staticmethod
+    def _is_authored_text(message: WeChatMessage) -> bool:
+        """这条消息的文字是不是发送者本人打的
+
+        只有 `msg_type` 恰好是 1（文本）才算。其余类型——引用（appmsg 里的 refermsg）、合并转发
+        的聊天记录、链接、名片、系统消息，以及 `message_type` 认不出、退回成 TEXT 的类型——
+        存进消息段的都是原始 XML，里面可能是别人说的话；按 `ext_data.forwarded` 标上，
+        依赖「本人说过」的判据（例如聊天登记服务器的来源证明）不采用它们。
+        """
+        return int(message.msg_type) == MessageType.TEXT.value
+
     async def _process_message(self, message: WeChatMessage):
         """处理单条消息"""
         self.message_count += 1
@@ -573,7 +584,7 @@ class WeChatRealtimeProcessor:
             is_tome=is_tome,
             timestamp=message.create_time,
             is_self=is_self,
-            ext_data=PlatformMessageExt(),  # 扩展数据，后续可添加引用消息等信息
+            ext_data=PlatformMessageExt(forwarded=not self._is_authored_text(message)),
         )
 
         # 提交消息到收集器

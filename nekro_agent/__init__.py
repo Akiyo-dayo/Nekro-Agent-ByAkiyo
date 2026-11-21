@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from nekro_agent.adapters import cleanup_adapters, init_adapters
 from nekro_agent.core.args import Args
+from nekro_agent.core.config import config
 from nekro_agent.core.database import init_db
 from nekro_agent.core.db_migration import run_db_migrations
 from nekro_agent.core.logger import logger
@@ -32,7 +33,7 @@ async def _init_memory_scheduler() -> None:
         logger.info("记忆系统总开关关闭，跳过记忆调度器初始化")
         return
 
-    from nekro_agent.services.memory.consolidator import consolidate_workspace
+    from nekro_agent.services.memory.consolidator import ConsolidationResult, consolidate_workspace
     from nekro_agent.services.memory.embedding_service import get_memory_embedding_dimension
     from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
 
@@ -42,20 +43,29 @@ async def _init_memory_scheduler() -> None:
     except Exception as e:
         logger.warning(f"记忆系统 Qdrant Collection 初始化失败（可能 Qdrant 未启用）: {e}")
 
-    async def consolidation_handler(workspace_id: int, chat_key: str) -> None:
-        """沉淀处理器"""
-        try:
-            result = await consolidate_workspace(workspace_id, chat_key)
-            logger.debug(
-                f"记忆沉淀完成: workspace={workspace_id}, "
-                f"paragraphs={result.paragraphs_created}, "
-                f"entities={result.entities_created}",
-            )
-        except Exception as e:
-            logger.warning(f"记忆沉淀失败: workspace={workspace_id}, error={e}")
+    async def consolidation_handler(workspace_id: int, chat_key: str) -> ConsolidationResult:
+        """沉淀处理器
+
+        必须把 `ConsolidationResult` 原样交给调度器：失败 / 跳过 / 只初始化游标三种结果
+        决定 pending 与退避怎么走，在这里吞掉异常或返回 None 会让失败被记成成功。
+        """
+        result = await consolidate_workspace(workspace_id, chat_key)
+        logger.debug(
+            f"记忆沉淀完成: workspace={workspace_id}, "
+            f"paragraphs={result.paragraphs_created}, "
+            f"entities={result.entities_created}, failed={result.failed_reason}, "
+            f"skipped={result.skipped_reason}",
+        )
+        return result
 
     memory_scheduler.set_consolidation_handler(consolidation_handler)
     await memory_scheduler.start()
+
+    # 存量向量点缺新 payload 键；回填完成之前它们不会按域条件被召回（安全的一侧）。
+    # 闸开着启动时立即回填；运行中开闸由轮询发现后补跑一次。
+    from nekro_agent.services.memory.payload_backfill import payload_backfill_watcher
+
+    payload_backfill_watcher.start()
 
 
 async def _init_kb_collection() -> None:
@@ -237,11 +247,48 @@ if _driver is not None:
         except Exception as e:
             logger.warning(f"核对沙盒回调地址失败（非致命，沿用配置值）: {e}")
 
+        # 「默认启用」的新内置插件加进 `PLUGIN_ENABLED`（只改内存）。同样必须在 `bootstrap_model_groups()`
+        # 之前：由它那次常规落盘一起写进配置文件；它为了保住 YAML 里唯一的明文 Key 而不落盘时，这里也不落盘
+        # （见 `services/plugin/default_on.py`）
+        from nekro_agent.services.plugin.default_on import apply_default_on_plugins_at_startup
+
+        apply_default_on_plugins_at_startup()
+
         # 把配置文件里的存量模型组导入数据库，并据此重建 config.MODEL_GROUPS 运行时视图。
         # 必须紧跟迁移之后：适配器与插件初始化都会同步读 config.MODEL_GROUPS
         from nekro_agent.services.model_group_service import bootstrap_model_groups
 
         await bootstrap_model_groups()
+
+        # 工作区资源敏感字段的落库形态：把存量明文 / 历史密钥密文整批重写成当前主密钥的信封
+        # （`RESOURCE_PAYLOAD_AT_REST=plain` 时反过来写回明文，供回滚旧版本使用）。
+        # 放在迁移与模型组引导之后：数据库已就绪，且它不是关键路径——失败只记 ERROR，下次启动重试
+        try:
+            from nekro_agent.services.resources.service import resources_upgrade_at_rest
+
+            await resources_upgrade_at_rest()
+        except Exception as e:
+            logger.error(f"重写工作区资源敏感字段的落库形态失败（非致命，下次启动重试）: {e}")
+
+        # SSH 服务器凭据的既有明文 / 历史密钥密文：整批重写成当前主密钥的信封。
+        # 与上一步同样是数据形态维护，不是启动关键路径；解不开的行只点名、不动原密文
+        try:
+            from nekro_agent.services.ssh_gateway.secrets import ssh_credentials_upgrade_at_rest
+
+            await ssh_credentials_upgrade_at_rest()
+        except Exception as e:
+            logger.error(f"重写 SSH 服务器凭据的落库形态失败（非致命，下次启动重试）: {e}")
+
+        # 存量工作区资源里的三个 SSH 模板导进服务器凭据表（幂等，旧资源一行不改）。
+        # 闸关时不导：凭据行只服务网关，旧资源照旧注入；手动触发走后台接口。
+        # 与上面几步同样是数据迁移，失败只记 WARNING，可手动调后台接口重试
+        try:
+            from nekro_agent.services.ssh_gateway.import_resources import import_ssh_resources_on_startup
+
+            if config.SSH_GATEWAY_ENABLED:
+                await import_ssh_resources_on_startup()
+        except Exception as e:
+            logger.warning(f"导入存量 SSH 工作区资源失败（非致命，可手动重试）: {e}")
 
         # 只读自检：跨适配器重名的实例标识会让只按标识存取的数据串用，提示管理员改名，不改数据。
         # 放在迁移之后：此时表结构已是当前版本
@@ -284,6 +331,25 @@ if _driver is not None:
         from nekro_agent.services.mcp.web_chat_auth import init_web_chat_mcp_runtime_auth
 
         await init_web_chat_mcp_runtime_auth()
+
+        # 存量里可能已经有在 `direct` 模式下跑着的租户工作区：把不能拿平台方凭据的工作区
+        # 逐个处理一遍（重写配置文件、必要时停掉容器）。多租户 + `direct` 时另有一条启动告警
+        try:
+            from nekro_agent.services.workspace.credential_policy import enforce_platform_secret_policy_on_startup
+
+            await enforce_platform_secret_policy_on_startup()
+        except Exception as e:
+            logger.error(f"启动复核 CC 工作区的平台方凭据失败（下次启动重试）: {e}")
+
+        # 存量里可能已经有工作区在闸关期间变成了非平台方归属、平台方服务器凭据却没被挂起：
+        # 逐个按当前判据复核一遍。挂起只缩小权限，与总开关无关，所以这里不看
+        # `SSH_GATEWAY_ENABLED`；失败不拦住启动，下次启动重试
+        try:
+            from nekro_agent.services.ssh_gateway.suspend import suspend_platform_rows_on_startup
+
+            await suspend_platform_rows_on_startup()
+        except Exception as e:
+            logger.error(f"启动复核平台方 SSH 服务器凭据失败（非致命，下次启动重试）: {e}")
 
         # 注册内置命令
         from nekro_agent.services.command.built_in import register_built_in_commands
@@ -359,6 +425,84 @@ if _driver is not None:
         await _init_memory_scheduler()
         logger.info("Memory scheduler initialized")
 
+        # 频道额度告警的合并发送循环。告警积压只在进程内存里，重启丢掉的只是
+        # 「今天这个频道到过 80%」这类通知，不是需要重放的业务事件，所以不做持久化。
+        try:
+            from nekro_agent.services.channel_quota.alerts import alert_buffer
+
+            await alert_buffer.start()
+            logger.info("Channel quota alert buffer initialized")
+        except Exception as e:
+            logger.warning(f"频道额度告警循环启动失败（非致命）: {e}")
+
+        # 频道额度零点后的自动对账：按账本重算昨天、清掉过期的计数行。后台循环本身
+        # 不碰任何频道状态，起不来最多是「昨天的数字停在实时累加的结果上」，不值得拦住启动。
+        try:
+            from nekro_agent.services.channel_quota.reconcile import reconciler
+
+            await reconciler.start()
+            logger.info("Channel quota reconciler initialized")
+        except Exception as e:
+            logger.warning(f"频道额度对账循环启动失败（非致命）: {e}")
+
+        # 上传图片保留期：循环总是起，每次醒来先看开关，关着什么都不做（不扫描）。
+        # 起不来最多是「过期图片没被清」，不值得拦住启动
+        try:
+            from nekro_agent.services.upload_retention import upload_image_retention
+
+            await upload_image_retention.start()
+            logger.info("Upload image retention loop initialized")
+        except Exception as e:
+            logger.warning(f"上传图片保留期循环启动失败（非致命）: {e}")
+
+        # SSH 审计保留期：与上传图片同一种挂法，循环总是起，每次醒来先看配置。
+        # 起不来最多是「过期审计没被清」，不值得拦住启动
+        try:
+            from nekro_agent.services.ssh_gateway.audit_retention import ssh_audit_retention
+
+            await ssh_audit_retention.start()
+            logger.info("SSH audit retention loop initialized")
+        except Exception as e:
+            logger.warning(f"SSH 审计保留期循环启动失败（非致命）: {e}")
+
+        # SSH 审计队列：先起写入任务，再起网关监督任务。监督任务关着时只读一个布尔值；
+        # 起不来最多是网关不可用 / 审计写不进，不值得拦住 NA 启动
+        try:
+            from nekro_agent.services.ssh_gateway import audit_queue
+
+            await audit_queue.start()
+            logger.info("SSH audit queue initialized")
+        except Exception as e:
+            logger.warning(f"SSH 审计队列启动失败（非致命）: {e}")
+
+        try:
+            from nekro_agent.services.ssh_gateway import provisioning
+
+            # 必须在 supervisor.start() 之前：监督任务第一拍就可能发现开关从关变开，
+            # 订阅不在就会漏掉那一次补配（网络规则、容器文件、登记表）。
+            provisioning.install()
+            logger.info("SSH gateway provisioning subscriptions initialized")
+        except Exception as e:
+            logger.warning(f"SSH 网关补配订阅注册失败（非致命）: {e}")
+
+        try:
+            from nekro_agent.services.ssh_gateway.supervisor import supervisor
+
+            await supervisor.start()
+            logger.info("SSH gateway supervisor initialized")
+        except Exception as e:
+            logger.warning(f"SSH 网关监督任务启动失败（非致命）: {e}")
+
+        # 节日邮件队列的发信工人：循环总是起，每一封发出前自己看总闸与实例状态。
+        # 起不来最多是「已入队的祝福邮件晚一点发」，不值得拦住启动
+        try:
+            from nekro_agent.services.email_outbox import start_outbox_worker
+
+            start_outbox_worker()
+            logger.info("Festival mail outbox worker initialized")
+        except Exception as e:
+            logger.warning(f"节日邮件发信工人启动失败（非致命）: {e}")
+
         # 初始化知识库 Collection
         await _init_kb_collection()
         logger.info("Knowledge base collection initialized")
@@ -428,6 +572,90 @@ if _driver is not None:
         logger.debug("[shutdown] stopping memory scheduler")
         await memory_scheduler.stop()
         logger.debug(f"[shutdown] memory scheduler stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        # 关停前把还没发出去的额度告警发一次，剩下的积压随进程结束丢弃（见启动处的说明）
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] flushing channel quota alerts")
+            from nekro_agent.services.channel_quota.alerts import alert_buffer
+
+            await alert_buffer.stop()
+        except Exception as e:
+            logger.warning(f"[shutdown] 频道额度告警刷出失败（非致命）: {e}")
+        logger.debug(f"[shutdown] channel quota alerts flushed in {time.perf_counter() - step_started_at:.3f}s")
+
+        # 对账循环只是「有没有对过昨天」的定时器，关停时直接取消；没对完的那一天
+        # 下次启动会补（重算是幂等的）
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] stopping channel quota reconciler")
+            from nekro_agent.services.channel_quota.reconcile import reconciler
+
+            await reconciler.stop()
+        except Exception as e:
+            logger.warning(f"[shutdown] 频道额度对账循环停止失败（非致命）: {e}")
+        logger.debug(f"[shutdown] channel quota reconciler stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        # 清理循环直接取消；正在线程里跑的那一批（最多几百个目录项）会自己跑完
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] stopping upload image retention loop")
+            from nekro_agent.services.upload_retention import upload_image_retention
+
+            await upload_image_retention.stop()
+        except Exception as e:
+            logger.warning(f"[shutdown] 上传图片保留期循环停止失败（非致命）: {e}")
+        logger.debug(f"[shutdown] upload image retention loop stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] stopping SSH audit retention loop")
+            from nekro_agent.services.ssh_gateway.audit_retention import ssh_audit_retention
+
+            await ssh_audit_retention.stop()
+        except Exception as e:
+            logger.warning(f"[shutdown] SSH 审计保留期循环停止失败（非致命）: {e}")
+        logger.debug(f"[shutdown] SSH audit retention loop stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        # SSH 网关：先停监督任务与后端（断开全部连接），再让审计队列把剩下的写掉。
+        # 两步各最多 5 秒，非致命，绝不挂住 NA 退出
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] stopping SSH gateway supervisor")
+            from nekro_agent.services.ssh_gateway.supervisor import supervisor
+
+            await supervisor.stop(timeout=5.0)
+        except Exception as e:
+            logger.warning(f"[shutdown] SSH 网关监督任务停止失败（非致命）: {e}")
+        logger.debug(f"[shutdown] SSH gateway supervisor stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] stopping SSH audit queue")
+            from nekro_agent.services.ssh_gateway import audit_queue
+
+            await audit_queue.stop(timeout=5.0)
+        except Exception as e:
+            logger.warning(f"[shutdown] SSH 审计队列停止失败（非致命）: {e}")
+        logger.debug(f"[shutdown] SSH audit queue stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        # 发信工人停在适配器清理之前：它发信要用适配器的 SMTP 客户端
+        step_started_at = time.perf_counter()
+        try:
+            logger.debug("[shutdown] stopping festival mail outbox worker")
+            from nekro_agent.services.email_outbox import stop_outbox_worker
+
+            await stop_outbox_worker()
+        except Exception as e:
+            logger.warning(f"[shutdown] 节日邮件发信工人停止失败（非致命）: {e}")
+        logger.debug(f"[shutdown] festival mail outbox worker stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        step_started_at = time.perf_counter()
+        logger.debug("[shutdown] stopping memory payload backfill watcher")
+        from nekro_agent.services.memory.payload_backfill import payload_backfill_watcher
+
+        await payload_backfill_watcher.stop()
+        logger.debug(f"[shutdown] memory payload backfill watcher stopped in {time.perf_counter() - step_started_at:.3f}s")
 
         # 必须早于适配器清理：探活会调用适配器，适配器拆完再探活会抛一片噪声异常
         step_started_at = time.perf_counter()

@@ -21,6 +21,7 @@
 from pydantic import Field
 
 from nekro_agent.adapters.onebot_v11.core.bot import get_bot_by_chat_key
+from nekro_agent.adapters.onebot_v11.core.channel import parse_numeric_target_id
 from nekro_agent.api import core, i18n
 from nekro_agent.api.plugin import (
     ConfigBase,
@@ -137,7 +138,8 @@ async def ai_voice(_ctx: AgentCtx, chat_key: str, text: str) -> bool:
         bot = await get_bot_by_chat_key(chat_key)
         await bot.call_api(
             "send_group_ai_record",
-            group_id=int(chat_id.partition("_")[2]),
+            # 频道标识不是 group_<群号> 时抛的异常带着频道标识，下面的失败日志就能看出是哪个频道
+            group_id=parse_numeric_target_id(chat_id),
             character=config.AI_VOICE_CHARACTER,
             text=text,
         )

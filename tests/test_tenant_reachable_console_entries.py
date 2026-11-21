@@ -342,9 +342,21 @@ class TestTenantTeamPageIsWiredEndToEnd:
 
         后端 `create_tenant_member` 对 `platform_owner` 直接 400，
         但入口开给租户之后，这个下拉是租户唯一碰得到的角色选择器。
+
+        租户管理员的那一份还多收一格：它只能建只读成员，新增管理员由平台方来建
+        （后端对非平台方的其它角色一律 403）。两份清单各钉一条，缺哪一条都要红。
         """
         source = _read(MEMBER_TABLE)
-        match = re.search(r"const ASSIGNABLE_ROLES: TenantRole\[\] = \[(.*?)\]", source, re.S)
-        assert match, "没找到 ASSIGNABLE_ROLES"
-        roles: Set[str] = set(re.findall(r"'([a-z_]+)'", match.group(1)))
-        assert roles == {"tenant_admin", "tenant_user"}
+        platform_match = re.search(r"const PLATFORM_ASSIGNABLE_ROLES: TenantRole\[\] = \[(.*?)\]", source, re.S)
+        assert platform_match, "没找到 PLATFORM_ASSIGNABLE_ROLES"
+        platform_roles: Set[str] = set(re.findall(r"'([a-z_]+)'", platform_match.group(1)))
+        assert platform_roles == {"tenant_admin", "tenant_user"}
+
+        tenant_admin_match = re.search(
+            r"const TENANT_ADMIN_ASSIGNABLE_ROLES: TenantRole\[\] = \[(.*?)\]",
+            source,
+            re.S,
+        )
+        assert tenant_admin_match, "没找到 TENANT_ADMIN_ASSIGNABLE_ROLES"
+        tenant_admin_roles: Set[str] = set(re.findall(r"'([a-z_]+)'", tenant_admin_match.group(1)))
+        assert tenant_admin_roles == {"tenant_user"}

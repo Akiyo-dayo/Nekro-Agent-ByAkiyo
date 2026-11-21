@@ -50,13 +50,6 @@ else:
     router.include_router(model_groups_router)
 
 try:
-    from .ops_actions import router as ops_actions_router
-except ImportError:
-    logger.debug("Console 运维确认路由尚未就绪，跳过挂载")
-else:
-    router.include_router(ops_actions_router)
-
-try:
     from .quota import router as quota_router
 except ImportError:
     logger.debug("Console 配额管理路由尚未就绪，跳过挂载")
@@ -85,6 +78,13 @@ else:
     router.include_router(usage_router)
 
 try:
+    from .channel_quota import router as channel_quota_router
+except ImportError:
+    logger.debug("Console 频道额度路由尚未就绪，跳过挂载")
+else:
+    router.include_router(channel_quota_router)
+
+try:
     from .napcat_orphans import router as napcat_orphans_router
 except ImportError:
     logger.debug("Console NapCat 残留回收路由尚未就绪，跳过挂载")
@@ -104,3 +104,10 @@ except ImportError:
     logger.debug("Console OneBot 协议端状态路由尚未就绪，跳过挂载")
 else:
     router.include_router(onebot_endpoint_router)
+
+try:
+    from .ops_audit import router as ops_audit_router
+except ImportError:
+    logger.debug("Console 运维审计路由尚未就绪，跳过挂载")
+else:
+    router.include_router(ops_audit_router)

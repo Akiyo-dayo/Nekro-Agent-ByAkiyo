@@ -14,6 +14,10 @@
  * - **只读身份**（`tenant_user`）：`require_tenant_admin()` 直接 403，添加/移除全部隐藏；
  * - **移除自己**：后端 `remove_tenant_member` 明确 `不能移除自己` → 400。
  *   租户自助场景下这一条是天天会碰到的（成员表里第一行往往就是登录者本人）。
+ *
+ * 还有一条与角色下拉有关：**租户管理员的角色下拉只有只读成员**，新增管理员由平台方来建。
+ * 后端同样会拒（`create_tenant_member` 对非平台方只放行 `tenant_user`），判定以后端为准；
+ * 这里少摆一个选项只是避免递一个必然 403 的请求。
  */
 
 import { useState } from 'react'
@@ -54,10 +58,14 @@ import {
   type TenantRole,
 } from '../../../services/api/tenant'
 
-const MIN_PASSWORD_LENGTH = 8
+// 与后端 `schemas/tenant.py:MIN_INITIAL_PASSWORD_LENGTH` 同值：两边不一致时前端会放过一个
+// 后端必然 400 的提交，或者反过来拦住一个后端接受的提交。
+const MIN_PASSWORD_LENGTH = 12
 
 /** 可分配给成员的角色；平台方角色不通过租户成员接口下发 */
-const ASSIGNABLE_ROLES: TenantRole[] = ['tenant_admin', 'tenant_user']
+const PLATFORM_ASSIGNABLE_ROLES: TenantRole[] = ['tenant_admin', 'tenant_user']
+/** 租户管理员只能建只读成员，后端对其它角色一律 403 */
+const TENANT_ADMIN_ASSIGNABLE_ROLES: TenantRole[] = ['tenant_user']
 
 export default function TenantMemberTable({ tenantId }: { tenantId: number }) {
   const theme = useTheme()
@@ -67,15 +75,31 @@ export default function TenantMemberTable({ tenantId }: { tenantId: number }) {
   const { t: tCommon } = useTranslation('common')
   // 只读身份写不动成员（后端 `require_tenant_admin()` 403），登录者也移不掉自己（后端 400）。
   // 两条都以后端为准，这里只决定按钮画不画。
-  const { isReadOnly, identity } = useIdentity()
+  const { isReadOnly, identity, isTenantAdmin } = useIdentity()
   const currentUserId = identity?.user_id ?? null
   const canManageMembers = !isReadOnly
+
+  // 身份是异步加载的：默认角色在「打开对话框」与「创建成功」这两个时刻按当时的身份重算，
+  // 而不是只在首次渲染时算一次——否则冷启动时按平台方算出的 `tenant_admin` 会一直留在状态里。
+  const assignableRoles = isTenantAdmin ? TENANT_ADMIN_ASSIGNABLE_ROLES : PLATFORM_ASSIGNABLE_ROLES
+  const defaultDraftRole: TenantRole = isTenantAdmin
+    ? TENANT_ADMIN_ASSIGNABLE_ROLES[0]
+    : PLATFORM_ASSIGNABLE_ROLES[0]
 
   const [createOpen, setCreateOpen] = useState(false)
   const [removeTarget, setRemoveTarget] = useState<TenantMemberInfo | null>(null)
   const [draftUsername, setDraftUsername] = useState('')
   const [draftPassword, setDraftPassword] = useState('')
   const [draftRole, setDraftRole] = useState<TenantRole>('tenant_admin')
+
+  // 下拉框的取值与提交用的角色都走这一个值：`draftRole` 不在可选列表里时退回第一项，
+  // 保证一个不在列表里的角色不会被提交出去。
+  const effectiveDraftRole = assignableRoles.includes(draftRole) ? draftRole : assignableRoles[0]
+
+  const openCreateDialog = () => {
+    setDraftRole(defaultDraftRole)
+    setCreateOpen(true)
+  }
 
   const membersQuery = useQuery({
     queryKey: TENANT_QUERY_KEYS.members(tenantId),
@@ -95,14 +119,14 @@ export default function TenantMemberTable({ tenantId }: { tenantId: number }) {
       tenantApi.createMember(tenantId, {
         username: draftUsername.trim(),
         password: draftPassword,
-        role: draftRole,
+        role: effectiveDraftRole,
       }),
     onSuccess: () => {
       notification.success(t('members.createSuccess'))
       setCreateOpen(false)
       setDraftUsername('')
       setDraftPassword('')
-      setDraftRole('tenant_admin')
+      setDraftRole(defaultDraftRole)
       invalidate()
     },
     onError: (error: Error) => notification.error(error.message),
@@ -143,7 +167,7 @@ export default function TenantMemberTable({ tenantId }: { tenantId: number }) {
             size="small"
             startIcon={<PersonAddAlt1RoundedIcon />}
             disabled={isEndpointMissing}
-            onClick={() => setCreateOpen(true)}
+            onClick={openCreateDialog}
           >
             {t('actions.addMember')}
           </ActionButton>
@@ -340,15 +364,17 @@ export default function TenantMemberTable({ tenantId }: { tenantId: number }) {
             size="small"
             fullWidth
             label={t('members.createDialog.role')}
-            value={draftRole}
+            value={effectiveDraftRole}
             helperText={
-              draftRole === 'tenant_admin'
-                ? t('members.createDialog.roleAdminHint')
-                : t('members.createDialog.roleUserHint')
+              isTenantAdmin
+                ? t('members.createDialog.roleTenantAdminOnlyUserHint')
+                : effectiveDraftRole === 'tenant_admin'
+                  ? t('members.createDialog.roleAdminHint')
+                  : t('members.createDialog.roleUserHint')
             }
             onChange={event => setDraftRole(event.target.value as TenantRole)}
           >
-            {ASSIGNABLE_ROLES.map(role => (
+            {assignableRoles.map(role => (
               <MenuItem key={role} value={role}>
                 {t(`role.${role}`)}
               </MenuItem>

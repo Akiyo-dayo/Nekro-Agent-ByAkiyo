@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import ClassVar
+from typing import ClassVar, Literal, cast
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -18,8 +18,12 @@ from nekro_agent.schemas.errors import (
 from nekro_agent.schemas.i18n import I18nDict, i18n_text
 from nekro_agent.schemas.tenant import CurrentIdentity
 from nekro_agent.schemas.user import (
+    SUPPORTED_UI_LOCALES,
+    UI_LOCALE_FIELD,
     UpdatePassword,
+    UpdateUserLocaleRequest,
     UserCreate,
+    UserLocaleResponse,
     UserLogin,
     UserToken,
 )
@@ -273,6 +277,68 @@ async def me_identity(_current_user: DBUser = Depends(get_current_active_user)) 
     未启用多租户时所有账号都是平台方，该接口的返回与单管理员时代等价。
     """
     return await resolve_current_identity(_current_user)
+
+
+@router.get("/me/locale", summary="读取自己的界面语言", response_model=UserLocaleResponse)
+async def get_my_locale(_current_user: DBUser = Depends(get_current_active_user)) -> UserLocaleResponse:
+    """读取**自己**的界面语言，没设置过时返回 `None`
+
+    存在 `ext_data` 里而不是加一列：界面语言是"这台账号的偏好"，不参与任何授权判定，
+    为它走一次迁移（含回填与回滚路径）不划算，而 `ext_data` 本来就是按用户挂扩展数据的地方。
+
+    读出来的值先按 `SUPPORTED_UI_LOCALES` 过一遍再返回。库里的值可能是旧版本写的、
+    手工改的，或者两套文案里已经删掉的那一种；照直返回会让前端拿着一个查不到的语种去
+    加载资源，界面回退成中文而设置页仍显示"已选英文"。这类"设置了但没生效"最难排查。
+
+    `ext_data` 是 JSON 列，历史行上可能是 `None`、也可能被写成非对象的值（字符串、数组），
+    两种都按"空扩展数据"处理——本函数只读，不该因为别的模块写坏了这一列而 500。
+    """
+    ext = _current_user.ext_data if isinstance(_current_user.ext_data, dict) else {}
+    raw = ext.get(UI_LOCALE_FIELD)
+    if isinstance(raw, str) and raw in SUPPORTED_UI_LOCALES:
+        return UserLocaleResponse(locale=cast(Literal["zh-CN", "en-US"], raw))
+    return UserLocaleResponse(locale=None)
+
+
+@router.put("/me/locale", summary="保存自己的界面语言", response_model=ActionResponse)
+async def update_my_locale(
+    req_data: UpdateUserLocaleRequest,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> ActionResponse:
+    """保存**自己**的界面语言
+
+    ## 为什么租户账号需要这条端点
+
+    界面语言原先是全局配置 `SYSTEM_LANG`，只有平台方能改（`POST /config/batch/system`：
+    `system` 是跨租户共享的作用域，租户写入一律 403）。租户账号改语言会当场 403，
+    于是"切换语言"对它们等于不可用——而语言恰恰是
+    每个账号自己的偏好，不该由平台方代劳、也不该全站统一。
+
+    ## 为什么不复用全局配置
+
+    `SYSTEM_LANG` 回答的是"这个部署默认说什么话"（例如系统消息、给未设置偏好的账号的
+    回退值），本条回答的是"这个账号自己想看什么话"。两者一旦共用一个字段，任何租户改语言
+    都会改掉全站默认值——那是跨租户越权，不只是体验问题。
+
+    ## 没有跨账号目标标识
+
+    请求体里没有 `user_id`、路径里也没有：写死的目标是 `_current_user`。这条端点挂在
+    `TENANT_AGNOSTIC` 桶里（`tests/test_route_permission_contract.py`），任何登录账号都
+    能用，包括只读成员——它改的只有自己那一行。
+
+    ## 只改 `ext_data` 里的这一个键
+
+    `ext_data` 是共享的扩展字典（成员创建时写进去的 `created_by` 就在里面）。整块覆盖会
+    把那些字段一起抹掉，所以这里读出来、只替换 `ui_locale`、再整列写回。
+    `update_fields` 显式列出 `update_time`：Tortoise 的 `save(update_fields=...)` 不会自动
+    带上它，漏掉的话"最近修改时间"停在这一行上一次被别处写过的时刻。
+    """
+    ext = dict(_current_user.ext_data) if isinstance(_current_user.ext_data, dict) else {}
+    ext[UI_LOCALE_FIELD] = req_data.locale
+    _current_user.ext_data = ext
+    await _current_user.save(update_fields=["ext_data", "update_time"])
+    logger.info(f"用户 {_current_user.username} 已保存界面语言: {req_data.locale}")
+    return ActionResponse(ok=True)
 
 
 @router.delete("/delete", summary="删除用户", response_model=ActionResponse)

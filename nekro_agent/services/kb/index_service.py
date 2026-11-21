@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_kb_chunk import DBKBChunk
 from nekro_agent.models.db_kb_document import DBKBDocument
+from nekro_agent.services.kb import kb_files
 from nekro_agent.services.kb.chunker import ChunkDraft, split_text_into_chunks
 from nekro_agent.services.kb.extractors import extract_source_file
 from nekro_agent.services.kb.qdrant_manager import kb_qdrant_manager
@@ -69,14 +71,28 @@ def _normalized_rel_path_for(document_id: int, text_hash: str) -> str:
     return f"{document_id}-{text_hash[:32]}.md"
 
 
-def _write_normalized_text(target: Path, text: str) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text, "utf-8")
+def _write_normalized_text(workspace_id: int, rel_path: str, text: str) -> None:
+    # `.normalized` 在容器可写的工作区里：逐级不跟随链接，临时文件 + rename
+    kb_files.write_text(workspace_id, kb_files.NORMALIZED, rel_path, text)
 
 
-def _discard_normalized_text(target: Path) -> None:
-    with suppress(OSError):
-        target.unlink()
+def _discard_normalized_text(workspace_id: int, rel_path: str) -> None:
+    with suppress(OSError, ValueError):
+        kb_files.unlink(workspace_id, kb_files.NORMALIZED, rel_path)
+
+
+def _extract_workspace_source(workspace_id: int, source_path: str, file_name: str) -> Any:
+    """抽取工作区知识库源文件的正文
+
+    抽取器按路径打开文件（PDF / Office 解析库都要路径），而源文件在容器可写的目录里：
+    先不跟随链接地复制到 NA 自己的临时目录，再从副本抽取，抽完删掉。源文件不存在或
+    被换成链接时抽取器看到的是「文件不存在」，与原来源文件缺失时同一种失败。
+    """
+    with tempfile.TemporaryDirectory(prefix="nekro-kb-extract-") as staging_dir:
+        staged = Path(staging_dir) / (Path(file_name).name or "source")
+        if not kb_files.copy_to(workspace_id, kb_files.SOURCE, source_path, staged):
+            staged = Path(staging_dir) / "missing" / (Path(file_name).name or "source")
+        return extract_source_file(staged, file_name)
 
 
 @dataclass(frozen=True)
@@ -331,10 +347,7 @@ async def _swap_document_index(
         except Exception as e:
             logger.warning(f"清理知识库旧向量点失败（不影响新索引可用性）: document_id={document.id}, error={e}")
         if snapshot.normalized_text_path and snapshot.normalized_text_path != normalized_rel_path:
-            with suppress(ValueError):
-                _discard_normalized_text(
-                    WorkspaceService.resolve_kb_normalized_path(document.workspace_id, snapshot.normalized_text_path)
-                )
+            _discard_normalized_text(document.workspace_id, snapshot.normalized_text_path)
     except asyncio.CancelledError as e:
         # 旧点 / 旧文本只是没清干净（旧 chunk 行已删，检索不会再选中它们），新索引照常生效
         raise _CancelledAfterSwitch() from e
@@ -357,12 +370,15 @@ async def index_document(document: DBKBDocument) -> int:
         await document.save(update_fields=["extract_status", "sync_status", "last_error", "update_time"])
     await _publish_index_progress(document, phase="extracting", started_at=started_at, progress_percent=5)
 
-    source_file = WorkspaceService.resolve_kb_source_path(document.workspace_id, document.source_path)
-    extracted = await asyncio.to_thread(extract_source_file, source_file, document.file_name)
+    extracted = await asyncio.to_thread(
+        _extract_workspace_source,
+        document.workspace_id,
+        document.source_path,
+        document.file_name,
+    )
     normalized_text = extracted.text.strip()
     normalized_text_hash = _hash_text(normalized_text)
     staged_rel_path = _normalized_rel_path_for(document.id, normalized_text_hash)
-    staged_file = WorkspaceService.resolve_kb_normalized_path(document.workspace_id, staged_rel_path)
     reuses_live_text = staged_rel_path == snapshot.normalized_text_path
 
     if not snapshot.searchable:
@@ -374,8 +390,8 @@ async def index_document(document: DBKBDocument) -> int:
     committed = False
     try:
         # staging 阶段：新文本写到独立路径，旧 chunk / 向量点 / 旧文本一律不动
-        if not reuses_live_text or not staged_file.exists():
-            await asyncio.to_thread(_write_normalized_text, staged_file, normalized_text)
+        if not reuses_live_text or not kb_files.exists(document.workspace_id, kb_files.NORMALIZED, staged_rel_path):
+            await asyncio.to_thread(_write_normalized_text, document.workspace_id, staged_rel_path, normalized_text)
 
         drafts = split_text_into_chunks(normalized_text)
         if drafts:
@@ -405,7 +421,7 @@ async def index_document(document: DBKBDocument) -> int:
         raise
     finally:
         if not committed and not reuses_live_text:
-            _discard_normalized_text(staged_file)
+            _discard_normalized_text(document.workspace_id, staged_rel_path)
 
     # 切换已提交：此后不得再有可失败步骤，否则 rebuild_document 会误把元数据回滚到已删除的旧文本
     return chunk_count
@@ -534,15 +550,10 @@ async def rebuild_workspace_documents(workspace_id: int) -> tuple[int, int]:
 
 
 async def delete_document_files(document: DBKBDocument) -> None:
-    source_file = WorkspaceService.resolve_kb_source_path(document.workspace_id, document.source_path)
-    if source_file.exists():
-        source_file.unlink()
+    # 删的是目录项本身：是容器放的链接也只删链接，不会删到链接指向的宿主文件
+    kb_files.unlink(document.workspace_id, kb_files.SOURCE, document.source_path)
     if document.normalized_text_path:
-        normalized_file = WorkspaceService.resolve_kb_normalized_path(
-            document.workspace_id, document.normalized_text_path
-        )
-        if normalized_file.exists():
-            normalized_file.unlink()
+        kb_files.unlink(document.workspace_id, kb_files.NORMALIZED, document.normalized_text_path)
 
 
 async def delete_document_index(document: DBKBDocument) -> None:

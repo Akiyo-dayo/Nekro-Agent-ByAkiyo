@@ -149,9 +149,13 @@ class WorkspaceResourceSecretIssue(BaseModel):
 class WorkspaceResourceSecretHealthResponse(BaseModel):
     ok: bool
     total: int = 0
+    encrypted_count: int = 0
     plaintext_count: int = 0
+    empty_count: int = 0
     legacy_encrypted_count: int = 0
     invalid_count: int = 0
+    # 下一次启动会被重写的行数（存量明文 + 用历史密钥加密的行）
+    stale_count: int = 0
     issues: List[WorkspaceResourceSecretIssue] = Field(default_factory=list)
 
 

@@ -77,6 +77,8 @@ def _install_injection_fakes(
         *,
         scope: Any = None,
         record_access: bool = True,
+        requester: Any = None,
+        exclude_origin_kinds: Any = (),
     ) -> list[list[RetrievedMemory]]:
         return [list(memories) for _ in requests]
 

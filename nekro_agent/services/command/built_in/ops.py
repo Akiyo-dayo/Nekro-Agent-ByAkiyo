@@ -1,5 +1,6 @@
 """内置命令 - 运维类: clear_sandbox_cache, docker_restart, docker_logs, sh, instance_id, github_stars_check, log_err_list"""
 
+import asyncio
 import os
 import shutil
 from collections.abc import AsyncIterator
@@ -11,6 +12,11 @@ from nekro_agent.schemas.i18n import i18n_text, t
 from nekro_agent.services.command.base import BaseCommand, CommandMetadata, CommandPermission
 from nekro_agent.services.command.ctl import CmdCtl
 from nekro_agent.services.command.schemas import Arg, CommandExecutionContext, CommandResponse
+
+# 工作区重建是后台任务，命令只负责等它结束并汇总。轮询间隔与最长等待写成常量，
+# 用例可以把它们改小，不必真的等三秒一次。
+REBUILD_COMMAND_POLL_INTERVAL_SECONDS = 3.0
+REBUILD_COMMAND_MAX_WAIT_SECONDS = 600.0
 
 
 class ClearSandboxCacheCommand(BaseCommand):
@@ -393,6 +399,46 @@ class MemoryReindexCommand(BaseCommand):
         )
 
 
+class MemoryBackfillPayloadCommand(BaseCommand):
+    """补齐存量记忆向量的新 payload 键"""
+
+    @property
+    def metadata(self) -> CommandMetadata:
+        return CommandMetadata(
+            name="memory_backfill_payload",
+            aliases=["mem_backfill_payload"],
+            description="补齐存量记忆向量缺失的 payload 键",
+            i18n_description=i18n_text(
+                zh_CN="补齐存量记忆向量缺失的 payload 键",
+                en_US="Backfill missing payload keys on existing memory vectors",
+            ),
+            usage="memory_backfill_payload -y",
+            permission=CommandPermission.SUPER_USER,
+            category="运维",
+            i18n_category=i18n_text(zh_CN="运维", en_US="Operations"),
+            params_schema=self._auto_params_schema(),
+        )
+
+    async def execute(
+        self,
+        context: CommandExecutionContext,
+        args_str: Annotated[str, Arg("参数", positional=True, greedy=True)] = "",
+    ) -> AsyncIterator[CommandResponse]:
+        if "-y" not in args_str:
+            yield CmdCtl.failed("请输入 -y 确认补齐记忆向量 payload")
+            return
+
+        from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
+
+        yield CmdCtl.message("开始补齐存量记忆向量的 payload，可中断、可重复执行...")
+        try:
+            updated = await memory_qdrant_manager.backfill_paragraph_payloads()
+        except Exception as e:
+            yield CmdCtl.failed(f"补齐记忆向量 payload 失败: {e!s}")
+            return
+        yield CmdCtl.success(f"记忆向量 payload 补齐完成，共处理 {updated} 个点")
+
+
 class MemoryPruneCommand(BaseCommand):
     """清理低价值记忆"""
 
@@ -470,22 +516,147 @@ class MemoryRebuildCommand(BaseCommand):
             yield CmdCtl.failed("请输入 -y 确认清空并重建工作区记忆库")
             return
 
-        from nekro_agent.services.memory.rebuild import rebuild_workspace_memories
+        from nekro_agent.services.memory.rebuild import (
+            get_workspace_memory_rebuild_status,
+            start_workspace_memory_rebuild,
+        )
 
-        yield CmdCtl.message(f"开始重建工作区 {workspace_id} 的记忆库，这可能需要一些时间...")
         try:
-            result = await rebuild_workspace_memories(workspace_id)
+            # 与后台 / 控制台走同一条路径：这个函数的参数是工作区 ID，它自己创建任务并返回任务 ID。
+            # 直接调用 `rebuild_workspace_memories` 会把它当成任务 ID，永远找不到任务。
+            started = start_workspace_memory_rebuild(workspace_id, requested_by="ops")
         except Exception as e:
-            yield CmdCtl.failed(f"重建工作区记忆库失败: {e!s}")
+            yield CmdCtl.failed(f"启动工作区记忆库重建失败: {e!s}")
             return
 
-        yield CmdCtl.success(
-            "工作区记忆库重建完成！\n"
-            f"已清空段落: {result.paragraphs_deleted} 条\n"
-            f"重置频道: {result.channels_reset} 个\n"
-            f"已重建频道: {result.channels_rebuilt} 个\n"
-            f"重新处理消息: {result.messages_processed} 条\n"
-            f"情景记忆: {result.episodic_paragraphs_created} 条\n"
-            f"语义任务记忆: {result.semantic_tasks_replayed} 条\n"
-            f"事件: {result.episodes_created} 个"
+        yield CmdCtl.message(
+            f"记忆重建已{'复用现有任务' if started.reused else '创建新任务'}: job={started.job_id}, "
+            f"状态={started.status}。任务在后台运行，结束后这里会输出统计。",
         )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REBUILD_COMMAND_MAX_WAIT_SECONDS
+        status = None
+        while True:
+            await asyncio.sleep(max(0.0, REBUILD_COMMAND_POLL_INTERVAL_SECONDS))
+            try:
+                status = await get_workspace_memory_rebuild_status(workspace_id)
+            except Exception as e:
+                yield CmdCtl.failed(f"查询记忆重建状态失败: {e!s}")
+                return
+            if status.status in {"completed", "failed", "cancelled", "idle"}:
+                break
+            if loop.time() >= deadline:
+                # 命令上下文没有单独的等待预算，这里用一个固定上限兜住：超时就不等了，
+                # 任务仍在后台跑，管理员可以稍后用状态接口查看。
+                yield CmdCtl.message(
+                    "等待已超过 10 分钟，任务仍在后台运行。可稍后用工作区记忆重建状态接口查看进度与结果。",
+                )
+                return
+
+        if status is None or status.status == "idle":
+            yield CmdCtl.failed("没有查到记忆重建任务的状态")
+            return
+        if status.status == "failed":
+            yield CmdCtl.failed(
+                f"工作区记忆库重建失败: {status.failure_reason or status.failure_code or '未知原因'}",
+            )
+            return
+        if status.status == "cancelled":
+            yield CmdCtl.failed("工作区记忆库重建已被取消")
+            return
+
+        failed_channels = [channel for channel in status.channels if channel.status == "failed"]
+        lines = [
+            "工作区记忆库重建完成！",
+            f"已处理消息: {status.total_messages_processed} 条",
+            f"成功频道: {status.completed_channels} / {status.total_channels} 个",
+            f"失败频道: {len(failed_channels)} 个",
+        ]
+        for channel in failed_channels:
+            lines.append(f" - {channel.chat_key}: {channel.last_error or '未知原因'}")
+        yield CmdCtl.success("\n".join(lines))
+
+
+class MemoryRebuildChannelCommand(BaseCommand):
+    """按频道重建域分区聊天记忆"""
+
+    @property
+    def metadata(self) -> CommandMetadata:
+        return CommandMetadata(
+            name="memory_rebuild_channel",
+            aliases=["mem_rebuild_channel"],
+            description="按频道重建域分区聊天记忆",
+            i18n_description=i18n_text(
+                zh_CN="按频道重建域分区聊天记忆",
+                en_US="Rebuild domain-partitioned chat memory for one channel",
+            ),
+            usage="memory_rebuild_channel <chat_key> [-y]",
+            permission=CommandPermission.SUPER_USER,
+            category="运维",
+            i18n_category=i18n_text(zh_CN="运维", en_US="Operations"),
+            params_schema=self._auto_params_schema(),
+        )
+
+    async def execute(
+        self,
+        context: CommandExecutionContext,
+        chat_key: Annotated[str, Arg("频道标识", positional=True)] = "",
+        args_str: Annotated[str, Arg("参数", positional=True, greedy=True)] = "",
+    ) -> AsyncIterator[CommandResponse]:
+        resolved_chat_key = chat_key.strip()
+        if not resolved_chat_key:
+            yield CmdCtl.failed("请输入 chat_key")
+            return
+
+        from nekro_agent.services.memory.feature_flags import is_domain_scope_enabled
+        from nekro_agent.services.memory.rebuild import (
+            estimate_domain_channel_rebuild,
+            rebuild_domain_channel,
+        )
+
+        if not is_domain_scope_enabled():
+            yield CmdCtl.failed("记忆域分区未开启")
+            return
+
+        try:
+            estimate = await estimate_domain_channel_rebuild(resolved_chat_key)
+        except Exception as e:
+            yield CmdCtl.failed(f"估算频道重建失败: {e!s}")
+            return
+
+        cutoff_text = estimate.cutoff or "不限（回看天数为 0）"
+        estimate_lines = [
+            f"频道: {resolved_chat_key}",
+            f"需回放消息: {estimate.message_count} 条",
+            f"约需沉淀模型调用: {estimate.estimated_calls} 次",
+            f"回看截止时间: {cutoff_text}",
+        ]
+        if "-y" not in args_str:
+            yield CmdCtl.success(
+                "\n".join([*estimate_lines, "", "以上是估算，没有改动任何数据；确认执行请加 -y"]),
+            )
+            return
+
+        yield CmdCtl.message("\n".join([*estimate_lines, "", "开始按频道重建域分区记忆..."]))
+
+        try:
+            result = await rebuild_domain_channel(resolved_chat_key)
+        except Exception as e:
+            yield CmdCtl.failed(f"按频道重建记忆失败: {e!s}")
+            return
+
+        lines = [
+            "频道记忆重建结束",
+            f"删除旧段落: {result.paragraphs_deleted} 条",
+            f"已回放消息: {result.messages_processed} 条",
+            f"新写段落: {result.episodic_paragraphs_created} 条",
+        ]
+        if result.channels_failed:
+            lines.append("结果: 失败")
+            for failed_chat_key in result.failed_channels:
+                lines.append(f" - {failed_chat_key}: {result.last_error or '未知原因'}")
+            yield CmdCtl.failed("\n".join(lines))
+            return
+        lines.append("结果: 完成")
+        yield CmdCtl.success("\n".join(lines))

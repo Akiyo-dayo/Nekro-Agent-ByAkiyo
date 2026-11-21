@@ -29,6 +29,7 @@ import ast
 import inspect
 import json
 import pathlib
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -47,14 +48,17 @@ from nekro_agent.models.db_mem_paragraph import (
 )
 from nekro_agent.models.db_mem_relation import DBMemRelation
 from nekro_agent.models.db_preset import DBPreset
+from nekro_agent.services import identity_scope as identity_scope_module
 from nekro_agent.services.identity_scope import PRESET_NONE
 from nekro_agent.services.memory import episode_aggregator as episode_module
+from nekro_agent.services.memory import instance_scope as instance_scope_module
 from nekro_agent.services.memory import qdrant_manager as qdrant_module
 from nekro_agent.services.memory import query_service as query_service_module
 from nekro_agent.services.memory import retriever as retriever_module
 from nekro_agent.services.memory import semantic_writer as semantic_writer_module
 from nekro_agent.services.memory.consolidator import EpisodicConsolidator
 from nekro_agent.services.memory.instance_scope import (
+    CONSOLE_ONLY_PRESET_ID,
     MemoryScope,
     build_instance_filter,
     resolve_allowed_instance_keys,
@@ -121,15 +125,35 @@ def memory_system_on(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _StubChannel:
-    """`identity_scope.ChannelLike`：域两列 + 人设。"""
+    """`identity_scope.ChannelLike`：域两列 + 人设（闸开时还要频道类型、工作区与生效配置）。"""
 
-    def __init__(self, instance_key: str, *, preset_id: int = PRESET_NONE, adapter_key: str = ADAPTER) -> None:
+    def __init__(
+        self,
+        instance_key: str,
+        *,
+        preset_id: int = PRESET_NONE,
+        adapter_key: str = ADAPTER,
+        chat_key: str = CHAT_A,
+        channel_type: str = "group",
+        workspace_id: Optional[int] = None,
+    ) -> None:
         self.adapter_key = adapter_key
         self.instance_key = instance_key
+        self.chat_key = chat_key
+        self.channel_type = channel_type
+        self.workspace_id = workspace_id
         self._preset_id = preset_id
 
     async def get_effective_preset_id(self) -> int:
         return self._preset_id
+
+    async def get_effective_config(self) -> SimpleNamespace:
+        # 三个跨频道召回开关一律关闭：本组用例只关心人设维，别的维度不参与
+        return SimpleNamespace(
+            MEMORY_RECALL_GROUP_TO_GROUP="off",
+            MEMORY_RECALL_GROUP_TO_PRIVATE="off",
+            MEMORY_RECALL_PRIVATE_TO_GROUP="off",
+        )
 
 
 class _PassThroughQdrant:
@@ -186,6 +210,7 @@ async def _seed_paragraph(
     instance_key: str = INSTANCE_A,
     preset_id: int = PRESET_NONE,
     origin_chat_key: str = CHAT_A,
+    origin_chat_type: str = "",
 ) -> DBMemParagraph:
     paragraph = await DBMemParagraph.create(
         workspace_id=WORKSPACE_ID,
@@ -199,21 +224,63 @@ async def _seed_paragraph(
         half_life_seconds=30 * 24 * 3600,
         origin_kind=OriginKind.TASK,
         origin_chat_key=origin_chat_key,
+        origin_chat_type=origin_chat_type,
     )
     # `default=` 只在 create 不带该列时生效，统一回写一次，不依赖写入时机
-    await DBMemParagraph.filter(id=paragraph.id).update(instance_key=instance_key, preset_id=preset_id)
+    await DBMemParagraph.filter(id=paragraph.id).update(
+        instance_key=instance_key,
+        preset_id=preset_id,
+        origin_chat_type=origin_chat_type,
+    )
     return paragraph
 
 
 def _install_qdrant(monkeypatch: pytest.MonkeyPatch, scores: Dict[int, float]) -> _PassThroughQdrant:
     fake = _PassThroughQdrant(scores)
 
-    async def fake_embed(_text: str) -> List[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
         return [1.0, 0.0, 0.0, 0.0]
 
     monkeypatch.setattr(retriever_module, "embed_text", fake_embed)
     monkeypatch.setattr(retriever_module, "memory_qdrant_manager", fake)
     return fake
+
+
+async def _boot_deployment() -> DBPreset:
+    """跑一次 `init_default_preset()`，得到任何部署启动之后的状态。"""
+    from nekro_agent.services import preset_service
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(config, "AI_CHAT_PRESET_NAME", "")
+        patch.setattr(config, "AI_CHAT_PRESET_SETTING", "")
+        patch.setattr(preset_service, "save_config", lambda: None)
+        await preset_service.init_default_preset()
+    assert config.AI_CHAT_DEFAULT_PRESET_ID is not None
+    return await DBPreset.get(id=config.AI_CHAT_DEFAULT_PRESET_ID)
+
+
+async def _seed_console_direct_cc(monkeypatch: pytest.MonkeyPatch, *, origin_ref: str = "cc-1") -> DBMemParagraph:
+    """走真实写入出口沉淀一条控制台直发的 CC 结论（向量库换成不落盘的替身）。"""
+
+    async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
+        return [1.0, 0.0, 0.0, 0.0]
+
+    class _NoopQdrant:
+        async def upsert_paragraph(self, **_kwargs: Any) -> bool:
+            return True
+
+    monkeypatch.setattr(semantic_writer_module, "embed_text", fake_embed)
+    monkeypatch.setattr(semantic_writer_module, "memory_qdrant_manager", _NoopQdrant())
+
+    paragraph = await persist_cc_task_memory(
+        workspace_id=WORKSPACE_ID,
+        task_content="整理季度预算",
+        result_content="季度预算已按部门拆分完毕，三条线的上限与结转规则都已确认。" * 3,
+        source_chat_key="__user__",
+        origin_ref=origin_ref,
+    )
+    assert paragraph is not None
+    return paragraph
 
 
 # --------------------------------------------------------------------------------------
@@ -327,15 +394,7 @@ class TestZeroConfigOnARealDeploymentNotJustAStub:
 
     async def _boot(self) -> DBPreset:
         """跑一次 `init_default_preset()`，得到任何部署启动之后的状态。"""
-        from nekro_agent.services import preset_service
-
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(config, "AI_CHAT_PRESET_NAME", "")
-            patch.setattr(config, "AI_CHAT_PRESET_SETTING", "")
-            patch.setattr(preset_service, "save_config", lambda: None)
-            await preset_service.init_default_preset()
-        assert config.AI_CHAT_DEFAULT_PRESET_ID is not None
-        return await DBPreset.get(id=config.AI_CHAT_DEFAULT_PRESET_ID)
+        return await _boot_deployment()
 
     async def test_an_unbound_channel_resolves_to_the_system_default_not_zero(self, scope_db: None) -> None:
         """先把真实前提本身钉死，否则下面两条会因为"恰好是 0"而空转。"""
@@ -379,49 +438,58 @@ class TestZeroConfigOnARealDeploymentNotJustAStub:
         )
         assert [memory.target_id for memory in memories] == [legacy.id]
 
-    async def test_console_direct_cc_memory_is_recallable_from_a_channel(
+    async def test_console_direct_cc_memory_is_never_recalled_in_a_channel(
         self,
         scope_db: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """控制台直发 CC 沉淀的那一档（`instance_key=""` + `preset_id=0`）频道必须读得到。
+        """控制台直发 CC 的结论落在**仅控制台**的负数人设档，任何频道都召回不到。
 
-        **这条与存量数据无关**：`persist_cc_task_memory` 的默认档在全新部署上照样写 0
-        （控制台上没有频道，既没有实例也没有人设）。等值条件下这些行写了就没人能读，
-        而"上线时全新启动"挡不住它。
+        这些结论是一个人对着工作区下的指令与产出，不属于任何频道。它以前落在
+        `(instance_key="", preset_id=0)`——而 0 是所有频道都放行的「无人设档」，
+        于是任何群和私聊都能把它当成自己的记忆召回。
+
+        现在写入侧把它收进 `CONSOLE_ONLY_PRESET_ID`（负数），频道侧的人设维只放行
+        「当前人设」与 0，因此**闸关闸开都读不到**，而条件本身一个字都没改。
+        后台记忆页与 CC 握手用的 `MemoryScope.unrestricted()` 不按人设过滤，照旧读得到。
         """
         await self._boot()
 
-        async def fake_embed(_text: str) -> List[float]:
-            return [1.0, 0.0, 0.0, 0.0]
-
-        class _NoopQdrant:
-            async def upsert_paragraph(self, **_kwargs: Any) -> bool:
-                return True
-
-        monkeypatch.setattr(semantic_writer_module, "embed_text", fake_embed)
-        monkeypatch.setattr(semantic_writer_module, "memory_qdrant_manager", _NoopQdrant())
-
-        console_row = await persist_cc_task_memory(
-            workspace_id=WORKSPACE_ID,
-            task_content="整理季度预算",
-            result_content="季度预算已按部门拆分完毕，三条线的上限与结转规则都已确认。" * 3,
-            source_chat_key="__user__",
-            origin_ref="cc-1",
-        )
-        assert console_row is not None
-        assert (console_row.instance_key, console_row.preset_id) == ("", PRESET_NONE)
+        console_row = await _seed_console_direct_cc(monkeypatch)
+        assert (console_row.instance_key, console_row.preset_id) == ("", CONSOLE_ONLY_PRESET_ID)
 
         _install_qdrant(monkeypatch, {console_row.id: 0.9})
-        channel = await _seed_channel(CHAT_A, INSTANCE_A, preset_id=None)
-        memories = await retrieve_memories(
+        no_preset_channel = await _seed_channel(CHAT_A, INSTANCE_A, preset_id=None)
+        assert console_row.id not in [
+            memory.target_id
+            for memory in await retrieve_memories(
+                workspace_id=WORKSPACE_ID,
+                query="季度预算",
+                limit=10,
+                scope=await resolve_memory_scope(no_preset_channel),
+            )
+        ]
+
+        real_preset = await _seed_preset(PRESET_JIA)
+        preset_channel = await _seed_channel(CHAT_A2, INSTANCE_A, preset_id=real_preset.id)
+        assert console_row.id not in [
+            memory.target_id
+            for memory in await retrieve_memories(
+                workspace_id=WORKSPACE_ID,
+                query="季度预算",
+                limit=10,
+                scope=await resolve_memory_scope(preset_channel),
+            )
+        ]
+
+        # 后台记忆页与握手走的是这一条：不按人设过滤，要读得到
+        everything = await retrieve_memories(
             workspace_id=WORKSPACE_ID,
             query="季度预算",
             limit=10,
-            scope=await resolve_memory_scope(channel),
+            scope=MemoryScope.unrestricted(),
         )
-        paragraphs = [memory.target_id for memory in memories if memory.source_type == "paragraph"]
-        assert paragraphs == [console_row.id]
+        assert console_row.id in [memory.target_id for memory in everything]
 
     async def test_a_real_preset_still_cannot_see_another_real_preset(
         self,
@@ -751,7 +819,7 @@ class TestWriteSideTagsPresetWithoutCopies:
         await _seed_channel(CHAT_A, INSTANCE_A, preset_id=preset.id)
         consolidator = EpisodicConsolidator(WORKSPACE_ID)
 
-        async def fake_embed(_text: str) -> List[float]:
+        async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
             return [1.0, 0.0, 0.0, 0.0]
 
         class _NoopQdrant:
@@ -796,7 +864,7 @@ class TestWriteSideTagsPresetWithoutCopies:
         assert yi.id != jia.id
         await _seed_channel(CHAT_A, INSTANCE_A, preset_id=jia.id)
 
-        async def fake_embed(_text: str) -> List[float]:
+        async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
             return [1.0, 0.0, 0.0, 0.0]
 
         class _NoopQdrant:
@@ -819,7 +887,7 @@ class TestWriteSideTagsPresetWithoutCopies:
         assert rows[0].preset_id == jia.id
 
     async def test_cc_semantic_writer_carries_the_preset(self, scope_db: None, monkeypatch: pytest.MonkeyPatch) -> None:
-        async def fake_embed(_text: str) -> List[float]:
+        async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
             return [1.0, 0.0, 0.0, 0.0]
 
         class _NoopQdrant:
@@ -841,18 +909,34 @@ class TestWriteSideTagsPresetWithoutCopies:
         assert paragraph is not None
         assert (paragraph.instance_key, paragraph.preset_id) == (INSTANCE_A, 7)
 
-    async def test_console_direct_cc_lands_in_the_no_instance_no_preset_bucket(
+    async def test_console_direct_cc_lands_in_the_console_only_bucket(
         self,
         scope_db: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """控制台直发（`__user__`）不属于任何实例、任何人设，两个默认值成对成立。
+        """控制台直发（`__user__`）落成「不属于任何实例 + 仅控制台可见」的那一档。
 
-        它与 `_build_cc_memory_handshake` 的全量读是配套的一对：写在"无实例无人设"这一档，
-        读的时候不设限。任何一侧单独改都会让控制台直发的记忆握手读不到自己写的东西。
+        它与 `_build_cc_memory_handshake` 的全量读是配套的一对：写在负数档、读的时候不按
+        人设过滤。任何一侧单独改都会让控制台直发读不到自己写的东西——或者更糟，
+        让这些结论重新跑进频道的召回里。
+        """
+        await _boot_deployment()
+        paragraph = await _seed_console_direct_cc(monkeypatch, origin_ref="reply-2")
+        assert (paragraph.instance_key, paragraph.preset_id) == ("", CONSOLE_ONLY_PRESET_ID)
+
+    async def test_console_identity_overrides_whatever_the_caller_passed(
+        self,
+        scope_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """以 `__user__` 写回时，调用方传的实例与人设一律被覆盖。
+
+        收口放在 `persist_cc_task_memory` 内部而不是各个调用点：控制台身份是"这条结论从哪来"，
+        任何新增的写回路径只要带着 `__user__` 就自动落进仅控制台档。
+        这里传一个像模像样的实例与人设，落库仍必须是 `("", CONSOLE_ONLY_PRESET_ID)`。
         """
 
-        async def fake_embed(_text: str) -> List[float]:
+        async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
             return [1.0, 0.0, 0.0, 0.0]
 
         class _NoopQdrant:
@@ -864,13 +948,97 @@ class TestWriteSideTagsPresetWithoutCopies:
 
         paragraph = await persist_cc_task_memory(
             workspace_id=WORKSPACE_ID,
-            task_content="控制台直发",
+            task_content="控制台直发但传了频道参数",
             result_content="结论正文足够长，能过最小沉淀阈值。" * 5,
             source_chat_key="__user__",
-            origin_ref="reply-2",
+            origin_ref="reply-3",
+            instance_key="x",
+            preset_id=5,
         )
         assert paragraph is not None
-        assert (paragraph.instance_key, paragraph.preset_id) == ("", 0)
+        assert (paragraph.instance_key, paragraph.preset_id) == ("", CONSOLE_ONLY_PRESET_ID)
+
+    async def test_a_channel_sourced_cc_conclusion_is_still_recalled_there(
+        self,
+        scope_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """对照组：频道里自己发起的 CC 任务照常召回得到。
+
+        没有它，上一条在"CC 记忆整体关掉"或"人设维把 CC 一律挡掉"的实现下也会绿。
+        """
+
+        async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
+            return [1.0, 0.0, 0.0, 0.0]
+
+        class _NoopQdrant:
+            async def upsert_paragraph(self, **_kwargs: Any) -> bool:
+                return True
+
+        monkeypatch.setattr(semantic_writer_module, "embed_text", fake_embed)
+        monkeypatch.setattr(semantic_writer_module, "memory_qdrant_manager", _NoopQdrant())
+
+        preset = await _seed_preset(PRESET_JIA)
+        paragraph = await persist_cc_task_memory(
+            workspace_id=WORKSPACE_ID,
+            task_content="频道里委托的任务",
+            result_content="频道委托的结论正文，长度足够过最小沉淀阈值。" * 5,
+            source_chat_key=CHAT_A,
+            origin_ref="reply-4",
+            instance_key=INSTANCE_A,
+            preset_id=preset.id,
+        )
+        assert paragraph is not None
+        assert (paragraph.instance_key, paragraph.preset_id) == (INSTANCE_A, preset.id)
+
+        _install_qdrant(monkeypatch, {paragraph.id: 0.9})
+        channel = await _seed_channel(CHAT_A, INSTANCE_A, preset_id=preset.id)
+        memories = await retrieve_memories(
+            workspace_id=WORKSPACE_ID,
+            query="频道委托的结论",
+            limit=10,
+            scope=await resolve_memory_scope(channel),
+        )
+        assert paragraph.id in [memory.target_id for memory in memories if memory.source_type == "paragraph"]
+
+    async def test_console_direct_cc_relations_are_also_channel_invisible(
+        self,
+        scope_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """实体与关系跟着段落一起落进仅控制台档。
+
+        关系召回那一支单独按 `MemTable.RELATION` 过滤，只把段落堵住的话，这条三元组照样
+        会以"关系记忆"的身份进频道上下文。
+        """
+        await _boot_deployment()
+        paragraph = await _seed_console_direct_cc(monkeypatch, origin_ref="reply-5")
+
+        entities = await DBMemEntity.filter(workspace_id=WORKSPACE_ID).all()
+        relations = await DBMemRelation.filter(workspace_id=WORKSPACE_ID).all()
+        assert entities, "控制台直发的结论没有产出实体，下面的断言会空转"
+        assert relations, "控制台直发的结论没有产出关系，下面的断言会空转"
+        assert {entity.preset_id for entity in entities} == {CONSOLE_ONLY_PRESET_ID}
+        assert {relation.preset_id for relation in relations} == {CONSOLE_ONLY_PRESET_ID}
+
+        _install_qdrant(monkeypatch, {})
+        channel = await _seed_channel(CHAT_A, INSTANCE_A, preset_id=None)
+        scope = await resolve_memory_scope(channel)
+        query = " ".join([entities[0].canonical_name, entities[-1].canonical_name])
+        memories = await retrieve_memories(workspace_id=WORKSPACE_ID, query=query, limit=10, scope=scope)
+        assert [memory for memory in memories if memory.source_type == "relation"] == []
+
+        everything = await retrieve_memories(
+            workspace_id=WORKSPACE_ID,
+            query=query,
+            limit=10,
+            scope=MemoryScope.unrestricted(),
+        )
+        relation_hits = [memory for memory in everything if memory.source_type == "relation"]
+        assert relation_hits, "全量检索也读不到这些关系，说明上一条断言是空转"
+        assert {memory.target_id for memory in relation_hits} == {relation.id for relation in relations}
+        # 段落本身同样要读得到：控制台侧的握手靠的就是这一条
+        assert paragraph.id in [memory.target_id for memory in everything]
 
     async def test_entities_of_different_presets_are_separate_nodes(self, scope_db: None) -> None:
         """同名实体在两个人设下是两个节点。
@@ -1115,29 +1283,43 @@ def _unscoped_queries(path: pathlib.Path) -> List[str]:
     """找出检索侧所有**没有**展开作用域过滤的 `mem_*` 查询。
 
     写死一份"消费点清单"挡不住第五个消费点——它对任何新增都恒真。这里改成扫源码：
-    `DBMemParagraph.filter(...)` / `.get_or_none(...)` 这类调用里必须出现
-    `**self._scope_filter` 或 `**scope_filter`，否则就是一条无过滤的旁路。
+    `DBMemParagraph.filter(...)` / `.get_or_none(...)` 这类调用，必须要么出现
+    `**self._scope_filter` / `**scope_filter`，要么整个调用作为参数交给
+    `scope.apply(...)`。两条都是「作用域被展开」的形状；裸查询就是无过滤的旁路。
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    offenders: List[str] = []
-    for node in ast.walk(tree):
+
+    def is_scope_apply(node: ast.AST) -> bool:
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
+            return False
+        if node.func.attr != "apply":
+            return False
         owner = node.func.value
-        if not isinstance(owner, ast.Name) or owner.id not in _SCOPED_MODELS:
-            continue
-        if node.func.attr not in {"filter", "get_or_none", "get"}:
-            continue
-        spread = any(
-            keyword.arg is None
-            and isinstance(keyword.value, (ast.Attribute, ast.Name))
-            and (
-                getattr(keyword.value, "attr", getattr(keyword.value, "id", "")) in _SCOPE_SPREADS
-            )
-            for keyword in node.keywords
-        )
-        if not spread:
-            offenders.append(f"{path.name}:{node.lineno} {owner.id}.{node.func.attr}()")
+        return getattr(owner, "attr", getattr(owner, "id", "")) == "scope"
+
+    offenders: List[str] = []
+
+    def visit(node: ast.AST, inside_scope_apply: bool) -> None:
+        next_inside = inside_scope_apply or is_scope_apply(node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            owner = node.func.value
+            if (
+                isinstance(owner, ast.Name)
+                and owner.id in _SCOPED_MODELS
+                and node.func.attr in {"filter", "get_or_none", "get"}
+            ):
+                spread = any(
+                    keyword.arg is None
+                    and isinstance(keyword.value, (ast.Attribute, ast.Name))
+                    and getattr(keyword.value, "attr", getattr(keyword.value, "id", "")) in _SCOPE_SPREADS
+                    for keyword in node.keywords
+                )
+                if not spread and not next_inside:
+                    offenders.append(f"{path.name}:{node.lineno} {owner.id}.{node.func.attr}()")
+        for child in ast.iter_child_nodes(node):
+            visit(child, next_inside)
+
+    visit(tree, False)
     return offenders
 
 
@@ -1276,8 +1458,10 @@ class TestDeliberateNonIsolationIsDocumented:
         断言落在**真的传下去的那个值**上而不是源码文本：源码里那串字面量在 docstring 里
         也出现，拿 `in source` 判定会被"改了代码没改注释"整个骗过去（实测这个变异存活）。
 
-        它与 `persist_cc_task_memory` 的默认值是配套的一对：写在"无实例无人设"这一档、
-        读的时候不设限。任何一侧单独改都会让控制台直发读不到自己写的东西。
+        它与 `persist_cc_task_memory` 的默认值是配套的一对：写在 `CONSOLE_ONLY_PRESET_ID`
+        这一档、读的时候不按人设过滤。频道侧的人设维永远命不中那个负数档，
+        所以控制台直发的结论只有这里读得到——任何一侧单独改都会让这条链路断掉。
+        写侧落在负数档这件事由 `TestWriteSideTagsPresetWithoutCopies` 的用例钉住。
         """
         from nekro_agent.routers import workspaces as workspaces_module
 
@@ -1342,3 +1526,117 @@ class TestDeliberateNonIsolationIsDocumented:
             scope=await resolve_memory_scope(_StubChannel(INSTANCE_A, preset_id=1)),
         )
         assert [memory.target_id for memory in memories] == [from_group_1.id]
+
+
+# --------------------------------------------------------------------------------------
+# 9. 闸门打开时，仅控制台档依然进不了群与私聊
+# --------------------------------------------------------------------------------------
+
+
+class TestConsoleOnlyBucketUnderAnOpenGate:
+    """闸关时人设维是 `in (人设, 0)`，闸开时是 `PresetVisible` —— 两条不同的渲染路径。
+
+    闸关那组用例只钉住了前者。闸开时频道还多出本地集与域成员两维，正好是"某一维
+    顺手把负数档放过去"最容易发生的形态，所以这一组在闸开下把两个频道类型各跑一遍。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _gate_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(config, "MEMORY_DOMAIN_SCOPE_ENABLED", True)
+
+    async def test_neither_a_group_nor_a_private_chat_recalls_it(
+        self,
+        scope_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _boot_deployment()
+        console_row = await _seed_console_direct_cc(monkeypatch, origin_ref="cc-gate")
+        group = await _seed_channel(CHAT_A, INSTANCE_A, preset_id=None)
+        private = await DBChatChannel.create(
+            chat_key=CHAT_A2,
+            adapter_key=ADAPTER,
+            instance_key=INSTANCE_A,
+            channel_id="private_1",
+            channel_name="私聊",
+            channel_type="private",
+            is_active=True,
+            workspace_id=WORKSPACE_ID,
+            preset_id=None,
+            data=json.dumps({}),
+        )
+        preset_id = await group.get_effective_preset_id()
+        # 两个频道各自的原生记忆：证明"读不到"不是因为检索整个空转
+        own_group = await _seed_paragraph(TEXT_JIA, preset_id=preset_id, origin_chat_type="group")
+        own_private = await _seed_paragraph(
+            TEXT_YI,
+            preset_id=preset_id,
+            origin_chat_key=CHAT_A2,
+            origin_chat_type="private",
+        )
+        _install_qdrant(monkeypatch, {console_row.id: 0.9, own_group.id: 0.9, own_private.id: 0.9})
+
+        for channel, own in ((group, own_group), (private, own_private)):
+            scope = await resolve_memory_scope(channel)
+            assert scope.visibility is not None, "闸必须真的开着，否则这条用例测的是另一条路径"
+            memories = await retrieve_memories(
+                workspace_id=WORKSPACE_ID,
+                query="季度预算",
+                limit=10,
+                scope=scope,
+            )
+            ids = {memory.target_id for memory in memories}
+            assert console_row.id not in ids, f"控制台直发的结论被 {channel.chat_key} 召回了"
+            assert own.id in ids, f"{channel.chat_key} 自己的记忆也没读到，上一条断言是空转"
+
+        everything = await retrieve_memories(
+            workspace_id=WORKSPACE_ID,
+            query="季度预算",
+            limit=10,
+            scope=MemoryScope.unrestricted(),
+        )
+        assert console_row.id in {memory.target_id for memory in everything}
+
+
+# --------------------------------------------------------------------------------------
+# 10. 人设维的防线：频道解析出负数时回落到无人设档，而不是沿用或清空
+# --------------------------------------------------------------------------------------
+
+
+class TestNegativePresetIdIsDefused:
+    """负数档是控制台专用的标记，不是合法人设。
+
+    一个频道如果解析出负数，说明人设那一维的数据或回退链坏了。沿用它会读走控制台直发的
+    结论；而"什么都不放行"会让这个频道永久失忆、且现场只表现为"Bot 突然不记得任何事"。
+    正确的退化是当成"没有配置人设"。
+    """
+
+    @pytest.mark.parametrize("gate_open", [False, True])
+    async def test_negative_preset_falls_back_to_no_preset(
+        self,
+        scope_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+        gate_open: bool,
+    ) -> None:
+        monkeypatch.setattr(config, "MEMORY_DOMAIN_SCOPE_ENABLED", gate_open)
+        warnings: List[str] = []
+
+        class _Recorder:
+            def __getattr__(self, _name: str) -> Any:
+                return lambda *_a, **_k: None
+
+            def warning(self, message: str, *_a: Any, **_k: Any) -> None:
+                warnings.append(message)
+
+        async def fake_resolve_preset_id(_channel: Any) -> int:
+            return CONSOLE_ONLY_PRESET_ID
+
+        monkeypatch.setattr(instance_scope_module, "logger", _Recorder())
+        monkeypatch.setattr(identity_scope_module, "resolve_preset_id", fake_resolve_preset_id)
+
+        channel = _StubChannel(INSTANCE_A, chat_key=CHAT_A, workspace_id=WORKSPACE_ID)
+        scope = await resolve_memory_scope(channel)
+
+        assert scope.preset_id == PRESET_NONE
+        assert scope.as_filter()["preset_id"] == PRESET_NONE
+        assert any(str(CONSOLE_ONLY_PRESET_ID) in message for message in warnings), "回落必须留痕"
+        assert any(CHAT_A in message for message in warnings), "告警要带上出问题的频道"

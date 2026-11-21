@@ -116,6 +116,12 @@ async def _template_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.setattr(onebot_routers, "NAPCAT_ONEBOT_ADAPTER_DIR", str(config_dir))
     # 账号不在库里：令牌按部署级令牌回落。这里只看端口，令牌值无关
     monkeypatch.setenv("ONEBOT_ACCESS_TOKEN", "irrelevant-to-port")
+    # 令牌解析要查库：本文件不建库，之前的用例留下的数据库配置会让它现开一个 sqlite 连接、没人关。
+    # 这里只看端口，令牌值无关
+    async def _fixed_token(_self_id: str) -> SimpleNamespace:
+        return SimpleNamespace(token="irrelevant-to-port")
+
+    monkeypatch.setattr(onebot_routers, "resolve_expected_token", _fixed_token)
 
     await onebot_routers.restart(instance_key=None, _current_user=_platform_owner())
 

@@ -18,26 +18,25 @@
 ## 读写分离
 
 - **读操作**直接在 IM 里返回结果（实例在线状态、租户概览、近期错误…）
-- **写操作**在 IM 里**不执行**，只回一条带签名、短时效、一次性的深链，
-  点进去在总后台里看清楚要做什么再确认
+- **写操作**直接执行，执行后在本频道回一条回执（谁、对什么、做了什么、成败）
 
-理由：IM 消息可以被伪造、被转发、被撤回后重放，且没有二次确认界面。
-这与本项目既有的「合并转发消息伪造防护」（`nekro_agent/tools/untrusted_content.py`）
-是同一套威胁模型——**只要内容能被第三方构造，就不能直接拿它触发高危动作**。
-高危动作必须回到有会话认证的后台，由 `Role.Super` 的平台方账号亲自点一次。
+写操作与给模型调用的运维工具共用 `services/ops_agent/writes.py` 的同一条执行路径。
+「直接执行」的前提是准入判据只看宿主侧事实：运维人员白名单 + 指定的运维频道 +
+平台方能担保的发送者来源。回执让群里所有人都看得到发生了什么，写操作本身也限制在
+可撤回的范围内。
 
 ## 为什么是核心服务而不是插件
 
 1. 插件的启用状态与配置对**租户管理员**可见可改（`plugin_activation`、插件配置页），
    把运维能力放进插件等于给租户开了一条自助开关。
 2. 插件可以被热重载、卸载、从市场覆盖安装；运维通道的鉴权逻辑不应该有这种生命周期。
-3. 写操作需要复用 `services/console/` 与 `routers/console/` 的落地端点，
+3. 写操作需要复用 `services/console/` 与 `services/channel_quota/` 的业务函数，
    本来就在核心层。
 
 ## 与多租户的关系
 
 运维 Bot 是**平台方专属**。租户不能有自己的运维 Bot——那等于给租户一条
-绕过总后台权限体系的通道。落地端点一律走 `require_platform_owner()`。
+绕过总后台权限体系的通道。
 """
 
 from .actions import (
@@ -48,14 +47,6 @@ from .actions import (
     execute_write_action,
     parse_ops_command,
     resolve_action,
-)
-from .deeplink import (
-    OpsDeepLinkError,
-    OpsDeepLinkPayload,
-    OpsDeepLinkReason,
-    consume_ops_deeplink,
-    issue_ops_deeplink,
-    peek_ops_deeplink,
 )
 from .policy import (
     OpsAccessDecision,
@@ -70,14 +61,8 @@ __all__ = [
     "OpsActionSpec",
     "OpsBotPolicy",
     "OpsCommandInput",
-    "OpsDeepLinkError",
-    "OpsDeepLinkPayload",
-    "OpsDeepLinkReason",
-    "consume_ops_deeplink",
     "evaluate_ops_access",
     "execute_write_action",
-    "issue_ops_deeplink",
     "parse_ops_command",
-    "peek_ops_deeplink",
     "resolve_action",
 ]

@@ -56,6 +56,8 @@
     "joinTitle": "Join domain",
     "joinLine": "\"{{instance}}\" will join domain \"{{domain}}\".",
     "joinConfirm": "Join",
+    "joinMemoryLine": "After joining, this instance's previous {{paragraphs}} memories are immediately visible to other instances in the group (cross-channel recall is still bounded by the three switches); {{summaries}} channel summaries are only injected in their own channels and are not affected.",
+    "joinMemoryQuarantined": "{{count}} more are in quarantine and will not be recalled until restored.",
     "migrateLabel": "Bring over this instance's own-domain affection, event log and account merges",
     "deleteTitle": "Delete domain",
     "deleteWarning": "Deleting domain \"{{name}}\" returns its {{count}} instance(s) to their own domains (no longer shared). Existing affection and memory are NOT deleted, but they live on the group domain — you would have to put the same instances back into one group to see them again.",

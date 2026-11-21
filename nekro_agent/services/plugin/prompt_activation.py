@@ -138,7 +138,18 @@ def get_plugin_brief(plugin: NekroPlugin) -> str:
     这段文字是模型在"该用哪个能力"这一步唯一能扫到的路由依据，因此它对**所有**披露状态
     都要给出，而不只在插件休眠时给。`sleep_brief` 通常写得比 `description` 更具体，优先取它；
     第三方插件没写 `sleep_brief` 时回落到 `description`，两者都空则不渲染该段。
+
+    插件设置了 `brief_resolver` 时先取它的结果（例如措辞要随运行时开关变的内置插件）；
+    它返回空或抛错都回落到上面的规则，摘要不会因为一个回调出错而消失。
     """
+    resolver = plugin.brief_resolver
+    if resolver is not None:
+        try:
+            resolved = resolver().strip()
+        except Exception:
+            resolved = ""
+        if resolved:
+            return resolved
     return plugin.sleep_brief or plugin.description
 
 

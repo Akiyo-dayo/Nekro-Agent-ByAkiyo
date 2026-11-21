@@ -33,6 +33,51 @@ CHANNEL_TYPE_PREFIXES = ("group_", "private_")
 # 实例标识的合法字符集：小写字母、数字、下划线。刻意排除 `-`，见模块文档
 INSTANCE_KEY_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
 
+# 频道标识的严格形态：前缀 + 纯 ASCII 数字。刻意不用 `\d`：它在 Python 里也匹配全角、阿拉伯数字等，
+# 而那些字符 `int()` 照样能转，转出来的号码却不是任何一个真实的群号 / QQ 号
+_NUMERIC_CHANNEL_ID_PATTERN = re.compile(r"(group|private)_([0-9]+)")
+
+
+class NonNumericChannelIdError(ValueError):
+    """频道标识不是 `group_<数字>` / `private_<数字>`，取不出目标 ID
+
+    故意继承 `ValueError`：既有调用点大多把「取不出目标 ID」写成 `except ValueError`，
+    换一个无关的异常类型会让那些兜底静默失效。
+
+    为什么需要这个类型：正常入站造不出非数字形态（NoneBot 的事件模型把群号 / QQ 号校验成整数），
+    但库里可能躺着测试脚本、手工写库留下的 `group_<非数字>` 频道行。以前的
+    `int(channel_id.split("_")[1])` 抛的是 `invalid literal for int() with base 10: 'tenant'`，
+    报错里没有频道标识，日志上看不出是哪个频道出的问题。把原频道标识带进异常文案，
+    才能一眼定位到那条脏数据。
+    """
+
+    def __init__(self, channel_id: str) -> None:
+        self.channel_id = channel_id
+        super().__init__(
+            f"OneBot V11 频道标识 {channel_id!r} 不是 group_<数字> / private_<数字>，取不出目标 ID",
+        )
+
+
+def is_numeric_channel_id(channel_id: str) -> bool:
+    """频道标识是否为 `group_<数字>` / `private_<数字>` 的严格形态
+
+    用 `fullmatch` 而不是 `match` + `$`：后者会放过结尾的换行符，
+    `group_123\\n` 会被当成合法标识，而 `int()` 也能把它转成 123。
+    """
+    return _NUMERIC_CHANNEL_ID_PATTERN.fullmatch(channel_id) is not None
+
+
+def parse_numeric_target_id(channel_id: str) -> int:
+    """从频道标识取出数字目标 ID，形如 `group_123456` -> `123456`
+
+    Raises:
+        NonNumericChannelIdError: 标识不是严格形态，取不出目标 ID（异常里带原频道标识）
+    """
+    matched = _NUMERIC_CHANNEL_ID_PATTERN.fullmatch(channel_id)
+    if matched is None:
+        raise NonNumericChannelIdError(channel_id)
+    return int(matched.group(2))
+
 
 def is_valid_instance_key(instance_key: str) -> bool:
     """校验实例标识是否符合命名约束"""

@@ -18,6 +18,7 @@ from nekro_agent.adapters.interface import (
     collect_message,
 )
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
+from nekro_agent.adapters.onebot_v11.core.bot import BotInstanceOfflineError
 from nekro_agent.adapters.onebot_v11.core.endpoint_status import endpoint_status
 from nekro_agent.adapters.onebot_v11.core.instance import resolve_instance_key, set_current_instance
 from nekro_agent.adapters.onebot_v11.core.message_id import parse_message_id
@@ -28,6 +29,7 @@ from nekro_agent.adapters.onebot_v11.core.self_sent import (
     self_sent_channel,
     self_sent_registry,
 )
+from nekro_agent.adapters.onebot_v11.tools.bot_membership import restore_after_bot_returned
 from nekro_agent.adapters.onebot_v11.tools.convertor import convert_chat_message
 from nekro_agent.adapters.onebot_v11.tools.display_name import clean_display_name
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
@@ -170,11 +172,21 @@ def register_self_sent_matcher(adapter: BaseAdapter) -> None:
         await handle_self_sent_event(adapter, event, bot)
 
 
+def _log_endpoint_gone(kind: str, bot: Bot, error: BotInstanceOfflineError) -> None:
+    """协议端连接在处理入站事件的半路没了：记一行 WARNING，这条事件不再处理
+
+    协议端掉线时（日志里先是几条 `notice.bot_status.offline`）连接表里已经没有这个账号，
+    还在处理中的入站事件一旦按会话去找连接（取「Bot 自己是谁」、解析 @）就会抛
+    `BotInstanceOfflineError`。这不是代码错误，也没有任何可补救的动作——连回复都发不出去；
+    放任它冒出去，nonebot 会把每一条都打成 `Running Matcher(...) failed` 的 ERROR + traceback。
+    """
+    logger.warning(f"协议端连接已不可用，这条{kind}没有处理: self_id={bot.self_id} | {error}")
+
+
 def register_matcher(adapter: BaseAdapter):
 
-    @on_message(priority=99999, block=False).handle()
-    async def _(_: Matcher, event: Union[MessageEvent, GroupMessageEvent], bot: Bot):
-        """消息匹配器"""
+    async def _process_message(event: Union[MessageEvent, GroupMessageEvent], bot: Bot) -> None:
+        """消息匹配器的处理本体；协议端掉线的异常由外面的匹配器接住"""
 
         # 有的协议端把自身消息也按 `post_type=message` 上报。当成用户消息的话，NA 自己的回复
         # 会再触发一轮 Agent，所以这条分流要排在最前面
@@ -199,6 +211,10 @@ def register_matcher(adapter: BaseAdapter):
             instance_key=instance_key,
         )
         db_chat_channel: DBChatChannel = await plt_channel.get_db_chat_channel(adapter)
+
+        # 停用的频道连消息都不落库（见 adapters/interface/collector.py），所以「群里又有人说话 → 自动恢复」
+        # 只能在这里、在 collect_message 之前做；collect_message 会重新取频道行，拿到的就是恢复后的状态
+        await restore_after_bot_returned(db_chat_channel, "群里有新消息")
 
         if not db_chat_channel.channel_name:
             plt_channel = await adapter.get_channel_info(channel_id)
@@ -273,9 +289,16 @@ def register_matcher(adapter: BaseAdapter):
         # 提交收集消息
         await collect_message(adapter, plt_channel, plt_user, plt_msg)
 
-    @on_notice(priority=99999, block=False).handle()
-    async def _(_: Matcher, event: GroupUploadNoticeEvent, bot: Bot):
-        """上传事件匹配器"""
+    @on_message(priority=99999, block=False).handle()
+    async def _(_: Matcher, event: Union[MessageEvent, GroupMessageEvent], bot: Bot):
+        """消息匹配器"""
+        try:
+            await _process_message(event, bot)
+        except BotInstanceOfflineError as e:
+            _log_endpoint_gone("消息", bot, e)
+
+    async def _process_upload(event: GroupUploadNoticeEvent, bot: Bot) -> None:
+        """上传事件匹配器的处理本体；协议端掉线的异常由外面的匹配器接住"""
         instance_key = await resolve_instance_key(bot.self_id)
         set_current_instance(instance_key, bot.self_id)
         if not await is_inbound_dispatch_allowed(adapter.key, instance_key):
@@ -334,3 +357,11 @@ def register_matcher(adapter: BaseAdapter):
 
         # 提交收集消息
         await collect_message(adapter, plt_channel, plt_user, plt_msg)
+
+    @on_notice(priority=99999, block=False).handle()
+    async def _(_: Matcher, event: GroupUploadNoticeEvent, bot: Bot):
+        """上传事件匹配器"""
+        try:
+            await _process_upload(event, bot)
+        except BotInstanceOfflineError as e:
+            _log_endpoint_gone("群文件上传通知", bot, e)

@@ -47,10 +47,12 @@
   },
   "detail": {
     "title": "This relationship",
+    "loadFailed": "This affection record is not visible or no longer exists (it may have been reset, or it belongs to another instance)",
     "timeline": "What happened",
     "timelineEmpty": "Nothing recorded yet",
     "source": {
       "llm": "Natural change",
+      "tool": "Self-adjustment",
       "manual": "Manual adjustment",
       "reset": "Reset",
       "merge": "Merged in",
@@ -64,7 +66,24 @@
     "scopeLine": "This affection belongs to: domain {{domain}} / preset {{preset}}",
     "presetDeleted": "That preset was deleted; this data is kept as an orphan (never cascade-deleted, clean it up manually under Console → Identity & Domains)",
     "mergedAccounts": "Accounts merged into this person: {{accounts}}",
-    "reasonDeleted": "Reason deleted by {{operator}} at {{time}}"
+    "reasonDeleted": "Reason deleted by {{operator}} at {{time}}",
+    "callNameLine": "Call name: {{name}}",
+    "milestones": "Relationship milestones",
+    "milestonesHint": "Relationship changes recorded automatically; they are part of long-term memory",
+    "milestonesEmpty": "No milestones yet. The bot records one when the relationship changes.",
+    "milestonesGone": "The memory behind this milestone was permanently deleted; only this record is left.",
+    "milestonesMoved": "The instance that wrote this milestone was transferred to another tenant and the memory went with it; only this record is left.",
+    "milestonesViewInMemory": "View on memory page",
+    "milestonesDelete": "Delete this milestone",
+    "milestonesStatus": {
+      "active": "Active",
+      "quarantined": "Quarantined",
+      "deleted": "Deleted",
+      "pruned": "Pruned",
+      "hard_deleted": "Permanently deleted",
+      "moved": "Moved with its instance"
+    },
+    "notesHint": "Notes written by an admin; they are part of the worldbook"
   },
   "adjustDialog": {
     "title": "Adjust affection",
@@ -77,17 +96,21 @@
   },
   "resetDialog": {
     "title": "Reset affection",
-    "description": "This clears the score of {{share}} and wipes the impression the bot wrote. Shares under other presets are not affected; it will build up again from the next conversation.",
+    "description": "This clears the score of {{share}} and wipes the impression and call name the bot wrote. Shares under other presets are not affected; it will build up again from the next conversation.",
+    "alsoMilestones": "This also deletes the relationship milestones of this share (soft delete, recoverable on the memory page)",
     "submit": "Reset"
   },
   "clearDialog": {
     "title": "Clear impression only",
-    "description": "This wipes the impression and the recent note of {{share}}. The score stays. The bot will write a new one after the next conversation.",
+    "description": "This wipes the impression, the recent note and the call name of {{share}}. The score stays. The bot will write a new one after the next conversation.",
     "submit": "Clear"
   },
   "editDialog": {
     "title": "Edit impression",
     "description": "Rewrite the impression and the recent note of {{share}}. The score stays. Later conversations will keep evolving it from here.",
+    "callName": "How the bot addresses them",
+    "callNameHelper": "Up to {{max}} characters; leave blank for no call name",
+    "callNameTooLong": "Longer than {{max}} characters; shorten it to save",
     "stateText": "Impression",
     "eventText": "Recent note",
     "lengthHelper": "Up to {{max}} characters; anything longer is cut off on save",
@@ -98,11 +121,17 @@
     "description": "Only the reason text of this entry is removed: the score and the entry itself stay, with a deletion trace. The impression and recent note are not affected; use \"Clear impression only\" or \"Edit impression\" for those.",
     "submit": "Delete"
   },
+  "deleteMilestoneDialog": {
+    "title": "Delete this relationship milestone?",
+    "description": "Soft delete: it disappears from prompts and retrieval but stays under \"Deleted\" on the memory page, so it can be recovered.",
+    "submit": "Delete"
+  },
   "messages": {
     "loadFailed": "Failed to load the affection list",
     "resetDone": "Reset done",
     "clearDone": "Impression cleared",
     "editDone": "Impression saved",
-    "reasonDeleted": "Reason deleted"
+    "reasonDeleted": "Reason deleted",
+    "milestoneDeleted": "Milestone deleted"
   }
 }

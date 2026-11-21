@@ -1,4 +1,4 @@
-import shutil
+import asyncio
 from pathlib import Path
 from typing import Type, Union
 
@@ -194,8 +194,19 @@ class FileSystem:
             elif file.is_relative_to(self.upload_path):
                 file_path = self.upload_path / file.relative_to(self.upload_path)
             else:
-                shutil.copy(file, self.shared_path / file.name)
-                file_path = self.shared_path / file.name
+                # 目标在沙盒共享目录里（沙盒可写、能放链接）：在目录句柄上写临时文件再 rename，
+                # 同名条目是链接也只换掉链接本身，不会顺着它写到宿主别处
+                from nekro_agent.services.workspace import safe_fs
+
+                target_name = file.name
+                shared_path = self.shared_path
+
+                def _copy_in() -> None:
+                    with open(file, "rb") as source, safe_fs.open_dir(shared_path) as target_dir:
+                        target_dir.write_stream(target_name, source, mode=0o644)
+
+                await asyncio.to_thread(_copy_in)
+                file_path = shared_path / target_name
         else:
             if not isinstance(file, str):
                 raise TypeError(f"不支持的文件类型: {type(file)}")

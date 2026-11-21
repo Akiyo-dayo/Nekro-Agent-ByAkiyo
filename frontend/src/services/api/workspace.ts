@@ -11,7 +11,7 @@ export interface WorkspaceSummary {
   id: number
   name: string
   description: string
-  status: 'active' | 'stopped' | 'failed' | 'deleting'
+  status: 'active' | 'stopped' | 'failed' | 'deleting' | 'transitioning'
   memory_system_enabled: boolean
   sandbox_image: string
   sandbox_version: string
@@ -624,9 +624,12 @@ export interface WorkspaceResourceSecretIssue {
 export interface WorkspaceResourceSecretHealth {
   ok: boolean
   total: number
+  encrypted_count: number
   plaintext_count: number
+  empty_count: number
   legacy_encrypted_count: number
   invalid_count: number
+  stale_count: number
   issues: WorkspaceResourceSecretIssue[]
 }
 

@@ -27,7 +27,7 @@
 """
 
 import datetime
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Type
 
 import pytest
 from tortoise import Tortoise
@@ -71,6 +71,8 @@ MALFORMED_INSTANCE_CONFIG_KEY = "instance_override_onebot_v11"
 OWN_CHANNEL_CONFIG_KEY = f"channel_config_{OWN_CHAT_KEY}"
 FOREIGN_CHANNEL_CONFIG_KEY = f"channel_config_{FOREIGN_CHAT_KEY}"
 MISSING_CHANNEL_CONFIG_KEY = "channel_config_onebot_v11-inst1-group_99999"
+# 指向不存在的实例 / 频道（或切不出实例的畸形键）：平台方读写这些也是 404
+MISSING_OVERRIDE_TARGETS = {MISSING_INSTANCE_CONFIG_KEY, MALFORMED_INSTANCE_CONFIG_KEY, MISSING_CHANNEL_CONFIG_KEY}
 
 PLATFORM_API_KEY = "sk-platform-tenant-must-never-see-this"
 PLATFORM_BASE_URL = "https://api.platform-internal.example/v1"
@@ -294,21 +296,43 @@ class TestReadSideHonoursOwnership:
 
     @pytest.mark.parametrize(
         "config_key",
-        sorted({key for key, _ in READ_SCOPE_CASES} | {key for key, _ in WRITE_SCOPE_CASES}),
+        sorted(
+            ({key for key, _ in READ_SCOPE_CASES} | {key for key, _ in WRITE_SCOPE_CASES}) - MISSING_OVERRIDE_TARGETS,
+        ),
     )
     async def test_platform_owner_is_never_filtered(self, spy: ConfigServiceSpy, config_key: str) -> None:
-        """未启用多租户的部署里全部账号都走这条分支，行为必须与改造前逐字一致"""
+        """未启用多租户的部署里全部账号都走这条分支：目标存在时不受归属限制，与改造前逐字一致"""
         user = platform_owner()
-        for call in (
+        for call in self._calls(config_key, user):
+            spy.touched.clear()
+            await call()
+            assert spy.touched == [config_key]
+
+    @pytest.mark.parametrize("config_key", sorted(MISSING_OVERRIDE_TARGETS))
+    async def test_platform_owner_cannot_touch_overrides_of_missing_targets(
+        self, spy: ConfigServiceSpy, config_key: str
+    ) -> None:
+        """实例 / 频道不存在时平台方也是 404，且挡在服务层之前
+
+        覆盖按标识存在文件里，服务层一跑就会落一份文件；以后用同一个标识新建的实例（可能归别的
+        租户）会直接读到它。
+        """
+        user = platform_owner()
+        for call in self._calls(config_key, user):
+            spy.touched.clear()
+            with pytest.raises(NotFoundError):
+                await call()
+            assert spy.touched == []
+
+    @staticmethod
+    def _calls(config_key: str, user: DBUser) -> List[Callable[[], Awaitable[Any]]]:
+        return [
             lambda: get_config_info(config_key=config_key, _current_user=user),
             lambda: get_config_list(config_key=config_key, _current_user=user),
             lambda: get_config_item(config_key=config_key, item_key="USE_MODEL_GROUP", _current_user=user),
             lambda: save_config_api(config_key=config_key, _current_user=user),
             lambda: reload_config_api(config_key=config_key, _current_user=user),
-        ):
-            spy.touched.clear()
-            await call()
-            assert spy.touched == [config_key]
+        ]
 
 
 class TestConfigKeyListDoesNotEnumerateOtherTenants:

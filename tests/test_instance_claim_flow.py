@@ -721,10 +721,10 @@ class TestAdoptIntoExistingInstance:
 
         original = migration_module._migrate_one_channel  # noqa: SLF001
 
-        async def flaky(adapter_key: str, item, target_instance_key: str):
+        async def flaky(adapter_key: str, item, target_instance_key: str, **kwargs):
             if item.channel_id == OTHER_GROUP:
                 raise RuntimeError("模拟一次数据库抖动")
-            return await original(adapter_key, item, target_instance_key)
+            return await original(adapter_key, item, target_instance_key, **kwargs)
 
         monkeypatch.setattr(migration_module, "_migrate_one_channel", flaky)
 
@@ -752,11 +752,11 @@ class TestAdoptIntoExistingInstance:
         original = migration_module._migrate_one_channel  # noqa: SLF001
         failures = {OTHER_GROUP}
 
-        async def flaky(adapter_key: str, item, target_instance_key: str):
+        async def flaky(adapter_key: str, item, target_instance_key: str, **kwargs):
             if item.channel_id in failures:
                 failures.discard(item.channel_id)
                 raise RuntimeError("模拟一次数据库抖动")
-            return await original(adapter_key, item, target_instance_key)
+            return await original(adapter_key, item, target_instance_key, **kwargs)
 
         monkeypatch.setattr(migration_module, "_migrate_one_channel", flaky)
 

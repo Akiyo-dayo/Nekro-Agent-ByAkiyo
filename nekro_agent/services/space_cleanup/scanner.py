@@ -2,7 +2,6 @@
 """空间扫描服务"""
 
 import asyncio
-import contextlib
 import json
 import shutil
 import uuid
@@ -39,6 +38,7 @@ from nekro_agent.schemas.space_cleanup import (
     ScanSummary,
 )
 from nekro_agent.services.plugin.collector import plugin_collector
+from nekro_agent.services.workspace import safe_fs
 
 # 扫描缓存目录
 
@@ -268,15 +268,14 @@ class ScannerService:
         total_size = 0
         file_count = 0
         try:
-            for item in directory.rglob("*"):
-                if item.is_file():
-                    with contextlib.suppress(OSError, PermissionError):
-                        total_size += item.stat().st_size
-                        file_count += 1
+            # 不跟随链接（`is_file()` / `stat()` 会顺着沙盒放的链接去量宿主别处的文件），嵌套有深度上限
+            for _item, item_stat in safe_fs.walk_regular_files(directory):
+                total_size += item_stat.st_size
+                file_count += 1
 
-                        # 每处理100个文件让出一次控制权
-                        if file_count % 100 == 0:
-                            await asyncio.sleep(0)
+                # 每处理100个文件让出一次控制权
+                if file_count % 100 == 0:
+                    await asyncio.sleep(0)
         except Exception as e:
             logger.warning(f"计算目录大小失败 {directory}: {e}")
 
@@ -314,28 +313,25 @@ class ScannerService:
                 chat_size = 0
                 file_count_in_chat = 0
 
-                # 遍历该聊天目录下的所有文件
-                for file_path in chat_dir.rglob("*"):
-                    if file_path.is_file():
-                        with contextlib.suppress(OSError, PermissionError):
-                            stat = file_path.stat()
-                            file_info = FileInfo(
-                                relative_path=str(file_path.relative_to(directory)),
-                                name=file_path.name,
-                                size=stat.st_size,
-                                created_time=stat.st_ctime,
-                                modified_time=stat.st_mtime,
-                                chat_key=chat_key,
-                                plugin_key=None,
-                            )
-                            files.append(file_info)
-                            chat_size += stat.st_size
-                            total_files += 1
-                            file_count_in_chat += 1
+                # 遍历该聊天目录下的所有文件（不跟随链接，嵌套有深度上限）
+                for file_path, stat in safe_fs.walk_regular_files(chat_dir):
+                    file_info = FileInfo(
+                        relative_path=str(file_path.relative_to(directory)),
+                        name=file_path.name,
+                        size=stat.st_size,
+                        created_time=stat.st_ctime,
+                        modified_time=stat.st_mtime,
+                        chat_key=chat_key,
+                        plugin_key=None,
+                    )
+                    files.append(file_info)
+                    chat_size += stat.st_size
+                    total_files += 1
+                    file_count_in_chat += 1
 
-                            # 每处理50个文件让出一次控制权
-                            if file_count_in_chat % 50 == 0:
-                                await asyncio.sleep(0)
+                    # 每处理50个文件让出一次控制权
+                    if file_count_in_chat % 50 == 0:
+                        await asyncio.sleep(0)
 
                 if files:
                     chat_resources[chat_key] = ChatResourceInfo(
@@ -371,17 +367,13 @@ class ScannerService:
         total_files = 0
 
         try:
-            for file_path in directory.rglob("*"):
-                if file_path.is_file():
-                    try:
-                        total_size += file_path.stat().st_size
-                        total_files += 1
+            for _file_path, file_stat in safe_fs.walk_regular_files(directory):
+                total_size += file_stat.st_size
+                total_files += 1
 
-                        # 每处理100个文件让出一次控制权
-                        if total_files % 100 == 0:
-                            await asyncio.sleep(0)
-                    except (OSError, PermissionError):
-                        pass
+                # 每处理100个文件让出一次控制权
+                if total_files % 100 == 0:
+                    await asyncio.sleep(0)
         except Exception as e:
             logger.warning(f"扫描目录失败 {directory}: {e}")
 
@@ -462,28 +454,25 @@ class ScannerService:
                 chat_size = 0
                 file_count_in_chat = 0
 
-                # 遍历该聊天目录下的所有文件
-                for file_path in chat_dir.rglob("*"):
-                    if file_path.is_file():
-                        with contextlib.suppress(OSError, PermissionError):
-                            stat = file_path.stat()
-                            file_info = FileInfo(
-                                relative_path=str(file_path.relative_to(directory)),
-                                name=file_path.name,
-                                size=stat.st_size,
-                                created_time=stat.st_ctime,
-                                modified_time=stat.st_mtime,
-                                chat_key=chat_key,
-                                plugin_key=None,
-                            )
-                            files.append(file_info)
-                            chat_size += stat.st_size
-                            total_files += 1
-                            file_count_in_chat += 1
+                # 遍历该聊天目录下的所有文件（沙盒能在这里放链接：不跟随，嵌套有深度上限）
+                for file_path, stat in safe_fs.walk_regular_files(chat_dir):
+                    file_info = FileInfo(
+                        relative_path=str(file_path.relative_to(directory)),
+                        name=file_path.name,
+                        size=stat.st_size,
+                        created_time=stat.st_ctime,
+                        modified_time=stat.st_mtime,
+                        chat_key=chat_key,
+                        plugin_key=None,
+                    )
+                    files.append(file_info)
+                    chat_size += stat.st_size
+                    total_files += 1
+                    file_count_in_chat += 1
 
-                            # 每处理50个文件让出一次控制权
-                            if file_count_in_chat % 50 == 0:
-                                await asyncio.sleep(0)
+                    # 每处理50个文件让出一次控制权
+                    if file_count_in_chat % 50 == 0:
+                        await asyncio.sleep(0)
 
                 if files:
                     chat_resources[chat_key] = ChatResourceInfo(

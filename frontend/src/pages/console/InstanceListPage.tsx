@@ -158,6 +158,14 @@ export default function InstanceListPage() {
   const canSubmitDelete =
     deleteMode === 'archive' || confirmKey.trim() === deleteTarget?.instance_key
 
+  // 彻底删除时才查：邮箱、用户邮件偏好与收集库表情跟着实例一起删，确认框里写出具体数目
+  const purgePreviewQuery = useQuery({
+    queryKey: ['console-instance-purge-preview', deleteTarget?.instance_key ?? ''],
+    queryFn: () => consoleApi.getPurgePreview(deleteTarget?.instance_key ?? ''),
+    enabled: deleteMode === 'purge' && Boolean(deleteTarget),
+    retry: false,
+  })
+
   return (
     <Box
       sx={{
@@ -449,6 +457,29 @@ export default function InstanceListPage() {
               ? t('deleteDialog.purgeDescription')
               : t('deleteDialog.archiveDescription')}
           </Typography>
+          {deleteMode === 'purge' && purgePreviewQuery.data && (
+            <Typography variant="body2" sx={{ color: theme.palette.error.main }}>
+              {t('deleteDialog.purgeMailAndEmotion', {
+                mailboxes: purgePreviewQuery.data.email_accounts,
+                prefs: purgePreviewQuery.data.email_user_prefs,
+                emotions: purgePreviewQuery.data.collected_emotions,
+              })}
+            </Typography>
+          )}
+          {deleteMode === 'purge' && (purgePreviewQuery.data?.plugin_settings ?? 0) > 0 && (
+            <Typography variant="body2" sx={{ color: theme.palette.error.main }}>
+              {t('deleteDialog.purgePluginSettings', {
+                count: purgePreviewQuery.data?.plugin_settings ?? 0,
+              })}
+            </Typography>
+          )}
+          {deleteMode === 'purge' && (purgePreviewQuery.data?.config_overrides ?? 0) > 0 && (
+            <Typography variant="body2" sx={{ color: theme.palette.error.main }}>
+              {t('deleteDialog.purgeConfigOverrides', {
+                count: purgePreviewQuery.data?.config_overrides ?? 0,
+              })}
+            </Typography>
+          )}
           {/* 删实例不会动 qbob：接着的 bot 会继续运行、带着本实例的令牌反复重连。先到协议端页解绑。
               判据不能只看账号：账号被清空、qbob_appid 还在时 bot 同样接着 */}
           {deleteTarget?.provider === 'builtin_qbob' &&

@@ -26,7 +26,7 @@ PWD_GEN_CLAIM = "pwd_gen"
 # 里 `sub == "admin"` 取 admin 行是同一个判据）
 ADMIN_USERNAME = "admin"
 
-# admin 口令指纹的密钥派生用途串。改它 = 所有 admin 令牌当场失效（属破坏性变更），与取件签名 / 深链各用各的串
+# admin 口令指纹的密钥派生用途串。改它 = 所有 admin 令牌当场失效（属破坏性变更），与取件签名各用各的串
 ADMIN_FINGERPRINT_PURPOSE = b"nekro-agent/admin-password-fingerprint/v1"
 
 
@@ -51,7 +51,7 @@ def admin_password_fingerprint() -> str:
     **为什么是 HMAC 而不是口令的哈希**：令牌载荷是公开可读的（JWT 只签名不加密），
     无密钥哈希放进去等于把离线撞库的靶子贴在每一张令牌上。这里 `HMAC(HMAC(JWT 密钥, 用途串), 口令)`：
     不知道 JWT 密钥就推不回口令，而知道 JWT 密钥的人本来就能自签 admin 令牌。
-    用途串与 `upload_access` / `ops_bot.deeplink` 同一种派生套路（HMAC 到固定用途串），
+    用途串与 `upload_access` 同一种派生套路（HMAC 到固定用途串），
     各用途的密钥互不相通。
 
     调用时读 `OsEnv`、不缓存：测试要能换口令 / 换密钥（§2.9），产品里两个值进程内也不会变。

@@ -11,6 +11,9 @@ import {
   Group as GroupIcon,
   Face as FaceIcon,
   Favorite as FavoriteIcon,
+  Psychology as PsychologyIcon,
+  MenuBook as MenuBookIcon,
+  MailOutline as MailOutlineIcon,
   AccountCircle as AccountCircleIcon,
   CloudDownload as CloudDownloadIcon,
   Palette as PaletteIcon,
@@ -25,7 +28,10 @@ import {
   Business as BusinessIcon,
   Speed as SpeedIcon,
   Security as SecurityIcon,
+  History as HistoryIcon,
   Paid as PaidIcon,
+  Science as ScienceIcon,
+  VpnKey as VpnKeyIcon,
 } from '@mui/icons-material'
 import i18next from './i18n'
 
@@ -160,6 +166,13 @@ export const PLATFORM_ONLY_PATHS = [
   // 两份是分开维护的（`getPageConfigs()` 与本数组），漏登记的那一半没有任何运行时信号
   // ——`tests/test_console_platform_only_paths.py` 就是为此把两份对起来的看门人。
   '/console/network-rules',
+  // 运维审计：一行可能同时提到平台方实例与租户会话，后端整条路由是
+  // `require_platform_owner()`。菜单标 `visibility: 'platformOnly'`，这里管 URL 兜底，
+  // 两份成对登记（`tests/test_console_platform_only_paths.py`）。
+  '/console/ops-audit',
+  // SSH 网关：全部凭据、网关状态、存量导入与全局审计都是平台方专属
+  // （后端路由是 `Role.Super`）。菜单标 `visibility: 'platformOnly'`，这里管 URL 兜底。
+  '/console/ssh-gateway',
   '/user-manager',
   '/plugins/editor',
   // 宿主级运行日志与沙盒日志：两族端点全是 `Role.Super`，日志里混着全部租户的数据。
@@ -205,9 +218,10 @@ export const isPlatformOnlyPath = (pathname: string): boolean =>
  */
 export const TENANT_ADMIN_ONLY_PATHS = [
   // 总后台：概览 / 实例列表 / 实例详情 / 新建向导 / 配额 / 身份与域 / 模型组。
-  // `/console/team` 与 `/console/ops-confirm` 刻意不在此列，所以这里逐条写而不是写 `/console`
+  // `/console/team` 刻意不在此列，所以这里逐条写而不是写 `/console`
   '/console/instances',
   '/console/quota',
+  '/console/channel-quota',
   '/console/usage',
   '/console/identity',
   '/console/model-groups',
@@ -220,6 +234,10 @@ export const TENANT_ADMIN_ONLY_PATHS = [
   // `isTenantAdminOnlyPath()` 只在只读成员身上生效。
   '/web-chat',
   '/affection',
+  '/memory',
+  '/worldbook',
+  '/mailbox',
+  '/prompt-lab',
   '/presets',
   '/plugins',
   '/workspace',
@@ -375,6 +393,17 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         visibility: 'tenantAdminOnly',
       },
       {
+        // 频道额度：平台方给每个群 / 私聊承诺的每日额度。**不是** platformOnly，租户也要看得到
+        // 自己名下频道的用量与剩余，可见范围由后端按租户作用域收敛；整族端点都是 `Role.Admin`，
+        // 只读成员进来是一页 403，所以与配额同档走 tenantAdminOnly。
+        path: '/console/channel-quota',
+        text: t('menu.consoleChannelQuota'),
+        translationKey: 'menu.consoleChannelQuota',
+        icon: <ListAltIcon />,
+        parent: 'console',
+        visibility: 'tenantAdminOnly',
+      },
+      {
         // 用量与费用：定制版客户要看得到自己烧了多少 token、折算多少钱，所以**不是** platformOnly；
         // 可见范围由后端按租户作用域收敛。整族端点都是 `Role.Admin`，只读成员进来是一页 403，
         // 因此与配额同档走 tenantAdminOnly。
@@ -401,6 +430,24 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         text: t('menu.consoleNetworkRules'),
         translationKey: 'menu.consoleNetworkRules',
         icon: <SecurityIcon />,
+        parent: 'console',
+        visibility: 'platformOnly',
+      },
+      {
+        // 运维审计：行里可能带着租户会话与平台方实例，后端整条路由只给平台方
+        path: '/console/ops-audit',
+        text: t('menu.consoleOpsAudit'),
+        translationKey: 'menu.consoleOpsAudit',
+        icon: <HistoryIcon />,
+        parent: 'console',
+        visibility: 'platformOnly',
+      },
+      {
+        // SSH 网关：状态、全部凭据、存量导入与全局审计都只给平台方
+        path: '/console/ssh-gateway',
+        text: t('menu.consoleSshGateway'),
+        translationKey: 'menu.consoleSshGateway',
+        icon: <VpnKeyIcon />,
         parent: 'console',
         visibility: 'platformOnly',
       },
@@ -450,6 +497,42 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         text: t('menu.affection'),
         translationKey: 'menu.affection',
         icon: <FavoriteIcon />,
+        parent: 'chatManagement',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 记忆管理：`routers/memory_admin.py` 全族 `Role.Admin`
+        path: '/memory',
+        text: t('menu.memory'),
+        translationKey: 'menu.memory',
+        icon: <PsychologyIcon />,
+        parent: 'chatManagement',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 世界书管理：`routers/worldbook.py` 全族 `Role.Admin`
+        path: '/worldbook',
+        text: t('menu.worldbook'),
+        translationKey: 'menu.worldbook',
+        icon: <MenuBookIcon />,
+        parent: 'chatManagement',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 邮箱：`routers/instance_email.py` 全族 `Role.Admin`，按实例收敛
+        path: '/mailbox',
+        text: t('menu.mailbox'),
+        translationKey: 'menu.mailbox',
+        icon: <MailOutlineIcon />,
+        parent: 'chatManagement',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 提示词预览：`routers/tavern.py` 整族 `Role.Admin`
+        path: '/prompt-lab',
+        text: t('menu.promptLab'),
+        translationKey: 'menu.promptLab',
+        icon: <ScienceIcon />,
         parent: 'chatManagement',
         visibility: 'tenantAdminOnly',
       },

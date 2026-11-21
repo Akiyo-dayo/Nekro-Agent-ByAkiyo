@@ -522,10 +522,10 @@ class TestOwnershipDerivedFromAChannel:
 
     def test_run_agent_hands_the_channels_adapter_to_the_guard(self) -> None:
         """运行时兜底只有拿到频道的适配器才判得对；漏传就退回按标识反查"""
-        from nekro_agent.services.agent import run_agent
+        from nekro_agent.services.agent import round_prompt
 
-        # run_agent 现在只解析频道并设置实例上下文，守卫调用在 _run_agent_in_instance_scope 里
-        tree = ast.parse(inspect.getsource(run_agent._run_agent_in_instance_scope))
+        # 守卫调用随提示词组装搬到了 `_build_round_prompt`：run_agent 只负责实例上下文。
+        tree = ast.parse(inspect.getsource(round_prompt._build_round_prompt))
         calls = [
             node
             for node in ast.walk(tree)

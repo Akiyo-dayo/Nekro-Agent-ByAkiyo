@@ -390,6 +390,8 @@ class _Harness:
     # （`record_access` → `reinforce()`）。#58 的 `break` 位置决定它在末轮跑不跑，
     # 而挪动 `break` 不会改变 `llm_calls`——只数请求数的话那个变异会活着，所以单独计数。
     history_renders: int = 0
+    # 每次迭代增量渲染收到的关键字参数（世界书只在本轮第一次渲染的历史里出现一次）
+    history_render_kwargs: List[Dict[str, Any]] = field(default_factory=list)
     sandbox_codes: List[str] = field(default_factory=list)
     llm_last_user_text: List[str] = field(default_factory=list)
     events: List[Any] = field(default_factory=list)
@@ -401,6 +403,7 @@ class _Harness:
         return len(self.sandbox_codes)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import nekro_agent.services.agent.round_prompt as round_prompt_module
         import nekro_agent.services.system_broadcast as broadcast_module
 
         model_group = SimpleNamespace(
@@ -471,6 +474,7 @@ class _Harness:
 
         async def _render_history_data(**_kwargs: Any) -> OpenAIChatMessage:
             self.history_renders += 1
+            self.history_render_kwargs.append(dict(_kwargs))
             return OpenAIChatMessage.from_text("user", "[history]")
 
         class _FakePromptCompiler:
@@ -492,16 +496,24 @@ class _Harness:
         monkeypatch.setattr(run_agent_module, "parse_chat_response", _parse)
         monkeypatch.setattr(run_agent_module, "limited_run_code", _limited_run_code)
         monkeypatch.setattr(run_agent_module, "render_history_data", _render_history_data)
-        monkeypatch.setattr(run_agent_module, "PromptCompiler", _FakePromptCompiler)
-        monkeypatch.setattr(run_agent_module, "enforce_channel_model_group_scope", _async_noop)
-        monkeypatch.setattr(run_agent_module, "resolve_active_plugins", _async_value([]))
+        # 组装整体搬进了 `round_prompt`：编译器、配置兜底、插件 / 好感 / 世界书入口都在那边，
+        # 替身跟着搬过去；`run_agent` 自己只留发送、迭代与沙盒这几处。
+        monkeypatch.setattr(round_prompt_module, "PromptCompiler", _FakePromptCompiler)
+        monkeypatch.setattr(round_prompt_module, "enforce_channel_model_group_scope", _async_noop)
+        monkeypatch.setattr(round_prompt_module, "resolve_active_plugins", _async_value([]))
         monkeypatch.setattr(
-            run_agent_module,
+            round_prompt_module,
             "render_plugins_prompt",
             _async_value(SimpleNamespace(system_prompt="", runtime_prompt="")),
         )
-        monkeypatch.setattr(run_agent_module, "render_affection_prompt", _async_value(""))
-        monkeypatch.setattr(run_agent_module, "schedule_affection_evaluation", lambda *_a, **_k: None)
+        monkeypatch.setattr(round_prompt_module, "render_affection_prompt", _async_value(""))
+        monkeypatch.setattr(round_prompt_module, "schedule_affection_evaluation", lambda *_a, **_k: None)
+        # 回合首尾的频道额度计数（开始标记、收尾记一次回复）都要查消息表，这里没有库。
+        # 不替掉的话，前面用例留下的 Tortoise 配置会让查询现开一条 sqlite 连接并一直挂着；
+        # 之后哪个用例收尾时还有写库在飞，事件循环一关就把这条连接的工作线程弄死，
+        # 再往后谁查它谁就永远等不到结果——整轮全量测试卡住，而单跑这个文件照样全过。
+        monkeypatch.setattr(run_agent_module, "_channel_message_marker", _async_value(0))
+        monkeypatch.setattr(run_agent_module, "_record_round_reply", _async_value(None))
 
     async def run(self) -> None:
         await run_agent_module.run_agent(chat_key=CHAT_KEY, ctx=cast(Any, self.ctx))
@@ -646,6 +658,25 @@ class TestNoStallWhenErrorsDiffer:
         # 最后一趟末尾还会再发一次含全量上下文的请求，而它的结果无人消费。
         assert harness.llm_calls == harness.max_retry
         assert harness.parse_calls == harness.llm_calls, "有响应被解析了却没有对应的请求（或反过来）"
+
+    def test_iteration_history_renders_leave_the_worldbook_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """迭代时追加的增量历史不再带世界书：两组已经在本轮第一次渲染的历史里"""
+        harness = _Harness(
+            max_retry=3,
+            parses=[_Parsed(), _Parsed(), _Parsed()],
+            sandbox_results=[
+                _error_result(SEND_TEXT_FAILURE),
+                _error_result(DRAW_PLUGIN_FAILURE),
+                _SandboxResult(output=f"TypeError: {STICKER_SIGNATURE_FAILURE}", stop_type=ExecStopType.ERROR),
+            ],
+        )
+        harness.install(monkeypatch)
+
+        with pytest.raises(AgentRoundUnfinishedError):
+            asyncio.run(harness.run())
+
+        assert harness.history_render_kwargs, "迭代没有发生，这条用例没测到东西"
+        assert all(kwargs.get("inject_worldbook") is False for kwargs in harness.history_render_kwargs)
 
     def test_interleaved_repeat_does_not_early_exit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A、B、A：同一个错出现了两次但不连续，说明模型确实在变，不该早停"""

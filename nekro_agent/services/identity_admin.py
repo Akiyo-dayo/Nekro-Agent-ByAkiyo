@@ -45,7 +45,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from tortoise.exceptions import IntegrityError
@@ -63,6 +63,7 @@ from nekro_agent.models.db_instance_group import (
 from nekro_agent.models.db_mem_paragraph import DBMemParagraph
 from nekro_agent.models.db_preset import DBPreset
 from nekro_agent.schemas.errors import ConcurrentWriteConflictError
+from nekro_agent.services.affection import milestones as milestones_module
 from nekro_agent.services.affection.key import AffectionKey
 from nekro_agent.services.affection.merge import COMPENSATION_SOURCES
 from nekro_agent.services.affection.stage import AffectionEventSource, stage_label, stage_of
@@ -74,6 +75,7 @@ from nekro_agent.services.identity_scope import (
     resolve_domain_instance_keys,
     resolve_memory_domain,
 )
+from nekro_agent.services.memory.instance_scope import CONSOLE_ONLY_PRESET_ID
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 logger = get_sub_logger("identity_admin")
@@ -84,6 +86,9 @@ NOTE_MAX_LENGTH = 500
 
 # 「无人设档」在后台的展示名。0 不是一个人设行，它是"回落到内置默认人设"那一档。
 PRESET_NONE_LABEL = "未绑定人设（内置默认）"
+
+# 控制台直发 CC 的结论专用的人设档（负数）在后台的展示名。它同样不是一个人设行。
+CONSOLE_ONLY_PRESET_LABEL = "仅控制台（控制台直发 CC 的结论）"
 
 # 合并预览里逐人设明细的条数上限。一个人在几十个人设下都有记录是异常形态，
 # 展示前几条足以判断，不要把一个越权探测变成一次全表扫描。
@@ -154,6 +159,14 @@ class DomainJoinPreview:
     # 搬过去时被跟到终点改写的源别名，形如「A（P → Q）」
     alias_rewrites: List[str]
     person_rows: int
+    # 该实例留下的记忆规模。入组后这些域行立刻对组内其他实例可见，跨频道召回仍受三个
+    # 开关约束；摘要只在自己的频道注入，所以单独给份数（不是版本数）。
+    memory_paragraphs: int = 0
+    memory_quarantined: int = 0
+    memory_summaries: int = 0
+    # 入组后域书与个人书立刻对组内其它实例的频道生效：这两个数说明「会一起生效的还有多少本」。
+    worldbook_books: int = 0
+    worldbook_entries: int = 0
     blockers: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
@@ -352,6 +365,10 @@ async def preset_names(preset_ids: Sequence[int]) -> Dict[int, str]:
 
 def preset_display_name(preset_id: int, names: Dict[int, str]) -> str:
     """人设的展示名；`0` 是"无人设档"，查不到的是孤儿"""
+    if preset_id == CONSOLE_ONLY_PRESET_ID:
+        # 负数档不是"被删掉的人设"，而是控制台直发 CC 的结论专用的那一档。
+        # 显示成「已删除的人设 #-1」会让管理员以为数据坏了。
+        return CONSOLE_ONLY_PRESET_LABEL
     if preset_id <= PRESET_NONE:
         return PRESET_NONE_LABEL
     return names.get(preset_id, f"已删除的人设 #{preset_id}")
@@ -594,7 +611,46 @@ _FOLD_NARRATIVE_FIELDS = [
     "last_interact_at",
     "nickname",
     "last_chat_key",
+    "milestone_refs",
+    "call_name",
 ]
+
+
+def _merged_milestone_refs(*sides: object) -> list[dict[str, object]]:
+    """两行好感的里程碑引用合并：按 `at` 倒序、按段落 ID 去重、截到保留条数
+
+    脏值（不是 list、元素不是 dict、`at` 读不出来）一律跳过：合并是一次性动作，
+    为一条读不懂的旧值把整次入域并入搞失败，代价远大于少留一条里程碑。
+    """
+    from nekro_agent.services.affection.milestones import MILESTONE_REFS_KEEP
+    from nekro_agent.services.affection.store import normalize_milestone_refs
+
+    merged: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for side in sides:
+        for item in normalize_milestone_refs(side):
+            paragraph_id = item.get("paragraph_id")
+            if isinstance(paragraph_id, bool) or not isinstance(paragraph_id, int) or paragraph_id in seen:
+                continue
+            seen.add(paragraph_id)
+            merged.append(dict(item))
+    merged.sort(key=lambda item: _ref_sort_key(item.get("at")), reverse=True)
+    return merged[:MILESTONE_REFS_KEEP]
+
+
+def _ref_sort_key(value: object) -> datetime:
+    """引用的时间排序键：读不出来的一律排到最后
+
+    不能直接按字符串排：ISO 串带不同时区偏移时字典序与时间序不一致，
+    同一批数据在不同部署时区下会排出不同的顺序。
+    """
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -783,6 +839,19 @@ async def preview_domain_join(
         for account, reason in alias_plan.conflicts:
             notes.append(f"账号 {account} 的合并关系不随迁：{reason}，以目标域为准——请并入后在目标域里人工核对。")
 
+    # 记忆条数只取三项：好感那几项已经由上面的并入预览逐项说明，重复列出会让
+    # 「跟着好感走」与「跟着域走」两组数字混在一起。
+    from nekro_agent.services.memory.admin_service import count_instance_memory
+
+    memory_counts = await count_instance_memory(adapter_key, instance_key)
+    if memory_counts.worldbook_books > 0 or memory_counts.worldbook_entries > 0:
+        # 书跟着实例走、入组后立刻对组内其它实例的频道生效，这句话在预览里必须先说清楚：
+        # 并入之后这些内容会影响的不只是本实例。
+        notes.append(
+            f"本实例有 {memory_counts.worldbook_books} 本世界书（{memory_counts.worldbook_entries} 条）；"
+            "其中域书与个人书入组后对组内其它实例的频道同样生效。",
+        )
+
     return DomainJoinPreview(
         adapter_key=adapter_key,
         instance_key=instance_key,
@@ -798,6 +867,11 @@ async def preview_domain_join(
         alias_conflicts=alias_conflicts,
         alias_rewrites=alias_plan.rewrite_labels,
         person_rows=len(person_moves),
+        memory_paragraphs=memory_counts.paragraphs,
+        memory_quarantined=memory_counts.quarantined,
+        memory_summaries=memory_counts.summaries,
+        worldbook_books=memory_counts.worldbook_books,
+        worldbook_entries=memory_counts.worldbook_entries,
         blockers=blockers,
         notes=notes,
     )
@@ -1051,6 +1125,10 @@ async def _merge_self_domain_into_group(
                 twin.state_generated_at = row.state_generated_at
                 twin.last_event_text = row.last_event_text
             twin.interaction_count += row.interaction_count
+            # 里程碑取两边的并集里最新的几条：两侧的关系都是真实发生过的，折叠只是把两行合成
+            # 一行，不该让任何一侧「怎么熟起来的」凭空消失。按 `at` 倒序、按段落 ID 去重，
+            # 截到保留条数——与写入侧同一个口径。
+            twin.milestone_refs = _merged_milestone_refs(row.milestone_refs, twin.milestone_refs)
             if row.last_interact_at is not None and (
                 twin.last_interact_at is None or row.last_interact_at > twin.last_interact_at
             ):
@@ -1059,6 +1137,14 @@ async def _merge_self_domain_into_group(
                     twin.nickname = row.nickname
                 if row.last_chat_key:
                     twin.last_chat_key = row.last_chat_key
+                # 称呼跟着最近一次互动的那一侧：它是主模型对着那段对话叫出来的，
+                # 换了另一边的话就会把「他最近怎么被叫」换成一段更旧的记忆。
+                if row.call_name:
+                    twin.call_name = row.call_name
+            # 但也不让任何一侧已有的称呼凭空消失：两边都记过称呼时，上面那条按「谁更新」取；
+            # 只有一边记过时，那一侧就是唯一的一份，不论它的互动时间更早还是更晚。
+            if not twin.call_name and row.call_name:
+                twin.call_name = row.call_name
             # **只写叙事与计数字段，绝不写 score / stage**：分数的唯一写入口是 `apply_delta`
             # （它在库里行锁内读改写），而 `twin` 是循环外读出来的内存对象——前一条源行折叠时
             # `apply_delta` 已把库里的分数涨上去，这里若整行 save，下一条折叠到同一 twin 的源行
@@ -1570,6 +1656,10 @@ async def cleanup_orphan_preset(bucket: OrphanPresetBucket) -> Dict[str, int]:
 
     **只删指定的那一桶**，而且执行前再确认一次那个人设确实不存在——预览与执行之间
     人设可能被重新建出来（云端人设导入会带回同一个 ID），那时候删的就不是孤儿了。
+
+    这一桶的关系里程碑连带软删，与好感「重置」同一口径：人设已经不在，这些段落本来也
+    召回不到，留着只会在记忆页里变成一堆谁也解释不了的孤儿。**必须在删流水之前做**：
+    段落 ID 只记在流水的 `memory_paragraph_id` 上，流水删了就再也找不回那些段落。
     """
     if await DBPreset.filter(id=bucket.preset_id).exists():
         raise IdentityAdminRejected(f"人设 {bucket.preset_id} 现在是存在的，它名下的数据不是孤儿，拒绝清理")
@@ -1581,13 +1671,18 @@ async def cleanup_orphan_preset(bucket: OrphanPresetBucket) -> Dict[str, int]:
         "preset_id": bucket.preset_id,
     }
     async with in_transaction():
+        milestones = await milestones_module.clear_for_orphan_bucket(columns)
         events = await DBAffectionEvent.filter(**columns).delete()
         records = await DBAffection.filter(**columns).delete()
     logger.warning(
         f"孤儿好感数据已清理: domain={bucket.domain_id}, preset_id={bucket.preset_id}, "
-        f"affection={records}, events={events}",
+        f"affection={records}, events={events}, milestones={milestones}",
     )
-    return {"affection": int(records or 0), "affection_event": int(events or 0)}
+    return {
+        "affection": int(records or 0),
+        "affection_event": int(events or 0),
+        "milestones": int(milestones or 0),
+    }
 
 
 __all__ = [

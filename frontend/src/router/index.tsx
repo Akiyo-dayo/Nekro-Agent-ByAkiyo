@@ -151,6 +151,13 @@ const router = createHashRouter([
             element: lazyLoad(() => import('../pages/console/UsagePage')),
           },
           {
+            // 频道额度（平台方给每个群 / 私聊的每日额度）。**不做平台方限定**：租户要看得到
+            // 自己名下频道的用量与剩余，可见范围由后端按租户作用域收敛（越权 404）；
+            // 整族端点都是 `Role.Admin`，只读成员由菜单与兜底清单拦住。形态对照 `usage`。
+            path: 'channel-quota',
+            element: lazyLoad(() => import('../pages/console/ChannelQuotaPage')),
+          },
+          {
             // 身份与域（记忆域配置 + 账号合并 + 人设孤儿数据）。
             // **不做平台方限定**：定制版客户要能自助配自己的域、合并自己客户的账号，
             // 可见范围由后端按租户作用域收敛（越权 404）。形态对照 `/console/quota`。
@@ -163,9 +170,16 @@ const router = createHashRouter([
             element: lazyLoad(() => import('../pages/console/NetworkRuleOrphansPage')),
           },
           {
-            // 运维 Bot 写操作的确认落地页，链接由 Bot 在聊天频道里签发
-            path: 'ops-confirm',
-            element: lazyLoad(() => import('../pages/console/OpsActionConfirmPage')),
+            // 运维审计：整条路由都是 `require_platform_owner()`，租户连读都不允许；
+            // 租户身份的兜底拦截在 MainLayout 统一处理
+            path: 'ops-audit',
+            element: lazyLoad(() => import('../pages/console/OpsAuditPage')),
+          },
+          {
+            // SSH 网关：状态、全部凭据、存量导入与全局审计都只给平台方；
+            // 租户身份的兜底拦截在 MainLayout 统一处理
+            path: 'ssh-gateway',
+            element: lazyLoad(() => import('../pages/console/SshGatewayPage')),
           },
         ],
       },
@@ -201,6 +215,66 @@ const router = createHashRouter([
       {
         path: 'affection',
         element: lazyLoad(() => import('../pages/affection')),
+      },
+      {
+        // 记忆页的标签属于主视图，进 path；页面自己把非法标签回落到默认标签
+        path: 'memory',
+        children: [
+          {
+            index: true,
+            element: <Navigate to="items" replace />,
+          },
+          {
+            path: ':tab',
+            element: lazyLoad(() => import('../pages/memory')),
+          },
+        ],
+      },
+      {
+        // 世界书页的标签属于主视图，进 path；页面自己把非法标签回落到默认标签
+        path: 'worldbook',
+        children: [
+          {
+            index: true,
+            element: <Navigate to="books" replace />,
+          },
+          {
+            path: ':tab',
+            element: lazyLoad(() => import('../pages/worldbook')),
+          },
+          {
+            path: 'books/:bookId',
+            element: lazyLoad(() => import('../pages/worldbook/BookDetailPage')),
+          },
+        ],
+      },
+      {
+        // 邮箱页的标签进 path；页面自己把非法标签回落到默认标签
+        path: 'mailbox',
+        children: [
+          {
+            index: true,
+            element: <Navigate to="accounts" replace />,
+          },
+          {
+            path: ':tab',
+            element: lazyLoad(() => import('../pages/mailbox')),
+          },
+        ],
+      },
+      {
+        // 提示词预览页的标签同样进 path；页面自己把非法标签重定向到预览
+        path: 'prompt-lab',
+        children: [
+          {
+            index: true,
+            element: <Navigate to="preview" replace />,
+          },
+          {
+            path: ':tab',
+            element: lazyLoad(() => import('../pages/prompt-lab')),
+          },
+        ],
       },
       {
         path: 'user-manager',

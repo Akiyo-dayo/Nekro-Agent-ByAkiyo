@@ -856,6 +856,9 @@ def _install_fake_openai(monkeypatch, *, result) -> None:
 
     monkeypatch.setattr(openai_module, "AsyncOpenAI", _FakeClient)
     monkeypatch.setattr(openai_module, "_get_http_client", lambda **_kwargs: object())
+    # 用量记账会起一个写库的后台任务：本文件不建库，留着它会在之前的用例留下的数据库配置上
+    # 现开一个 sqlite 连接、没人关
+    monkeypatch.setattr(openai_module, "record_llm_usage", lambda *_args, **_kwargs: None)
 
 
 class TestGenChatResponseEmptyAndSalvage:

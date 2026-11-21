@@ -34,9 +34,28 @@ from nekro_agent.services.network.proxy_manager import (
 from .base import NekroPlugin
 from .isolation import call_plugin, release_quarantine
 from .schema import SandboxMethod
-from .scope import is_enabled_in_any_scope
+from .scope import is_enabled_in_any_scope, plugin_effective_with_instance, resolve_chat_plugin_instance
 
 logger = get_sub_logger("plugin_system")
+
+
+def _hook_chat_key(ctx: AgentCtx) -> str:
+    """取消息钩子要判定的频道标识
+
+    正常入站上下文都带 `from_chat_key`；没有时再退到 `chat_key`。`AgentCtx.chat_key`
+    在既没有 `from_chat_key` 也没有频道行时会抛错，所以这里兜住，按「判不出频道」处理：
+    返回空串会让 :func:`resolve_chat_plugin_instance` 判不出实例，钩子因此整体跳过——
+    对一条连频道都认不出的消息，少跑几个插件比按全局状态乱跑安全。
+    """
+    chat_key = getattr(ctx, "from_chat_key", None)
+    if chat_key:
+        return chat_key
+    try:
+        return ctx.chat_key
+    except (AttributeError, ValueError):
+        return ""
+
+
 class PackageInfo(BaseModel):
     """云端插件信息"""
 
@@ -163,6 +182,14 @@ class PluginCollector:
         # 添加 packages 目录到 Python 路径
         if str(self.packages_dir.parent.absolute()) not in sys.path:
             sys.path.insert(0, str(self.packages_dir.parent.absolute()))
+
+        # 「默认启用」的新内置插件必须在加载之前写进 `PLUGIN_ENABLED`：加载时按它决定插件是否活着。
+        # 正式启动时 `nekro_agent/__init__.py` 已经在 `bootstrap_model_groups()` 之前做过一次（这里幂等，
+        # 不会重复添加）；保留这一处是为了不经过那条启动流程的入口。只改内存、从不落盘，理由见
+        # `services/plugin/default_on.py`
+        from nekro_agent.services.plugin.default_on import apply_default_on_plugins_at_startup
+
+        apply_default_on_plugins_at_startup()
 
         # 加载内置插件
         for item in self.builtin_plugin_dir.iterdir():
@@ -791,6 +818,14 @@ class PluginCollector:
             if plugin.support_adapter and ctx.adapter_key not in plugin.support_adapter:
                 continue
             methods.extend(await plugin.collect_available_methods(ctx))
+
+        # 运维工具是核心方法，不是插件：它们的可用性由回合开始时签发的授权决定，
+        # 与插件启停无关（理由见 `services/ops_agent/__init__.py`）。没有授权时这里是空表，
+        # 方法清单与沙盒许可白名单都与改造前逐字一致。
+        # 函数内导入：`ops_agent` 会拖进实例管理、用量、日志一串服务，模块级导入会成环。
+        from nekro_agent.services.ops_agent.provider import methods_for
+
+        methods.extend(await methods_for(ctx))
         logger.debug(f"获取到 {len(methods)} 个沙盒方法（instance={instance_key or '-'} chat={chat_key or '-'}）")
         return methods
 
@@ -801,10 +836,16 @@ class PluginCollector:
             ctx: 上下文
             message: 消息
         """
+        # 插件进程级活着不等于它在这个频道生效：租户会在自己实例 / 频道上关掉冷处理一类插件，
+        # 而本循环是每条入站消息都会跑的。先按目标频道解析一次实例，再按 会话 > 实例 > 全局 判定。
+        # 判不出归属（多租户部署里频道行缺失）时按不生效，宁可让这条消息不被插件干预。
+        chat_key = _hook_chat_key(ctx)
+        instance_key = await resolve_chat_plugin_instance(chat_key)
+
         max_signal: MsgSignal = MsgSignal.CONTINUE
         min_signal: MsgSignal = MsgSignal.CONTINUE
         for plugin in self.loaded_plugins.values():
-            if plugin.is_enabled and plugin.on_user_message_method:
+            if plugin.is_enabled and plugin_effective_with_instance(plugin.key, instance_key, chat_key) and plugin.on_user_message_method:
                 # 坏掉的插件回落到 CONTINUE：它对本轮消息不再有发言权，
                 # 但既不会拦下消息，也不会影响排在它后面的插件与其他实例。
                 signal = (
@@ -833,10 +874,15 @@ class PluginCollector:
             ctx: 上下文
             message: 消息
         """
+        # 与 `handle_on_user_message` 同理由：系统消息也会推给某个具体频道，
+        # 这个频道所在作用域关掉的插件不该再看到它、更不该拦下它。
+        chat_key = _hook_chat_key(ctx)
+        instance_key = await resolve_chat_plugin_instance(chat_key)
+
         max_signal: MsgSignal = MsgSignal.CONTINUE
         min_signal: MsgSignal = MsgSignal.CONTINUE
         for plugin in self.loaded_plugins.values():
-            if plugin.is_enabled and plugin.on_system_message_method:
+            if plugin.is_enabled and plugin_effective_with_instance(plugin.key, instance_key, chat_key) and plugin.on_system_message_method:
                 signal = (
                     await call_plugin(
                         plugin,
@@ -987,8 +1033,11 @@ class PluginCollector:
 
     async def chat_channel_on_reset(self, ctx: AgentCtx) -> None:
         """聊天频道重置时执行"""
+        # 重置的是某一个频道：这个频道上关掉的插件不该再改群名片一类的副作用。
+        chat_key = _hook_chat_key(ctx)
+        instance_key = await resolve_chat_plugin_instance(chat_key)
         for plugin in self.loaded_plugins.values():
-            if plugin.is_enabled and plugin.on_reset_method:
+            if plugin.is_enabled and plugin_effective_with_instance(plugin.key, instance_key, chat_key) and plugin.on_reset_method:
                 await call_plugin(plugin, "on_channel_reset", plugin.on_reset_method, ctx.model_copy(), default=None)
 
     async def cleanup_all_plugins(self) -> None:

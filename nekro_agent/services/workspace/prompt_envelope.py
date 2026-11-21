@@ -46,6 +46,11 @@ class CcPromptEnvelope:
     task_body: str
     memory_lines: list[str] = field(default_factory=list)
     system_notes: list[str] = field(default_factory=list)
+    ssh_servers: tuple[str, ...] = ()
+    """本任务被授权使用的 SSH 服务器别名（按别名排序）。
+
+    空元组时 `to_prompt()` 与 `to_metadata_json()` 与改造前逐字一致。
+    """
 
     # ------------------------------------------------------------------
     # 构造辅助方法
@@ -99,6 +104,15 @@ class CcPromptEnvelope:
     # 输出方法
     # ------------------------------------------------------------------
 
+    def _ssh_note(self) -> str:
+        """本任务被授权使用的服务器说明；没有授权别名时调用方不会拼它"""
+        aliases = "、".join(self.ssh_servers)
+        return (
+            f"本任务可用的服务器：{aliases}。"
+            "用 `ssh -T <别名> '命令'`；`scp` / `rsync` / `git` 用 `<别名>:路径`。"
+            "其余登记过的服务器本任务没有授权。"
+        )
+
     def to_prompt(self) -> str:
         """生成发送给 CC 的完整 prompt 字符串。
 
@@ -125,18 +139,22 @@ class CcPromptEnvelope:
             parts = [header, "", self.task_body]
             for note in self.system_notes:
                 parts.extend(["", "---", note])
+            if self.ssh_servers:
+                # 与系统附加段同一形状，放在任务正文（及已有附加段）之后
+                parts.extend(["", "---", self._ssh_note()])
             return "\n".join(parts)
         else:
             # 用户直发路径
             time_header = f"[当前时间: {self.meta.current_time}]"
+            ssh_suffix = f"\n\n---\n{self._ssh_note()}" if self.ssh_servers else ""
             if not self.memory_lines:
-                return f"{time_header}\n\n{self.task_body}"
+                return f"{time_header}\n\n{self.task_body}{ssh_suffix}"
             memory_block = (
                 "[统一记忆握手]\n"
                 "以下内容来自当前工作区的历史记忆，请在执行任务时优先参考；若与工作区现状冲突，以实际工作区状态为准。\n"
                 + "\n".join(self.memory_lines)
             )
-            return f"{time_header}\n\n{memory_block}\n\n[当前任务]\n{self.task_body}"
+            return f"{time_header}\n\n{memory_block}\n\n[当前任务]\n{self.task_body}{ssh_suffix}"
 
     def to_metadata_json(self) -> str:
         """序列化为存入 DBWorkspaceCommLog.extra_data 的 JSON 字符串。"""

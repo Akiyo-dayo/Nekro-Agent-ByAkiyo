@@ -12,10 +12,13 @@
     "private": "私聊",
     "active": "已激活",
     "observe": "旁观中",
-    "inactive": "未激活"
+    "inactive": "未激活",
+    "botMembership": "Bot 在群",
+    "botNotInGroup": "Bot 不在群"
   },
   "list": {
     "empty": "暂无聊天频道",
+    "botNotInGroupBadge": "Bot 不在群",
     "emptyOtherUnclaimed_one": "该实例名下暂无会话；有 {{count}} 个会话在尚未认领的实例「{{instance}}」下——协议端连上时会先自行登记一个实例并把会话归给它，认领后这些会话才会出现在这里。",
     "emptyOtherUnclaimed_other": "该实例名下暂无会话；有 {{count}} 个会话在尚未认领的实例「{{instance}}」下——协议端连上时会先自行登记一个实例并把会话归给它，认领后这些会话才会出现在这里。",
     "emptyOtherInstances_one": "该实例名下暂无会话；有 {{count}} 个会话在其它实例（如「{{instance}}」）下，切换上方的实例作用域即可查看。",
@@ -77,7 +80,57 @@
     "setPresetSuccess": "已{{action}}人设: {{name}}",
     "setPresetFailed": "设置人设失败",
     "set": "设置",
-    "clear": "清除"
+    "clear": "清除",
+    "autoDisable": {
+      "title": "这个频道是系统自动停用的：{{reason}}",
+      "reasons": {
+        "bot_left_group": "Bot 已不在这个群里"
+      },
+      "reasonUnknown": "未知原因",
+      "disabledAt": "停用时间：{{time}}",
+      "hint": "Bot 重新入群、或群里再有人发言时，会自动恢复到原来的状态；在这里手动启用或停用之后，就不再自动恢复"
+    },
+    "botMembership": {
+      "notInGroupTitle": "核对结果：Bot 不在这个群里",
+      "checkedAt": "核对时间：{{time}}",
+      "hint": "这只是标记，频道不会因此被停用；需要停用请手动操作，或在频道列表里筛选后批量停用。Bot 回群、或群里再有人发言时，标记会自动清除",
+      "inGroup": "最近确认 Bot 在群：{{time}}（{{source}}）",
+      "sources": {
+        "check": "核对",
+        "inbound": "群里有新消息"
+      }
+    }
+  },
+  "botMembership": {
+    "check": {
+      "button": "核对 Bot 在群",
+      "dialogTitle": "核对 Bot 在群",
+      "dialogHint": "向协议端取一次群列表，标出 Bot 已经不在的群频道。只做标记，不会停用频道，也不发任何消息。",
+      "run": "立即核对",
+      "close": "关闭",
+      "results": {
+        "checked": "核对完成：协议端返回 {{groups}} 个群；本实例 {{channels}} 个群频道里有 {{notInGroup}} 个 Bot 不在群（新标记 {{marked}} 个，清除 {{cleared}} 个）",
+        "offline": "实例不在线或未绑定账号，没有核对",
+        "call_failed": "向协议端取群列表失败，没有改动任何标记：{{message}}",
+        "empty": "协议端返回了空的群列表，为免误标，没有改动任何标记",
+        "malformed": "协议端返回的群列表格式不对，没有改动任何标记",
+        "incomplete": "协议端返回的群列表看起来不完整，为免误标，没有改动任何标记：{{message}}"
+      }
+    },
+    "disable": {
+      "button": "批量停用",
+      "dialogTitle": "批量停用 Bot 不在群的频道",
+      "loading": "正在加载预览…",
+      "count_one": "将停用 {{count}} 个频道",
+      "count_other": "将停用 {{count}} 个频道",
+      "empty": "没有需要停用的频道",
+      "manualHint": "这是手动停用：Bot 回群后不会自动恢复，需要时请手动启用",
+      "confirm": "确认停用",
+      "cancel": "取消",
+      "done": "已停用 {{disabled}} 个，跳过 {{skipped}} 个",
+      "failed": "批量停用失败",
+      "previewFailed": "加载预览失败：{{message}}"
+    }
   },
   "overrideSettings": {
     "info": "此处的配置将仅对当前聊天频道生效。它的优先级最高，将覆盖所有来自适配器和系统的同名配置。",
@@ -100,7 +153,8 @@
       "overrideSettings": "覆盖配置",
       "messageHistory": "实时消息",
       "pluginData": "插件数据",
-      "commandPermissions": "命令权限"
+      "commandPermissions": "命令权限",
+      "memory": "记忆"
     },
     "resetDialog": {
       "title": "确认重置聊天？",

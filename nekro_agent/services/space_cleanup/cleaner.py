@@ -1,13 +1,34 @@
 
-"""空间清理服务"""
+"""空间清理服务
+
+## 删除为什么不能按路径来
+
+清理的目录里有几类是容器能写的：沙盒共享目录（`sandboxes/<container_key>`，挂进沙盒）、
+沙盒的 pip 缓存与动态包目录，NapCat 的临时文件目录。收集要删的文件之后、真正 `unlink` 之前，
+容器可以把路径中间任何一级目录换成指向宿主别处的符号链接；按路径 `unlink` 会顺着那个链接
+删掉宿主上的任意文件（只看最后一级是不是链接挡不住）。
+
+所以删除与清空目录一律从资源根目录（NA 自己建的那一级）出发，用 `safe_fs` 的目录句柄逐级
+不跟随链接地打开，途中任何一级是链接就跳过这个文件；最后一级是链接只删链接本身。统计大小也
+按 `lstat` 走同一条路，不跟着链接去量宿主别处的文件。收集阶段同样用目录句柄往下列
+（`safe_fs.walk_regular_files`：链接不跟随，嵌套有深度上限）。
+
+## 关于 NapCat
+
+NapCat 容器以读写方式挂着整个 `DATA_DIR`（内置 NapCat 的建容器参数与 compose 文件都是这样），
+这里按「NapCat 视为可信」处理：它的临时目录照样按上面的规则清理，但一个被攻破的 NapCat 本来就
+能直接改写 `DATA_DIR` 里的任何东西，清理器这一层挡不住它。收窄 NapCat 的挂载是另一件事
+（登记在 0.4.7 的待办里）。
+"""
 
 import asyncio
 import json
+import os
 import stat
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import (
@@ -30,12 +51,56 @@ from nekro_agent.schemas.space_cleanup import (
     CleanupStatus,
     ResourceType,
 )
+from nekro_agent.services.workspace import safe_fs
 
 # 清理任务缓存目录
 
 logger = get_sub_logger("space_cleanup")
 CLEANUP_CACHE_DIR = Path(APP_SYSTEM_DIR) / "space_cleanup" / "tasks"
 CLEANUP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _resource_base_dirs() -> List[Path]:
+    """各类可清理资源的根目录（解析成真实路径）
+
+    这些根目录本身是 NA 建的、容器换不掉的那一级，解析它们自己路径里的链接是安全的；
+    收集文件时也是先把根目录 `resolve()` 再往下列，所以收集到的路径都落在这里某一个下面。
+    """
+    roots = (
+        USER_UPLOAD_DIR,
+        SANDBOX_SHARED_HOST_DIR,
+        SANDBOX_PIP_CACHE_DIR,
+        SANDBOX_PACKAGE_DIR,
+        PLUGIN_DYNAMIC_PACKAGE_DIR,
+        PROMPT_LOG_DIR,
+        PROMPT_ERROR_LOG_DIR,
+        MEMORY_PARSE_LOG_DIR,
+        NAPCAT_TEMPFILE_DIR,
+    )
+    return [Path(root).resolve() for root in roots]
+
+
+def _locate(file_path: Path, bases: Sequence[Path]) -> Optional[Tuple[Path, List[str], str]]:
+    """把一个要删的文件拆成 `(资源根目录, 中间各级目录名, 文件名)`；不在任何资源根目录下返回 None
+
+    候选路径只按字面展开、不解析链接；落在多个根目录下（`sandboxes` 与它下面的 `.pip_cache`）
+    时取最具体的那个。
+    """
+    candidate = Path(os.path.abspath(str(file_path)))
+    best: Optional[Tuple[Path, Path]] = None
+    for base in bases:
+        try:
+            rel = candidate.relative_to(base)
+        except ValueError:
+            continue
+        if best is None or len(base.parts) > len(best[0].parts):
+            best = (base, rel)
+    if best is None:
+        return None
+    parts = list(best[1].parts)
+    if not parts:
+        return None
+    return best[0], parts[:-1], parts[-1]
 
 
 def _normalize_datetime(dt: datetime) -> datetime:
@@ -198,7 +263,8 @@ class CleanupService:
                 ResourceType.NAPCAT_TEMP: Path(NAPCAT_TEMPFILE_DIR),
             }
 
-            # 逐个删除文件
+            # 逐个删除文件。删与量大小都从资源根目录逐级不跟随链接地走，见模块文档
+            bases = _resource_base_dirs()
             for idx, file_path in enumerate(files_to_clean):
                 progress.current_file = str(file_path)
                 progress.processed_files = idx + 1
@@ -206,8 +272,8 @@ class CleanupService:
 
                 if not request.dry_run:
                     try:
-                        file_size = file_path.stat().st_size if file_path.exists() else 0
-                        success = self._safe_remove_file(file_path)
+                        file_size = self._safe_file_size(file_path, bases)
+                        success = self._safe_remove_file(file_path, bases)
                         if success:
                             deleted_files += 1
                             freed_space += file_size
@@ -222,7 +288,7 @@ class CleanupService:
                 else:
                     # 模拟运行，只统计不删除
                     try:
-                        file_size = file_path.stat().st_size if file_path.exists() else 0
+                        file_size = self._safe_file_size(file_path, bases)
                         deleted_files += 1
                         freed_space += file_size
                         progress.freed_space = freed_space
@@ -395,20 +461,14 @@ class CleanupService:
                 if request.chat_keys and chat_key not in request.chat_keys:
                     continue
 
-                # 收集该聊天目录下的文件
-                for file_path in chat_dir.rglob("*"):
-                    if file_path.is_file():
-                        # 检查时间过滤（使用修改时间）
-                        if request.before_date:
-                            try:
-                                file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
-                                before_date_naive = _normalize_datetime(request.before_date)
-                                if file_mtime >= before_date_naive:
-                                    continue
-                            except (OSError, PermissionError):
-                                continue
-
-                        files.append(file_path)
+                # 收集该聊天目录下的文件：目录句柄往下列，不跟随链接（链接本身也收进来，删的时候
+                # 只删链接），时间按 `lstat` 判，嵌套有深度上限
+                for file_path, file_stat in safe_fs.walk_regular_files(chat_dir, include_links=True):
+                    if request.before_date:
+                        file_mtime = datetime.fromtimestamp(file_stat.st_mtime)
+                        if file_mtime >= _normalize_datetime(request.before_date):
+                            continue
+                    files.append(file_path)
 
         except Exception as e:
             logger.warning(f"收集文件失败 {directory}: {e}")
@@ -428,61 +488,68 @@ class CleanupService:
         files: List[Path] = []
 
         try:
-            for file_path in directory.rglob("*"):
-                if file_path.is_file():
-                    # 检查时间过滤（使用修改时间）
-                    if request.before_date:
-                        try:
-                            file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
-                            before_date_naive = _normalize_datetime(request.before_date)
-                            if file_mtime >= before_date_naive:
-                                continue
-                        except (OSError, PermissionError):
-                            continue
-
-                    files.append(file_path)
+            # 同 `_collect_chat_based_files`：目录句柄往下列，不跟随链接，时间按 `lstat` 判
+            for file_path, file_stat in safe_fs.walk_regular_files(directory, include_links=True):
+                if request.before_date:
+                    file_mtime = datetime.fromtimestamp(file_stat.st_mtime)
+                    if file_mtime >= _normalize_datetime(request.before_date):
+                        continue
+                files.append(file_path)
 
         except Exception as e:
             logger.warning(f"收集文件失败 {directory}: {e}")
 
         return files
 
-    def _safe_remove_file(self, file_path: Path) -> bool:
-        """安全删除文件
+    def _safe_remove_file(self, file_path: Path, bases: Optional[Sequence[Path]] = None) -> bool:
+        """从资源根目录出发逐级不跟随链接地删一个文件
+
+        途中任何一级目录是链接（收集之后被换掉的）就不删、返回 False；最后一级是链接只删
+        链接本身；已经不在了算删成功。不在任何资源根目录下的路径一律不删。
 
         Args:
-            file_path: 文件路径
+            file_path: 收集阶段得到的文件路径
+            bases: 资源根目录；不给时现算（见 `_resource_base_dirs`）
 
         Returns:
             bool: 是否成功删除
         """
-        if not file_path.exists():
-            return True
-
-        if not file_path.is_file():
+        located = _locate(file_path, bases if bases is not None else _resource_base_dirs())
+        if located is None:
+            logger.warning(f"跳过不在任何清理目录下的路径: {file_path}")
             return False
-
+        base, parents, name = located
         try:
-            # 尝试删除
-            file_path.unlink()
-        except PermissionError:
-            # 尝试修改权限后删除
-            try:
-                file_path.chmod(stat.S_IWRITE)
-                file_path.unlink()
-            except Exception as e:
-                logger.warning(f"删除文件失败（权限问题）{file_path}: {e}")
-                return False
-            else:
-                return True
+            # 删掉了、或者已经不在了，都算这个文件清理完了
+            safe_fs.remove_file(base, [*parents, name], allow_chmod=True)
+        except safe_fs.UnsafePathError as e:
+            logger.warning(f"清理时路径上有符号链接或不是普通文件，没有删（不跟随链接）: {file_path}: {e}")
+            return False
         except Exception as e:
             logger.warning(f"删除文件失败 {file_path}: {e}")
             return False
-        else:
-            return True
+        return True
+
+    def _safe_file_size(self, file_path: Path, bases: Optional[Sequence[Path]] = None) -> int:
+        """量一个要删的文件有多大：逐级不跟随链接，链接与读不了的一律按 0 算"""
+        located = _locate(file_path, bases if bases is not None else _resource_base_dirs())
+        if located is None:
+            return 0
+        base, parents, name = located
+        try:
+            with safe_fs.open_dir(base, parents) as directory:
+                if directory.kind(name) != "file":
+                    return 0
+                st = directory.lstat(name)
+                return int(st.st_size) if st is not None else 0
+        except (OSError, ValueError):
+            return 0
 
     async def _cleanup_empty_subdirectories(self, base_directory: Path) -> None:
         """清理基础目录下的空子目录（不包括基础目录本身）
+
+        从基础目录出发用目录句柄往下走，链接不进去也不删；按路径 `rmdir` 的话，中间某一级
+        被换成链接就会删到宿主别处的空目录。
 
         Args:
             base_directory: 基础目录路径
@@ -491,24 +558,7 @@ class CleanupService:
             return
 
         try:
-            # 从最深层开始删除空目录
-            # 使用 rglob 获取所有子目录，按深度从深到浅排序
-            # rglob("*") 不会包含基础目录本身，所以不需要额外检查
-            all_dirs = [p for p in base_directory.rglob("*") if p.is_dir()]
-            # 按路径深度从深到浅排序，确保先删除深层目录
-            sorted_dirs = sorted(all_dirs, key=lambda p: len(p.parts), reverse=True)
-
-            for dirpath in sorted_dirs:
-                try:
-                    # 检查目录是否为空
-                    if not any(dirpath.iterdir()):
-                        dirpath.rmdir()
-                except OSError:
-                    # 目录不为空或删除失败，忽略
-                    pass
-                except Exception as e:
-                    logger.warning(f"删除空目录失败 {dirpath}: {e}")
-
+            safe_fs.remove_empty_dirs(base_directory.resolve())
         except Exception as e:
             logger.warning(f"清理空目录失败 {base_directory}: {e}")
 

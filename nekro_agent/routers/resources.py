@@ -40,7 +40,7 @@ from fastapi import APIRouter, Depends
 
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.models.db_workspace import DBWorkspace
-from nekro_agent.schemas.errors import NotFoundError
+from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.schemas.workspace_resource import (
     ActionOkResponse,
     WorkspaceResourceBindBody,
@@ -236,6 +236,18 @@ async def check_workspace_resource_bind(
     body: WorkspaceResourceCheckBindBody,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> WorkspaceResourceCheckBindResponse:
+    """检查绑定冲突；工作区不能拿平台方凭据时与绑定接口回同一个拒绝
+
+    在这里也拦一次，是因为前端先调 check-bind 再调绑定：只在绑定时拒的话，界面上这一步
+    显示「可以绑定」，点下去才失败，看起来像是绑定接口坏了。
+    """
+    workspace = await DBWorkspace.get_or_none(id=workspace_id)
+    if workspace is None:
+        raise NotFoundError(resource=f"工作区 {workspace_id}")
+    from nekro_agent.services.workspace.credential_policy import platform_credentials_allowed
+
+    if not await platform_credentials_allowed(workspace):
+        raise ValidationError(reason="租户工作区不能绑定平台方资源")
     conflicts = await workspace_resource_service.check_bind_conflicts(workspace_id, body.resource_id)
     return WorkspaceResourceCheckBindResponse(ok=not conflicts, conflicts=conflicts)
 

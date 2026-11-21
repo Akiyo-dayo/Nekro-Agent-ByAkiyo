@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 import os
@@ -5,7 +6,7 @@ import re
 import time
 from collections import deque
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from nekro_agent.core.config import CoreConfig, ModelConfigGroup
 from nekro_agent.core.logger import get_sub_logger
@@ -14,30 +15,36 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_exec_code import ExecStopType
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.schemas.chat_message import ChatMessage
-from nekro_agent.services.affection.evaluator import schedule_affection_evaluation
-from nekro_agent.services.affection.prompt import render_affection_prompt
 from nekro_agent.services.affection.suppression import lift_narrative_suppression, suppress_narrative
 from nekro_agent.services.agent.provider_refusal import (
-    detect_provider_refusal,
+    detect_provider_refusal as detect_text_provider_refusal,
+)
+from nekro_agent.services.agent.provider_refusal import (
     normalize_for_match,
 )
+from nekro_agent.services.agent.round_trigger_accounts import begin_round_triggers, clear_round_triggers
 from nekro_agent.services.agent.session_token import attach_untrusted_result, register_session_token
+from nekro_agent.services.memory import prompt_rounds
 from nekro_agent.services.memory.round_recall import commit_round_recall, discard_round_recall
-from nekro_agent.services.model_group_service import enforce_channel_model_group_scope
-from nekro_agent.services.plugin.call_priority import build_plugin_call_priority_rules
-from nekro_agent.services.plugin.prompt_activation import build_plugin_activation_rules
-from nekro_agent.services.plugin.scope import instance_scope, resolve_active_plugins
+from nekro_agent.services.ops_agent.round_grant import close_round as close_ops_round
+from nekro_agent.services.ops_agent.round_grant import open_round as open_ops_round
+from nekro_agent.services.ops_agent.triggers import round_trigger_book
+from nekro_agent.services.plugin.scope import instance_scope
 from nekro_agent.services.sandbox.runner import build_container_key, limited_run_code
+from nekro_agent.services.tavern import runtime as tavern_runtime
 from nekro_agent.services.usage import (
     LLMUsageContext,
     LLMUsageScene,
     resolve_model_group_name,
     usage_scope,
 )
+from nekro_agent.services.worldbook import runtime as wb_runtime
 
 from .creator import OpenAIChatMessage
 from .model_capability import (
+    _CONTENT_REJECT_STATUS,
     LLMFailureKind,
+    _extract_status_code,
     classify_llm_failure,
     has_image_segments,
     note_capability_ok,
@@ -45,11 +52,11 @@ from .model_capability import (
     strip_image_segments,
     supports_vision,
 )
-from .openai import EmptyLLMResponseError, OpenAIResponse, gen_openai_chat_response
+from .openai import EmptyLLMResponseError, OpenAIResponse, gen_openai_chat_response, log_pending_chat_key
+from .prefill import PREFILL_CAPABILITY, PrefillSpec, merge_prefill, prefill_message
 from .resolver import ParsedCodeRunData, parse_chat_response
-from .templates.compiler import PromptCompiler
+from .round_prompt import build_round_prompt
 from .templates.history import render_history_data
-from .templates.plugin import render_plugins_prompt
 from .upstream_redaction import collect_llm_secret_values, redact_upstream_text
 
 # 使用deque保存最近100条错误日志路径
@@ -437,7 +444,7 @@ def match_provider_refusal(text: str) -> str:
     「是靠哪一条判出来的」，而上游正文既可能很长、也可能带供应商内部信息，
     不该因为一次拒答就整段落进运维日志。
     """
-    match = detect_provider_refusal(text)
+    match = detect_text_provider_refusal(text)
     if match is None:
         return ""
     normalized = _normalize_for_marker_match(text)
@@ -452,6 +459,22 @@ def match_provider_refusal(text: str) -> str:
 def is_provider_refusal(text: str) -> bool:
     """这段正文是不是渠道/供应商的「拒绝受理」说明（而不是模型写的东西）"""
     return bool(match_provider_refusal(text))
+
+
+def detect_provider_refusal(parsed: ParsedCodeRunData, response: OpenAIResponse) -> Optional[str]:
+    """这一轮是不是「渠道把拒绝受理当成正文返回」；是则返回拒答类别，否则 `None`
+
+    判据是 `raise_if_provider_refusal` 原来的两条合取：回复里**没有可执行代码**
+    （`code_missing`）且正文命中供应商拒答标志。带代码的回复永远不算拒答——模型正常
+    写了调用的响应里也可能出现「拒绝」「policy」这些词，只有整段正文都像拒绝页时才拦。
+
+    抽成模块级函数是为了让提示词试发复用同一份判据：试发不跑迭代、也不该在 `run_agent`
+    的闭包里再抄一遍。`run_agent` 仍按原来的位置与顺序调用它，行为不变。
+    """
+    if not is_code_missing(parsed):
+        return None
+    refusal_marker = match_provider_refusal(response.response_content)
+    return refusal_marker or None
 
 
 async def run_agent(
@@ -500,6 +523,55 @@ def _round_was_blocked(error: BaseException) -> bool:
     return isinstance(error, AllLLMRequestsFailedError) and LLMFailureKind.CONTENT_BLOCKED in error.kinds
 
 
+async def _channel_message_marker(chat_key: str) -> int:  # noqa: ARG001 - 签名保持按频道，调用方与替身都不用改
+    """取「回合开始标记」：消息表当前最大的消息 ID；没有消息就是 0
+
+    **用消息 ID 而不是时间戳**：`send_timestamp` 是秒级的，两轮紧挨着开始时上一轮的
+    回复会与这一轮落在同一秒里，按 `>= 开始时刻` 数就会把上一轮的消息算进这一轮，
+    一个频道连续被叫两次时会凭空多记一次回复。消息 ID 是单调递增的，天然分得清先后。
+
+    **取全表最大值而不是本频道最大值**：ID 全表单调递增，本轮之后落库的 Bot 消息 ID 一定大于
+    回合开始时的全表最大值；收尾那条查询仍按 `chat_key` 过滤，结果与按频道取标记相同。
+    按频道取 `MAX(id)` 在只有 `chat_key` 单列索引的表上会退化成沿主键倒着扫、边扫边过滤：
+    一个很久没人说话的频道（定时任务、节日祝福常在这种频道上开回合）要把它之后的所有消息
+    扫一遍。全表最大值只读主键索引的末端一页；收尾查询的 `id > 标记` 也因此只落在本轮新增的
+    那几行上。
+    """
+    from tortoise.functions import Max
+
+    from nekro_agent.models.db_chat_message import DBChatMessage
+
+    rows = await DBChatMessage.all().annotate(agg_max_id=Max("id")).values("agg_max_id")
+    if not rows:
+        return 0
+    return int(rows[0].get("agg_max_id") or 0)
+
+
+async def _record_round_reply(chat_key: str, db_chat_channel: DBChatChannel, marker: int) -> None:
+    """回合收尾：这一轮发出过 Bot 消息就记一次回复，并做一次告警评估
+
+    **按「回合」计而不是按「消息条数」计**：一轮回复常常被拆成三条消息发出去，
+    按条数算等于对客户收三次费，也没法解释「一次回复」到底是什么。判据因此是
+    「这一轮之后这个频道里有没有新的 Bot 消息」，有几条都只算一次。
+
+    Bot 消息的判据与旧回复配额那段一致：`sender_id = -1` 且不是 `SYSTEM`
+    （系统消息是宿主推进去的，不是这一轮的回复）。
+    """
+    from nekro_agent.models.db_chat_message import DBChatMessage
+    from nekro_agent.services.channel_quota.counter import record_reply
+    from nekro_agent.services.channel_quota.service import check_and_alert
+
+    sent = await (
+        DBChatMessage.filter(chat_key=chat_key, id__gt=marker, sender_id="-1")
+        .exclude(sender_name="SYSTEM")
+        .exists()
+    )
+    if not sent:
+        return
+    await record_reply(chat_key, db_chat_channel.adapter_key, db_chat_channel.instance_key)
+    await check_and_alert(db_chat_channel)
+
+
 async def _run_agent_with_affection_suppression(
     chat_key: str,
     chat_message: Optional[ChatMessage],
@@ -515,8 +587,24 @@ async def _run_agent_with_affection_suppression(
     注入过的记忆一次性补记强化。其余失败（超时、无进展、没写代码……）与描述无关，不动标记，
     但同样不强化——只有正常收尾才算「这些记忆被用上了」。
     标记与召回记录都只在进程内，重启即失，见 `services/affection/suppression.py` 与
-    `services/memory/round_recall.py`。
+    `services/memory/round_recall.py`。世界书的定时状态（sticky / cooldown 锚点）也只在
+    正常收尾时提交：被拦、失败、取消的轮次不开始 sticky、也不进 cooldown，否则一次被拦的
+    轮次会让下一条本该注入的条目进冷却，而明细里只会显示「冷却中」。
+
+    收尾处还要记一次频道额度回复：失败与异常路径也要记（这一轮的消息已经发出去了），
+    只有被取消的那一轮不记（任务被打断，发出去了多少无法确定）。
     """
+    outcome = "failed"
+    # 回合开始标记。取不到（库抖动）就不计这一轮的回复：按 0 算会把这个频道历史上任何一条
+    # Bot 消息都当成「这一轮发的」，多记一次回复。额度是平台方给客户的承诺，查询失败时
+    # 宁可少记一次，也不替客户多算。
+    round_marker: Optional[int]
+    try:
+        round_marker = await _channel_message_marker(chat_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[run_agent] {chat_key} | 取回合开始标记失败，这一轮不计频道额度回复: {exc}")
+        round_marker = None
+    prompt_rounds.begin(one_time_code, db_chat_channel)
     try:
         await _run_agent_in_instance_scope(
             chat_key=chat_key,
@@ -527,18 +615,65 @@ async def _run_agent_with_affection_suppression(
         )
     except (AllLLMRequestsFailedError, AgentProviderRefusalError) as error:
         if _round_was_blocked(error):
+            outcome = "blocked"
             suppress_narrative(chat_key)
             logger.info(
                 f"[run_agent] {chat_key} | 本轮被内容审核拦下或被供应商拒答，好感描述暂不注入这个频道；"
                 "本轮注入的记忆不强化，下一轮也不注入记忆块",
             )
         raise
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    except Exception:
+        outcome = "failed"
+        raise
     else:
+        outcome = "ok"
         lift_narrative_suppression(chat_key)
         await commit_round_recall(one_time_code)
     finally:
         # 成功路径上已被 `commit` 弹出，这里是空操作；任何失败路径都在这里丢掉本轮记录。
         discard_round_recall(one_time_code)
+        prompt_rounds.finish(one_time_code, outcome)
+        # 世界书的定时锚点同样只在这个位置定音：成功提交，其余一律丢弃。
+        wb_runtime.finish_round(one_time_code, outcome)
+        # 酒馆上下文只活一轮：与提示词明细、世界书缓存同一个生命周期，正常收尾就弹出。
+        tavern_runtime.discard_tavern_round(one_time_code)
+        # 运维授权随回合结束一起失效：回合已经跑完，沙盒里再来的回调没有可依据的授权了。
+        # 包 try 且不 re-raise，与下面几条一样：这里正在往外走异常，不能把它盖掉。
+        try:
+            close_ops_round(build_container_key(chat_key))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[run_agent] {chat_key} | 运维授权撤销失败（已忽略）: {exc}")
+        # 本轮触发者记录只活一轮：插件关着时也照常清，避免下一轮读到上一轮的账号。
+        # 同样包 try 且不 re-raise：这里正在往外走异常，不能把真正的原因盖掉。
+        try:
+            clear_round_triggers(chat_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[run_agent] {chat_key} | 清理本轮触发者记录失败（已忽略）: {exc}")
+        # 触发记录簿的本轮快照同样只活一轮：D6 与网关都只在回合进行中读它，收尾必须清掉，
+        # 否则下一轮会拿去上一轮的人当授权依据。同样包 try 且不 re-raise。
+        try:
+            round_trigger_book.end_round(chat_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[run_agent] {chat_key} | 清理本轮触发快照失败（已忽略）: {exc}")
+        # 本轮在聊天里登记过服务器时，回合收尾补扫一次聊天记录：登记之后才落库的消息
+        # （例如 Bot 自己的回复）也不能留着凭据原文。没有待清理项时只是一次字典查找。
+        # 同样包 try 且不 re-raise。
+        try:
+            from nekro_agent.services.ssh_gateway.scrub import finish_round as _finish_scrub_round
+
+            await _finish_scrub_round(chat_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[run_agent] {chat_key} | 收尾补扫凭据原文失败（已忽略）: {type(exc).__name__}")
+        # 计数与告警整体兜住：**绝不能改变这个函数原本的异常与返回**。
+        # 上面几条 `raise` 正在往外走，这里再抛一个异常会把真正的原因盖掉。
+        if outcome != "cancelled" and round_marker is not None:
+            try:
+                await _record_round_reply(chat_key, db_chat_channel, round_marker)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[run_agent] {chat_key} | 频道额度回复计数失败（已忽略）: {exc}")
 
 
 async def _run_agent_in_instance_scope(
@@ -553,42 +688,45 @@ async def _run_agent_in_instance_scope(
     # 只能靠服务端按 container_key 存查——令牌绝不下发进容器，否则模型生成的代码能读到并伪造可信标签。
     register_session_token(build_container_key(chat_key), one_time_code)
 
-    config = await db_chat_channel.get_effective_config()
-    # 模型组归属的运行时兜底。接口层（`routers/config.py:_assert_tenant_may_write`）只管住
-    # "从今往后"，而**存量覆盖文件里可能已经写着**越权的组名——补接口层挡不住已落盘的，
-    # 而这一行下面立刻就要拿组名去取真实的 API Key。越界引用会被就地回落并打 WARNING，
-    # 不抛异常：让 Bot 因为一条历史配置直接哑掉，对租户是不可诊断的故障。
-    # 平台方实例与未启用多租户的部署在函数入口即返回，行为逐字不变。
-    await enforce_channel_model_group_scope(
-        config,
-        instance_key=db_chat_channel.instance_key,
-        adapter_key=db_chat_channel.adapter_key,
+    # 消息撤回插件的日志要写「这一轮是谁叫的 Bot」：把 `schedule_agent_task` 另记的那份待处理触发整体取走，
+    # 作为本轮记录（不借运维工具的触发记录簿，它受运维开关控制，见 `services/agent/round_trigger_accounts.py`）
+    try:
+        begin_round_triggers(chat_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[run_agent] {chat_key} | 记录本轮触发者失败（已忽略）: {exc}")
+
+    # 触发记录簿的本轮快照：整批取走一次，D6 与 SSH 网关都读这一份。必须在
+    # `open_ops_round` 之前——D6 的判定输入就是这个快照，晚一步它就又去取一次，
+    # 后取的那家会拿到空批。失败一律吞掉按「这一轮没有触发」处理：纯内存操作不应
+    # 让正常对话哑掉，而空批在两家都只会收紧权限。
+    try:
+        round_trigger_book.begin_round(chat_key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[run_agent] {chat_key} | 取本轮触发快照失败（已忽略）: {exc}")
+
+    # 运维工具的本轮授权。必须在 `register_session_token` 之后：沙盒容器键就是这一轮的键，
+    # 授权按它存查（见 `services/ops_agent/round_grant.py`）。
+    # 失败一律吞掉按「这一轮没有运维工具」处理：查库抖动不该让正常对话哑掉，
+    # 而没有授权时方法清单与提示词都与未启用时一致，是安全的失败方向。
+    try:
+        await open_ops_round(db_chat_channel)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[run_agent] {chat_key} | 运维工具本轮授权失败，按不可用处理: {exc}")
+
+    # 提示词组装整体在 `round_prompt.build_round_prompt` 里：真实一轮与提示词预览 / 试发
+    # 走同一条路径，预览看到的东西不会与真发出去的慢慢分叉。预览的临时状态由它自己收尾。
+    round_prompt = await build_round_prompt(
         chat_key=chat_key,
+        db_chat_channel=db_chat_channel,
+        ctx=ctx,
+        one_time_code=one_time_code,
+        trigger_message=chat_message,
     )
-    preset = await db_chat_channel.get_preset()
-    adapter_dialog_examples = await ctx.adapter.set_dialog_example()
-    adapter_jinja_env = await ctx.adapter.get_jinja_env()
-    self_info = await ctx.adapter.get_self_info(chat_key)
-    logger.debug(f"[run_agent] {chat_key} | 适配器信息就绪，开始渲染插件 prompt")
-
-    # 获取当前使用的模型组
-    used_model_group: ModelConfigGroup = config.MODEL_GROUPS[config.USE_MODEL_GROUP]
-    # 按 会话 > 实例 > 全局 解析本轮真正可见的插件集合；单实例部署下等价于全局开关
-    active_plugins = await resolve_active_plugins(instance_key=db_chat_channel.instance_key, chat_key=chat_key)
-    # 激活策略控制器本身也受作用域约束：某个实例把它关掉时，本轮就该退回全量披露模式
-    activation_enabled = any(plugin.module_name == "plugin_activation" for plugin in active_plugins)
-
-    rendered_plugins = await render_plugins_prompt(
-        active_plugins,
-        ctx,
-        activation_enabled=activation_enabled,
-    )
-    adapter_runtime_prompt = await ctx.adapter.render_runtime_prompt()
-    runtime_prompts = [
-        prompt for prompt in (adapter_runtime_prompt, rendered_plugins.runtime_prompt) if prompt.strip()
-    ]
-    runtime_prompt = "\n\n".join(runtime_prompts)
-    logger.debug(f"[run_agent] {chat_key} | 插件 prompt 渲染完成，开始构建 system prompt")
+    config = round_prompt.config
+    preset = round_prompt.preset
+    used_model_group: ModelConfigGroup = round_prompt.used_model_group
+    runtime_prompt = round_prompt.runtime_prompt
+    messages = round_prompt.messages
 
     from nekro_agent.services.system_broadcast import AgentRuntimeStatusEvent, publish_system_event
 
@@ -634,41 +772,6 @@ async def _run_agent_in_instance_scope(
         except Exception as e:
             logger.debug(f"[run_agent] {chat_key} | 运行阶段广播失败: {e}")
 
-    # 好感度：读路径 fail-open（失败返回空串），写路径只登记后台任务后立刻返回。
-    # 两者都不会让主对话因为好感度而变慢或失败，详见 services/affection/。
-    affection_prompt = await render_affection_prompt(
-        db_chat_channel=db_chat_channel,
-        one_time_code=one_time_code,
-        config=config,
-    )
-    schedule_affection_evaluation(db_chat_channel, config)
-
-    prompt_compiler = PromptCompiler(
-        affection_prompt=affection_prompt,
-        platform_name=self_info.platform_name,
-        bot_platform_id=self_info.user_id,
-        chat_preset=preset.content,
-        plugins_prompt=rendered_plugins.system_prompt,
-        plugins_runtime_prompt=runtime_prompt,
-        plugin_activation_rules=build_plugin_activation_rules() if activation_enabled else "",
-        plugin_call_priority_rules=build_plugin_call_priority_rules(),
-        enable_cot=used_model_group.ENABLE_COT,
-        chat_key_rules="\n".join(f"- {r}" for r in db_chat_channel.adapter.chat_key_rules),
-        enable_at=db_chat_channel.adapter.config.SESSION_ENABLE_AT,
-    )
-
-    messages = [prompt_compiler.render_system_message()]
-    messages.extend(prompt_compiler.render_practice_messages(adapter_dialog_examples, adapter_jinja_env))
-    messages.append(
-        await prompt_compiler.render_history_message(
-            chat_key=chat_key,
-            db_chat_channel=db_chat_channel,
-            one_time_code=one_time_code,
-            config=config,
-            model_group=used_model_group,
-        ),
-    )
-
     logger.debug(f"[run_agent] {chat_key} | 历史记录渲染完成，发送 LLM 请求 (model={used_model_group.CHAT_MODEL})")
     history_render_until_time = time.time()
     llm_retry_errors: list[str] = []
@@ -677,6 +780,7 @@ async def _run_agent_in_instance_scope(
             messages=messages,
             config=config,
             chat_key=chat_key,
+            prefill=round_prompt.prefill,
             on_llm_retry=lambda retry_index, retry_total, model_name, error_summary: publish_runtime_state(
                 phase="llm_retrying",
                 iteration_index=1,
@@ -693,6 +797,10 @@ async def _run_agent_in_instance_scope(
                 model_name=model_name,
             ),
         )
+        # 预填的最终状态由发送侧写在 `PrefillSpec` 上（sent / unsupported / retried_without），
+        # 每发一次覆盖一次，明细里留下的是最后一次的真实结果。
+        if round_prompt.prefill is not None:
+            prompt_rounds.note_tavern(one_time_code, prefill_state=round_prompt.prefill.state)
     except AllLLMRequestsFailedError as e:
         await publish_runtime_state(
             phase="failed",
@@ -701,6 +809,7 @@ async def _run_agent_in_instance_scope(
             error_summary=_summarize_runtime_text(str(e)),
         )
         raise
+
     async def raise_if_provider_refusal(
         parsed: ParsedCodeRunData,
         response: OpenAIResponse,
@@ -733,7 +842,7 @@ async def _run_agent_in_instance_scope(
         """
         if not is_code_missing(parsed):
             return
-        refusal_marker = match_provider_refusal(response.response_content)
+        refusal_marker = detect_provider_refusal(parsed, response)
         if not refusal_marker:
             return
         await publish_runtime_state(
@@ -990,6 +1099,8 @@ async def _run_agent_in_instance_scope(
                 record_sta_timestamp=history_render_until_time,
                 model_group=used_model_group,
                 config=config,
+                # 世界书的两组已经在本轮第一次渲染的历史里，增量这一条不再带
+                inject_worldbook=False,
             ),
         )
 
@@ -1034,6 +1145,7 @@ async def _run_agent_in_instance_scope(
                 config=config,
                 is_debug_iteration=True,
                 chat_key=chat_key,
+                prefill=round_prompt.prefill,
                 on_llm_retry=lambda retry_index, retry_total, model_name, error_summary, iteration_index=i + 2: publish_runtime_state(
                     phase="llm_retrying",
                     iteration_index=iteration_index,
@@ -1050,6 +1162,8 @@ async def _run_agent_in_instance_scope(
                     model_name=model_name,
                 ),
             )
+            if round_prompt.prefill is not None:
+                prompt_rounds.note_tavern(one_time_code, prefill_state=round_prompt.prefill.state)
         except AllLLMRequestsFailedError as e:
             await publish_runtime_state(
                 phase="failed",
@@ -1224,6 +1338,7 @@ async def send_agent_request(
     chat_key: str = "",
     on_llm_attempt: Optional[Callable[[int, int, str], Awaitable[None]]] = None,
     on_llm_retry: Optional[Callable[[int, int, str, str], Awaitable[None]]] = None,
+    prefill: Optional[PrefillSpec] = None,
 ) -> Tuple[OpenAIResponse, ModelConfigGroup, list[str]]:
     model_group: ModelConfigGroup = resolve_primary_model_group(config, is_debug_iteration=is_debug_iteration)
     fallback_model_group: ModelConfigGroup = resolve_fallback_model_group(config, model_group)
@@ -1244,12 +1359,33 @@ async def send_agent_request(
     # 「能力不匹配」不计入可重试：修复后的那一次额外补进计划，而不是占用原有重试预算。
     # 只补一次，避免上游文案抖动时把重试次数变成不设上限
     repair_budget = 1
+    # 预填被服务商以请求错误拒绝时，同组去掉预填再试一次；与视觉修复各自的预算分开，
+    # 同样只插一次——否则上游每次 400 都能再换一次尝试，次数就不再受配置约束。
+    prefill_repair_budget = 1
+    # 下一次尝试是不是「带预填被拒后的去预填重发」；只影响明细里的状态，
+    # 不影响发什么：那时该组已被打上负判据，`prefill_message` 自然返回 None。
+    pending_prefill_retry = False
     attempt_index = 0
 
     while attempt_index < len(attempt_plan):
         use_model_group: ModelConfigGroup = attempt_plan[attempt_index]
         retry_index = attempt_index + 1
-        attempt_messages, payload_has_image = _prepare_attempt_payload(messages, use_model_group, chat_key)
+        prepared_messages, payload_has_image = _prepare_attempt_payload(messages, use_model_group, chat_key)
+        # 预填必须追加在裁剪之后：`_prepare_attempt_payload` 只认 `OpenAIChatMessage` 里的图片
+        # 片段，预填是普通 dict，提前塞进去会白白走一遍图片扫描。
+        attempt_messages: List[Any] = list(prepared_messages)
+        prefill_payload: Optional[Dict[str, Any]] = None
+        if prefill is not None and prefill.text:
+            prefill_payload = prefill_message(use_model_group, prefill.text)
+            if prefill_payload is None:
+                if pending_prefill_retry:
+                    prefill.state = "retried_without"
+                    pending_prefill_retry = False
+                else:
+                    prefill.state = "unsupported"
+        sent_prefill = prefill_payload is not None
+        if prefill_payload is not None:
+            attempt_messages.append(prefill_payload)
         # 「这次用的是不是备用组」在下面的失败分支里本来就要算一次，提到这里来是因为
         # 记账也要它，而两处各算一遍就是同一判据的第二处实现
         is_fallback = fallback_model_group is not model_group and use_model_group is fallback_model_group
@@ -1269,7 +1405,7 @@ async def send_agent_request(
         )
         err_log_path = _build_err_log_path(config, use_model_group.CHAT_MODEL, retry_index)
         try:
-            with usage_scope(attempt_usage_context):
+            with log_pending_chat_key(chat_key), usage_scope(attempt_usage_context):
                 llm_response: OpenAIResponse = await gen_openai_chat_response(
                     model=use_model_group.CHAT_MODEL,
                     messages=attempt_messages,
@@ -1332,6 +1468,29 @@ async def send_agent_request(
                     attempt_plan.insert(attempt_index + 1, repair_group)
                     repair_budget -= 1
 
+            # 已经判成「拒绝图片」的那一类不算预填被拒：带着预填与图片的请求因为图片被 400，
+            # 视觉修复会剥图重试；这时把模型组记成「不支持预填」就冤枉了它。真是预填的问题，
+            # 剥图后的那一次还会再 400，那时再走这条修复。
+            if (
+                sent_prefill
+                and prefill is not None
+                and kind is not LLMFailureKind.VISION_UNSUPPORTED
+                and _extract_status_code(e) in _CONTENT_REJECT_STATUS
+            ):
+                # 带预填的请求被当成「请求内容不合法」拒绝：换别的模型组也会是同一份消息形态，
+                # 所以同组去掉预填重发一次，并在这个组的 TTL 内不再发预填。
+                note_capability_unsupported(use_model_group, PREFILL_CAPABILITY)
+                prefill.state = "unsupported"
+                logger.warning(
+                    f"[send_agent_request] {chat_key} | 模型 {use_model_group.CHAT_MODEL} 拒绝带预填的请求，"
+                    f"已记为不支持预填；去掉预填后重试同一模型"
+                    + ("" if prefill_repair_budget > 0 else "（修复预算已用完，按原重试计划继续）"),
+                )
+                if prefill_repair_budget > 0:
+                    attempt_plan.insert(attempt_index + 1, use_model_group)
+                    prefill_repair_budget -= 1
+                    pending_prefill_retry = True
+
             if on_llm_retry is not None:
                 await on_llm_retry(retry_index, len(attempt_plan), use_model_group.CHAT_MODEL, error_summary)
             # 只登记真的落了盘的那些：`/debug err-logs` 与运维 Bot 会按这些路径去读文件，
@@ -1348,6 +1507,12 @@ async def send_agent_request(
             continue
         else:
             used_model_group = use_model_group  # 记录成功使用的模型组
+            if sent_prefill and prefill is not None:
+                # 服务商只返回续写部分，解析前把预填接回去；回复已经以预填开头时由
+                # `merge_prefill` 判重，避免个别中转回显时叠成两遍。
+                llm_response.response_content = merge_prefill(llm_response.response_content, prefill.text)
+                prefill.state = "sent"
+                note_capability_ok(use_model_group, PREFILL_CAPABILITY)
             if payload_has_image:
                 # 带图请求成功 → 立刻作废可能存在的负判据，避免一次误判把模型永久钉成瞎子
                 note_capability_ok(use_model_group)
@@ -1359,12 +1524,18 @@ async def send_agent_request(
         # 测试部署上 `logs/prompts/` 里 267 个文件全部由这一行产生，而开关是 `false`。
         # 失败本身不会被吞掉：下面那个异常照抛，逐次失败的原因也已经在 `logs/app/` 里
         if config.SAVE_PROMPTS_LOG:
+            from nekro_agent.services.ssh_gateway.scrub import apply_pending, note_prompt_log
+
             err_log = Path(f"{PROMPT_LOG_DIR}/chat_err_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log")
             err_log.parent.mkdir(parents=True, exist_ok=True)
             err_log.write_text(
-                json.dumps([message.to_dict() for message in messages], indent=2, ensure_ascii=False),
+                apply_pending(
+                    chat_key,
+                    json.dumps([message.to_dict() for message in messages], indent=2, ensure_ascii=False),
+                ),
                 encoding="utf-8",
             )
+            note_prompt_log(chat_key, err_log)
         raise AllLLMRequestsFailedError("所有 LLM 请求失败", kinds=failure_kinds)
 
     return llm_response, used_model_group, retry_errors

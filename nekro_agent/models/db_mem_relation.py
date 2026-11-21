@@ -36,6 +36,14 @@ class DBMemRelation(Model):
     # 不会因为存在人设乙而复制。
     preset_id = fields.IntField(default=0, index=True, description="人设标识；0 表示无人设档")
 
+    adapter_key = fields.CharField(max_length=64, default="", description="来源适配器标识；空 = 未知或存量")
+    origin_chat_key = fields.CharField(
+        max_length=256,
+        null=True,
+        index=True,
+        description="记忆产生的聊天频道标识；存量行与工作区行为空",
+    )
+
     # === 三元组结构 ===
     subject_entity_id = fields.IntField(index=True, description="主体实体 ID")
     predicate = fields.CharField(max_length=64, index=True, description="关系谓词")
@@ -117,27 +125,36 @@ class DBMemRelation(Model):
         cognitive_type: str = "episodic",
         instance_key: str = "",
         preset_id: int = 0,
+        adapter_key: str = "",
+        origin_chat_key: str | None = None,
+        dedup_by_origin: bool = False,
     ) -> tuple["DBMemRelation", bool]:
         """查找或创建关系
 
         去重维度包含 instance_key：不同实例即使产生了相同的三元组，也必须落成独立行，
         否则关系记忆会跨实例复用并绕过检索侧的实例过滤。
         `preset_id` 同理（理由与 `DBMemEntity.find_or_create` 逐字相同）。
+        `origin_chat_key` 同理：域行传了来源键且 `dedup_by_origin=True` 时按
+        (adapter_key, origin_chat_key) 分开去重，工作区行不传来源键、保持旧键、不写 `origin_chat_key`。
 
         Returns:
             (relation, created): 关系对象和是否新创建
         """
         predicate_normalized = predicate.strip().lower()
 
-        existing = await cls.filter(
-            workspace_id=workspace_id,
-            instance_key=instance_key,
-            preset_id=preset_id,
-            subject_entity_id=subject_entity_id,
-            predicate=predicate_normalized,
-            object_entity_id=object_entity_id,
-            is_inactive=False,
-        ).first()
+        filters: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "instance_key": instance_key,
+            "preset_id": preset_id,
+            "subject_entity_id": subject_entity_id,
+            "predicate": predicate_normalized,
+            "object_entity_id": object_entity_id,
+            "is_inactive": False,
+        }
+        if dedup_by_origin:
+            filters["adapter_key"] = adapter_key
+            filters["origin_chat_key"] = origin_chat_key
+        existing = await cls.filter(**filters).first()
 
         if existing:
             await existing.reinforce(0.1)
@@ -147,6 +164,8 @@ class DBMemRelation(Model):
             workspace_id=workspace_id,
             instance_key=instance_key,
             preset_id=preset_id,
+            adapter_key=adapter_key,
+            origin_chat_key=origin_chat_key,
             subject_entity_id=subject_entity_id,
             predicate=predicate_normalized,
             object_entity_id=object_entity_id,

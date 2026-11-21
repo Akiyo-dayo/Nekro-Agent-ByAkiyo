@@ -62,6 +62,7 @@ import { useLocaleStore } from '../../stores/locale'
 import type { SupportedLocale } from '../../config/i18n'
 import { PanelTabs, PanelTabsContainer } from '../../components/common/NekroTabs'
 import ActionButton from '../../components/common/ActionButton'
+import OutputFilterHitsPanel from './components/OutputFilterHitsPanel'
 
 export default function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -145,9 +146,9 @@ export default function SettingsPage() {
 
   const preferredCategoryOrder = useMemo(() => {
     if (i18n.language.startsWith('zh')) {
-      return ['基础设置', '模型配置', '聊天配置', '沙盒配置', '记忆系统']
+      return ['基础设置', '模型配置', '聊天配置', '沙盒配置', '记忆系统', '世界书']
     }
-    return ['Basic Settings', 'Model Configuration', 'Chat Configuration', 'Sandbox Configuration', 'Memory System']
+    return ['Basic Settings', 'Model Configuration', 'Chat Configuration', 'Sandbox Configuration', 'Memory System', 'Worldbook']
   }, [i18n.language])
 
   // 按分类组织配置，同时提取分类列表
@@ -296,6 +297,8 @@ export default function SettingsPage() {
     return configsByCategory[activeTab] || []
   }, [activeTab, configs, configsByCategory, searchInput])
 
+  const showOutputFilterPanel = displayConfigs.some((c) => c.key === 'OUTPUT_FILTER_ENABLE')
+
   const handleSearchChange = (text: string | undefined) => {
     setSearchInput(text ?? '')
   }
@@ -432,6 +435,15 @@ export default function SettingsPage() {
           </PanelTabs>
         </PanelTabsContainer>
       </Box>
+
+      {showOutputFilterPanel && (
+        <Box sx={{ mb: 2, flexShrink: 0 }}>
+          <OutputFilterHitsPanel
+            adapterKey={currentInstance?.adapter_key}
+            instanceKey={currentInstance?.instance_key}
+          />
+        </Box>
+      )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
         {configService && (

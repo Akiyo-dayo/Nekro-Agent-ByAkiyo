@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from nonebot import logger
 
@@ -25,6 +25,10 @@ from nekro_agent.tools.path_convertor import sanitize_chat_key_for_path
 UserPermissionSource = Literal["manual", "platform"]
 USER_PERMISSION_SOURCE_MANUAL: UserPermissionSource = "manual"
 USER_PERMISSION_SOURCE_PLATFORM: UserPermissionSource = "platform"
+
+# 「调用方没有传实例判据」与「传了一个明确判不出的 None」必须区分开：
+# 前者是后台列表一类只判进程级的老调用，后者是多租户部署里频道行缺失、必须按不生效处理。
+_UNSET: object = object()
 
 # 一个频道里按频道授权的人数上限。所有租户的频道授权在同一个文件里，每次写入整份重写，
 # 不设上限的话一个租户就能把它撑大、拖慢所有人的写入
@@ -410,8 +414,14 @@ class CommandManager:
         *,
         meta: Optional[CommandMetadata] = None,
         plugin_enabled_cache: Optional[dict[str, bool]] = None,
+        chat_instance_key: Any = _UNSET,
     ) -> bool:
-        """统一的命令启用检查实现。"""
+        """统一的命令启用检查实现。
+
+        `chat_instance_key` 是**显式传入**的实例判据：给了它（包括明确给 `None`）时，
+        插件来源的命令除了「进程级活着」之外，还要在目标频道上真的生效；没给时保持旧行为，
+        只判进程级。后台命令列表要的是配置视图、不代表某个频道能用，所以不传。
+        """
         target_meta = meta
         if target_meta is None:
             from nekro_agent.services.command.registry import command_registry
@@ -426,6 +436,14 @@ class CommandManager:
             plugin_enabled_cache,
         ):
             return False
+
+        # 插件来源的命令：进程级活着只是必要条件，还要按 会话 > 实例 > 全局 判它在目标频道生效。
+        # 内置命令没有插件来源，不受这一层影响。
+        if chat_instance_key is not _UNSET and target_meta is not None and target_meta.source != BUILT_IN_SOURCE:
+            from nekro_agent.services.plugin.scope import plugin_effective_with_instance
+
+            if not plugin_effective_with_instance(target_meta.source, chat_instance_key, chat_key or ""):
+                return False
 
         if chat_key:
             channel_state = self._load_channel_state(chat_key)
@@ -444,13 +462,19 @@ class CommandManager:
         chat_key: Optional[str] = None,
         *,
         plugin_enabled_cache: Optional[dict[str, bool]] = None,
+        chat_instance_key: Any = _UNSET,
     ) -> bool:
-        """按命令元数据查询启用状态，同时校验插件启用态。"""
+        """按命令元数据查询启用状态，同时校验插件启用态。
+
+        `chat_instance_key` 由异步调用方先用 `resolve_chat_plugin_instance(chat_key)` 算好传入；
+        不传时行为与改造前完全相同（只判插件进程级是否活着）。
+        """
         return self._is_command_enabled_impl(
             meta.name,
             chat_key,
             meta=meta,
             plugin_enabled_cache=plugin_enabled_cache,
+            chat_instance_key=chat_instance_key,
         )
 
     def is_command_enabled(self, command_name: str, chat_key: Optional[str] = None) -> bool:
@@ -796,6 +820,8 @@ class CommandManager:
         plugin_enabled_cache: dict[str, bool] = {}
         result = []
         for meta in commands:
+            # 这里刻意不传实例判据：后台列表展示的是「命令在配置上开没开」，供管理员改状态用，
+            # 不代表它在某个具体频道能用。按频道生效与否由执行入口（registry / export_tools）判。
             enabled = self.is_command_enabled_for_meta(meta, chat_key, plugin_enabled_cache=plugin_enabled_cache)
             permission = self.get_command_permission(meta.name, meta.permission, chat_key)
             has_channel_override = chat_key is not None and meta.name in channel_state

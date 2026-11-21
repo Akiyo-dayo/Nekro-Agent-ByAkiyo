@@ -1,4 +1,3 @@
-import datetime
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import json5
@@ -24,6 +23,7 @@ from nekro_agent.schemas.chat_message import (
     segments_from_list,
 )
 from nekro_agent.tools.common_util import limited_text_output
+from nekro_agent.tools.history_time import format_history_time
 from nekro_agent.tools.path_convertor import convert_filename_to_sandbox_upload_path
 from nekro_agent.tools.untrusted_content import (
     UntrustedToolResult,
@@ -102,7 +102,7 @@ class DBChatMessage(Model):
             video_note=self._video_note(),
         )
         content = _join_with_limit(pieces, limit, placeholder="(content too long, omitted)")
-        time_str = datetime.datetime.fromtimestamp(self.send_timestamp).strftime("%m-%d %H:%M:%S")
+        time_str = format_history_time(self.send_timestamp)
 
         # 消息引用前缀生成
         additional_info: str = f"msg_id:{self.message_id}" if ref_mode and self.message_id else ""

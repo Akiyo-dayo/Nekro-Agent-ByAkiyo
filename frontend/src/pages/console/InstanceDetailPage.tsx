@@ -45,6 +45,7 @@ import {
 } from '../../services/api/console'
 import { isNotFoundError } from '../../services/api/axios'
 import InstanceMigrationDialog from './components/InstanceMigrationDialog'
+import InstanceChannelQuotaSection from './components/InstanceChannelQuotaSection'
 import InstanceStatusChip from './components/InstanceStatusChip'
 import UnclaimedProtocolPanel from './components/UnclaimedProtocolPanel'
 
@@ -183,7 +184,7 @@ function AccountBindDialog({
 function OverviewTab({ instance }: { instance: InstanceInfo }) {
   const { t } = useTranslation('console')
   const { t: tCommon } = useTranslation('common')
-  const { isPlatformOwner } = useIdentity()
+  const { isPlatformOwner, isTenantAdmin } = useIdentity()
   const navigate = useNavigate()
   const [migrationOpen, setMigrationOpen] = useState(false)
   const [accountOpen, setAccountOpen] = useState(false)
@@ -396,6 +397,19 @@ function OverviewTab({ instance }: { instance: InstanceInfo }) {
           <Suspense fallback={null}>
             <AccessTokenCard instance={instance} />
           </Suspense>
+        )}
+
+        {/* 频道额度：平台方看实例层策略，租户管理员看「我的额度」。
+            只读成员整块不画——这一族端点最低 `Role.Admin`，画出来就是一条 403 */}
+        {(isPlatformOwner || isTenantAdmin) && (
+          <Card sx={CARD_VARIANTS.default.styles}>
+            <CardContent>
+              <InstanceChannelQuotaSection
+                adapterKey={instance.adapter_key}
+                instanceKey={instance.instance_key}
+              />
+            </CardContent>
+          </Card>
         )}
       </Box>
 

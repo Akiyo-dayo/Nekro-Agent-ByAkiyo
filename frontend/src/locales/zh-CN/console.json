@@ -174,6 +174,12 @@
     "confirmHelper": "请手工输入 {{instanceKey}}",
     "confirmMismatch": "输入的实例标识不匹配",
     "submit": "执行迁移",
+    "deleteSshCredentialsLabel": "一并删除源实例上用户登记的服务器凭据（{{count}} 条）",
+    "deleteSshCredentialsHint": "两个实例归属不同。凭据是能进别人家门的东西，默认随迁移删除；取消勾选则跟到目标实例，归目标实例的主人管理",
+    "deletePluginSettingsLabel": "一并删除源实例的插件设置（{{count}} 个插件）",
+    "deletePluginSettingsHint": "两个实例归属不同。源实例上与它各频道上的插件开关、实例单独填的插件配置（API Key 之类）默认随迁移删除；取消勾选则跟到目标实例",
+    "deleteConfigOverridesLabel": "一并删除源实例的配置覆盖（{{count}} 处）",
+    "deleteConfigOverridesHint": "两个实例归属不同。源实例与它各频道单独改过的配置（告警 Webhook、选用的模型组、提示词等）默认随迁移删除；取消勾选则跟到目标实例",
     "resource": {
       "chat_channel": "会话",
       "chat_message": "消息",
@@ -190,7 +196,8 @@
       "qdrant_paragraph_payload": "记忆向量",
       "affection": "好感度",
       "affection_event": "好感度变化流水",
-      "announcement_delivery": "公告投递流水"
+      "announcement_delivery": "公告投递流水",
+      "plugin_settings": "有实例级设置的插件"
     }
   },
   "unclaimedPanel": {
@@ -231,6 +238,9 @@
     "modePurge": "彻底删除",
     "archiveDescription": "归档后实例停止工作，会话、消息与记忆等数据只读保留，后续可再处理。",
     "purgeDescription": "彻底删除会级联清除该实例的全部会话、消息与记忆数据，且无法恢复。",
+    "purgeMailAndEmotion": "一并删除：本实例自己的邮箱 {{mailboxes}} 个（连同收到的信与附件）、用户邮件偏好 {{prefs}} 条、收集库表情 {{emotions}} 条。",
+    "purgePluginSettings": "一并删除：{{count}} 个插件在本实例与它的频道上的设置（开关与实例单独填的插件配置），以后用同一个标识新建的实例从空白开始。",
+    "purgeConfigOverrides": "一并删除：本实例与它的频道单独改过的配置 {{count}} 处（告警 Webhook、选用的模型组、提示词等）。",
     "qbobAttached": "该实例接着 qbob 里的一个 QQ 官方机器人。删除实例不会删除那个 bot，它会继续运行并反复尝试连接。请先在实例详情的「协议端」页解绑。",
     "confirmLabel": "输入实例标识以确认",
     "confirmHelper": "请手工输入 {{instanceKey}}",

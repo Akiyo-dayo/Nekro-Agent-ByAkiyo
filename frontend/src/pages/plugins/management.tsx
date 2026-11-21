@@ -101,6 +101,36 @@ const server_addr = window.location.origin
 // 后端 `Role.Super` 的数值，全进程一份的插件设置（调用优先级）按它放行
 const SUPER_PERM_LEVEL = 3
 
+/**
+ * 自带网页控制台的插件（插件路由提供的单页，不在 NA 前端工程里）
+ *
+ * 控制台按实例限定范围：链接带上当前实例；平台方在全局视图下打开时看的是全部（服务端判）。
+ * 页面直接读后台的登录态，所以必须同源打开。
+ */
+const PLUGIN_CONSOLES: Record<string, string> = {
+  'KroMiose.emotion': '/plugins/KroMiose.emotion/console/',
+}
+
+function PluginConsoleLink({ pluginId, label }: { pluginId: string; label: string }) {
+  const { currentInstanceKey, currentInstance } = useInstanceScope()
+  const base = PLUGIN_CONSOLES[pluginId]
+  if (!base) return null
+  const params = new URLSearchParams()
+  if (currentInstanceKey && currentInstance?.adapter_key) {
+    params.set('adapter_key', currentInstance.adapter_key)
+    params.set('instance_key', currentInstanceKey)
+  }
+  const href = params.toString() ? `${base}?${params.toString()}` : base
+  return (
+    <Stack direction="row" spacing={1.5} alignItems="center">
+      <LinkIcon color="action" />
+      <Link href={href} target="_blank" rel="noopener" variant="body2" sx={{ fontWeight: 600 }}>
+        {label}
+      </Link>
+    </Stack>
+  )
+}
+
 // 插件国际化辅助函数
 const getPluginName = (plugin: Plugin, language: string) => {
   return getLocalizedText(plugin.i18n_name, plugin.name, language)
@@ -779,6 +809,7 @@ function PluginDetails({
                       </Link>
                     </Typography>
                   </Stack>
+                  {!plugin.loadFailed && <PluginConsoleLink pluginId={plugin.id} label={t('info.openConsole')} />}
                   {!plugin.loadFailed && activationStrategy && (
                     <Stack direction="row" spacing={1.5} alignItems="center">
                       <ExtensionIcon color="action" />

@@ -1,20 +1,23 @@
 import asyncio
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import BUILTIN_SKILLS_SOURCE_DIR, SKILLS_LOCAL_DIR, SKILLS_REPOS_DIR, WORKSPACE_ROOT_DIR
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.schemas.workspace import ChannelAnnotation as ChannelAnnotationData
+from nekro_agent.services.workspace import safe_fs
 from nekro_agent.services.workspace.cc_credential import (
     DEFAULT_TIMEOUT_MS,
     WorkspaceCredential,
     build_claude_settings_payload,
     build_settings_payload,
+    claude_settings_carries_platform_secret,
     resolve_workspace_credential,
 )
 
@@ -22,6 +25,16 @@ if TYPE_CHECKING:
     from nekro_agent.core.cc_model_presets import CCModelPresetItem
 
 logger = get_sub_logger("workspace_manager")
+
+# 挂进容器当 `~/.claude/` 的宿主目录（CC 会话历史、技能、用户级设置都在这里）
+CLAUDE_HOME_DIRNAME = ".claude_home"
+# CC 格式的设置文件名。NA 写的是**用户级**那一份：宿主 `{ws}/.claude_home/settings.json`，
+# 容器里 `~/.claude/settings.json`——CC 每次启动都读，不受工作目录影响
+CLAUDE_SETTINGS_FILENAME = "settings.json"
+# 早先 NA 把这份设置写在 `{ws}/.claude/settings.json`（容器里 `/workspace/.claude/`），
+# 而 CC 的工作目录是 `/workspace/default`，项目级设置只从工作目录下的 `.claude/` 读，所以那份
+# 文件从来没生效过；里面却可能留着以前写出去的凭据。写设置与启动复核都会把它删掉
+LEGACY_CLAUDE_SETTINGS_PARTS: Tuple[str, str] = (".claude", "settings.json")
 
 # 每 workspace 一把 asyncio.Lock，避免 MCP read-modify-write 并发覆盖
 _mcp_locks: Dict[int, asyncio.Lock] = {}
@@ -33,6 +46,16 @@ def _get_mcp_lock(workspace_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _mcp_locks[workspace_id] = lock
     return lock
+
+
+def _write_workspace_json(ws_dir: Path, rel: str, payload: Dict[str, Any]) -> None:
+    """把 JSON 整份写进工作区里容器可写的位置，不跟随容器放的符号链接（见 `safe_fs`）
+
+    先写临时文件再改名：容器里的 CC 随时可能在读，不能让它读到写了一半的 JSON。
+    权限给 0644：容器里的 appuser 与 NA 进程未必是同一个 uid，要保证它读得到。
+    上级目录由调用方先建好（`create_dirs=False`），这里不顺手建。
+    """
+    safe_fs.write_text(ws_dir, rel, json.dumps(payload, indent=2, ensure_ascii=False), mode=0o644, create_dirs=False)
 
 
 def _global_library_by_name() -> Dict[str, Dict[str, Any]]:
@@ -88,11 +111,27 @@ def _resolve_library_entry(name: str, library: Dict[str, Dict[str, Any]]) -> Opt
     return next((entry for entry in library.values() if is_web_chat_mcp_entry(entry)), None)
 
 
+def mcp_entry_has_credentials(raw: Mapping[str, Any]) -> bool:
+    """这条全局 MCP 库条目是不是「带凭据」的
+
+    判据刻意只看**有没有** `env` / `headers`，不看里面装的是什么：库条目只有平台方能改，
+    而任何一项都可能是令牌、口令或外部服务的鉴权头；逐项猜测哪些「像凭据」必然会漏。
+    代价是空字典与纯配置项也会被算进来——写成非空才算，`{"FOO": ""}` 这一种仍然算。
+    网页聊天那一条不按这个判据（它有自己的资格判据，见 `is_web_chat_mcp_entry`）。
+    """
+    for key in ("env", "headers"):
+        value = raw.get(key)
+        if isinstance(value, Mapping) and value:
+            return True
+    return False
+
+
 def _build_disk_mcp_config(
     workspace_metadata: Dict[str, Any],
     library: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
     web_chat_workspace_id: Optional[int] = None,
+    allow_platform_secrets: bool,
 ) -> Dict[str, Any]:
     """从全局 MCP 库 + workspace.metadata.mcp_servers_enabled 构建 .mcp.json 写盘内容。
 
@@ -103,6 +142,10 @@ def _build_disk_mcp_config(
     签一张。为 None（工作区此刻不合格）时直接跳过这一条——不仅调用时会被拒，也没有理由把
     一张平台方令牌摆进以后可能交给租户的文件里。`headers` 整体覆盖：库里或手工条目里带的
     任何头都不保留。
+
+    `allow_platform_secrets=False`（工作区不能拿平台方凭据）时，`env` / `headers` 非空的条目
+    整条跳过（判据见 :func:`mcp_entry_has_credentials`）：那些值会写进租户读得到的
+    `.mcp.json`。不带凭据的条目照写。
     """
     if library is None:
         library = _global_library_by_name()
@@ -131,17 +174,28 @@ def _build_disk_mcp_config(
                 logger.debug(f"跳过网页聊天 MCP 条目 {name}：工作区不含该条目或此刻不合格")
                 continue
             entry["headers"] = build_workspace_web_chat_mcp_headers(web_chat_workspace_id)
+        elif not allow_platform_secrets and mcp_entry_has_credentials(raw):
+            logger.debug(f"跳过带凭据的 MCP 条目 {name}：工作区不能拿平台方凭据")
+            continue
         dst_servers[name] = entry
     return {"mcpServers": dst_servers}
 
 
-async def _render_disk_mcp_json(workspace: DBWorkspace) -> str:
+async def _render_disk_mcp_json(workspace: DBWorkspace) -> Tuple[str, bool]:
     """渲染这个工作区的 `.mcp.json` 内容
 
     网页聊天条目的令牌只发给合格的工作区：启用清单里确实有这一条时才去判资格，没有就不必
     付出一次归属推导与记录重建的代价。
+
+    带凭据的条目同样只发给能拿平台方凭据的工作区（同一条判据，见
+    `services/workspace/credential_policy.py`）。
+
+    Returns:
+        （文件内容，内容里有没有带凭据的全局库条目）。后者按渲染出来的条目算，网页聊天
+        那一条不算（它的令牌只对本工作区有效，有自己的清理路径）。
     """
     from nekro_agent.services.mcp.web_chat_auth import is_web_chat_mcp_entry
+    from nekro_agent.services.workspace.credential_policy import platform_credentials_allowed
 
     library = _global_library_by_name()
     metadata = workspace.metadata or {}
@@ -162,10 +216,52 @@ async def _render_disk_mcp_json(workspace: DBWorkspace) -> str:
         if await is_workspace_web_chat_token_eligible(workspace):
             web_chat_workspace_id = workspace.id
 
-    return json.dumps(
-        _build_disk_mcp_config(metadata, library, web_chat_workspace_id=web_chat_workspace_id),
-        indent=2,
-        ensure_ascii=False,
+    allowed = await platform_credentials_allowed(workspace)
+
+    config = _build_disk_mcp_config(
+        metadata,
+        library,
+        web_chat_workspace_id=web_chat_workspace_id,
+        allow_platform_secrets=allowed,
+    )
+    carries_secret = any(
+        (raw := _resolve_library_entry(name, library)) is not None
+        and not is_web_chat_mcp_entry(raw)
+        and mcp_entry_has_credentials(raw)
+        for name in config["mcpServers"]
+    )
+    return json.dumps(config, indent=2, ensure_ascii=False), carries_secret
+
+
+async def _write_disk_mcp_json(workspace: DBWorkspace) -> None:
+    """写出 `default/.mcp.json`；写出了带凭据的条目就记「下发过平台方凭据」
+
+    记在写盘之后：归属变化时撤销那一步靠这个标记决定要不要停容器——MCP 服务进程是带着
+    这些 `env` 拉起来的，只重写文件挡不住已经在跑的那一份。
+
+    工作区目录整个挂进容器，`default/` 与文件本身都可能被换成符号链接：走 `safe_fs`，
+    逐级不跟随，写临时文件再 rename。
+    """
+    content, carries_secret = await _render_disk_mcp_json(workspace)
+    write_workspace_text(workspace.id, ("default", ".mcp.json"), content)
+    if carries_secret:
+        from nekro_agent.services.workspace.credential_policy import mark_platform_secret_delivered
+
+        await mark_platform_secret_delivered(workspace)
+
+
+def write_workspace_text(workspace_id: int, rel: Tuple[str, ...], text: str, *, mode: Optional[int] = None) -> None:
+    """往工作区目录里写一个 NA 自己的文件（CLAUDE.md、.mcp.json、settings 一类）
+
+    工作区根目录是 NA 建的、容器换不掉的那一级，从它出发逐级 `O_NOFOLLOW`；途中被容器换成
+    链接或文件的目录是 NA 自己的路径，删掉链接本身重建。`mode` 不给时沿用原文件的权限与属主。
+    """
+    safe_fs.write_text(
+        WorkspaceService.get_workspace_dir(workspace_id),
+        rel,
+        text,
+        mode=mode,
+        replace_links=True,
     )
 
 
@@ -330,8 +426,10 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
     @staticmethod
     def ensure_kb_dirs(workspace_id: int) -> None:
-        WorkspaceService.get_kb_files_root(workspace_id).mkdir(parents=True, exist_ok=True)
-        WorkspaceService.get_kb_normalized_root(workspace_id).mkdir(parents=True, exist_ok=True)
+        # `default/kb` 在容器可写的工作区里：逐级不跟随，途中被换成链接的一级删掉链接重建
+        ws_dir = WorkspaceService.get_workspace_dir(workspace_id)
+        safe_fs.ensure_dir(ws_dir, ("default", "kb", "files"), replace_links=True)
+        safe_fs.ensure_dir(ws_dir, ("default", "kb", ".normalized"), replace_links=True)
 
     @staticmethod
     def resolve_kb_source_path(workspace_id: int, rel_path: str) -> "Path":
@@ -386,32 +484,42 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
                 shared_rules = str(shared_layer.get("content") or "").strip()
         shared_section = f"## 共享固定事实\n\n{shared_rules}" if shared_rules else ""
         extra_section = f"## 自定义附加指令\n\n{raw_extra}" if raw_extra else ""
-        return (
+        content = (
             WorkspaceService._CLAUDE_MD_TEMPLATE
             .replace("{runtime_policy}", workspace.runtime_policy or "agent")
             .replace("{resource_section}", resource_section)
             .replace("{shared_section}", shared_section)
             .replace("{extra_section}", extra_section)
         )
+        # 总开关关着时**不读缓存、不查库**：输出必须与改造前逐字一致。缓存由异步的
+        # 建容器 / 凭据变更路径刷新（`ssh_gateway/container_files.py`），这里只做拼接。
+        from nekro_agent.core.config import config
+
+        if config.SSH_GATEWAY_ENABLED:
+            from nekro_agent.services.ssh_gateway.container_files import get_ssh_servers_section
+
+            ssh_section = get_ssh_servers_section(workspace.id)
+            if ssh_section:
+                content = f"{content}\n\n{ssh_section}"
+        return content
 
     @staticmethod
     def update_claude_md(workspace: "DBWorkspace") -> None:
         """（重新）生成并写入 CLAUDE.md，不触发完整 init_workspace_dir。
         适用于 metadata 变更（runtime_policy 等）后的即时刷新。"""
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
-        default_dir = ws_dir / "default"
-        if not default_dir.exists():
+        if not os.path.lexists(ws_dir / "default"):
             return  # 目录尚未初始化，跳过
-        claude_md_path = default_dir / "CLAUDE.md"
-        claude_md_path.write_text(WorkspaceService._generate_claude_md_content(workspace), encoding="utf-8")
-        logger.debug(f"刷新 CLAUDE.md: {claude_md_path}")
+        write_workspace_text(workspace.id, ("default", "CLAUDE.md"), WorkspaceService._generate_claude_md_content(workspace))
+        logger.debug(f"刷新 CLAUDE.md: 工作区 {workspace.id}")
 
     @staticmethod
     def _resolve_model_and_timeout(cc_preset: Optional["CCModelPresetItem"]) -> "tuple[str, int]":
         """从预设取出写进 settings.json 的模型名与超时
 
-        `model_type == "preset"` 时刻意留空模型名：那一档由 `.claude/settings.json` 的
-        `model` 字段决定，写进来反而会把预设档位覆盖掉。
+        `model_type == "preset"` 时刻意留空模型名：那一档由用户级 CC 设置
+        （`.claude_home/settings.json`）的 `model` 字段决定；写进来就会变成 `ANTHROPIC_MODEL`
+        环境变量，优先级高于设置文件，反而把预设档位覆盖掉。
         """
         model = ""
         if cc_preset and cc_preset.model_type == "manual":
@@ -430,37 +538,125 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         cc_preset: Optional["CCModelPresetItem"],
         credential: WorkspaceCredential,
         label: str,
-    ) -> None:
-        """把 settings.json 与 .claude/settings.json 落盘
+        *,
+        allow_platform_secrets: bool,
+    ) -> bool:
+        """把 cc-sandbox 的 settings.json 与 CC 的用户级设置落盘
 
         两处此前各自拼一份同形状的字典，凭据换成中继令牌之后再复制一遍就等于给自己留一个
         「改了一处忘了另一处、真 Key 从另一份文件漏出去」的坑，所以收在这里。
+
+        - `{ws}/settings.json`：cc-sandbox 自己的格式，它每次拉起 `claude` 前只从这里取
+          地址、令牌、手动档模型名、超时四项，翻成环境变量；
+        - `{ws}/.claude_home/settings.json`（容器里 `~/.claude/settings.json`）：CC 自己的
+          格式，preset 档位的 `model`、`extra_env`、手动档的小模型与别名映射都只在这里。
+          写在用户级而不是项目目录（`/workspace/default/.claude/`），是因为 CC 在工作区里做
+          git 操作时会把项目目录下的文件连同中继令牌一起提交出去。
+
+        **整份覆盖，不合并**：这份文件按「NA 独占」处理。撤销平台方凭据必须保证
+        上一次写出去的凭据一个不剩；合并就得记住「哪些键是 NA 写的」，预设里删掉的
+        `extra_env` 项才不会留在文件里，记漏一次就是凭据残留。`-p` 模式下 CC 不往这份文件写，
+        CC 自己的状态在 `~/.claude.json`；要自定义的项写项目级设置，优先级本来就更高。
+
+        每次写都顺手删掉早先的旧位置 `{ws}/.claude/settings.json`。
+
+        两份文件都在容器可写的目录里，写入、删除一律走 `safe_fs`，不跟随容器放的符号链接。
+        路径被容器动过（上级换成了链接、文件换成了目录）时这一份不写，记 WARNING：那是容器
+        自己的目录，坏掉的只是它自己。
+
+        `allow_platform_secrets`：这个工作区能不能拿平台方凭据，两个调用方各自按
+        `credential_policy.platform_credentials_allowed` 算好再传进来。为假时用户级设置里
+        键名像凭据的 `extra_env` 项被去掉（见 `build_claude_settings_payload`）。
+
+        Returns:
+            用户级设置里有没有写出 `extra_env` 带来的平台方凭据。这里是同步函数，
+            「下发过」标记由两个调用方据此落库。
         """
         model, timeout_ms = WorkspaceService._resolve_model_and_timeout(cc_preset)
 
-        settings_path = ws_dir / "settings.json"
-        settings_path.write_text(
-            json.dumps(build_settings_payload(credential, model, timeout_ms), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        logger.debug(f"{label} settings.json: {settings_path}")
+        try:
+            _write_workspace_json(ws_dir, "settings.json", build_settings_payload(credential, model, timeout_ms))
+            logger.debug(f"{label} settings.json: {ws_dir / 'settings.json'}")
+        except (safe_fs.UnsafePathError, IsADirectoryError) as e:
+            logger.warning(f"{label} 工作区 {ws_dir.name} 的 settings.json 被换成了目录，没有写入: {e}")
 
-        if cc_preset:
-            claude_dir = ws_dir / ".claude"
-            claude_dir.mkdir(exist_ok=True)
-            claude_settings_path = claude_dir / "settings.json"
-            claude_settings_path.write_text(
-                json.dumps(build_claude_settings_payload(cc_preset, credential), indent=2, ensure_ascii=False),
-                encoding="utf-8",
+        WorkspaceService.remove_legacy_claude_settings(ws_dir)
+
+        try:
+            WorkspaceService.ensure_claude_home(ws_dir)
+            if not cc_preset:
+                # 没有预设就没有 NA 要下发的内容；留着上一份等于留着上一份里的凭据
+                with safe_fs.open_dir(ws_dir, CLAUDE_HOME_DIRNAME) as claude_home:
+                    if claude_home.kind(CLAUDE_SETTINGS_FILENAME) not in (None, "dir"):
+                        claude_home.unlink(CLAUDE_SETTINGS_FILENAME)
+                return False
+            claude_payload = build_claude_settings_payload(
+                cc_preset,
+                credential,
+                allow_platform_secrets=allow_platform_secrets,
             )
-            logger.debug(f"{label} .claude/settings.json: {claude_settings_path}")
+            _write_workspace_json(ws_dir, f"{CLAUDE_HOME_DIRNAME}/{CLAUDE_SETTINGS_FILENAME}", claude_payload)
+        except (safe_fs.UnsafePathError, IsADirectoryError) as e:
+            # 刚重建完 `.claude_home` 又被换掉（容器还在跑），或者 settings.json 被换成了目录
+            logger.warning(f"{label} 工作区 {ws_dir.name} 的 .claude_home 路径被容器改动过，CC 用户级设置没有写入: {e}")
+            return False
+        logger.debug(f"{label} CC 用户级设置: {ws_dir / CLAUDE_HOME_DIRNAME / CLAUDE_SETTINGS_FILENAME}")
+        return claude_settings_carries_platform_secret(claude_payload)
+
+    @staticmethod
+    def ensure_claude_home(ws_dir: Path) -> Path:
+        """建好挂进容器当 `~/.claude/` 的目录，并让容器里的 appuser 可写
+
+        bind mount 跨越用户边界时宿主上的属主可能对不上，所以照旧放开成 0777。
+
+        这个目录整个归 NA 管，容器却能把它换成符号链接（工作区目录以读写挂进容器）：
+        按路径 `chmod` 会把链接指向的宿主目录改成 0777，建容器时按路径算挂载源还会把
+        链接指向的目录挂进容器。所以不跟随链接地建、先打开再 `fchmod`；它是链接或文件时删掉
+        条目本身重建成目录（`replace_links=True`）。建法与 `init_workspace_dir` 里那两行相同；
+        建容器时这一步在算挂载源之前，那时旧容器已经停了，没人能再把它换回去。
+        """
+        previous = safe_fs.kind(ws_dir, (CLAUDE_HOME_DIRNAME,))
+        safe_fs.ensure_dir(ws_dir, (CLAUDE_HOME_DIRNAME,), replace_links=True)
+        safe_fs.chmod(ws_dir, (CLAUDE_HOME_DIRNAME,), 0o777)
+        if previous not in (None, "dir"):
+            logger.warning(f"工作区 {ws_dir.name} 的 {CLAUDE_HOME_DIRNAME} 不是普通目录（{previous}，可能是容器换的），已删掉重建")
+        return ws_dir / CLAUDE_HOME_DIRNAME
+
+    @staticmethod
+    def remove_legacy_claude_settings(ws_dir: Path) -> bool:
+        """删掉早先写在 `{ws}/.claude/settings.json` 的那份 CC 设置
+
+        CC 从来不读它，但里面可能还留着以前写出去的凭据（`direct` 模式下的真实 Key、
+        像凭据的 `extra_env`）。目录删空了顺手删掉，里面还有别的东西就留着。
+
+        `.claude` 在容器可写的工作区目录里，删除不跟随符号链接：它被换成了链接时什么都不删
+        （链接那头不是 NA 的东西），只记一条 WARNING。
+
+        Returns:
+            这次确实删掉了一个条目时为 True
+        """
+        legacy_dirname, legacy_filename = LEGACY_CLAUDE_SETTINGS_PARTS
+        try:
+            with safe_fs.open_dir(ws_dir, legacy_dirname) as legacy_dir:
+                if legacy_dir.kind(legacy_filename) in (None, "dir"):
+                    return False
+                removed = legacy_dir.unlink(legacy_filename)
+        except FileNotFoundError:
+            return False  # 工作区或 .claude 不存在
+        except safe_fs.UnsafePathError as e:
+            logger.warning(f"工作区 {ws_dir.name} 的 .claude 不是普通目录（可能被容器换成了符号链接），没有清旧设置: {e}")
+            return False
+        if removed:
+            with safe_fs.open_dir(ws_dir) as root:
+                root.rmdir(legacy_dirname)  # 只删空的真目录
+        return removed
 
     @staticmethod
     async def update_workspace_settings(
         workspace: "DBWorkspace",
         cc_preset: Optional["CCModelPresetItem"] = None,
     ) -> None:
-        """更新工作区 settings.json 和 .claude/settings.json，使模型预设变更立即生效无需重建容器。
+        """更新工作区 settings.json 和 CC 用户级设置，使模型预设变更立即生效无需重建容器。
 
         CC sandbox 的 ClaudeRuntime 每次 spawn 子进程时动态读取 settings.json，
         因此写入新文件后下一条消息即可使用新的模型配置。
@@ -468,11 +664,23 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         **不轮换中继令牌**：这条路径不重启容器，轮换会让容器里正在跑的那一轮 LLM 调用当场 401。
         """
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
-        if not ws_dir.exists():
+        if not ws_dir.is_dir():
             return  # 工作区目录尚未初始化，容器首次启动时 init_workspace_dir 会完整写入
 
+        from nekro_agent.services.workspace.credential_policy import (
+            mark_platform_secret_delivered,
+            platform_credentials_allowed,
+        )
+
         credential = await resolve_workspace_credential(workspace, cc_preset)
-        WorkspaceService._write_settings_files(ws_dir, cc_preset, credential, "热更新")
+        if WorkspaceService._write_settings_files(
+            ws_dir,
+            cc_preset,
+            credential,
+            "热更新",
+            allow_platform_secrets=await platform_credentials_allowed(workspace),
+        ):
+            await mark_platform_secret_delivered(workspace)
 
     @staticmethod
     def get_effective_cc_preset_id(workspace: "DBWorkspace") -> Optional[int]:
@@ -539,135 +747,183 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
                 return meta, body
         return {}, raw
 
+    # 记忆目录 `default/memory` 在容器可写的工作区里：下面几个函数都从工作区根逐级不跟随链接地打开，
+    # 读到链接一律当作不存在（或拒绝写），不会顺着链接读出、写入或删掉宿主别处的文件。
+    _MEMORY_REL = ("default", "memory")
+    _MEMORY_MAX_READ_BYTES = 1024 * 1024
+
+    @staticmethod
+    def _memory_meta(rel: str, stem: str, raw: str) -> "Dict[str, Any]":
+        m, _ = WorkspaceService._parse_frontmatter(raw)
+        tags = m.get("tags", [])
+        return {
+            "path": rel,
+            "title": m.get("title", stem),
+            "category": m.get("category", ""),
+            "tags": tags if isinstance(tags, list) else [],
+            "shared": bool(m.get("shared", False)),
+            "updated": str(m.get("updated", "")),
+        }
+
     @staticmethod
     def list_memory_tree(workspace_id: int) -> "List[Dict[str, Any]]":
         """返回记忆目录树（仅包含 .md 文件和目录）。"""
-        memory_root = WorkspaceService.get_memory_root(workspace_id)
-        if not memory_root.exists():
+        try:
+            memory_dir = safe_fs.open_dir(
+                WorkspaceService.get_workspace_dir(workspace_id),
+                WorkspaceService._MEMORY_REL,
+            )
+        except (FileNotFoundError, safe_fs.UnsafePathError):
             return []
 
-        def _build(path: "Path", base: "Path") -> "List[Dict[str, Any]]":
+        # 记忆目录在容器可写的工作区里：嵌套超过 `MAX_TREE_DEPTH` 的那一层不再往下列
+        # （列成空目录），不让一棵故意造得很深的树撞上递归上限
+        def _build(directory: safe_fs.DirHandle, prefix: str, remaining_depth: int) -> "List[Dict[str, Any]]":
             nodes: List[Dict[str, Any]] = []
-            try:
-                entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
-            except PermissionError:
-                return []
-            for entry in entries:
-                rel = str(entry.relative_to(base))
-                if entry.is_dir():
-                    nodes.append({"name": entry.name, "type": "dir", "path": rel, "meta": None, "children": _build(entry, base)})
-                elif entry.is_file() and entry.suffix == ".md":
+            entries = sorted(directory.entries(), key=lambda item: (item[1] == "file", item[0]))
+            for name, kind in entries:
+                rel = f"{prefix}{name}"
+                if kind == "dir":
+                    children: List[Dict[str, Any]] = []
+                    if remaining_depth > 0:
+                        try:
+                            with directory.subdir(name) as child:
+                                children = _build(child, f"{rel}/", remaining_depth - 1)
+                        except (FileNotFoundError, safe_fs.UnsafePathError):
+                            continue
+                    nodes.append({"name": name, "type": "dir", "path": rel, "meta": None, "children": children})
+                elif kind == "file" and name.endswith(".md"):
                     try:
-                        m, _ = WorkspaceService._parse_frontmatter(entry.read_text(encoding="utf-8"))
-                    except Exception:
-                        m = {}
-                    tags = m.get("tags", [])
+                        raw = directory.read_text(
+                            name,
+                            max_bytes=WorkspaceService._MEMORY_MAX_READ_BYTES,
+                            errors="replace",
+                        ) or ""
+                    except OSError:
+                        raw = ""
                     nodes.append({
-                        "name": entry.name,
+                        "name": name,
                         "type": "file",
                         "path": rel,
-                        "meta": {
-                            "path": rel,
-                            "title": m.get("title", entry.stem),
-                            "category": m.get("category", ""),
-                            "tags": tags if isinstance(tags, list) else [],
-                            "shared": bool(m.get("shared", False)),
-                            "updated": str(m.get("updated", "")),
-                        },
+                        "meta": WorkspaceService._memory_meta(rel, name[:-3], raw),
                         "children": None,
                     })
             return nodes
 
-        return _build(memory_root, memory_root)
+        with memory_dir:
+            return _build(memory_dir, "", safe_fs.MAX_TREE_DEPTH)
 
     @staticmethod
     def read_memory_file(workspace_id: int, rel_path: str) -> "Optional[Dict[str, Any]]":
         """读取记忆文件，返回 {path, raw, content, meta}，不存在则返回 None。"""
-        memory_root = WorkspaceService.get_memory_root(workspace_id)
         try:
-            target = (memory_root / rel_path).resolve()
-            target.relative_to(memory_root.resolve())
-        except ValueError:
+            parts = safe_fs.split_rel(rel_path)
+            if not parts:
+                return None
+            raw = safe_fs.read_text(
+                WorkspaceService.get_workspace_dir(workspace_id),
+                (*WorkspaceService._MEMORY_REL, *parts),
+                max_bytes=WorkspaceService._MEMORY_MAX_READ_BYTES,
+                errors="replace",
+            )
+        except (safe_fs.UnsafePathError, IsADirectoryError, NotADirectoryError):
             return None
-        if not target.exists() or not target.is_file():
+        if raw is None:
             return None
-        raw = target.read_text(encoding="utf-8")
-        m, body = WorkspaceService._parse_frontmatter(raw)
-        tags = m.get("tags", [])
+        _m, body = WorkspaceService._parse_frontmatter(raw)
+        stem = parts[-1][:-3] if parts[-1].endswith(".md") else parts[-1]
         return {
             "path": rel_path,
             "raw": raw,
             "content": body,
-            "meta": {
-                "path": rel_path,
-                "title": m.get("title", target.stem),
-                "category": m.get("category", ""),
-                "tags": tags if isinstance(tags, list) else [],
-                "shared": bool(m.get("shared", False)),
-                "updated": str(m.get("updated", "")),
-            },
+            "meta": WorkspaceService._memory_meta(rel_path, stem, raw),
         }
 
     @staticmethod
     def write_memory_file(workspace_id: int, rel_path: str, raw: str) -> None:
-        """创建或更新记忆文件，自动创建父目录。路径穿越时抛出 ValueError。"""
-        memory_root = WorkspaceService.get_memory_root(workspace_id)
+        """创建或更新记忆文件，自动创建父目录。路径穿越或途中有链接时抛出 ValueError。"""
         try:
-            target = (memory_root / rel_path).resolve()
-            target.relative_to(memory_root.resolve())
-        except ValueError:
-            raise ValueError(f"非法路径: {rel_path}")
-        memory_root.mkdir(parents=True, exist_ok=True)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(raw, encoding="utf-8")
+            parts = safe_fs.split_rel(rel_path)
+            if not parts:
+                raise safe_fs.UnsafePathError("空路径")
+            safe_fs.write_text(
+                WorkspaceService.get_workspace_dir(workspace_id),
+                (*WorkspaceService._MEMORY_REL, *parts),
+                raw,
+            )
+        except safe_fs.UnsafePathError as e:
+            raise ValueError(f"非法路径: {rel_path}") from e
 
     @staticmethod
     def delete_memory_file(workspace_id: int, rel_path: str) -> bool:
         """删除记忆文件，返回是否成功。"""
-        memory_root = WorkspaceService.get_memory_root(workspace_id)
         try:
-            target = (memory_root / rel_path).resolve()
-            target.relative_to(memory_root.resolve())
-        except ValueError:
+            parts = safe_fs.split_rel(rel_path)
+            if not parts:
+                return False
+            with safe_fs.open_dir(
+                WorkspaceService.get_workspace_dir(workspace_id),
+                (*WorkspaceService._MEMORY_REL, *parts[:-1]),
+            ) as directory:
+                if directory.kind(parts[-1]) != "file":
+                    return False
+                return directory.unlink(parts[-1])
+        except (FileNotFoundError, safe_fs.UnsafePathError):
             return False
-        if target.exists() and target.is_file():
-            target.unlink()
-            return True
-        return False
 
     @staticmethod
     def reset_memory(workspace_id: int) -> int:
         """清空工作区记忆目录下的所有 .md 文件（保留目录结构）。返回删除的文件数量。"""
-        memory_root = WorkspaceService.get_memory_root(workspace_id)
-        if not memory_root.exists():
+        try:
+            memory_dir = safe_fs.open_dir(
+                WorkspaceService.get_workspace_dir(workspace_id),
+                WorkspaceService._MEMORY_REL,
+            )
+        except (FileNotFoundError, safe_fs.UnsafePathError):
             return 0
-        count = 0
-        for md_file in memory_root.rglob("*.md"):
-            try:
-                md_file.unlink()
-                count += 1
-            except Exception:
-                pass
-        # 清理空目录（保留 memory_root 本身）
-        for dirpath in sorted(memory_root.rglob("*"), reverse=True):
-            if dirpath.is_dir() and dirpath != memory_root:
-                try:
-                    dirpath.rmdir()  # 只删除空目录
-                except OSError:
-                    pass
-        return count
+
+        # 嵌套超过 `MAX_TREE_DEPTH` 的那一层不再往下走（只试着删它自己，不空就不删）
+        def _clear(directory: safe_fs.DirHandle, remaining_depth: int) -> int:
+            removed = 0
+            for name, kind in directory.entries():
+                if kind == "file" and name.endswith(".md"):
+                    if directory.unlink(name):
+                        removed += 1
+                elif kind == "dir":
+                    if remaining_depth > 0:
+                        try:
+                            with directory.subdir(name) as child:
+                                removed += _clear(child, remaining_depth - 1)
+                        except (FileNotFoundError, safe_fs.UnsafePathError):
+                            continue
+                    directory.rmdir(name)  # 只删空目录；不空或已被换成链接都不删
+            return removed
+
+        with memory_dir:
+            return _clear(memory_dir, safe_fs.MAX_TREE_DEPTH)
 
     @staticmethod
     def read_na_context(workspace_id: int) -> "tuple[str, str]":
         """读取 _na_context.md 正文与更新时间，截取前 1800 字符（约 600 中文字）。
 
+        结果会进每轮 NA 提示词与后台页面：文件或途中某一级被容器换成链接时当作没有，
+        不会把链接指向的宿主文件读出来。
+
         Returns:
             (body, updated): 正文内容（最多1800字符）和 frontmatter 中的 updated 字段（可能为空字符串）
         """
-        na_context_path = WorkspaceService.get_memory_root(workspace_id) / "_na_context.md"
-        if not na_context_path.exists():
+        try:
+            raw = safe_fs.read_text(
+                WorkspaceService.get_workspace_dir(workspace_id),
+                (*WorkspaceService._MEMORY_REL, "_na_context.md"),
+                max_bytes=WorkspaceService._MEMORY_MAX_READ_BYTES,
+                errors="replace",
+            )
+        except (safe_fs.UnsafePathError, IsADirectoryError, NotADirectoryError) as e:
+            logger.warning(f"工作区 {workspace_id} 的 _na_context.md 不是普通文件，按没有处理: {e}")
             return "", ""
-        raw = na_context_path.read_text(encoding="utf-8")
+        if raw is None:
+            return "", ""
         meta, body = WorkspaceService._parse_frontmatter(raw)
         return body[:1800], str(meta.get("updated", ""))
 
@@ -680,9 +936,6 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         title: str = "协作现状摘要",
     ) -> None:
         """写入 _na_context.md，自动生成最小 frontmatter。"""
-        memory_root = WorkspaceService.get_memory_root(workspace_id)
-        memory_root.mkdir(parents=True, exist_ok=True)
-        na_context_path = memory_root / "_na_context.md"
         updated = datetime.now(timezone.utc).isoformat()
         frontmatter = "\n".join([
             "---",
@@ -693,7 +946,11 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             "---",
             "",
         ])
-        na_context_path.write_text(frontmatter + body.strip() + "\n", encoding="utf-8")
+        write_workspace_text(
+            workspace_id,
+            (*WorkspaceService._MEMORY_REL, "_na_context.md"),
+            frontmatter + body.strip() + "\n",
+        )
 
     @staticmethod
     def get_capability_summary(workspace: "DBWorkspace") -> str:
@@ -747,7 +1004,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         controller_address: str = "",
         host_address: str = "",
     ) -> None:
-        """初始化 workspace 目录，写入 settings.json / .mcp.json / .claude/settings.json / skills/（幂等）
+        """初始化 workspace 目录，写入 settings.json / .mcp.json / .claude_home/settings.json / skills/（幂等）
 
         Args:
             workspace: 工作区记录
@@ -758,7 +1015,22 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             host_address: 该工作区网络的网关地址，NA 跑在宿主上时容器经它回连中继
         """
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
-        ws_dir.mkdir(parents=True, exist_ok=True)
+
+        # 这里的文件系统操作一律放进线程：调用方（启动 / 重启）拿着工作区的锁，事件循环不能
+        # 跟着卡住（容器能往目录里塞很多东西，删起来要一阵子）
+        def _prepare() -> None:
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            # 上次同步技能时删不完、挪进回收目录的东西：再清一次。回收目录在工作区之外、只有 NA
+            # 往里放东西（见 `_discard_tree`）；还删不完就留着下次再来，不让初始化失败
+            try:
+                with WorkspaceService._open_trash_dir(workspace.id, create=False) as trash:
+                    trash.purge_trash()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(f"清理工作区 {workspace.id} 的回收目录失败（已忽略）: {e}")
+
+        await asyncio.to_thread(_prepare)
 
         # 写进容器的凭据：默认是**只对本工作区有效的中继令牌**，真实上游 Key 不进容器
         credential = await resolve_workspace_credential(
@@ -768,39 +1040,66 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             controller_address=controller_address,
             host_address=host_address,
         )
-        WorkspaceService._write_settings_files(ws_dir, cc_preset, credential, "写入")
+        from nekro_agent.services.workspace.credential_policy import (
+            mark_platform_secret_delivered,
+            platform_credentials_allowed,
+        )
+
+        allow_platform_secrets = await platform_credentials_allowed(workspace)
+        if await asyncio.to_thread(
+            WorkspaceService._write_settings_files,
+            ws_dir,
+            cc_preset,
+            credential,
+            "写入",
+            allow_platform_secrets=allow_platform_secrets,
+        ):
+            await mark_platform_secret_delivered(workspace)
 
         # 同步 skills 目录
         await WorkspaceService.sync_skills(workspace)
 
-        # 创建 shared 目录（CC↔NA 文件共享目录，NA 实时感知）
-        shared_dir = ws_dir / "default" / "shared"
-        shared_dir.mkdir(parents=True, exist_ok=True)
-        # 确保容器内的 appuser 有写入权限（bind mount 跨越用户边界时宿主机 owner 可能不匹配）
-        shared_dir.chmod(0o777)
+        def _ensure_dirs() -> None:
+            # 创建 shared 目录（CC↔NA 文件共享目录，NA 实时感知）。
+            # 建目录与 chmod 都逐级不跟随链接：容器能把 `default`、`shared` 换成指向宿主别处的链接，
+            # 按路径 chmod 0777 会把链接指向的宿主目录改成人人可写。
+            safe_fs.ensure_dir(ws_dir, ("default", "shared"), replace_links=True)
+            # 确保容器内的 appuser 有写入权限（bind mount 跨越用户边界时宿主机 owner 可能不匹配）
+            safe_fs.chmod(ws_dir, ("default", "shared"), 0o777)
 
-        # 创建工作区知识库目录，供知识库源文件和规范化全文使用
-        WorkspaceService.ensure_kb_dirs(workspace.id)
+            # 创建工作区知识库目录，供知识库源文件和规范化全文使用
+            WorkspaceService.ensure_kb_dirs(workspace.id)
 
-        # 创建 .claude_home 目录（挂载到容器内 ~/.claude/，持久化 Claude Code 会话历史）
-        claude_home = ws_dir / ".claude_home"
-        claude_home.mkdir(exist_ok=True)
-        # 确保容器内的 appuser 有写入权限（bind mount 跨越用户边界时宿主机 owner 可能不匹配）
-        claude_home.chmod(0o777)
+            # 创建 .claude_home 目录（挂载到容器内 ~/.claude/，持久化 Claude Code 会话历史）。
+            # 它还会被当作 bind 源挂进下一个容器：是链接就删掉链接重建，绝不顺着它挂宿主别处
+            safe_fs.ensure_dir(ws_dir, (".claude_home",), replace_links=True)
+            # 确保容器内的 appuser 有写入权限（bind mount 跨越用户边界时宿主机 owner 可能不匹配）
+            safe_fs.chmod(ws_dir, (".claude_home",), 0o777)
+
+        await asyncio.to_thread(_ensure_dirs)
 
         # 写入 .mcp.json 到 CC 工作目录（/workspace/default/.mcp.json）
         # 注意：与 CLAUDE.md 同理，必须放在 /workspace/default/ 下，CC 只在项目根目录查找
-        mcp_path = ws_dir / "default" / ".mcp.json"
-        mcp_path.parent.mkdir(parents=True, exist_ok=True)
-        mcp_path.write_text(await _render_disk_mcp_json(workspace), encoding="utf-8")
-        logger.debug(f"写入 .mcp.json: {mcp_path}")
+        await _write_disk_mcp_json(workspace)
+        logger.debug(f"写入 .mcp.json: 工作区 {workspace.id}")
 
         # 写入 CLAUDE.md 到 CC 工作目录（/workspace/default/CLAUDE.md）
         # 注意：不能放在 /workspace/CLAUDE.md，否则当 /workspace/default/ 成为 git 根目录时
         # Claude Code 会停止向上遍历，导致 CLAUDE.md 被忽略
-        claude_md_path = ws_dir / "default" / "CLAUDE.md"
-        claude_md_path.write_text(WorkspaceService._generate_claude_md_content(workspace), encoding="utf-8")
-        logger.debug(f"写入 CLAUDE.md: {claude_md_path}")
+        from nekro_agent.core.config import config as app_config
+
+        if app_config.SSH_GATEWAY_ENABLED:
+            # `_generate_claude_md_content` 是同步的，凭据行得在这里先查好放进进程内缓存。
+            # 闸关时不走这一段：一次库都不多查。
+            try:
+                from nekro_agent.services.ssh_gateway.container_files import refresh_ssh_servers_section
+
+                await refresh_ssh_servers_section(workspace.id)
+            except Exception as e:  # noqa: BLE001 - SSH 小节刷新失败不该拦住工作区初始化
+                logger.warning(f"刷新工作区 {workspace.id} 的 SSH 服务器小节失败（已忽略）: {type(e).__name__}: {e}")
+        claude_md = WorkspaceService._generate_claude_md_content(workspace)
+        await asyncio.to_thread(write_workspace_text, workspace.id, ("default", "CLAUDE.md"), claude_md)
+        logger.debug(f"写入 CLAUDE.md: 工作区 {workspace.id}")
 
     @staticmethod
     def scan_shared_dir(workspace_id: int, max_files: int = 10) -> list[dict[str, str]]:
@@ -813,26 +1112,33 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         Returns:
             按修改时间倒序排列的文件信息列表，每项包含 name, size_human, mtime_str, rel_path。
         """
-        shared_dir = Path(WORKSPACE_ROOT_DIR) / str(workspace_id) / "default" / "shared"
-        if not shared_dir.is_dir():
+        # 共享目录是容器可写的：逐级不跟随链接地打开，只列普通文件，元数据取 `lstat`，
+        # 链接一律跳过——否则链接指向的宿主文件名、大小、时间会进提示词
+        try:
+            shared_dir = safe_fs.open_dir(Path(WORKSPACE_ROOT_DIR) / str(workspace_id), ("default", "shared"))
+        except (FileNotFoundError, safe_fs.UnsafePathError):
             return []
 
-        files: list[tuple[float, Path]] = []
-        for item in shared_dir.iterdir():
-            if item.is_file():
-                files.append((item.stat().st_mtime, item))
-            elif item.is_dir():
-                # 浅层递归：只扫描 1 级子目录
-                for sub_item in item.iterdir():
-                    if sub_item.is_file():
-                        files.append((sub_item.stat().st_mtime, sub_item))
+        files: list[tuple[float, int, str, str]] = []
+        with shared_dir:
+            for name, kind, st in shared_dir.entries_with_stat():
+                if kind == "file":
+                    files.append((st.st_mtime, st.st_size, name, name))
+                elif kind == "dir":
+                    # 浅层递归：只扫描 1 级子目录
+                    try:
+                        with shared_dir.subdir(name) as sub_dir:
+                            for sub_name, sub_kind, sub_st in sub_dir.entries_with_stat():
+                                if sub_kind == "file":
+                                    files.append((sub_st.st_mtime, sub_st.st_size, sub_name, f"{name}/{sub_name}"))
+                    except (FileNotFoundError, safe_fs.UnsafePathError):
+                        continue
 
         # 按修改时间倒序
         files.sort(key=lambda x: x[0], reverse=True)
 
         result: list[dict[str, str]] = []
-        for mtime, fpath in files[:max_files]:
-            size = fpath.stat().st_size
+        for mtime, size, file_name, rel_path in files[:max_files]:
             if size < 1024:
                 size_human = f"{size}B"
             elif size < 1024 * 1024:
@@ -844,40 +1150,44 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             mtime_str = mtime_dt.strftime("%m-%d %H:%M")
 
             result.append({
-                "name": fpath.name,
+                "name": file_name,
                 "size_human": size_human,
                 "mtime_str": mtime_str,
-                "rel_path": str(fpath.relative_to(shared_dir)),
+                "rel_path": rel_path,
             })
         return result
 
     @staticmethod
     def _read_skill_meta(skill_dir: Path) -> Optional[Dict[str, str]]:
         """从 SKILL.md frontmatter 读取 skill 元信息，不存在时返回 None。"""
+        # 只用于技能库（宿主侧）的目录；工作区里的 skill 走 `_read_skill_md_in` + `_parse_skill_meta`
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             return None
         try:
-            content = skill_md.read_text(encoding="utf-8")
-            meta: Dict[str, str] = {}
-            lines = content.splitlines()
-            in_frontmatter = False
-            for i, line in enumerate(lines):
-                if i == 0 and line.strip() == "---":
-                    in_frontmatter = True
-                    continue
-                if in_frontmatter and line.strip() == "---":
-                    break
-                if in_frontmatter and ":" in line and not line.startswith("#"):
-                    key, _, value = line.partition(":")
-                    meta[key.strip()] = value.strip().strip('"').strip("'")
-            return {
-                "name": meta.get("name", skill_dir.name),
-                "description": meta.get("description", ""),
-            }
+            return WorkspaceService._parse_skill_meta(skill_md.read_text(encoding="utf-8"), skill_dir.name)
         except Exception as e:
             logger.warning(f"读取 SKILL.md 失败: {skill_dir.name}: {e}")
             return None
+
+    @staticmethod
+    def _parse_skill_meta(content: str, default_name: str) -> Dict[str, str]:
+        """从 SKILL.md 正文的 frontmatter 取 name 与 description"""
+        meta: Dict[str, str] = {}
+        in_frontmatter = False
+        for i, line in enumerate(content.splitlines()):
+            if i == 0 and line.strip() == "---":
+                in_frontmatter = True
+                continue
+            if in_frontmatter and line.strip() == "---":
+                break
+            if in_frontmatter and ":" in line and not line.startswith("#"):
+                key, _, value = line.partition(":")
+                meta[key.strip()] = value.strip().strip('"').strip("'")
+        return {
+            "name": meta.get("name", default_name),
+            "description": meta.get("description", ""),
+        }
 
     @staticmethod
     def _resolve_skill_source(skill_id: str, tenant_id: Optional[int] = None) -> "tuple[Optional[Path], str]":
@@ -935,15 +1245,48 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         from nekro_agent.services.skill_scope import workspace_skill_scope
 
         scope = await workspace_skill_scope(workspace)
-        ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
-        skills_home = ws_dir / ".claude_home" / "skills"
-        skills_home.mkdir(parents=True, exist_ok=True)
 
+        # `.claude_home` 是 0777、整个挂进容器：`skills` 乃至 `.claude_home` 都可能被换成链接，
+        # 指到技能库或宿主别处。逐级不跟随地打开，删用 `remove_tree`（链接只删链接本身）。
+        # 这是启动路径：删不完的挪进工作区之外的回收目录，不让启动失败（见 `_discard_tree`）。
+        # 整段文件系统操作放进线程，调用方拿着工作区的锁，事件循环不跟着卡住
+        def _sync() -> None:
+            skills_home = WorkspaceService._open_workspace_skills(workspace.id, create=True)
+            assert skills_home is not None
+            with skills_home, WorkspaceService._open_trash_dir(workspace.id, create=True) as trash:
+                WorkspaceService._sync_skills_in(workspace, scope, skills_home, trash=trash)
+
+        await asyncio.to_thread(_sync)
+
+    @staticmethod
+    def _open_trash_dir(workspace_id: int, *, create: bool) -> safe_fs.DirHandle:
+        """这个工作区的回收目录：`{工作区根}/.nk-trash/<id>`，在工作区之外、容器写不到
+
+        同步技能时删不完的树整体改名进这里，下次初始化再清（`purge_trash`）。它不在
+        `/workspace` 挂载里，所以里面的条目只可能是 NA 放进去的——清的时候不必提防容器
+        在里面起名、塞东西。改名是同一文件系统里的 `renameat`（工作区目录就在工作区根下）。
+
+        Raises:
+            FileNotFoundError: `create=False` 且还没有回收目录
+        """
+        root = WorkspaceService.get_workspace_dir(workspace_id).parent
+        rel = (".nk-trash", str(workspace_id))
+        if create:
+            safe_fs.ensure_dir(root, rel, mode=0o700)
+        return safe_fs.open_dir(root, rel)
+
+    @staticmethod
+    def _sync_skills_in(
+        workspace: DBWorkspace,
+        scope: Optional[int],
+        skills_home: safe_fs.DirHandle,
+        *,
+        trash: Optional[safe_fs.DirHandle] = None,
+    ) -> None:
         # 旧结构已废弃：~/.claude/skills/{builtin,user,dynamic}/
         for legacy_dir_name in ("builtin", "user", "dynamic"):
-            legacy_dir = skills_home / legacy_dir_name
-            if legacy_dir.exists() and legacy_dir.is_dir():
-                shutil.rmtree(legacy_dir)
+            if skills_home.kind(legacy_dir_name) == "dir":
+                WorkspaceService._discard_tree(skills_home, legacy_dir_name, trash)
                 logger.debug(f"清理旧版 skills 分层目录: {legacy_dir_name}")
 
         Path(SKILLS_LOCAL_DIR).mkdir(parents=True, exist_ok=True)
@@ -963,31 +1306,23 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         # 清理未选中的“受管理 skill”；未标记技能视为 workspace-local dynamic skill，保留。
         # 判据用的是**解析后**的名字集合：一条选中但已不可见的技能落在这里会被删掉，
         # 这正是"工作区先建后绑租户"那条时序的收口。
-        for d in list(skills_home.iterdir()):
-            if not d.is_dir() or d.name.startswith("."):
+        for name, kind in skills_home.entries():
+            if kind != "dir" or name.startswith("."):
                 continue
-            origin = WorkspaceService.read_skill_origin(d)
+            origin = WorkspaceService._skill_origin_in(skills_home, name)
             if not origin:
                 continue
-            if d.name not in selected_names:
-                shutil.rmtree(d)
-                logger.debug(f"清理未选中的受管理 skill: {d.name}")
+            if name not in selected_names:
+                WorkspaceService._discard_tree(skills_home, name, trash)
+                logger.debug(f"清理未选中的受管理 skill: {name}")
 
         # 复制/更新选中的 skill
         for skill_id, src, cat in resolved_sources:
             target_name = skill_id.split("/")[-1] if "/" in skill_id else skill_id
-            dst = skills_home / target_name
-            if dst.exists():
-                existing_origin = WorkspaceService.read_skill_origin(dst)
-                if not existing_origin:
-                    logger.warning(
-                        f"跳过同步 skill（与 workspace-local dynamic skill 同名冲突）: {skill_id} -> {target_name}"
-                    )
-                    continue
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-            WorkspaceService._write_skill_origin(dst, origin=cat, source_skill_id=skill_id)
-            logger.debug(f"同步 skill: {skill_id} → {target_name}")
+            if WorkspaceService._sync_skill_into(
+                skills_home, src, target_name, category=cat, skill_id=skill_id, trash=trash,
+            ):
+                logger.debug(f"同步 skill: {skill_id} → {target_name}")
 
     @staticmethod
     async def list_mcp_servers(workspace: DBWorkspace) -> list[Any]:
@@ -1140,11 +1475,8 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
     @staticmethod
     async def _write_mcp_disk_locked(workspace: DBWorkspace) -> None:
-        """在持锁状态下重写 .mcp.json"""
-        ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
-        mcp_path = ws_dir / "default" / ".mcp.json"
-        mcp_path.parent.mkdir(parents=True, exist_ok=True)
-        mcp_path.write_text(await _render_disk_mcp_json(workspace), encoding="utf-8")
+        """在持锁状态下重写 .mcp.json（逐级不跟随链接，见 `_write_disk_mcp_json`）"""
+        await _write_disk_mcp_json(workspace)
 
     @staticmethod
     async def sync_mcp_to_disk(workspace: DBWorkspace) -> None:
@@ -1336,69 +1668,206 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         return WorkspaceService.get_workspace_dir(workspace_id) / ".claude_home" / "skills"
 
     @staticmethod
-    def _is_workspace_local_dynamic_skill(skill_dir: Path) -> bool:
-        # 目录本身是软链时一律不认：`is_dir()` 会跟着链接走，于是容器里一句
-        # `ln -s {DATA_DIR}/skills/local/ops-runbook mine` 就能让这条判据点头，
-        # 之后读 / 写 / 晋升全都落在链接指向的地方
-        if skill_dir.is_symlink():
+    def _valid_skill_dir_name(dir_name: str) -> bool:
+        try:
+            return len(safe_fs.split_rel([dir_name])) == 1 and not dir_name.startswith(".")
+        except safe_fs.UnsafePathError:
             return False
-        if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+
+    @staticmethod
+    def is_dynamic_skill(workspace_id: int, dir_name: str) -> bool:
+        """`dir_name` 是不是这个工作区的动态 skill（真目录、不是链接、有 SKILL.md、没被技能库接管）
+
+        目录本身是软链时一律不认：容器里一句 `ln -s {DATA_DIR}/skills/local/ops-runbook mine`
+        不能让这条判据点头。
+        """
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
             return False
-        if not (skill_dir / "SKILL.md").exists():
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
             return False
-        origin = WorkspaceService.read_skill_origin(skill_dir)
-        return not origin or origin.get("origin") == "dynamic"
+        with skills:
+            return WorkspaceService._is_dynamic_skill_in(skills, dir_name)
 
     @staticmethod
     def list_dynamic_skills(workspace_id: int) -> List[Dict[str, str]]:
         """列出工作区内所有未固化的 workspace-local dynamic skills。"""
-        skills_root = WorkspaceService.get_workspace_skills_dir(workspace_id)
-        if not skills_root.exists():
+        skills_root = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills_root is None:
             return []
         skills: List[Dict[str, str]] = []
-        for skill_dir in sorted(skills_root.iterdir()):
-            if not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
-                continue
-            meta = WorkspaceService._read_skill_meta(skill_dir)
-            skills.append(
-                {
-                    "dir_name": skill_dir.name,
-                    "name": meta["name"] if meta else skill_dir.name,
-                    "description": meta["description"] if meta else "",
-                }
-            )
+        with skills_root:
+            for name, _kind in skills_root.entries():
+                if not WorkspaceService._is_dynamic_skill_in(skills_root, name):
+                    continue
+                content = WorkspaceService._read_skill_md_in(skills_root, name)
+                meta = WorkspaceService._parse_skill_meta(content, name) if content is not None else None
+                skills.append(
+                    {
+                        "dir_name": name,
+                        "name": meta["name"] if meta else name,
+                        "description": meta["description"] if meta else "",
+                    }
+                )
         return skills
 
     @staticmethod
     def read_dynamic_skill(workspace_id: int, dir_name: str) -> Optional[str]:
         """读取 workspace-local dynamic skill 的 SKILL.md 内容，不存在时返回 None。"""
-        skill_dir = WorkspaceService.get_workspace_skills_dir(workspace_id) / dir_name
-        if not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
             return None
-        skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
             return None
-        return skill_md.read_text(encoding="utf-8")
+        with skills:
+            if not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+                return None
+            return WorkspaceService._read_skill_md_in(skills, dir_name)
 
     @staticmethod
     def write_dynamic_skill(workspace_id: int, dir_name: str, content: str) -> None:
         """创建或更新 workspace-local dynamic skill（写入 SKILL.md）。"""
-        skills_root = WorkspaceService.get_workspace_skills_dir(workspace_id)
-        skills_root.mkdir(parents=True, exist_ok=True)
-        skill_dir = skills_root / dir_name
-        if skill_dir.exists() and not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
-            raise ValueError(f"技能 '{dir_name}' 已被受管理 skill 占用")
-        skill_dir.mkdir(exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
+            raise ValueError(f"技能目录名不合法: {dir_name}")
+        skills = WorkspaceService._open_workspace_skills(workspace_id, create=True)
+        assert skills is not None
+        with skills:
+            existing = skills.kind(dir_name)
+            if existing == "dir" and not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+                raise ValueError(f"技能 '{dir_name}' 已被受管理 skill 占用")
+            if existing not in (None, "dir"):
+                raise ValueError(f"技能 '{dir_name}' 不是普通目录（可能被换成了链接），请在沙盒里删掉后重试")
+            with skills.subdir(dir_name, create=True) as skill_dir:
+                skill_dir.write_text("SKILL.md", content)
+
+    @staticmethod
+    def list_dynamic_skill_tree(workspace_id: int, dir_name: str, *, max_depth: int = 5) -> Optional[List[Dict[str, Any]]]:
+        """列出动态 skill 目录里的文件与子目录；不是动态 skill 返回 None
+
+        隐藏条目（`.git` 等）与**所有**链接都跳过：这个目录容器可写，链接指向哪儿都不该被走进去，
+        连链接的名字也不列（列出来就等于告诉对方链接那头有什么）。
+        """
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
+            return None
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
+            return None
+
+        def _walk(directory: safe_fs.DirHandle, prefix: str, depth: int) -> List[Dict[str, Any]]:
+            if depth <= 0:
+                return []
+            result: List[Dict[str, Any]] = []
+            items = sorted(directory.entries_with_stat(), key=lambda item: (item[1] != "dir", item[0].lower()))
+            for name, kind, st in items:
+                if name.startswith("."):
+                    continue
+                rel = f"{prefix}{name}"
+                if kind == "dir":
+                    result.append({"name": name, "rel_path": rel, "type": "dir", "size": None})
+                    try:
+                        with directory.subdir(name) as child:
+                            result.extend(_walk(child, f"{rel}/", depth - 1))
+                    except (FileNotFoundError, safe_fs.UnsafePathError):
+                        continue
+                elif kind == "file":
+                    result.append({"name": name, "rel_path": rel, "type": "file", "size": int(st.st_size)})
+            return result
+
+        with skills:
+            if not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+                return None
+            try:
+                with skills.subdir(dir_name) as skill_dir:
+                    return _walk(skill_dir, "", max_depth)
+            except (FileNotFoundError, safe_fs.UnsafePathError):
+                return None
+
+    @staticmethod
+    def read_dynamic_skill_file(workspace_id: int, dir_name: str, rel_path: str) -> Optional[str]:
+        """读动态 skill 目录里的一个文件；不是动态 skill、路径不合法、途中有链接、不是普通文件都返回 None"""
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
+            return None
+        try:
+            parts = safe_fs.split_rel(rel_path)
+        except safe_fs.UnsafePathError:
+            return None
+        if not parts:
+            return None
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
+            return None
+        with skills:
+            if not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+                return None
+            try:
+                with skills.subdir(dir_name) as skill_dir:
+                    current = skill_dir
+                    opened: List[safe_fs.DirHandle] = []
+                    try:
+                        for part in parts[:-1]:
+                            current = current.subdir(part)
+                            opened.append(current)
+                        return current.read_text(
+                            parts[-1],
+                            max_bytes=WorkspaceService._SKILL_FILE_MAX_BYTES,
+                            errors="replace",
+                        )
+                    finally:
+                        for handle in reversed(opened):
+                            handle.close()
+            except (FileNotFoundError, safe_fs.UnsafePathError):
+                return None
+
+    @staticmethod
+    def write_dynamic_skill_file(workspace_id: int, dir_name: str, rel_path: str, content: str) -> None:
+        """写动态 skill 目录里的一个文件（缺的父目录建出来）
+
+        Raises:
+            LookupError: 不是动态 skill
+            ValueError: 路径不合法，或途中某一级是链接 / 文件
+        """
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
+            raise LookupError(dir_name)
+        try:
+            parts = safe_fs.split_rel(rel_path)
+        except safe_fs.UnsafePathError as e:
+            raise ValueError("路径不合法") from e
+        if not parts:
+            raise ValueError("路径不合法")
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
+            raise LookupError(dir_name)
+        with skills:
+            if not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+                raise LookupError(dir_name)
+            opened: List[safe_fs.DirHandle] = []
+            try:
+                current = skills.subdir(dir_name)
+                opened.append(current)
+                for part in parts[:-1]:
+                    current = current.subdir(part, create=True)
+                    opened.append(current)
+                if current.kind(parts[-1]) not in (None, "file"):
+                    raise ValueError("路径不合法")
+                current.write_text(parts[-1], content)
+            except safe_fs.UnsafePathError as e:
+                raise ValueError("路径不合法") from e
+            finally:
+                for handle in reversed(opened):
+                    handle.close()
 
     @staticmethod
     def delete_dynamic_skill(workspace_id: int, dir_name: str) -> bool:
         """删除 workspace-local dynamic skill，返回是否成功。"""
-        skill_dir = WorkspaceService.get_workspace_skills_dir(workspace_id) / dir_name
-        if not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
             return False
-        shutil.rmtree(skill_dir)
-        return True
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
+            return False
+        with skills:
+            if not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+                return False
+            return skills.remove_tree(dir_name)
 
     @staticmethod
     def promote_dynamic_skill(
@@ -1424,23 +1893,44 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         落点走 `skill_scope.resolve_writable_dir()` 这一个出口，因此租户的晋升**结构上**
         不可能写到平台方目录里，不依赖调用点记得判一次。
 
-        ⚠️ 落点判定只管「写到哪儿去」，**不管「从哪儿读」**：源目录是容器可写的，
-        而 `copytree` 默认解引用软链。所以复制之前先按 `skill_scope.contains_symlink`
-        做一次内容准入 —— 详见那个函数的 docstring。
+        ⚠️ 落点判定只管「写到哪儿去」，**不管「从哪儿读」**：源目录是容器可写的。
+        所以源一侧逐级不跟随链接地打开（`.claude_home`、`skills`、技能目录本身被换成链接都不认），
+        内含链接的直接拒绝晋升；真正复制时用 `copy_tree_out`，判完之后才冒出来的链接也只会被跳过，
+        不会把链接指向的宿主文件带进技能库。
         """
-        from nekro_agent.services.skill_scope import contains_symlink, resolve_writable_dir
-
-        src = WorkspaceService.get_workspace_skills_dir(workspace_id) / dir_name
-        if not WorkspaceService._is_workspace_local_dynamic_skill(src):
+        if not WorkspaceService._valid_skill_dir_name(dir_name):
             raise ValueError(f"动态 skill 不存在: {dir_name}")
-        if contains_symlink(src):
-            raise ValueError(
-                f"动态 skill '{dir_name}' 内含符号链接，无法晋升：技能库里的每个文件都必须是"
-                f"这个 skill 自己的内容。请在沙盒里把链接换成真实文件后重试",
-            )
+        skills = WorkspaceService._open_workspace_skills(workspace_id)
+        if skills is None:
+            raise ValueError(f"动态 skill 不存在: {dir_name}")
+        with skills:
+            WorkspaceService._promote_from(skills, workspace_id, dir_name, force=force, tenant_id=tenant_id)
+        return dir_name
+
+    @staticmethod
+    def _promote_from(
+        skills: safe_fs.DirHandle,
+        workspace_id: int,
+        dir_name: str,
+        *,
+        force: bool,
+        tenant_id: Optional[int],
+    ) -> None:
+        from nekro_agent.services.skill_scope import resolve_writable_dir
+
+        if not WorkspaceService._is_dynamic_skill_in(skills, dir_name):
+            raise ValueError(f"动态 skill 不存在: {dir_name}")
+        with skills.subdir(dir_name) as src_dir:
+            if WorkspaceService._tree_has_link(src_dir):
+                raise ValueError(
+                    f"动态 skill '{dir_name}' 内含符号链接（或目录嵌套超过 {safe_fs.MAX_TREE_DEPTH} 层），"
+                    f"无法晋升：技能库里的每个文件都必须是这个 skill 自己的内容。"
+                    f"请在沙盒里把链接换成真实文件、把目录层级收浅后重试",
+                )
 
         # 一致性校验：frontmatter name 必须与 dir_name 一致
-        meta = WorkspaceService._read_skill_meta(src)
+        content = WorkspaceService._read_skill_md_in(skills, dir_name)
+        meta = WorkspaceService._parse_skill_meta(content, dir_name) if content is not None else None
         if meta:
             fm_name = meta.get("name", "")
             if fm_name and fm_name != dir_name:
@@ -1458,19 +1948,47 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             from nekro_agent.schemas.errors import ConflictError
             raise ConflictError(resource=f"技能 '{dir_name}' 已存在于技能库中")
 
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
+        # 先复制到同级的临时目录，成功了再换上去：中途失败不会把库里原有的同名技能删掉一半
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        staging = dst.with_name(f".{dst.name}.nk-promote")
+        if staging.is_symlink() or staging.is_file():
+            staging.unlink()
+        elif staging.exists():
+            shutil.rmtree(staging)
+        try:
+            skills.copy_tree_out(dir_name, staging)
+            # 写入 .skill-origin.json（源目录里带过来的那份一并被覆盖）
+            WorkspaceService._write_skill_origin(
+                staging,
+                origin="promoted",
+                promoted_from_workspace=workspace_id,
+                source_skill_id=dir_name,
+            )
+            if dst.exists():
+                shutil.rmtree(dst)
+            staging.rename(dst)
+        except BaseException:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            raise
 
-        # 写入 .skill-origin.json
-        WorkspaceService._write_skill_origin(
-            dst,
-            origin="promoted",
-            promoted_from_workspace=workspace_id,
-            source_skill_id=dir_name,
-        )
+    @staticmethod
+    def _tree_has_link(directory: safe_fs.DirHandle, *, max_depth: int = safe_fs.MAX_TREE_DEPTH) -> bool:
+        """目录树里有没有符号链接（不跟随任何链接地递归）
 
-        return dir_name
+        嵌套超过 `max_depth` 层也按「有」处理：调用方据此拒绝晋升，不往更深处走
+        （否则一棵故意造得很深的目录会让递归撞上 Python 的递归上限）。
+        """
+        for name, kind in directory.entries():
+            if kind == "link":
+                return True
+            if kind == "dir":
+                if max_depth <= 0:
+                    return True
+                with directory.subdir(name) as child:
+                    if WorkspaceService._tree_has_link(child, max_depth=max_depth - 1):
+                        return True
+        return False
 
     @staticmethod
     def list_builtin_skills() -> List[Dict[str, str]]:
@@ -1614,19 +2132,34 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             logger.warning(f"全局 skill 不存在或对本工作区的作用域不可见，无法同步: {skill_id}")
             return False
         target_name = skill_id.split("/")[-1] if "/" in skill_id else skill_id
-        dst_parent = WorkspaceService.get_workspace_skills_dir(workspace.id)
-        dst_parent.mkdir(parents=True, exist_ok=True)
-        dst = dst_parent / target_name
-        if dst.exists():
-            existing_origin = WorkspaceService.read_skill_origin(dst)
-            if not existing_origin:
-                logger.warning(f"重新同步 skill 跳过：与 workspace-local dynamic skill 同名冲突: {skill_id}")
+        skills = WorkspaceService._open_workspace_skills(workspace.id, create=True)
+        assert skills is not None
+        with skills:
+            if not WorkspaceService._sync_skill_into(skills, src, target_name, category=cat, skill_id=skill_id):
                 return False
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
-        WorkspaceService._write_skill_origin(dst, origin=cat, source_skill_id=skill_id)
         logger.debug(f"重新同步 skill: {skill_id} → {target_name}")
         return True
+
+    @staticmethod
+    def _skill_origin_payload(
+        *,
+        origin: str,
+        source_skill_id: Optional[str] = None,
+        promoted_from_workspace: Optional[int] = None,
+        repo_url: Optional[str] = None,
+        community_id: Optional[str] = None,
+        community_slug: Optional[str] = None,
+    ) -> str:
+        data = {
+            "origin": origin,
+            "source_skill_id": source_skill_id,
+            "promoted_from_workspace": promoted_from_workspace,
+            "repo_url": repo_url,
+            "community_id": community_id,
+            "community_slug": community_slug,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return json.dumps(data, indent=2, ensure_ascii=False)
 
     @staticmethod
     def _write_skill_origin(
@@ -1639,18 +2172,130 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         community_id: Optional[str] = None,
         community_slug: Optional[str] = None,
     ) -> None:
-        """在 skill 目录下写入 .skill-origin.json 来源追溯文件。"""
-        data = {
-            "origin": origin,
-            "source_skill_id": source_skill_id,
-            "promoted_from_workspace": promoted_from_workspace,
-            "repo_url": repo_url,
-            "community_id": community_id,
-            "community_slug": community_slug,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        """在**技能库**（宿主侧、容器碰不到）的 skill 目录下写入 .skill-origin.json 来源追溯文件。
+
+        工作区里的 skill 目录在容器可写的 `.claude_home` 下，不走这里，见 `_sync_skill_into`。
+        """
         origin_path = skill_dir / ".skill-origin.json"
-        origin_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        origin_path.write_text(
+            WorkspaceService._skill_origin_payload(
+                origin=origin,
+                source_skill_id=source_skill_id,
+                promoted_from_workspace=promoted_from_workspace,
+                repo_url=repo_url,
+                community_id=community_id,
+                community_slug=community_slug,
+            ),
+            encoding="utf-8",
+        )
+
+    # ── 工作区里的 skill 目录（`.claude_home/skills`，容器可写） ─────────────────
+    # 下面这组函数都从工作区根出发逐级不跟随链接地打开，`.claude_home`、`skills`、技能目录、
+    # 技能目录里的文件，任何一级是链接都不跟：读当作不存在，删只删链接本身，写之前删掉链接重建。
+
+    _SKILL_FILE_MAX_BYTES = 1024 * 1024
+
+    @staticmethod
+    def _open_workspace_skills(workspace_id: int, *, create: bool = False) -> Optional[safe_fs.DirHandle]:
+        """打开 `.claude_home/skills`；`create` 时途中缺的建出来、被换成链接的删掉重建"""
+        base = WorkspaceService.get_workspace_dir(workspace_id)
+        if create:
+            return safe_fs.open_dir(base, (".claude_home", "skills"), create=True, replace_links=True)
+        try:
+            return safe_fs.open_dir(base, (".claude_home", "skills"))
+        except (FileNotFoundError, safe_fs.UnsafePathError):
+            return None
+
+    @staticmethod
+    def _skill_origin_in(skills: safe_fs.DirHandle, name: str) -> Optional[Dict[str, Any]]:
+        """读工作区里一个 skill 目录的 `.skill-origin.json`；目录或文件是链接、不存在、解析不了都返回 None"""
+        if skills.kind(name) != "dir":
+            return None
+        try:
+            with skills.subdir(name) as skill_dir:
+                text = skill_dir.read_text(".skill-origin.json", max_bytes=64 * 1024, errors="replace")
+        except (FileNotFoundError, safe_fs.UnsafePathError):
+            return None
+        if text is None:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _read_skill_md_in(skills: safe_fs.DirHandle, name: str) -> Optional[str]:
+        if skills.kind(name) != "dir":
+            return None
+        try:
+            with skills.subdir(name) as skill_dir:
+                return skill_dir.read_text(
+                    "SKILL.md",
+                    max_bytes=WorkspaceService._SKILL_FILE_MAX_BYTES,
+                    errors="replace",
+                )
+        except (FileNotFoundError, safe_fs.UnsafePathError):
+            return None
+
+    @staticmethod
+    def _is_dynamic_skill_in(skills: safe_fs.DirHandle, name: str) -> bool:
+        """工作区本地的动态 skill：真目录（不是链接）、里面有普通文件 SKILL.md、没有来源标记或标记为 dynamic"""
+        if name.startswith(".") or skills.kind(name) != "dir":
+            return False
+        try:
+            with skills.subdir(name) as skill_dir:
+                if skill_dir.kind("SKILL.md") != "file":
+                    return False
+        except (FileNotFoundError, safe_fs.UnsafePathError):
+            return False
+        origin = WorkspaceService._skill_origin_in(skills, name)
+        return not origin or origin.get("origin") == "dynamic"
+
+    @staticmethod
+    def _discard_tree(directory: safe_fs.DirHandle, name: str, trash: Optional[safe_fs.DirHandle]) -> None:
+        """删一个条目；给了 `trash`（启动路径）时删不完就整体挪进回收目录（`_open_trash_dir`）
+
+        `.claude_home` 里的东西是容器自己的：它造一棵上百万条目的目录，删不完也不该让工作区
+        启动失败。挪走之后这个名字就空出来了，下一次 `init_workspace_dir` 再清回收目录。
+        """
+        if trash is None:
+            directory.remove_tree(name)
+            return
+        if directory.remove_tree_or_discard(name, trash) == "discarded":
+            logger.warning(f"{directory.path / name} 里的条目太多，没删完，已整体挪进回收目录 {trash.path}，下次初始化再清")
+
+    @staticmethod
+    def _sync_skill_into(
+        skills: safe_fs.DirHandle,
+        src: Path,
+        target_name: str,
+        *,
+        category: str,
+        skill_id: str,
+        trash: Optional[safe_fs.DirHandle] = None,
+    ) -> bool:
+        """把技能库里的一个 skill 复制进工作区；同名的是动态 skill（无来源标记）时跳过，返回是否同步了
+
+        旧目录用 `remove_tree` 删（链接只删链接本身），新目录用 `copy_tree_in` 写（源里的链接跳过）。
+        `trash` 见 `_discard_tree`。
+        """
+        existing = skills.kind(target_name)
+        if existing == "dir":
+            if not WorkspaceService._skill_origin_in(skills, target_name):
+                logger.warning(f"跳过同步 skill（与 workspace-local dynamic skill 同名冲突）: {skill_id} -> {target_name}")
+                return False
+            WorkspaceService._discard_tree(skills, target_name, trash)
+        elif existing is not None:
+            # 容器放的链接或文件占了这个名字：它不是谁的技能，删掉链接本身再同步
+            WorkspaceService._discard_tree(skills, target_name, trash)
+        skills.copy_tree_in(src, target_name)
+        with skills.subdir(target_name) as skill_dir:
+            skill_dir.write_text(
+                ".skill-origin.json",
+                WorkspaceService._skill_origin_payload(origin=category, source_skill_id=skill_id),
+            )
+        return True
 
     @staticmethod
     def read_skill_origin(skill_dir: Path) -> Optional[Dict[str, Any]]:

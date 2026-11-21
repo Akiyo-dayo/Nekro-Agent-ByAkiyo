@@ -26,6 +26,7 @@
     "version": "Version",
     "type": "Type",
     "link": "Link",
+    "openConsole": "Open the plugin console (new tab)",
     "none": "None",
     "pluginDocs": "Plugin Documentation",
     "noDocs": "No documentation available for this plugin.",

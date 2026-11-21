@@ -163,6 +163,26 @@ class InstanceUpdateRequest(BaseModel):
     provider_account_id: Optional[str] = Field(default=None)
 
 
+class InstancePurgePreview(BaseModel):
+    """彻底删除实例之前给确认框看的影响面：本实例自己的邮箱、记下的用户邮件偏好与收集库表情
+
+    这几样跟着实例一起删（`instance_manager.purge_instance`）；别的级联（会话、消息、记忆）
+    确认框里本来就有一句总的说明，这里只补 #79 新增的那几样。
+    """
+
+    email_accounts: int = Field(default=0, description="本实例自己填的邮箱个数")
+    email_user_prefs: int = Field(default=0, description="本实例记下的用户邮件偏好条数")
+    collected_emotions: int = Field(default=0, description="本实例收集库里的表情数")
+    plugin_settings: int = Field(
+        default=0,
+        description="本实例名下有设置的插件个数（实例级启停、频道级启停、实例级配置的并集）",
+    )
+    config_overrides: int = Field(
+        default=0,
+        description="本实例名下有生效覆盖的配置文件个数（核心配置的实例层 + 它的频道）",
+    )
+
+
 class InstanceDeleteRequest(BaseModel):
     """删除实例
 
@@ -210,16 +230,44 @@ class InstanceMigrationPreview(BaseModel):
     channels: List[InstanceMigrationChannelItem] = Field(default_factory=list, description="逐频道明细")
     residues: List[InstanceMigrationResidueItem] = Field(default_factory=list, description="不会被搬走的数据")
     warnings: List[str] = Field(default_factory=list, description="执行前需要知道的风险提示")
+    cross_tenant: bool = Field(default=False, description="源实例与目标实例归属不同（租户与租户、租户与平台方）")
+    ssh_credentials: int = Field(
+        default=0,
+        description="源实例对上用户登记的服务器凭据行数；跨租户时默认删除，取消勾选才跟到目标实例",
+    )
+    plugin_settings: int = Field(
+        default=0,
+        description="源实例名下有设置的插件个数（实例级 + 它的频道）；跨租户时默认删除，取消勾选才跟到目标实例",
+    )
+    config_overrides: int = Field(
+        default=0,
+        description="源实例名下有生效覆盖的配置文件个数（实例层 + 它的频道）；跨租户时默认删除，取消勾选才跟到目标实例",
+    )
 
 
 class InstanceMigrationRequest(BaseModel):
     """执行归属迁移
 
     `confirm_source_instance_key` 必须回填源实例标识，与彻底删除实例同一套二次确认形态。
+
+    `delete_ssh_credentials` / `delete_plugin_settings` / `delete_config_overrides` 只在跨租户迁移时生效，
+    默认删除（与租户划转同一条取舍）；同一归属下的迁移，这几样总是跟到目标实例。
     """
 
     source_instance_key: str = Field(..., description="交出历史的实例标识")
     confirm_source_instance_key: str = Field(default="", description="回填源实例标识作为二次确认")
+    delete_ssh_credentials: bool = Field(
+        default=True,
+        description="跨租户迁移时一并删除源实例上用户登记的服务器凭据（默认删除；取消才跟到目标实例）",
+    )
+    delete_plugin_settings: bool = Field(
+        default=True,
+        description="跨租户迁移时一并删除源实例的插件设置（默认删除；取消才跟到目标实例）",
+    )
+    delete_config_overrides: bool = Field(
+        default=True,
+        description="跨租户迁移时一并删除源实例的配置覆盖（默认删除；取消才跟到目标实例）",
+    )
 
 
 class InstanceMigrationResult(BaseModel):
@@ -263,10 +311,25 @@ class InstanceAdoptRequest(BaseModel):
     """把一个未认领协议端并入某个既有实例
 
     路径上的实例是**接收方**（与历史归属迁移同一形态："把某个东西并到本实例来"）。
+
+    `delete_ssh_credentials` / `delete_plugin_settings` / `delete_config_overrides` 与换实例对同一口径：
+    只在两端归属不同时生效，默认删除源实例上的这几样；取消才跟到目标实例。条数用换实例对的预览接口取。
     """
 
     source_instance_key: str = Field(..., description="要被并入的未认领实例标识")
     confirm_source_instance_key: str = Field(default="", description="回填未认领实例标识作为二次确认")
+    delete_ssh_credentials: bool = Field(
+        default=True,
+        description="两端归属不同时一并删除源实例上用户登记的服务器凭据（默认删除；取消才跟到目标实例）",
+    )
+    delete_plugin_settings: bool = Field(
+        default=True,
+        description="两端归属不同时一并删除源实例的插件设置（默认删除；取消才跟到目标实例）",
+    )
+    delete_config_overrides: bool = Field(
+        default=True,
+        description="两端归属不同时一并删除源实例的配置覆盖（默认删除；取消才跟到目标实例）",
+    )
 
 
 class InstanceClaimResult(BaseModel):

@@ -41,7 +41,6 @@ import datetime
 import io
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import pytest
@@ -410,8 +409,10 @@ async def _check_deleted(result, env: Env) -> None:
 
 
 async def _check_raw(result, env: Env) -> None:
-    assert result.filename == "plan.md"
-    assert Path(str(result.path)).read_text(encoding="utf-8") == "rival-ws plan body"
+    # 原文件改为按「不跟随链接」打开后流式发出（不再按路径交给 FileResponse），所以读响应体本身
+    assert 'filename="plan.md"' in result.headers["content-disposition"]
+    body = b"".join([chunk async for chunk in result.body_iterator])
+    assert body.decode("utf-8") == "rival-ws plan body"
 
 
 async def _check_fulltext(result, env: Env) -> None:
@@ -1075,6 +1076,10 @@ class TestBindingIsPlatformOnly:
 
     这是**能力边界**而不是存在性问题，所以用 403 而不是 404：
     租户在任何工作区上（包括自己的）都不该有这个动作。
+
+    另有第二条边界：资源不下发给「不能拿平台方凭据」的工作区，所以**平台方**也不能把资源绑到
+    租户的工作区上（绑了也不下发，只会留下一条永远不生效、看不出原因的绑定）。因此下面
+    「平台方可以绑」的两条用例打的是平台方自己的工作区，而不是租户那个。
     """
 
     async def test_tenant_cannot_bind_even_its_own_workspace(self, env: Env, bound_resources) -> None:
@@ -1089,15 +1094,32 @@ class TestBindingIsPlatformOnly:
         assert exc_info.value.status_code == 403
         assert await _binding_order(env.acme_ws) == [bound_resources[1].id]
 
-    async def test_platform_owner_binds_the_same_workspace(self, env: Env, bound_resources) -> None:
-        await unbind_workspace_resource(
-            workspace_id=env.acme_ws, resource_id=bound_resources[0].id, _current_user=platform_owner()
-        )
+    async def test_platform_owner_binds_a_platform_workspace(self, env: Env, bound_resources) -> None:
         await bind_workspace_resource(
-            workspace_id=env.acme_ws, resource_id=bound_resources[0].id,
+            workspace_id=env.platform_ws, resource_id=bound_resources[0].id,
             body=WorkspaceResourceBindBody(note="平台方绑定"), _current_user=platform_owner(),
         )
-        assert await _binding_order(env.acme_ws) == [bound_resources[1].id, bound_resources[0].id]
+        await bind_workspace_resource(
+            workspace_id=env.platform_ws, resource_id=bound_resources[1].id,
+            body=WorkspaceResourceBindBody(note="平台方绑定"), _current_user=platform_owner(),
+        )
+        assert await _binding_order(env.platform_ws) == [bound_resources[0].id, bound_resources[1].id]
+
+    async def test_even_the_platform_owner_cannot_bind_a_tenant_workspace(
+        self, env: Env, bound_resources,
+    ) -> None:
+        """绑了也不下发，所以这个动作对租户工作区一律拒绝——省得留下一条永远不生效的绑定
+
+        资源注入按工作区判据拦，与是谁点的按钮无关：平台方的身份换不来「租户容器里能读到
+        平台方私钥」这件事。
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            await bind_workspace_resource(
+                workspace_id=env.acme_ws, resource_id=bound_resources[0].id,
+                body=WorkspaceResourceBindBody(note=""), _current_user=platform_owner(),
+            )
+        assert "租户工作区不能绑定平台方资源" in str(exc_info.value)
+        assert await _binding_order(env.acme_ws) == [bound_resources[0].id, bound_resources[1].id]
 
     async def test_tenant_cannot_check_bind_conflicts(self, env: Env, bound_resources) -> None:
         with pytest.raises(HTTPException) as exc_info:
@@ -1110,7 +1132,7 @@ class TestBindingIsPlatformOnly:
 
     async def test_platform_owner_checks_bind_conflicts(self, env: Env, bound_resources) -> None:
         result = await check_workspace_resource_bind(
-            workspace_id=env.acme_ws,
+            workspace_id=env.platform_ws,
             body=WorkspaceResourceCheckBindBody(resource_id=bound_resources[0].id),
             _current_user=platform_owner(),
         )

@@ -1,0 +1,52 @@
+name: Frontend Checks
+
+# 前端的类型检查与 eslint（0 警告），与本地 `poe frontend-check` 同一套命令。
+#
+# 为什么分开跑两个 tsconfig：根目录的 `tsconfig.json` 只有 references，对它跑 `tsc --noEmit`
+# 一个文件都不检查（本地的 frontend-check 曾经就这样空转过）。应用代码在 `tsconfig.app.json`，
+# vite 配置在 `tsconfig.node.json`，各跑一次才真的覆盖到。
+#
+# Node 与 pnpm 的装法照 `dockerfile` 的前端构建阶段：Node 20 + 全局装 pnpm，再按锁文件装依赖。
+# pnpm 钉在 10 这个主版本：`pnpm-workspace.yaml` 里的 allowBuilds / onlyBuiltDependencies 是 pnpm 10
+# 的配置，换主版本时要连同 dockerfile 一起看。
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-checks:
+    name: Frontend Typecheck & Lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (tsconfig.app.json)
+        run: pnpm exec tsc -p tsconfig.app.json --noEmit
+
+      - name: Typecheck (tsconfig.node.json)
+        run: pnpm exec tsc -p tsconfig.node.json --noEmit
+
+      - name: ESLint (0 warnings)
+        run: pnpm exec eslint src/ --max-warnings 0

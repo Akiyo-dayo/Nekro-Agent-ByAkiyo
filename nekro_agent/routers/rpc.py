@@ -2,7 +2,7 @@ import json
 import pickle
 import time
 from dataclasses import replace
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Header, Request, Response
 
@@ -12,6 +12,16 @@ from nekro_agent.schemas.errors import NotFoundError, UnauthorizedError
 from nekro_agent.schemas.rpc import RPCRequest
 from nekro_agent.services.agent.session_token import hold_untrusted_result
 from nekro_agent.services.message_service import message_service
+from nekro_agent.services.ops_agent import provider as ops_provider
+from nekro_agent.services.ops_agent.audit import (
+    OpsEventSlot,
+    close_ops_event,
+    current_ops_event,
+    open_ops_event,
+    record_ops_event,
+)
+from nekro_agent.services.ops_agent.round_grant import authorize_call, mark_tainted
+from nekro_agent.services.ops_agent.round_grant import get as get_ops_grant
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.isolation import observe_loop_blocking
 from nekro_agent.services.plugin.schema import SandboxMethodType
@@ -22,6 +32,7 @@ from nekro_agent.services.rpc_service import (
     RpcClientGone,
     decode_rpc_request_off_loop,
     execute_rpc_method,
+    execute_rpc_method_detailed,
     read_rpc_body,
     rpc_admission,
     rpc_execution,
@@ -45,6 +56,24 @@ from nekro_agent.tools.untrusted_content import (
 
 logger = get_sub_logger("rpc_bridge")
 router = APIRouter(prefix="/ext", tags=["Tools"])
+
+# 写操作的拒绝理由给模型的人话：模型据此决定「换个说法也没用，得等运维人员再说一句」，
+# 而不是把内部理由原样转述成一句不知所云的话
+OPS_DENY_HINTS = {
+    "tainted": "这一轮已经读过外部内容，写操作被拒绝；请运维人员再单独说一句",
+    "tainted_context": (
+        "这一轮的上下文里有不在运维人员名单上的人的发言、或推送进来的外部内容，写操作被拒绝；"
+        "再说一句也不行，请到运维人员本人的私聊里操作，或回后台操作"
+    ),
+    "round_limit": "本轮写操作次数已达上限",
+    "hourly_limit": "运维人员本小时写操作次数已达上限",
+    "audit_unavailable": "运维审计暂时写不进去，这次没有执行，请稍后再试或回后台操作。",
+}
+
+
+def _ops_deny_message(reason: str) -> str:
+    hint = OPS_DENY_HINTS.get(reason)
+    return f"运维工具调用被拒绝（{hint or reason}）"
 
 
 def _rpc_error(message: str, method_type: SandboxMethodType = SandboxMethodType.TOOL) -> Response:
@@ -118,6 +147,33 @@ def _rpc_rejected(message: str, retry_after: Optional[float] = None) -> Response
     return response
 
 
+def _ops_args(rpc_request: RPCRequest) -> Dict[str, Any]:
+    """把调用参数理成一份可记审计的字典（按位置传的记成 arg1、arg2……）
+
+    只用于审计：`record_ops_event` / `open_ops_event` 会脱敏并截断，正文不落在这里。
+    """
+    merged: Dict[str, Any] = dict(rpc_request.kwargs or {})
+    for index, value in enumerate(rpc_request.args or [], start=1):
+        merged[f"arg{index}"] = value
+    return merged
+
+
+def _ops_read_summary(result: Any) -> str:
+    """读工具的审计摘要：只记返回类型与规模，返回内容本身不落表
+
+    读工具多半返回多行文本，按行数记；列表、字典按条数记。外部内容的结果不计规模，
+    只记类型。
+    """
+    summary = f"返回 {type(result).__name__}"
+    if isinstance(result, UntrustedToolResult):
+        return summary
+    if isinstance(result, str):
+        return f"{summary}，{len(result.splitlines())} 行"
+    if isinstance(result, (list, tuple, set, frozenset, dict)):
+        return f"{summary}，{len(result)} 条"
+    return summary
+
+
 @router.post("/rpc_exec", summary="RPC 命令执行")
 async def rpc_exec(
     container_key: str,
@@ -174,8 +230,48 @@ async def rpc_exec(
 
     method = plugin_collector.get_method(rpc_request.method)
     if not method:
+        # 运维工具是核心方法，不在任何插件里（见 `services/ops_agent/provider.py`）
+        method = ops_provider.get_method(rpc_request.method)
+    if not method:
         raise NotFoundError(resource="RPC 方法")
     method_type: SandboxMethodType = get_sandbox_method_type(method=method)
+    # 运维方法在执行**之前**复核一次。授权是回合开始时签发的，而这一轮可能已经跑了很久：
+    # 开关被关掉、名单里的人被移出、实例被划给租户，任何一条都必须在这一次调用上生效，
+    # 而不是等下一轮（见 `services/ops_agent/round_grant.py` 的模块文档）
+    is_ops_method = ops_provider.is_ops_method(rpc_request.method)
+    is_write_method = is_ops_method and ops_provider.is_write_method(rpc_request.method)
+    event_id: Optional[int] = None
+    if is_ops_method:
+        allowed, deny_reason = await authorize_call(
+            container_key,
+            from_chat_key,
+            rpc_request.method,
+            is_write=is_write_method,
+        )
+        if not allowed:
+            await record_ops_event(
+                grant=get_ops_grant(container_key),
+                tool=rpc_request.method,
+                args=_ops_args(rpc_request),
+                outcome="refused",
+                reason=deny_reason,
+                source="agent",
+            )
+            logger.warning(f"拒绝运维工具调用: {rpc_request.method} reason={deny_reason} container_key={container_key}")
+            return _rpc_rejected(_ops_deny_message(deny_reason))
+
+        # 执行前先记：进程中途崩掉也留得下「尝试过」。写操作拿不到记录号就不执行——
+        # 改了东西却没有留痕，比这次调用失败更难收拾；读操作不改东西，审计失败不该
+        # 让查询也不能用
+        event_id = await open_ops_event(
+            grant=get_ops_grant(container_key),
+            tool=rpc_request.method,
+            args=_ops_args(rpc_request),
+            source="agent",
+        )
+        if event_id is None and is_write_method:
+            logger.warning(f"运维审计写不进去，写操作未执行: {rpc_request.method} container_key={container_key}")
+            return _rpc_rejected(_ops_deny_message("audit_unavailable"))
 
     ctx: AgentCtx = await AgentCtx.create_by_chat_key(
         chat_key=from_chat_key,
@@ -190,19 +286,49 @@ async def rpc_exec(
     # 沙盒方法的报错是模型可见的正常控制流（参数写错、上游 4xx），不计入插件失败计数，
     # 否则一个爱报错的方法会把整个插件拖进隔离。但"有没有把事件循环占死"必须看得见：
     # 这里跑的是宿主进程内的插件代码，不是沙盒容器里的模型代码。
+    #
+    # 运维调用把记录号放进 contextvar：写工具在 `_finish_write` 里据此把结果与记录号
+    # 写进回执/槽。方法一返回就 reset，别把记录号留给下一次调用。
+    slot = OpsEventSlot(event_id=event_id)
+    slot_token = current_ops_event.set(slot) if event_id is not None else None
+    error_type = ""
     try:
-        with (
-            rpc_execution(container_key),
-            observe_loop_blocking(f"沙盒方法 {rpc_request.method}"),
-            # 回调是独立请求，入站时写入的实例 contextvar 传不过来：按频道所属实例显式设置，
-            # 插件方法里读配置才会拿到该实例的覆盖
-            instance_scope(instance_key),
-        ):
-            result, error_message = await execute_rpc_method(method, args, kwargs)
-    except RpcBusyError as e:
-        # 本容器执行中的方法已满：每个执行中的调用都持有解码出的参数，不设上限就能挂起几百个调用占满内存
-        _log_rejection(container_key, str(e))
-        return _rpc_rejected(str(e), e.retry_after)
+        try:
+            with (
+                rpc_execution(container_key),
+                observe_loop_blocking(f"沙盒方法 {rpc_request.method}"),
+                # 回调是独立请求，入站时写入的实例 contextvar 传不过来：按频道所属实例显式设置，
+                # 插件方法里读配置才会拿到该实例的覆盖
+                instance_scope(instance_key),
+            ):
+                if is_ops_method:
+                    result, error_message, error_type = await execute_rpc_method_detailed(method, args, kwargs)
+                else:
+                    result, error_message = await execute_rpc_method(method, args, kwargs)
+        except RpcBusyError as e:
+            # 本容器执行中的方法已满：每个执行中的调用都持有解码出的参数，不设上限就能挂起几百个调用占满内存
+            _log_rejection(container_key, str(e))
+            if event_id is not None:
+                await close_ops_event(event_id, outcome="failed", error_type=type(e).__name__)
+            return _rpc_rejected(str(e), e.retry_after)
+    finally:
+        if slot_token is not None:
+            current_ops_event.reset(slot_token)
+
+    # 执行与拒绝都要留痕：拒绝在上面已经记过，这里关闭执行前写下的那一行。
+    # 审计写的是「宿主知道的事实」（授权上的运维人员、实例、会话），不是模型传进来的东西
+    if event_id is not None:
+        # 按异常类名判失败：`raise ValueError()` 这类没有消息的异常，错误文本是空串
+        if error_message or error_type:
+            # 异常原文不进表：只记类名，原文仍按原来的路径回给沙盒
+            await close_ops_event(event_id, outcome="failed", error_type=error_type)
+        elif is_write_method and slot.outcome:
+            await close_ops_event(event_id, outcome=slot.outcome, reason=slot.reason, summary=slot.summary)
+        elif is_write_method:
+            # 写工具没走到回执就返回了：只有执行时取不到本轮授权这一条路，业务函数没被调用
+            await close_ops_event(event_id, outcome="failed", reason="no_grant")
+        else:
+            await close_ops_event(event_id, outcome="executed", summary=_ops_read_summary(result))
 
     # 实例级覆盖不在 ConfigManager 里，必须按本次执行用的实例单独收集，否则会原样回沙盒
     secret_values = collect_platform_secrets() | collect_instance_plugin_secrets(instance_key)
@@ -221,6 +347,9 @@ async def rpc_exec(
             body = body[:MAX_TOOL_RESULT_BODY_CHARS] + TRUNCATION_MARK
         result = replace(result, body=body, summary=redact_sandbox_text(result.summary, secret_values))
         hold_untrusted_result(container_key, result)
+        # 读过外部内容之后这一轮不能再写：错误原文、日志、网页里都可能藏着「照我说的做」。
+        # `authorize_call` 的写分支会看这个标记（`ops_tools_off` 例外）
+        mark_tainted(container_key)
         await message_service.push_tool_result(chat_key=from_chat_key, result=result)
         return Response(
             content=pickle.dumps(UNTRUSTED_RESULT_PLACEHOLDER),
@@ -243,6 +372,10 @@ async def rpc_exec(
         reason = str(e) if isinstance(e, UnsafePickleError) else f"返回值无法序列化（{type(e).__name__}）"
         logger.warning(f"RPC 方法 {rpc_request.method} 的返回值不能回传沙盒: {reason}")
         return _rpc_error(f"方法 {rpc_request.method} 的返回值不能传回沙盒：{reason}", method_type)
+    if not is_ops_method and method_type in (SandboxMethodType.AGENT, SandboxMethodType.MULTIMODAL_AGENT):
+        # 运维授权回合里调了别的插件方法、结果要回到模型眼前：插件不一定把外部原文包成
+        # `UntrustedToolResult`，这里一律当作读过外部内容（没有授权时什么都不做）
+        mark_tainted(container_key)
     if method_type in [SandboxMethodType.AGENT, SandboxMethodType.BEHAVIOR]:
         await message_service.push_system_message(chat_key=from_chat_key, agent_messages=str(result))
     return Response(

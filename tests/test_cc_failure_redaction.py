@@ -226,7 +226,9 @@ class TestDelegateTaskErrorRedaction:
             return None
 
         monkeypatch.setattr(cc, "CCSandboxClient", _FailingClient)
-        monkeypatch.setattr(cc.workspace_resource_service, "resolve_workspace_resources_to_env", _env)
+        # 发消息前的凭据判据现在收在 `prepare_cc_dispatch` 里（插件在函数内导入它），
+        # 所以钉的是那个函数本身；这里只关心失败文本的脱敏，给一份空的环境变量即可
+        monkeypatch.setattr("nekro_agent.services.workspace.credential_policy.prepare_cc_dispatch", _env)
         monkeypatch.setattr(cc, "publish_system_event", _publish)
         monkeypatch.setattr(cc, "_broadcast_cc_status", _quiet)
         monkeypatch.setattr(cc.comm_broadcast, "publish", _quiet)
@@ -247,6 +249,35 @@ class TestDelegateTaskErrorRedaction:
         for summary in summaries:
             assert_no_secrets(summary)
 
+    async def test_a_failure_while_preparing_the_call_is_redacted_too(
+        self,
+        db,  # noqa: F811
+        cc,  # noqa: F811
+        fake_secrets: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """发消息前准备环境变量（资源解密等）出错：照主流程的口径失败，报错文字同样脱敏、不去调容器"""
+        workspace = await DBWorkspace.create(name="redaction-prepare-ws", status="active")
+        client_built: List[Any] = []
+
+        class _NeverCalledClient:
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                client_built.append(True)
+
+        async def _broken_prepare(*_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            raise ValueError(error_text())
+
+        monkeypatch.setattr(cc, "CCSandboxClient", _NeverCalledClient)
+        monkeypatch.setattr("nekro_agent.services.workspace.credential_policy.prepare_cc_dispatch", _broken_prepare)
+
+        handle = AsyncTaskHandle(task_id=CHAT_KEY, chat_key=CHAT_KEY, plugin=SimpleNamespace())
+        ctls = [ctl async for ctl in cc._cc_delegate_task(handle, workspace.id, "做点事")]  # noqa: SLF001
+
+        assert ctls and ctls[-1].signal.value == "fail"
+        assert ctls[-1].message.startswith("CC Workspace 发生意外错误: ")
+        assert_no_secrets(ctls[-1].message)
+        assert client_built == []
+
 
 class TestDirectSendRedaction:
     """后台「直接向 CC 发送指令」（`routers/workspaces.py` 的 `user_send_to_cc`）与插件委托路径用同一个脱敏出口"""
@@ -259,6 +290,52 @@ class TestDirectSendRedaction:
         redacted = redact_cc_failure_text(RuntimeError(error_text()))
         assert_no_secrets(redacted)
         assert REDACTED_CREDENTIAL in redacted
+
+    async def test_a_failure_while_preparing_the_direct_send_is_redacted(
+        self,
+        fake_secrets: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """直发在拉起后台任务之前就要准备环境变量：那里出错（资源解密失败等）不能冒成一个带原文的
+        500，照插件那条路的口径脱敏、记 WARNING、给出明确的报错，也不去调容器"""
+        from nekro_agent.core.logger import logger
+        from nekro_agent.routers import workspaces as ws_router
+        from nekro_agent.schemas.errors import OperationFailedError
+        from nekro_agent.schemas.workspace import CommSendBody
+        from nekro_agent.services.user.role import Role
+
+        async def fake_accessible(_user: Any, workspace_id: int) -> Any:
+            return SimpleNamespace(id=workspace_id, status="active")
+
+        async def broken_prepare(*_args: Any, **_kwargs: Any) -> Dict[str, str]:
+            raise ValueError(error_text())
+
+        monkeypatch.setattr(ws_router, "assert_workspace_accessible", fake_accessible)
+        monkeypatch.setattr("nekro_agent.services.workspace.credential_policy.prepare_cc_dispatch", broken_prepare)
+
+        warnings: List[str] = []
+        sink_id = logger.add(lambda message: warnings.append(str(message)), level="WARNING", format="{message}")
+        try:
+            with pytest.raises(OperationFailedError) as exc_info:
+                await ws_router.user_send_to_cc(
+                    7,
+                    CommSendBody(content="做点事"),
+                    _current_user=SimpleNamespace(perm_level=Role.Admin),
+                )
+        finally:
+            logger.remove(sink_id)
+
+        error = exc_info.value
+        assert error.detail
+        assert_no_secrets(error.detail)
+        assert REDACTED_CREDENTIAL in error.detail
+        assert_no_secrets(str(error))
+        # 原异常不挂在链上：全局异常处理把整条链打进日志时，原文会从那里漏出去
+        assert error.__cause__ is None and error.__suppress_context__
+        logged = [line for line in warnings if "准备 CC 调用失败" in line]
+        assert logged
+        for line in logged:
+            assert_no_secrets(line)
 
     def test_both_error_branches_of_the_direct_send_path_go_through_the_helper(self):
         """直发跑在接口拉起的后台任务里、要连真实的 SSE 流才走得到报错分支：在源码层钉住出口——

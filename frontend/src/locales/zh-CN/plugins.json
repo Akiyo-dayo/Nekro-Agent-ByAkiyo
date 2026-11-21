@@ -26,6 +26,7 @@
     "version": "版本",
     "type": "类型",
     "link": "链接",
+    "openConsole": "打开插件控制台（新标签页）",
     "none": "无",
     "pluginDocs": "插件文档",
     "noDocs": "该插件暂无文档说明。",

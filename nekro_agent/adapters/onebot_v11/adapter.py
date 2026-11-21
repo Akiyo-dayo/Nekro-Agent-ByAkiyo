@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 
 from fastapi import APIRouter
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageSegment
+from nonebot.adapters.onebot.v11.exception import ActionFailed
 from pydantic import Field
 
 from nekro_agent.adapters.interface.schemas.platform import (
@@ -14,6 +15,7 @@ from nekro_agent.adapters.interface.schemas.platform import (
     PlatformSendSegmentType,
     PlatformUser,
 )
+from nekro_agent.adapters.onebot_v11.core.output_filter_hook import install_output_filter_hook
 from nekro_agent.adapters.onebot_v11.core.self_sent import install_self_sent_support
 from nekro_agent.adapters.onebot_v11.matchers.message import register_matcher, register_self_sent_matcher
 from nekro_agent.core import config, logger
@@ -23,14 +25,18 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.schemas.agent_message import AgentMessageSegment, AgentMessageSegmentType
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.schemas.i18n import i18n_text
+from nekro_agent.services.channel_delivery import UndeliverableReason, channel_delivery_blocks
 from nekro_agent.services.command.base import CommandPermission
 from nekro_agent.services.command.schemas import CommandResponse
 
 from ..interface.base import AdapterMetadata, BaseAdapter, BaseAdapterConfig
 from .core import channel
 from .core.bot import BotInstanceOfflineError, get_bot, get_bot_by_chat_key
+from .core.channel import parse_numeric_target_id
 from .core.instance import get_current_instance, lookup_cached_account_id, resolve_account_id
 from .tools.at_parser import SegAt, parse_at_from_text
+from .tools.bot_membership import is_bot_not_in_group_failure
+from .tools.bot_membership_check import bot_membership_scheduler
 from .tools.cq_markup import neutralize_onebot_cq_at_all_markup
 from .tools.convertor import get_channel_type
 from .tools.display_name import clean_display_name
@@ -104,6 +110,35 @@ class OnebotV11Config(BaseAdapterConfig):
             i18n_description=i18n_text(
                 zh_CN="启用后群成员减少通知会触发 AI 退群提醒",
                 en_US="When enabled, group member decrease notices trigger AI leave notices.",
+            ),
+        ).model_dump(),
+    )
+
+    BOT_MEMBERSHIP_CHECK_INTERVAL_HOURS: int = Field(
+        default=6,
+        ge=0,
+        le=168,
+        title="核对 Bot 在群间隔（小时）",
+        description=(
+            "定期向协议端取群列表，标出 Bot 已经不在的群频道；只做标记，不会停用频道，也不发任何消息。"
+            "0 表示关闭定期核对（后台仍可手动核对）"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="OneBot", en_US="OneBot"),
+            i18n_title=i18n_text(
+                zh_CN="核对 Bot 在群间隔（小时）",
+                en_US="Bot Group Membership Check Interval (hours)",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "定期向协议端取群列表，标出 Bot 已经不在的群频道；只做标记，不会停用频道，也不发任何消息。"
+                    "0 表示关闭定期核对（后台仍可手动核对）"
+                ),
+                en_US=(
+                    "Periodically fetch the group list from the protocol endpoint and mark channels where the bot is "
+                    "no longer present. This only marks channels; it never disables them and sends no messages. "
+                    "0 disables the periodic check (manual checks in the admin UI still work)."
+                ),
             ),
         ).model_dump(),
     )
@@ -245,7 +280,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             return CommandPermission.USER
 
         try:
-            group_id = int(platform_channel.channel_id.replace("group_", "", 1))
+            group_id = parse_numeric_target_id(platform_channel.channel_id)
             user_id = int(platform_user.user_id)
         except ValueError:
             logger.debug(
@@ -291,12 +326,16 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         from . import matchers
 
         install_self_sent_support()
+        install_output_filter_hook()
         register_matcher(self)
         register_self_sent_matcher(self)
+        bot_membership_scheduler.start(
+            lambda: max(0, self.config.BOT_MEMBERSHIP_CHECK_INTERVAL_HOURS),
+        )
 
     async def cleanup(self) -> None:
         """清理适配器"""
-        return
+        await bot_membership_scheduler.stop()
 
     async def render_runtime_prompt(self) -> str:
         """渲染 OneBot V11 适配器运行时提示词"""
@@ -345,7 +384,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         bot: Bot = await get_bot_by_chat_key(chat_key)
         db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
         chat_type = db_chat_channel.chat_type
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        chat_id = parse_numeric_target_id(db_chat_channel.channel_id)
 
         # 智能拆分：优先按 ====== 分隔符，其次按双换行，最后按固定行数
         sections: List[str] = []
@@ -394,7 +433,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         bot: Bot = await get_bot_by_chat_key(chat_key)
         db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
         chat_type = db_chat_channel.chat_type
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        chat_id = parse_numeric_target_id(db_chat_channel.channel_id)
 
         nodes: list[dict[str, Any]] = []
         current_message = Message()
@@ -446,28 +485,54 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             raise ValueError(f"不支持的聊天类型: {chat_type}")
 
     async def forward_message(self, request: PlatformSendRequest) -> PlatformSendResponse:
-        """推送消息到 OneBot V11 协议端"""
+        """推送消息到 OneBot V11 协议端
 
-        message_id: Optional[str] = None
+        确定性失败（实例连接不在、Bot 已不在群里）会登记到进程内的投递阻塞表：
+        上层据此不再补发注定失败的失败回执。这里**不**自动停用频道——「已被移出该群」
+        只是旁证，确认 Bot 已离群后可在后台手动停用；自动停用走 Bot 离群通知那条路。
+        """
+        try:
+            message_id: Optional[str] = None
 
-        # 分离文件类型和其他类型的消息段
-        file_segments = [seg for seg in request.segments if seg.type == PlatformSendSegmentType.FILE]
-        other_segments = [seg for seg in request.segments if seg.type != PlatformSendSegmentType.FILE]
+            # 分离文件类型和其他类型的消息段
+            file_segments = [seg for seg in request.segments if seg.type == PlatformSendSegmentType.FILE]
+            other_segments = [seg for seg in request.segments if seg.type != PlatformSendSegmentType.FILE]
 
-        # 先发送文件（如果有）
-        if file_segments:
-            await self._send_files(request.chat_key, file_segments)
+            # 先发送文件（如果有）
+            if file_segments:
+                await self._send_files(request.chat_key, file_segments)
 
-        # 再发送其他类型消息（如果有）
-        if other_segments:
-            modified_request = PlatformSendRequest(
-                chat_key=request.chat_key,
-                segments=other_segments,
-                ref_msg_id=request.ref_msg_id,
+            # 再发送其他类型消息（如果有）
+            if other_segments:
+                modified_request = PlatformSendRequest(
+                    chat_key=request.chat_key,
+                    segments=other_segments,
+                    ref_msg_id=request.ref_msg_id,
+                )
+                message_id = await self._send_message(modified_request)
+
+            # 真发出去了：之前登记的「发不出去」作废
+            channel_delivery_blocks.clear(request.chat_key)
+            return PlatformSendResponse(success=True, message_id=message_id)
+        except BotInstanceOfflineError as e:
+            channel_delivery_blocks.mark(
+                request.chat_key,
+                UndeliverableReason.INSTANCE_OFFLINE,
+                str(e),
             )
-            message_id = await self._send_message(modified_request)
-
-        return PlatformSendResponse(success=True, message_id=message_id)
+            raise
+        except ActionFailed as e:
+            if is_bot_not_in_group_failure(e):
+                channel_delivery_blocks.mark(
+                    request.chat_key,
+                    UndeliverableReason.BOT_NOT_IN_GROUP,
+                    str(e),
+                )
+                logger.warning(
+                    f"QQ 回「已被移出该群」，频道 {request.chat_key} 的发送与失败回执会暂停一段时间；"
+                    "这条只作旁证，确认 Bot 已离群后可在后台手动停用频道",
+                )
+            raise
 
     async def _send_message(self, request: PlatformSendRequest) -> Optional[str]:
         """发送普通消息（文本、@、图片等）"""
@@ -533,7 +598,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         """发送文件（物化到 uploads 目录后通过 OneBot 文件上传 API 发送）"""
         bot: Bot = await get_bot_by_chat_key(chat_key)
         db_chat_channel = await DBChatChannel.get_channel(chat_key=chat_key)
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        chat_id = parse_numeric_target_id(db_chat_channel.channel_id)
 
         from nekro_agent.tools.common_util import copy_to_upload_dir
 
@@ -584,7 +649,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
         chat_type = db_chat_channel.chat_type
 
         # 从channel_id中提取真实的ID
-        chat_id = int(db_chat_channel.channel_id.split("_")[1])
+        chat_id = parse_numeric_target_id(db_chat_channel.channel_id)
 
         if chat_type is ChatType.GROUP:
             ret = await bot.send_group_msg(group_id=chat_id, message=message, auto_escape=self.config.RESOLVE_CQ_CODE)
@@ -659,10 +724,10 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             bot: Bot = get_bot()
             # 频道名同样来自协议端：彩色群名片那串原始字节也会出现在群名 / 陌生人昵称里
             if chat_type == ChatType.GROUP:
-                group_info = await bot.get_group_info(group_id=int(channel_id.replace("group_", "")))
+                group_info = await bot.get_group_info(group_id=parse_numeric_target_id(channel_id))
                 channel_name = clean_display_name(group_info.get("group_name")) or channel_name
             elif chat_type == ChatType.PRIVATE:
-                stranger_info = await bot.get_stranger_info(user_id=int(channel_id.replace("private_", "")))
+                stranger_info = await bot.get_stranger_info(user_id=parse_numeric_target_id(channel_id))
                 channel_name = clean_display_name(stranger_info.get("nickname")) or channel_name
         except Exception as e:
             logger.error(f"获取频道名称失败: {channel_id} | {e!s}")
@@ -691,7 +756,7 @@ class OnebotV11Adapter(BaseAdapter[OnebotV11Config]):
             uid = int(target_user_id)
 
             if chat_type is ChatType.GROUP:
-                gid = int(db_chat_channel.channel_id.split("_")[1])
+                gid = parse_numeric_target_id(db_chat_channel.channel_id)
                 await bot.call_api("group_poke", group_id=gid, user_id=uid)
             elif chat_type is ChatType.PRIVATE:
                 await bot.call_api("friend_poke", user_id=uid)

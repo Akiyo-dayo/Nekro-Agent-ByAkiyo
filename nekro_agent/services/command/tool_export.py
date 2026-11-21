@@ -8,12 +8,19 @@ from typing import Any, Optional
 
 from nekro_agent.services.command.schemas import CommandResponse, CommandResponseStatus
 
+# 与 `manager._UNSET` 同一个约定的局部哨兵：不传实例判据时保持只判进程级的旧行为。
+_UNSET: object = object()
+
 
 class AgentToolExporter:
     """将命令注册表导出为 Agent Tool-Use 格式"""
 
-    def export_tools(self, chat_key: Optional[str] = None) -> list[dict]:
-        """导出已启用命令为 Tool 列表 (OpenAI Function Calling 格式)"""
+    def export_tools(self, chat_key: Optional[str] = None, *, chat_instance_key: Any = _UNSET) -> list[dict]:
+        """导出已启用命令为 Tool 列表 (OpenAI Function Calling 格式)
+
+        `chat_instance_key` 由异步调用方先用 `resolve_chat_plugin_instance(chat_key)` 算好传入：
+        插件来源的命令要在这个频道真的生效才会出现在工具箱里。不传时与改造前相同。
+        """
         from nekro_agent.services.command.manager import command_manager
         from nekro_agent.services.command.registry import command_registry
 
@@ -26,6 +33,7 @@ class AgentToolExporter:
                 meta,
                 chat_key,
                 plugin_enabled_cache=plugin_enabled_cache,
+                chat_instance_key=chat_instance_key,
             ):
                 continue
             tools.append({

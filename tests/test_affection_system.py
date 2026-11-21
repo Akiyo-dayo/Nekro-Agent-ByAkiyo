@@ -26,7 +26,7 @@ from tortoise import Tortoise
 from tortoise.timezone import now as db_now
 
 from nekro_agent.core.config import CoreConfig, config
-from nekro_agent.models.db_affection import DBAffection
+from nekro_agent.models.db_affection import DBAffection, DBAffectionEvent
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.affection import evaluator as evaluator_module
@@ -41,6 +41,7 @@ from nekro_agent.services.affection.evaluator import (
     schedule_affection_evaluation,
 )
 from nekro_agent.services.affection.key import AffectionKey
+from nekro_agent.services.affection.milestones import FEELING_REDACTED, REASON_REDACTED
 from nekro_agent.services.affection.prompt import AFFECTION_BLOCK_KIND, render_affection_prompt
 from nekro_agent.services.affection.stage import (
     AFFECTION_HARD_MAX_DELTA,
@@ -627,6 +628,99 @@ class TestEvaluatorVerdicts:
 
         await evaluate_channel(_StubChannel(CHAT_KEY_A, INSTANCE_A), make_config())  # type: ignore[arg-type]
         assert (await load_snapshot(KEY_A, ttl_seconds=0)).score == expected_score
+
+    async def test_a_reason_quoting_the_conversation_is_replaced_but_still_scores(
+        self,
+        affection_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 理由会写进流水、回注成 `recently:`：照抄原话就是把用户的原文搬进系统提示词
+        await add_message(CHAT_KEY_A, INSTANCE_A, USER_ID, "我明天要去北京参加面试了好紧张")
+        feeling = "他在为一件大事发愁，我想多陪陪他"
+        stub_llm(
+            monkeypatch,
+            {"users": [{"user_id": USER_ID, "delta": 2, "reason": "他说明天要去北京参加面试", "feeling": feeling}]},
+        )
+
+        applied = await evaluate_channel(_StubChannel(CHAT_KEY_A, INSTANCE_A), make_config())  # type: ignore[arg-type]
+
+        assert applied == 1
+        event = await DBAffectionEvent.filter(**KEY_A.as_columns()).order_by("-id").first()
+        assert event is not None
+        assert event.reason == REASON_REDACTED
+        row = await DBAffection.get(**KEY_A.as_columns())
+        assert row.last_event_text == REASON_REDACTED
+        assert row.score == 2, "换掉的只是那句话，分数照常记"
+        assert row.state_text == feeling
+
+    async def test_a_feeling_quoting_the_conversation_is_replaced_but_still_scores(
+        self,
+        affection_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 印象回注成好感块里那一段，每一轮都进系统提示词：照抄原话与理由是同一回事
+        await add_message(CHAT_KEY_A, INSTANCE_A, USER_ID, "我明天要去北京参加面试了好紧张")
+        reason = "他愿意把心里的不安讲给我听"
+        stub_llm(
+            monkeypatch,
+            {
+                "users": [
+                    {"user_id": USER_ID, "delta": 2, "reason": reason, "feeling": "他明天要去北京参加面试了，我替他捏把汗"},
+                ],
+            },
+        )
+
+        applied = await evaluate_channel(_StubChannel(CHAT_KEY_A, INSTANCE_A), make_config())  # type: ignore[arg-type]
+
+        assert applied == 1
+        row = await DBAffection.get(**KEY_A.as_columns())
+        assert row.state_text == FEELING_REDACTED
+        assert row.last_event_text == reason, "理由是自己的话，不受印象连累"
+        assert row.score == 2, "换掉的只是那段印象，分数照常记"
+
+    async def test_reason_and_feeling_in_their_own_words_are_kept(
+        self,
+        affection_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await add_message(CHAT_KEY_A, INSTANCE_A, USER_ID, "我明天要去北京参加面试了好紧张")
+        reason = "他愿意把心里的不安讲给我听"
+        feeling = "很信任我，也很要强"
+        stub_llm(monkeypatch, {"users": [{"user_id": USER_ID, "delta": 2, "reason": reason, "feeling": feeling}]})
+
+        await evaluate_channel(_StubChannel(CHAT_KEY_A, INSTANCE_A), make_config())  # type: ignore[arg-type]
+
+        event = await DBAffectionEvent.filter(**KEY_A.as_columns()).order_by("-id").first()
+        assert event is not None
+        assert event.reason == reason
+        row = await DBAffection.get(**KEY_A.as_columns())
+        assert row.last_event_text == reason
+        assert row.state_text == feeling
+
+    async def test_quoting_the_bots_own_reply_counts_too(
+        self,
+        affection_db: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # 与主模型调分同一口径：所有发送者的话都算原文，Bot 自己刚说的也一样
+        await add_message(CHAT_KEY_A, INSTANCE_A, USER_ID, "明天就要面试了", timestamp=4_000_000_000)
+        await add_message(
+            CHAT_KEY_A,
+            INSTANCE_A,
+            "-1",
+            "放心吧你一定能发挥得很好的",
+            nickname="Bot",
+            sender_id="-1",
+            timestamp=4_000_000_001,
+        )
+        stub_llm(
+            monkeypatch,
+            {"users": [{"user_id": USER_ID, "delta": 1, "reason": "我对他说你一定能发挥得很好", "feeling": "想给他打气"}]},
+        )
+
+        await evaluate_channel(_StubChannel(CHAT_KEY_A, INSTANCE_A), make_config())  # type: ignore[arg-type]
+
+        assert (await DBAffection.get(**KEY_A.as_columns())).last_event_text == REASON_REDACTED
 
     async def test_malformed_json_does_not_reach_the_main_path(
         self,

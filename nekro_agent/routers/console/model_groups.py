@@ -76,6 +76,9 @@ class ModelGroupPayload(BaseModel):
     model_type: Optional[Literal["chat", "embedding", "draw"]] = Field(default=None, description="模型类型")
     enable_vision: Optional[bool] = Field(default=None, description="启用视觉功能")
     enable_cot: Optional[bool] = Field(default=None, description="启用外置思维链")
+    # 预填方式落在模型组上而不是槽位配置上：它决定「这个组的请求末尾要不要跟一条
+    # assistant 消息」，同一个频道换组就跟着换。
+    prefill_mode: Optional[Literal["off", "assistant", "deepseek"]] = Field(default=None, description="预填方式")
     token_input_rate: Optional[float] = Field(default=None, description="输入 Token 倍率")
     token_completion_rate: Optional[float] = Field(default=None, description="补全 Token 倍率")
     model_price_rate: Optional[float] = Field(default=None, description="模型价格倍率")

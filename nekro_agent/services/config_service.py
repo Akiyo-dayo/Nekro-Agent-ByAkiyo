@@ -22,6 +22,7 @@ from typing import (
 )
 
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 from nekro_agent.core.config import CHANNEL_CONFIG_DIR, CoreConfig
 from nekro_agent.core.config import reload_config as core_reload_config
@@ -31,6 +32,47 @@ from nekro_agent.core.os_env import OsEnv
 
 logger = get_sub_logger("config_system")
 T = TypeVar("T", bound=ConfigBase)
+
+
+def _field_range_text(config_cls: type, key: str) -> str:
+    """按字段声明的约束写出「允许范围」；没有数值约束时返回空串"""
+    field = getattr(config_cls, "model_fields", {}).get(key)
+    if field is None:
+        return ""
+    low: Any = None
+    high: Any = None
+    low_open = high_open = False
+    for meta in field.metadata:
+        if getattr(meta, "ge", None) is not None:
+            low = meta.ge
+        if getattr(meta, "gt", None) is not None:
+            low, low_open = meta.gt, True
+        if getattr(meta, "le", None) is not None:
+            high = meta.le
+        if getattr(meta, "lt", None) is not None:
+            high, high_open = meta.lt, True
+    if low is not None and high is not None:
+        return f"允许范围 {low}{'（不含）' if low_open else ''} ~ {high}{'（不含）' if high_open else ''}"
+    if low is not None:
+        return f"必须大于 {low}" if low_open else f"不能小于 {low}"
+    if high is not None:
+        return f"必须小于 {high}" if high_open else f"不能大于 {high}"
+    return ""
+
+
+def _describe_value_error(config_cls: type, key: str, err: Dict[str, Any]) -> str:
+    """把 pydantic 对这个字段的报错写成给人看的说明（越界写范围、超长写上限、枚举写可选值）"""
+    error_type = str(err.get("type", ""))
+    ctx = err.get("ctx") or {}
+    if error_type in ("less_than_equal", "greater_than_equal", "less_than", "greater_than"):
+        return _field_range_text(config_cls, key) or str(err.get("msg", ""))
+    if error_type in ("string_too_long", "too_long") and "max_length" in ctx:
+        return f"最长 {ctx['max_length']}"
+    if error_type in ("string_too_short", "too_short") and "min_length" in ctx:
+        return f"最短 {ctx['min_length']}"
+    if error_type in ("literal_error", "enum") and "expected" in ctx:
+        return f"可选值：{ctx['expected']}"
+    return str(err.get("msg", error_type))
 
 
 def _extract_extra_fields(field_json_schema_extra: dict) -> dict:
@@ -99,6 +141,11 @@ def _validate_instance_identifiers(adapter_key: str, instance_key: str) -> None:
         raise ValueError(f"非法的实例标识: {instance_key}")
 
 
+def adapter_override_config_path(adapter_key: str) -> Path:
+    """适配器层覆盖配置的落盘路径（`configs/<适配器>/overrides.yaml`），口径只写这一处"""
+    return Path(OsEnv.DATA_DIR) / "configs" / adapter_key / "overrides.yaml"
+
+
 def instance_override_root_dir(adapter_key: str) -> Path:
     """适配器下所有实例级覆盖配置的根目录
 
@@ -118,6 +165,30 @@ def instance_override_config_path(adapter_key: str, instance_key: str) -> Path:
     """实例级覆盖配置的落盘路径"""
     _validate_instance_identifiers(adapter_key, instance_key)
     return instance_override_root_dir(adapter_key) / instance_key / "overrides.yaml"
+
+
+def channel_override_dir(adapter_key: str) -> Path:
+    """某个适配器下频道级覆盖配置所在的目录（`configs/channels/<适配器>/`）"""
+    if not _SAFE_IDENTIFIER_PATTERN.fullmatch(adapter_key):
+        raise ValueError(f"非法的适配器标识: {adapter_key}")
+    return CHANNEL_CONFIG_DIR / adapter_key
+
+
+def channel_override_config_path(chat_key: str) -> Path:
+    """频道级覆盖配置的落盘路径：`configs/channels/<适配器>/<会话标识>.yaml`
+
+    读（`_get_config_instance`）与删、搬（实例生命周期）都从这里取，口径只写一次。
+    会话标识直接拼进文件名，含路径分隔符或相对路径片段的一律拒绝。
+
+    Raises:
+        ValueError: 会话标识为空或不能安全用作文件名
+    """
+    text = str(chat_key or "")
+    if not text or "/" in text or "\\" in text or "\x00" in text or text in {".", ".."}:
+        raise ValueError(f"非法的会话标识: {chat_key!r}")
+    from nekro_agent.adapters import resolve_adapter_key_from_chat_key
+
+    return channel_override_dir(resolve_adapter_key_from_chat_key(text)) / f"{text}.yaml"
 
 
 def _invalidate_effective_config_cache(config_key: str) -> None:
@@ -325,7 +396,7 @@ class UnifiedConfigService:
 
             if config_key.startswith(ADAPTER_OVERRIDE_KEY_PREFIX):
                 adapter_key = config_key.replace(ADAPTER_OVERRIDE_KEY_PREFIX, "")
-                path = Path(OsEnv.DATA_DIR) / "configs" / adapter_key / "overrides.yaml"
+                path = adapter_override_config_path(adapter_key)
                 instance = OverridableConfig.load_from_path(path)
 
             elif config_key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
@@ -342,11 +413,7 @@ class UnifiedConfigService:
                 instance = load_adapter_config(adapter_key)
 
             elif config_key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
-                chat_key = config_key.replace(CHANNEL_OVERRIDE_KEY_PREFIX, "")
-                from nekro_agent.adapters import resolve_adapter_key_from_chat_key
-
-                adapter_key = resolve_adapter_key_from_chat_key(chat_key)
-                path = CHANNEL_CONFIG_DIR / adapter_key / f"{chat_key}.yaml"
+                path = channel_override_config_path(config_key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :])
                 instance = OverridableConfig.load_from_path(path)
 
             if instance:
@@ -645,8 +712,63 @@ class ConfigService:
         return config_item
 
     @staticmethod
+    def parse_config_value(config_obj: ConfigBase, key: str, value: str) -> Tuple[bool, Any, str]:
+        """把提交的字符串按字段当前的类型解析成要写入的值（不写入、不查约束）
+
+        Returns:
+            (是否成功, 解析出的值, 错误消息)。取值问题的消息里带「无效」，路由据此回 400。
+        """
+        current_value = getattr(config_obj, key)
+        if isinstance(current_value, bool):
+            if value.lower() in ["true", "1", "yes", "t", "y"]:
+                return True, True, ""
+            if value.lower() in ["false", "0", "no", "f", "n"]:
+                return True, False, ""
+            return False, None, f"配置项 {key} 的取值 {value!r} 无效：布尔值只能是 true 或 false"
+        if isinstance(current_value, (int, float)):
+            try:
+                return True, type(current_value)(value), ""
+            except ValueError:
+                expected = "整数" if isinstance(current_value, int) else "数字"
+                return False, None, f"配置项 {key} 的取值 {value!r} 无效：需要{expected}"
+        if isinstance(current_value, str):
+            return True, value, ""
+        if isinstance(current_value, (list, dict)):
+            try:
+                parsed_value = json.loads(value)
+            except json.JSONDecodeError:
+                return False, None, f"配置项 {key} 的取值无效：输入必须是有效的 JSON 格式"
+            if isinstance(current_value, list) and not isinstance(parsed_value, list):
+                return False, None, f"配置项 {key} 的取值无效：输入必须是有效的列表格式"
+            if isinstance(current_value, dict) and not isinstance(parsed_value, dict):
+                return False, None, f"配置项 {key} 的取值无效：输入必须是有效的对象格式"
+            return True, parsed_value, ""
+        return False, None, f"不支持的配置类型: {type(current_value)}"
+
+    @staticmethod
+    def check_config_value(config_cls: type, key: str, value: Any) -> Optional[str]:
+        """按字段的约束（范围、长度、可选值、字段校验器）检查一个即将写入的值
+
+        以前写入只做类型转换、直接 `setattr`（配置模型不开赋值校验），越界值照样落盘，
+        下次启动加载时整份配置校验失败。这里在写入前单独校验这一个字段：只看落在这个字段
+        上的报错，别的字段取默认值，不影响判断。
+
+        Returns:
+            不合法时返回给人看的说明（含「无效」与允许范围，路由据此回 400）；合法返回 None。
+        """
+        try:
+            config_cls.model_validate({key: value})
+        except PydanticValidationError as e:
+            errors = [err for err in e.errors(include_url=False) if tuple(err.get("loc") or ())[:1] == (key,)]
+            if errors:
+                return f"配置项 {key} 的取值 {value!r} 无效：{_describe_value_error(config_cls, key, errors[0])}"
+        except (ValueError, TypeError) as e:
+            return f"配置项 {key} 的取值 {value!r} 无效：{e}"
+        return None
+
+    @staticmethod
     def set_config_value(config_obj: ConfigBase, key: str, value: str) -> Tuple[bool, str]:
-        """设置配置项值
+        """设置配置项值：先解析、再按字段约束校验，都通过才写入
 
         Args:
             config_obj: 配置对象实例
@@ -660,47 +782,13 @@ class ConfigService:
             return False, f"配置项 {key} 不存在"
 
         try:
-            current_value = getattr(config_obj, key)
-
-            # 根据类型转换值
-            if isinstance(current_value, bool):
-                if value.lower() in ["true", "1", "yes", "t", "y"]:
-                    setattr(config_obj, key, True)
-                elif value.lower() in ["false", "0", "no", "f", "n"]:
-                    setattr(config_obj, key, False)
-                else:
-                    return False, "布尔值只能是 true 或 false"
-            elif isinstance(current_value, (int, float)):
-                setattr(config_obj, key, type(current_value)(value))
-            elif isinstance(current_value, str):
-                setattr(config_obj, key, value)
-            elif isinstance(current_value, (list, dict)):
-                try:
-                    parsed_value = json.loads(value)
-                    # 简单类型检查
-                    if isinstance(current_value, list) and not isinstance(parsed_value, list):
-                        return False, "输入必须是有效的列表格式"
-                    if isinstance(current_value, dict) and not isinstance(parsed_value, dict):
-                        return False, "输入必须是有效的对象格式"
-
-                    # 对于复杂类型（如 List[Pydantic模型]），尝试使用 Pydantic 验证
-                    field_info = config_obj.__class__.model_fields.get(key)
-                    if field_info:
-                        test_data = {key: parsed_value}
-                        config_obj.__class__.model_validate(test_data)
-                        setattr(config_obj, key, parsed_value)
-                    else:
-                        setattr(config_obj, key, parsed_value)
-
-                except json.JSONDecodeError:
-                    return False, "输入必须是有效的 JSON 格式"
-                except (ValueError, TypeError) as e:
-                    return False, f"数据格式转换失败: {e}"
-            else:
-                return False, f"不支持的配置类型: {type(current_value)}"
-
-        except ValueError as e:
-            return False, f"配置值类型错误: {e}"
+            ok, parsed, message = ConfigService.parse_config_value(config_obj, key, value)
+            if not ok:
+                return False, message
+            problem = ConfigService.check_config_value(type(config_obj), key, parsed)
+            if problem:
+                return False, problem
+            setattr(config_obj, key, parsed)
         except Exception as e:
             return False, f"设置配置值时发生错误: {e}"
         else:
@@ -708,7 +796,10 @@ class ConfigService:
 
     @staticmethod
     def batch_update_config(config_obj: ConfigBase, configs: Dict[str, str]) -> Tuple[bool, Optional[str]]:
-        """批量更新配置
+        """批量更新配置：全部解析并校验通过才一起写入，有一项不合法就一项都不改
+
+        以前逐项写入，第三项不合法时前两项已经改进了内存里的配置对象（文件没写，内存与文件
+        从此不一致，下一次任何保存都会把它们一起落盘）。
 
         Args:
             config_obj: 配置对象实例
@@ -717,14 +808,24 @@ class ConfigService:
         Returns:
             Tuple[bool, Optional[str]]: (是否成功, 错误消息)
         """
+        existing = config_obj.model_dump()
+        staged: Dict[str, Any] = {}
         for key, value in configs.items():
-            if key not in config_obj.model_dump():
+            if key not in existing:
                 return False, f"配置项不存在: {key}"
+            try:
+                ok, parsed, message = ConfigService.parse_config_value(config_obj, key, value)
+                if not ok:
+                    return False, message
+                problem = ConfigService.check_config_value(type(config_obj), key, parsed)
+            except Exception as e:
+                return False, f"设置配置值时发生错误: {e}"
+            if problem:
+                return False, problem
+            staged[key] = parsed
 
-            success, message = ConfigService.set_config_value(config_obj, key, value)
-            if not success:
-                return False, message
-
+        for key, parsed in staged.items():
+            setattr(config_obj, key, parsed)
         return True, None
 
     @staticmethod

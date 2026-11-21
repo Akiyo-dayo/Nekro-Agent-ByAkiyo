@@ -1,6 +1,11 @@
 {
   "title": "实例配额",
   "subtitle": "按实例查看并设置每频道每日 AI 回复上限，同时看清此刻的沙盒并发占用。",
+  "layerHint": {
+    "text": "这里是租户对自己群的回复配额（自限，按回复条数）；平台方给每个群 / 私聊的每日额度在「",
+    "channelQuotaLink": "频道额度",
+    "after": "」页——两层都放行才回复。"
+  },
   "stats": {
     "globalCapacity": "全局并发容量",
     "globalActive": "并发占用",

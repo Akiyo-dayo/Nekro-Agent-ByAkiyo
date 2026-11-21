@@ -19,6 +19,7 @@ AI 在使用此功能时被要求保持谨慎和公正，避免滥用。
 from pydantic import Field
 
 from nekro_agent.adapters.onebot_v11.core.bot import get_bot_by_chat_key
+from nekro_agent.adapters.onebot_v11.core.channel import NonNumericChannelIdError, parse_numeric_target_id
 from nekro_agent.api import core, i18n, message
 from nekro_agent.api.plugin import (
     ConfigBase,
@@ -27,9 +28,8 @@ from nekro_agent.api.plugin import (
     SandboxMethodType,
 )
 from nekro_agent.api.schemas import AgentCtx
-from nekro_agent.services.plugin.scope_guard import require_own_chat_key
-from nekro_agent.core.config import config
 from nekro_agent.schemas.chat_message import ChatType
+from nekro_agent.services.plugin.scope_guard import require_own_chat_key, require_same_tenant_chat_key
 
 plugin = NekroPlugin(
     name="风纪委员",
@@ -61,6 +61,7 @@ class JudgementConfig(ConfigBase):
         title="最大禁言时长（秒）",
         description="单次禁言的最大时长，超过此时长将被拒绝",
         json_schema_extra=ExtraField(
+            tenant_may_only_lower=True,
             i18n_title=i18n.i18n_text(
                 zh_CN="最大禁言时长（秒）",
                 en_US="Max Mute Duration (seconds)",
@@ -145,13 +146,31 @@ async def mute_user(_ctx: AgentCtx, chat_key: str, user_qq: str, duration: int, 
         core.logger.error(f"禁言功能不支持 {chat_type} 的频道类型")
         return f"禁言功能不支持 {chat_type} 的频道类型"
 
-    # 发送禁言报告给管理员
+    # 群号必须在发管理员报告**之前**取出来：频道标识脏到取不出群号时禁言注定失败，
+    # 不该先给管理员发一份「已执行禁言」的报告。
+    try:
+        group_id = parse_numeric_target_id(_ctx.channel_id or "")
+    except NonNumericChannelIdError as e:
+        core.logger.error(f"禁言失败：无法从频道标识取到群号: {e}")
+        return f"禁言失败：{e}"
+
+    # 发送禁言报告给管理员。频道归属必须先按当前会话的租户校验：租户能把这个配置
+    # 改成任意频道（包括别的租户的群），不校验就等于让自己的 Bot 往别人的群里发报告。
+    # 校验不过只跳过报告，禁言本身照常执行，返回给模型的结果也不提报告频道。
     if config_judgement.ENABLE_ADMIN_REPORT and config_judgement.ADMIN_CHAT_KEY:
-        await message.send_text(
-            config_judgement.ADMIN_CHAT_KEY,
-            f"[{chat_key}] 执行禁言用户 [qq:{user_qq}] {duration} 秒 (来自 {_ctx.chat_key})\n理由: {report}",
-            _ctx,
-        )
+        admin_chat_key = config_judgement.ADMIN_CHAT_KEY
+        try:
+            await require_same_tenant_chat_key(_ctx, admin_chat_key)
+        except ValueError:
+            core.logger.warning(
+                f"禁言报告频道与当前会话不在同一租户，已跳过: 会话={chat_key}, 目标={admin_chat_key}",
+            )
+        else:
+            await message.send_text(
+                admin_chat_key,
+                f"[{chat_key}] 执行禁言用户 [qq:{user_qq}] {duration} 秒 (来自 {_ctx.chat_key})\n理由: {report}",
+                _ctx,
+            )
 
     # 检查禁言时长限制
     if duration > config_judgement.MAX_MUTE_DURATION:
@@ -161,7 +180,7 @@ async def mute_user(_ctx: AgentCtx, chat_key: str, user_qq: str, duration: int, 
         # 执行禁言操作
         bot = await get_bot_by_chat_key(_ctx.chat_key)
         await bot.set_group_ban(
-            group_id=int(chat_id),
+            group_id=group_id,
             user_id=int(user_qq),
             duration=duration,
         )

@@ -26,6 +26,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from nekro_agent.adapters.onebot_v11.core.bot import get_bot_by_chat_key
+from nekro_agent.adapters.onebot_v11.core.channel import is_numeric_channel_id, parse_numeric_target_id
 from nekro_agent.api import i18n, schemas
 from nekro_agent.api.plugin import (
     ConfigBase,
@@ -139,10 +140,11 @@ async def set_bot_group_card(ctx: schemas.AgentCtx, card_name: str) -> None:
     try:
         # channel_id 形如 `group_{group_id}`。原先的 `ctx.chat_key.split("_")` 兜底分支已删除：
         # chat_key 前缀 `onebot_v11` 自身含下划线，会切出 3 段并直接 ValueError，
-        # 它从来就不是一条可用的回退路径。
-        chat_type, _, chat_id = (ctx.channel_id or "").partition("_")
-
-        if chat_type != "group" or not chat_id:
+        # 它从来就不是一条可用的回退路径。现在直接在频道标识上判形态：不是严格的
+        # `group_<数字>` 就安静跳过——改群名片只是锦上添花，脏频道行不该刷出 error。
+        channel_id = ctx.channel_id or ""
+        if not channel_id.startswith("group_") or not is_numeric_channel_id(channel_id):
+            logger.debug(f"频道标识不是 group_<群号> 形态，跳过群名片设置: {channel_id!r}")
             return
 
         bot = await get_bot_by_chat_key(ctx.chat_key)
@@ -151,7 +153,7 @@ async def set_bot_group_card(ctx: schemas.AgentCtx, card_name: str) -> None:
         final_card = f"{config.NICKNAME_PREFIX}{card_name}"
 
         await bot.set_group_card(
-            group_id=int(chat_id),
+            group_id=parse_numeric_target_id(channel_id),
             user_id=user_id,
             card=final_card,
         )

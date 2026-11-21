@@ -11,6 +11,10 @@ import aiofiles
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import TIMER_ONE_SHOT_PERSIST_PATH
 from nekro_agent.services.message_service import message_service
+from nekro_agent.services.ops_agent.triggers import TRIGGER_KIND_TIMER, RoundTrigger
+from nekro_agent.services.plugin.scope import plugin_effective_in_chat
+from nekro_agent.services.timer.constants import TIMER_PLUGIN_KEY
+from nekro_agent.services.timer.reminder_message import build_reminder_result
 
 logger = get_sub_logger("timer")
 class TimerTask:
@@ -122,9 +126,13 @@ class TimerService:
                 lag = now - trigger_time
                 if 0 <= lag <= self._MISFIRE_GRACE_SECONDS and event_desc:
                     try:
-                        await message_service.push_system_message(
+                        await message_service.push_untrusted_message(
                             chat_key=chat_key,
-                            agent_messages=f"⏰ 定时提醒（补发）：{event_desc}",
+                            result=build_reminder_result(
+                                description=event_desc,
+                                task_id=task_id,
+                                is_misfire=True,
+                            ),
                             trigger_agent=True,
                         )
                         triggered += 1
@@ -243,7 +251,7 @@ class TimerService:
 
         # 如果触发时间为0，立即触发频道
         if trigger_time == 0:
-            await message_service.schedule_agent_task(chat_key)
+            await message_service.schedule_agent_task(chat_key, trigger=RoundTrigger(kind=TRIGGER_KIND_TIMER))
             return True
 
         now = int(time.time())
@@ -356,16 +364,32 @@ class TimerService:
 
     async def _execute_task(self, task: TimerTask) -> None:
         if task.callback:
+            # 带回调的是系统定时器（例如节日祝福自己的），它没有普通定时任务的频道语义，
+            # 由回调自己判全局开关与按频道生效，核心不替它判 timer 插件。
             await task.callback()
-        elif task.event_desc:
-            system_message = f"⏰ 定时提醒：{task.event_desc}"
-            await message_service.push_system_message(
+            return
+
+        # 普通提醒 / 自唤醒都是 `timer` 插件经 `nekro_agent/api/timer.py` 排的：
+        # 该插件在这个频道已不生效时跳过这一次。任务照常从队列与磁盘移除，
+        # 下一次循环不会重试，也不调度 Agent。
+        if not await plugin_effective_in_chat(TIMER_PLUGIN_KEY, task.chat_key):
+            logger.info(f"timer 插件在该频道未生效，跳过本次定时任务: chat_key={task.chat_key} task_id={task.task_id}")
+            return
+
+        if task.event_desc:
+            # `event_desc` 是设置提醒时写下的字符串，可能被注入过：走不可信通道，
+            # 让模型看到的是"一段数据"，而不是"系统下的指令"。可信摘要由构造器写死。
+            await message_service.push_untrusted_message(
                 chat_key=task.chat_key,
-                agent_messages=system_message,
+                result=build_reminder_result(
+                    description=task.event_desc,
+                    task_id=task.task_id,
+                    is_misfire=False,
+                ),
                 trigger_agent=True,
             )
         else:
-            await message_service.schedule_agent_task(task.chat_key)
+            await message_service.schedule_agent_task(task.chat_key, trigger=RoundTrigger(kind=TRIGGER_KIND_TIMER))
 
     async def _timer_loop(self):
         """定时器循环"""

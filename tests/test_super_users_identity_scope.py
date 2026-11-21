@@ -711,7 +711,7 @@ class TestQuotaThroughTheMessageEntry:
         scheduled: List[str] = []
         notices: List[str] = []
 
-        async def _schedule(*, message: Any, ctx: Any = None) -> None:  # noqa: ARG001
+        async def _schedule(*, message: Any, ctx: Any = None, bypass_channel_quota: bool = False, **_kwargs: Any) -> None:  # noqa: ARG001
             scheduled.append(message.chat_key)
 
         class _Adapter:

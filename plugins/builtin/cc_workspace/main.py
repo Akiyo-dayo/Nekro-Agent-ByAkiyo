@@ -23,11 +23,10 @@
 import asyncio
 import json
 import secrets
-import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, AsyncGenerator, Dict, List, Literal, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, Dict, List, Literal, Optional, Tuple
 
 import aiodocker
 from pydantic import BaseModel
@@ -47,11 +46,10 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.models.db_workspace_comm_log import DBWorkspaceCommLog
+from nekro_agent.schemas.workspace import CommLogEntry
 from nekro_agent.services.agent.upstream_redaction import redact_cc_failure_text
-from nekro_agent.services.message_service import message_service
 from nekro_agent.services.plugin.task import AsyncTaskHandle, TaskCtl
 from nekro_agent.services.plugin.task import task as task_api
-from nekro_agent.services.resources import workspace_resource_service
 from nekro_agent.services.system_broadcast import (
     WorkspaceCcActiveEvent,
     WorkspaceCcRuntimeStatusEvent,
@@ -68,10 +66,12 @@ from nekro_agent.tools.untrusted_content import (
     sanitize_block_text,
     sanitize_inline_text,
 )
-from nekro_agent.schemas.workspace import CommLogEntry
 
 from .plugin import cc_config, plugin
 from .prompt_envelope import CcPromptEnvelope
+
+if TYPE_CHECKING:
+    from nekro_agent.services.ssh_gateway.lease import SshLease
 
 _TASK_TYPE = "cc_delegate"
 _CC_COMMAND_PERMISSION = CommandPermission.SUPER_USER
@@ -116,7 +116,138 @@ def _format_workspace_status(status: str) -> str:
         "stopped": "已停止",
         "failed": "启动失败",
         "deleting": "删除中",
+        "transitioning": "启停中",
     }.get(status, status or "未知")
+
+
+def _ssh_user_whitelist_non_empty() -> bool:
+    """用户白名单里有没有人；空 = 用户服务器功能关"""
+    return any(str(item).strip() for item in (app_config.SSH_GATEWAY_USER_ACCOUNTS or []))
+
+
+async def _ssh_servers_prompt(ctx: schemas.AgentCtx, workspace: Optional[DBWorkspace]) -> str:
+    """给主 Agent 的服务器清单与用法提示；条件不满足时返回空串
+
+    先判总开关，关着时不查任何库。只写别名与归属，不写主机、端口、备注——容器与提示词
+    都不需要知道目标地址。本轮能用哪些行用与租约同一口径的 `compute_chat_coverage` 预判。
+    """
+    if not app_config.SSH_GATEWAY_ENABLED or workspace is None:
+        return ""
+
+    from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
+    from nekro_agent.services.ssh_gateway import constants as ssh_constants
+
+    rows = await (
+        DBWsSshCredential.filter(workspace_id=workspace.id)
+        .exclude(status=ssh_constants.STATUS_DISABLED)
+        .order_by("id")
+    )
+    whitelist_non_empty = _ssh_user_whitelist_non_empty()
+    if not rows and not whitelist_non_empty:
+        return ""
+
+    lines: List[str] = ["[SSH 服务器]"]
+    if rows:
+        lines.append("工作区上的服务器：")
+        for row in rows:
+            owner = "平台方" if row.owner_kind == ssh_constants.OWNER_PLATFORM else f"用户 {sanitize_inline_text(str(row.owner_account or ''), 64)}"
+            lines.append(f"- {sanitize_inline_text(str(row.alias or ''), 64)}（{owner}）")
+    else:
+        lines.append("工作区上的服务器：无")
+
+    usable_aliases: List[str] = []
+    if rows:
+        from nekro_agent.models.db_chat_channel import DBChatChannel
+        from nekro_agent.services.ssh_gateway.authz import compute_chat_coverage
+
+        channel = ctx.db_chat_channel
+        if channel is None and ctx.from_chat_key:
+            channel = await DBChatChannel.get_or_none(chat_key=ctx.from_chat_key)
+        if channel is not None:
+            coverage = await compute_chat_coverage(int(workspace.id), channel)
+            usable_aliases = [
+                sanitize_inline_text(str(row.alias or ""), 64)
+                for row in rows
+                if int(row.id) in coverage.credential_ids
+            ]
+    if usable_aliases:
+        lines.append("本轮能用的服务器：" + "、".join(usable_aliases))
+    else:
+        lines.append("本轮没有可用的服务器（只有凭据主人本人叫醒的一轮才能用）")
+    lines.append("要排查就用 delegate_to_cc 交给 CC，任务书里写别名，不要写密码。")
+    if whitelist_non_empty:
+        lines.append(
+            "白名单用户给出自己服务器的凭据时，可以用 register_ssh_server 登记；"
+            "可以建议他以后私聊发；帮不帮由你判断；登记后不要复述凭据。",
+        )
+    return "\n" + "\n".join(lines) + "\n"
+
+
+async def _scrub_task_prompt_for_credentials(
+    workspace: DBWorkspace,
+    chat_key: str,
+    task_prompt: str,
+) -> str:
+    """提交前把任务书里出现的凭据原文换成占位；闸关时一次库都不查
+
+    用这个工作区上全部解得开的凭据行（不限归属、不限状态）与本频道待清理的片段做
+    精确替换。替换发生时记一条 `scrub` 审计并打一条 warning，两者都不含原文。
+    """
+    if not app_config.SSH_GATEWAY_ENABLED:
+        return task_prompt
+
+    from nekro_agent.models.db_ws_ssh_audit import DBWsSshAudit
+    from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
+    from nekro_agent.services.ssh_gateway import constants as ssh_constants
+    from nekro_agent.services.ssh_gateway.scrub import (
+        pending_fragments,
+        replace_secrets,
+        secret_fragments,
+    )
+    from nekro_agent.services.ssh_gateway.secrets import decrypt_secret
+
+    fragments: List[str] = []
+    rows = await DBWsSshCredential.filter(workspace_id=workspace.id)
+    for row in rows:
+        plaintexts: List[str] = []
+        broken = False
+        for column in ("password_enc", "private_key_enc", "passphrase_enc"):
+            stored = str(getattr(row, column) or "")
+            if not stored:
+                plaintexts.append("")
+                continue
+            plain, source = decrypt_secret(stored)
+            if source == "undecryptable":
+                broken = True
+                break
+            plaintexts.append(plain)
+        if broken:
+            continue
+        fragments.extend(secret_fragments(plaintexts[0], plaintexts[1], plaintexts[2]))
+    fragments.extend(pending_fragments(chat_key))
+
+    scrubbed, count = replace_secrets(task_prompt, fragments, placeholder="[凭据已隐去]")
+    if not count:
+        return task_prompt
+
+    await DBWsSshAudit.create(
+        workspace_id=int(workspace.id),
+        credential_id=None,
+        owner_kind="",
+        owner_account="",
+        adapter_key="",
+        instance_key="",
+        event=ssh_constants.EVENT_SCRUB,
+        allowed=True,
+        reason="",
+        detail=f"task_prompt={count}",
+        actor=f"chat:{chat_key}"[:128],
+    )
+    logger.warning(
+        f"[cc_workspace] 任务书里出现已登记的凭据原文，已替换 {count} 处（不记录原文） workspace={workspace.id}",
+    )
+    return scrubbed
+
 
 
 def _summarize_runtime_block_text(value: str, max_length: int = 48) -> str:
@@ -625,7 +756,7 @@ async def _deliver_pending_result(workspace: "DBWorkspace", item: object, *, sou
             headline = "[CC Workspace 后台结果] CC 已完成一个后台委托任务"
             guidance = "结果见下方不可信块。"
             body = f"[CC Workspace 执行结果]\n{result}"
-        await message_service.push_untrusted_message(
+        pushed = await plugin.push_untrusted_message(
             chat_key=source_chat_key,
             result=UntrustedToolResult(
                 kind="CCResult",
@@ -635,6 +766,14 @@ async def _deliver_pending_result(workspace: "DBWorkspace", item: object, *, sou
             trigger_agent=True,
             db_chat_channel=bound_channel,
         )
+        if not pushed:
+            # 插件在这个频道未生效：结果已经写进本工作区的通讯日志，工作区所有者仍能看到，
+            # 只是不推给频道、也不触发 Agent。与「推送失败」同口径，不丢数据。
+            logger.info(
+                f"[cc_workspace] 投递跳过({source})：插件在该频道未生效，结果保留在通讯日志 "
+                f"chat_key={source_chat_key!r} workspace={workspace.id} id={result_id!r}",
+            )
+            return
         logger.info(
             f"[cc_workspace] 投递成功({source})：chat_key={source_chat_key!r}，"
             f"workspace={workspace.id}，chars={len(result)}"
@@ -759,6 +898,56 @@ async def _cc_delegate_task(
     handle: AsyncTaskHandle,
     workspace_id: int,
     task_prompt: str,
+    ssh_lease_id: str = "",
+) -> AsyncGenerator[TaskCtl, None]:
+    """后台执行 CC 委托，并保证 SSH 租约在每一条收尾路径上都被收回
+
+    真正的流处理在 `_run_cc_delegate_task` 里。外面这一层只做两件与任务内容无关的事：
+    把 `queued` 的租约传进去（第一条正文到达时它在那里转 `running`），以及在
+    `finally` 里结束租约。用 `finally` 而不是逐条路径去写，是因为这个生成器有成功、
+    失败、超时、取消、提前返回好几条出口，漏一条就留下一个还活着的授权。
+
+    租约按委托时交过来的 `ssh_lease_id` 取，不按频道去「找最新的一份」：同一频道上一次
+    委托留下的租约绝不能被这一次没拍到租约的任务认领。终态（成功、失败、取消）一出现就
+    先结束租约再交出去：任务调度在拿到终态后直接退出循环，不会再把生成器跑到 `finally`，
+    等它被回收时才结束会把所有结束原因都记成「取消」。
+    """
+    from nekro_agent.services.ssh_gateway.lease import LEASE_STATE_QUEUED, end_lease, get_lease
+
+    lease = get_lease(ssh_lease_id) if ssh_lease_id else None
+    if lease is not None and (lease.state != LEASE_STATE_QUEUED or int(lease.workspace_id) != int(workspace_id)):
+        # 交过来的不是一份待生效的租约（已经被顶替、过期或不属于这个工作区）：不认
+        lease = None
+    end_reason = "done"
+    try:
+        async for ctl in _run_cc_delegate_task(handle, workspace_id, task_prompt, lease):
+            signal = ctl.signal.value
+            if signal == "cancel":
+                end_reason = "cancelled"
+            elif signal == "fail":
+                end_reason = "timeout" if "超时" in ctl.message else "failed"
+            if lease is not None and signal in {"success", "fail", "cancel"}:
+                end_lease(lease.lease_id, end_reason)
+            yield ctl
+    except asyncio.CancelledError:
+        end_reason = "cancelled"
+        raise
+    except GeneratorExit:
+        end_reason = "cancelled"
+        raise
+    except Exception:
+        end_reason = "failed"
+        raise
+    finally:
+        if lease is not None:
+            end_lease(lease.lease_id, end_reason)
+
+
+async def _run_cc_delegate_task(
+    handle: AsyncTaskHandle,
+    workspace_id: int,
+    task_prompt: str,
+    lease: Optional["SshLease"] = None,
 ) -> AsyncGenerator[TaskCtl, None]:
     """后台通过 SSE 流式与 CC Sandbox 通信，完成后向主 Agent 推送结果"""
     workspace = await DBWorkspace.get_or_none(id=workspace_id)
@@ -776,6 +965,24 @@ async def _cc_delegate_task(
         yield TaskCtl.fail(f"工作区 '{workspace.name}' 当前状态为 {workspace.status}，无法执行任务")
         return
 
+    # 向 CC 发消息前统一过判据：`direct` 模式下不能拿平台方凭据的工作区在这里就给出解释，
+    # 而不是让用户从 `claude` CLI 的鉴权失败里去猜
+    from nekro_agent.services.workspace.credential_policy import (
+        PlatformCredentialWithheldError,
+        prepare_cc_dispatch,
+    )
+
+    try:
+        _env_vars = await prepare_cc_dispatch(workspace)
+    except PlatformCredentialWithheldError as e:
+        yield TaskCtl.fail(str(e))
+        return
+    except Exception as e:  # noqa: BLE001 - 资源解密失败等：与下面主流程的意外错误同一口径、同样脱敏
+        error_text = _redact_cc_text(str(e))
+        logger.warning(f"[cc_workspace] 准备 CC 调用失败: {error_text} workspace={workspace_id}")
+        yield TaskCtl.fail(f"CC Workspace 发生意外错误: {error_text}")
+        return
+
     client = CCSandboxClient(workspace)
     _queued_messages: list[str] = []
     chunks: list[str] = []
@@ -790,6 +997,23 @@ async def _cc_delegate_task(
         current_time=_now_str,
         task_body=task_prompt,
     )
+    # 只有拍到了租约、且总开关还开着时才写授权别名：总开关关着时的正文必须与改造前逐字一致。
+    # 别名按这份租约覆盖的行现查（不读上一次委托留下的存储），读失败只当没有授权说明。
+    if lease is not None and app_config.SSH_GATEWAY_ENABLED:
+        try:
+            from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
+
+            _aliases = sorted(
+                str(alias)
+                for alias in await DBWsSshCredential.filter(
+                    id__in=list(lease.credential_ids),
+                ).values_list("alias", flat=True)
+                if str(alias)
+            )
+            if _aliases:
+                _envelope.ssh_servers = tuple(_aliases)
+        except Exception as e:  # noqa: BLE001 - 少一段说明不该让任务失败
+            logger.warning(f"[cc_workspace] 读取 SSH 授权服务器别名失败（本次不写授权说明）: {e}")
     enriched_prompt = _envelope.to_prompt()
 
     async def _publish_runtime_status(
@@ -864,7 +1088,6 @@ async def _cc_delegate_task(
                 queue_length=queued_event.queue_length,
             )
 
-        _env_vars = await workspace_resource_service.resolve_workspace_resources_to_env(workspace.id)
         # 使用 asyncio.wait_for 保护每次 __anext__() 等待：
         _cc_data_timeout = cc_config.CC_DATA_TIMEOUT
         # _cc_data_timeout 仅在"无任何 data: 事件"时触发，keep-alive (": ping") 不计入，
@@ -927,6 +1150,13 @@ async def _cc_delegate_task(
                     "请告知用户 CC 当前不可用，建议稍后重试。不要立即自动重试！"
                 )
                 return
+
+            # 第一条不是排队事件的数据到了：CC 已经真正开始跑这个任务，租约这时才生效。
+            # `queued` 阶段容器里跑的是别人的任务，授权不能提前生效。
+            if lease is not None and getattr(lease, "state", "") == "queued":
+                from nekro_agent.services.ssh_gateway.lease import mark_running
+
+                mark_running(str(getattr(lease, "lease_id", "")))
 
             if handle.is_cancelled:
                 try:
@@ -1142,9 +1372,17 @@ async def cc_workspace_status(_ctx: schemas.AgentCtx) -> str:
         suffix=" Long-lived rules for NA's own reasoning and decision-making.",
     )
 
+    # 网关开着时才查库；闸关或无行且白名单为空时返回空串，注入内容与改造前逐字一致
+    ssh_hint = await _ssh_servers_prompt(_ctx, workspace)
+
     # ── 状态2：已绑定工作区，但沙盒未运行 ──────────────────────────────────
     if workspace.status != "active":
-        status_label = {"stopped": "Stopped", "failed": "Start failed", "deleting": "Deleting"}.get(workspace.status, workspace.status)
+        status_label = {
+            "stopped": "Stopped",
+            "failed": "Start failed",
+            "deleting": "Deleting",
+            "transitioning": "Starting/stopping",
+        }.get(workspace.status, workspace.status)
         error_hint = f" (error: {workspace.last_error[:50]}...)" if workspace.last_error else ""
         if workspace.last_error:
             action_hint = "Ask the user to check the workspace management page."
@@ -1157,6 +1395,7 @@ async def cc_workspace_status(_ctx: schemas.AgentCtx) -> str:
             f"{action_hint}\n"
             f"{shared_rules_hint}"
             f"{na_rules_hint}"
+            f"{ssh_hint}"
         )
 
     # ── 状态3：工作区正常运行 ────────────────────────────────────────────────
@@ -1186,6 +1425,7 @@ async def cc_workspace_status(_ctx: schemas.AgentCtx) -> str:
             f"The container is unreachable. Ask the user to check the workspace management page and restart the container. CC tools are currently unavailable.\n"
             f"{shared_rules_hint}"
             f"{na_rules_hint}"
+            f"{ssh_hint}"
         )
 
     # CC 应用状态：仅在异常时提示
@@ -1369,6 +1609,7 @@ async def cc_workspace_status(_ctx: schemas.AgentCtx) -> str:
             "- Avoid terms like `workspace` or `container` in user-facing replies.\n"
         )
 
+    result += ssh_hint
     return result
 
 
@@ -1536,8 +1777,9 @@ async def start_cc_sandbox(_ctx: schemas.AgentCtx) -> str:
         )
 
     # 确定镜像名称并检查本地是否存在
-    image_name = workspace.sandbox_image or app_config.CC_SANDBOX_IMAGE
-    image_tag = workspace.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG
+    from nekro_agent.services.workspace.container import effective_sandbox_image
+
+    image_name, image_tag = effective_sandbox_image(workspace)
     image = f"{image_name}:{image_tag}"
 
     image_exists = await _check_sandbox_image_exists(image)
@@ -1667,6 +1909,10 @@ async def delegate_to_cc(_ctx: schemas.AgentCtx, task_prompt: str) -> str:
             "请等待当前任务完成，或使用 `cancel_cc_task` 取消后再委托新任务。"
         )
 
+    # 提交前扫一遍任务书：工作区上已登记的凭据原文与本频道本轮的凭据片段不许进 CC。
+    # 闸关时这个函数直接返回原值，一次库都不查。
+    task_prompt = await _scrub_task_prompt_for_credentials(workspace, chat_key, task_prompt)
+
     # 持久化 task_prompt，供结果回传时提醒 NA 本次任务的原始目标
     await plugin.store.set(chat_key=chat_key, store_key="last_cc_task_prompt", value=task_prompt)
 
@@ -1728,9 +1974,11 @@ async def delegate_to_cc(_ctx: schemas.AgentCtx, task_prompt: str) -> str:
         body = "\n\n".join(section for section in sections if section)
         if not body:
             # 只有“中止且没存下任务描述”会走到这里：没有外部内容，引导语照旧作为系统消息
-            await message_service.push_system_message(chat_key=chat_key, agent_messages=guidance, trigger_agent=True)
+            pushed = await plugin.push_system_message(chat_key=chat_key, agent_messages=guidance, trigger_agent=True)
+            if not pushed:
+                logger.info(f"[cc_workspace] 终态通知未投递：插件在该频道未生效 chat_key={chat_key!r}")
             return
-        await message_service.push_untrusted_message(
+        pushed = await plugin.push_untrusted_message(
             chat_key=chat_key,
             result=UntrustedToolResult(
                 kind="CCTask",
@@ -1739,11 +1987,42 @@ async def delegate_to_cc(_ctx: schemas.AgentCtx, task_prompt: str) -> str:
             ),
             trigger_agent=True,
         )
+        if not pushed:
+            logger.info(f"[cc_workspace] 终态结果未投递：插件在该频道未生效 chat_key={chat_key!r}")
 
     def on_terminal(ctl: TaskCtl) -> None:
         asyncio.create_task(_push_result(ctl))
 
+    # 网关开着时，按本轮触发快照给这个 CC 任务拍一张租约。总开关关着时整段跳过：
+    # 一次库都不查，行为与改造前一致。拍不到覆盖（名单外的人、混入了别人的消息、
+    # 平台方服务器为空等）就不拍，后面的任务照样跑，只是连不上服务器。拍租约时同一频道
+    # 上一次留下的未结束租约一律先结束（`create_lease` 里做），这一次没拍到也一样。
+    lease = None
+    if app_config.SSH_GATEWAY_ENABLED:
+        try:
+            from nekro_agent.services.ssh_gateway.authz import Coverage, compute_chat_coverage
+            from nekro_agent.services.ssh_gateway.lease import create_lease
+
+            db_channel = await DBChatChannel.get_or_none(chat_key=chat_key)
+            coverage = (
+                await compute_chat_coverage(workspace.id, db_channel) if db_channel is not None else Coverage()
+            )
+            lease = create_lease(
+                workspace_id=workspace.id,
+                task_ref=f"cc_delegate:{task_id}",
+                origin="chat",
+                coverage=coverage,
+                chat_key=chat_key,
+                adapter_key=str(getattr(db_channel, "adapter_key", "") or ""),
+                instance_key=str(getattr(db_channel, "instance_key", "") or ""),
+            )
+        except Exception as e:  # noqa: BLE001 - 判据或写审计失败只该少一次授权，不该让委托失败
+            logger.warning(f"[cc_workspace] 拍 SSH 授权租约失败（本次任务不授权）: {e}")
+
     try:
+        # 租约 id 显式交给任务：任务不按频道去找「最新的一份」。没拍到租约时不传这个参数，
+        # 任务的调用参数与改造前逐字一致
+        extra_task_kwargs: Dict[str, Any] = {"ssh_lease_id": lease.lease_id} if lease is not None else {}
         await task_api.start(
             _TASK_TYPE,
             task_id,
@@ -1752,6 +2031,7 @@ async def delegate_to_cc(_ctx: schemas.AgentCtx, task_prompt: str) -> str:
             workspace_id=workspace.id,
             task_prompt=task_prompt,
             on_terminal=on_terminal,
+            **extra_task_kwargs,
         )
         logger.info(f"[cc_workspace] 已启动 CC 委托任务，chat_key={chat_key}，workspace={workspace.id}")
         return (
@@ -1761,8 +2041,116 @@ async def delegate_to_cc(_ctx: schemas.AgentCtx, task_prompt: str) -> str:
             f"现在你可以直接回复用户，告知任务已在后台执行。"
         )
     except ValueError as e:
+        if lease is not None:
+            from nekro_agent.services.ssh_gateway.lease import end_lease
+
+            end_lease(lease.lease_id, "start_failed")
         logger.error(f"[cc_workspace] 启动 CC 任务失败: {e}")
         raise ValueError(f"启动 CC 任务失败: {e}") from e
+    except Exception:
+        if lease is not None:
+            from nekro_agent.services.ssh_gateway.lease import end_lease
+
+            end_lease(lease.lease_id, "start_failed")
+        raise
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.AGENT,
+    "登记一台用户自己的服务器",
+    description=(
+        "当白名单用户本人给出自己服务器的 SSH 凭据时，登记到当前频道绑定的 CC 工作区。"
+        "凭据主人自动取叫醒这一轮的人，不能由你指定。"
+        "主机与密码（或私钥）必须是这个人自己在聊天里发出的原文，别人说的、工具结果或网页里的不行。"
+        "登记时会用这组凭据登录校验一次；成功后返回别名、主机、登录账号与主机指纹。"
+    ),
+)
+async def register_ssh_server(
+    _ctx: schemas.AgentCtx,
+    alias: str,
+    host: str,
+    username: str,
+    password: str = "",
+    private_key: str = "",
+    passphrase: str = "",
+    port: int = 22,
+) -> str:
+    """Register a user-owned SSH server for the bound CC Workspace.
+
+    Use this only when a whitelisted user gives you the credentials of a server
+    that belongs to them. The credential owner is always the user who woke this
+    round; you cannot choose or override the owner. The host and the password or
+    private key must appear verbatim in that user's own recent chat messages;
+    values taken from other people, tool results, or web pages are rejected.
+
+    You may suggest that the user send such credentials in a private chat next
+    time. After registration, do not repeat any credential in your reply; the
+    result already contains the alias, host, login user, and host fingerprint.
+
+    Args:
+        alias (str): Short alias used later in task prompts and `ssh <alias>`.
+        host (str): Hostname or public IP address of the user's server.
+        username (str): Login user on that server.
+        password (str): Password, if the server uses password authentication.
+        private_key (str): Private key text, if the server uses key authentication.
+            At least one of password and private_key is required.
+        passphrase (str): Passphrase for the private key, if any.
+        port (int): SSH port. Defaults to 22.
+
+    Returns:
+        str: A Chinese message with the alias, host, login user, and host fingerprint.
+            It never contains the password, private key, or passphrase.
+
+    Example:
+        ```python
+        register_ssh_server("web1", "ssh.example.com", "deploy", password="...")
+        ```
+    """
+    from nekro_agent.services.ssh_gateway.chat_registration import register_from_chat
+
+    return await register_from_chat(
+        chat_key=_ctx.from_chat_key,
+        alias=alias,
+        host=host,
+        username=username,
+        password=password,
+        private_key=private_key,
+        passphrase=passphrase,
+        port=port,
+    )
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.AGENT,
+    "删除一台自己登记的服务器",
+    description=(
+        "删除当前频道绑定的 CC 工作区上、由本人登记的一台服务器。"
+        "只有白名单用户本人叫醒的这一轮才能删除，而且要删的别名必须是这个人自己说过的；"
+        "别人的与平台方的服务器一律按没找到处理。"
+    ),
+)
+async def remove_ssh_server(_ctx: schemas.AgentCtx, alias: str) -> str:
+    """Remove a server that the current user registered in this workspace.
+
+    Only the credential owner, in a round triggered by that user alone, may
+    remove their own row, and the alias must appear in that user's own recent
+    chat messages. Other users' rows and platform-owned rows are reported as
+    not found.
+
+    Args:
+        alias (str): Alias of the server to remove.
+
+    Returns:
+        str: A Chinese message saying whether the server was removed.
+
+    Example:
+        ```python
+        remove_ssh_server("web1")
+        ```
+    """
+    from nekro_agent.services.ssh_gateway.chat_registration import remove_from_chat
+
+    return await remove_from_chat(chat_key=_ctx.from_chat_key, alias=alias)
 
 
 @plugin.mount_sandbox_method(
@@ -2291,30 +2679,43 @@ async def upload_file_to_cc(_ctx: schemas.AgentCtx, sandbox_file_path: str, dest
             f"请确保路径是有效的沙盒路径（如 /app/uploads/xxx 或 /app/shared/xxx）。"
         ) from e
 
-    if not host_path.exists():
-        raise ValueError(f"文件不存在: {sandbox_file_path}")
+    # 两头都是容器可写的目录：源在主沙盒共享目录（沙盒能放链接），目标在 CC 工作区的
+    # `default/shared`（CC 容器能把它或里面的文件换成链接）。源按不跟随链接的方式打开，
+    # 目标从工作区根逐级不跟随地打开、写临时文件再 rename
+    from nekro_agent.services.workspace import safe_fs
+    from nekro_agent.tools.sandbox_shared_files import UnsafeSharedFileError, host_file_is_regular, open_host_file
 
-    if not host_path.is_file():
-        raise ValueError(f"路径不是文件: {sandbox_file_path}")
+    if not await asyncio.to_thread(host_file_is_regular, Path(host_path)):
+        raise ValueError(f"文件不存在或不是普通文件: {sandbox_file_path}")
 
-    ws_shared_dir = WorkspaceService.get_workspace_dir(workspace.id) / "default" / "shared"
-    ws_shared_dir.mkdir(parents=True, exist_ok=True)
-
-    target_name = dest_name.strip() if dest_name.strip() else host_path.name
+    target_name = dest_name.strip() if dest_name.strip() else Path(host_path).name
     # 安全处理：强制取纯文件名，防止路径穿越（如 ../../etc/passwd）
-    target_name = Path(target_name).name
-    if not target_name:
+    target_name = Path(target_name.replace("\\", "/")).name
+    if not target_name or target_name in (".", ".."):
         raise ValueError("目标文件名无效")
-    target_path = ws_shared_dir / target_name
+
+    def _copy_into_workspace() -> None:
+        # 两头都按上限走：源读超了、或者写进去的字节数超了，都在那一刻停下（见 `_CC_TRANSFER_MAX_BYTES`）
+        with open_host_file(Path(host_path), max_bytes=_CC_TRANSFER_MAX_BYTES) as source, safe_fs.open_dir(
+            WorkspaceService.get_workspace_dir(workspace.id),
+            ("default", "shared"),
+            create=True,
+            replace_links=True,
+        ) as shared_dir:
+            shared_dir.write_stream(target_name, source, mode=0o644, max_bytes=_CC_TRANSFER_MAX_BYTES)
 
     try:
-        shutil.copy2(str(host_path), str(target_path))
+        await asyncio.to_thread(_copy_into_workspace)
+    except safe_fs.FileTooLargeError as e:
+        raise ValueError(f"文件超过 {_CC_TRANSFER_MAX_BYTES // 1024 // 1024} MB 上限，没有复制: {sandbox_file_path}") from e
+    except (UnsafeSharedFileError, safe_fs.UnsafePathError) as e:
+        raise ValueError(f"文件复制失败: {e}") from e
     except Exception as e:
         logger.error(f"[cc_workspace] upload_file_to_cc 失败: {e}")
         raise ValueError(f"文件复制失败: {e}") from e
 
     cc_path = f"/workspace/default/shared/{target_name}"
-    logger.info(f"[cc_workspace] upload_file_to_cc: {host_path} → {target_path} (cc_path={cc_path})")
+    logger.info(f"[cc_workspace] upload_file_to_cc: {host_path} → 工作区 {workspace.id} (cc_path={cc_path})")
     return cc_path
 
 
@@ -2356,52 +2757,77 @@ async def download_file_from_cc(_ctx: schemas.AgentCtx, cc_file_path: str, dest_
     if workspace is None:
         raise ValueError("当前频道未绑定任何 CC Workspace，无法下载文件。请先绑定工作区。")
 
-    ws_root = WorkspaceService.get_workspace_dir(workspace.id) / "default"
+    from nekro_agent.services.workspace import safe_fs
+
     cc_path = cc_file_path.strip()
 
+    # 只认 CC 的工作目录 `/workspace/default` 下的文件。工作区根下的其余条目（`settings.json`
+    # 里的中继令牌、`.claude/`、`.claude_home/` 里的网关私钥与会话）都是 NA 写给容器的配置，
+    # 不该被主沙盒取走再发进聊天；`default/.mcp.json` 与 `default/.claude/` 同理
     if cc_path.startswith("/workspace/default/"):
         rel = cc_path[len("/workspace/default/"):]
-        src_path = (ws_root / rel).resolve()
     elif cc_path.startswith("/workspace/"):
-        rel = cc_path[len("/workspace/"):]
-        src_path = (WorkspaceService.get_workspace_dir(workspace.id) / rel).resolve()
+        raise ValueError(f"只能下载 /workspace/default/ 下的文件: {cc_file_path}")
     elif "/" in cc_path or cc_path.startswith("./"):
-        src_path = (ws_root / cc_path).resolve()
+        rel = cc_path
     else:
-        src_path = (ws_root / "shared" / cc_path).resolve()
-
-    # 安全检查：路径 resolve 后必须在 workspace 目录内
-    ws_base = WorkspaceService.get_workspace_dir(workspace.id).resolve()
+        rel = f"shared/{cc_path}"
     try:
-        src_path.relative_to(ws_base)
-    except ValueError as e:
+        parts = safe_fs.split_rel(rel)
+    except safe_fs.UnsafePathError as e:
         raise ValueError(f"非法路径（路径穿越）: {cc_file_path}") from e
+    if not parts:
+        raise ValueError(f"路径不是文件: {cc_file_path}")
+    if parts[0] in _CC_DOWNLOAD_DENIED_TOP_LEVEL:
+        raise ValueError(f"这个文件是 NekroAgent 写给 CC 的配置，不能下载: {cc_file_path}")
 
-    if not src_path.exists():
+    target_name = dest_name.strip() if dest_name.strip() else parts[-1]
+    # 目标名只取纯文件名：`../x` 或绝对路径不能把副本落到共享目录外面
+    target_name = Path(target_name.replace("\\", "/")).name
+    if not target_name or target_name in (".", ".."):
+        raise ValueError("目标文件名无效")
+
+    shared_dir: Path = _ctx.fs.shared_path
+    ws_base = WorkspaceService.get_workspace_dir(workspace.id)
+
+    def _copy_into_sandbox() -> None:
+        # 源：从工作区根逐级不跟随链接地打开（CC 容器能在工作目录里放指向宿主任意位置的链接）；
+        # 目标：主沙盒共享目录（沙盒能放链接），在目录句柄上写临时文件再 rename
+        with safe_fs.open_dir(ws_base, ("default", *parts[:-1])) as source_dir:
+            with source_dir.open_read(parts[-1], max_bytes=_CC_TRANSFER_MAX_BYTES) as source, safe_fs.open_dir(
+                shared_dir,
+            ) as target_dir:
+                target_dir.write_stream(target_name, source, mode=0o644, max_bytes=_CC_TRANSFER_MAX_BYTES)
+
+    try:
+        await asyncio.to_thread(_copy_into_sandbox)
+    except safe_fs.FileTooLargeError as e:
+        raise ValueError(f"文件超过 {_CC_TRANSFER_MAX_BYTES // 1024 // 1024} MB 上限，没有复制: {cc_file_path}") from e
+    except FileNotFoundError as e:
         raise ValueError(
             f"CC Workspace 中文件不存在: {cc_file_path}\n"
             f"请检查路径是否正确。支持的格式：绝对路径 /workspace/default/...、"
             f"相对路径 shared/...、或纯文件名（在 shared/ 中查找）。"
-        )
-
-    if not src_path.is_file():
-        raise ValueError(f"路径不是文件: {cc_file_path}")
-
-    shared_dir: Path = _ctx.fs.shared_path
-    shared_dir.mkdir(parents=True, exist_ok=True)
-
-    target_name = dest_name.strip() if dest_name.strip() else src_path.name
-    target_host_path = shared_dir / target_name
-
-    try:
-        shutil.copy2(str(src_path), str(target_host_path))
+        ) from e
+    except safe_fs.UnsafePathError as e:
+        raise ValueError(f"路径不是普通文件（或途中有符号链接）: {cc_file_path}") from e
     except Exception as e:
         logger.error(f"[cc_workspace] download_file_from_cc 失败: {e}")
         raise ValueError(f"文件复制失败: {e}") from e
 
-    logger.info(f"[cc_workspace] download_file_from_cc: {src_path} → {target_host_path}")
+    target_host_path = shared_dir / target_name
+    logger.info(f"[cc_workspace] download_file_from_cc: 工作区 {workspace.id} default/{'/'.join(parts)} → {target_host_path}")
     sandbox_path = _ctx.fs.forward_file(target_host_path)
     return str(sandbox_path)
+
+
+# `download_file_from_cc` 不放行的 `default/` 顶层条目：NA 写给 CC 的配置（含凭据或令牌）
+_CC_DOWNLOAD_DENIED_TOP_LEVEL = frozenset({".mcp.json", ".claude"})
+
+# `upload_file_to_cc` / `download_file_from_cc` 单个文件的上限，与发给适配器的文件同一档
+# （`sandbox_shared_files.DEFAULT_MAX_BYTES`）。两头都是容器可写的目录：一个稀疏文件或一个
+# 一直在追加的文件，不设上限就能把 NA 这一侧的磁盘写满
+_CC_TRANSFER_MAX_BYTES = 512 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -2425,6 +2851,14 @@ async def _collect_cc_methods(ctx: schemas.AgentCtx) -> List:
     """
     workspace = await ctx.get_bound_workspace()
 
+    def _registration_methods() -> List:
+        """功能开关关着或白名单为空时返回空列表，方法列表与改造前逐字一致"""
+        from nekro_agent.services.ssh_gateway.chat_registration import chat_registration_available
+
+        if not chat_registration_available():
+            return []
+        return [register_ssh_server, remove_ssh_server]
+
     # 状态1：未绑定工作区
     if workspace is None:
         if cc_config.ALLOW_AUTO_CREATE_WORKSPACE:
@@ -2433,12 +2867,12 @@ async def _collect_cc_methods(ctx: schemas.AgentCtx) -> List:
 
     # 状态2：有工作区但沙盒未运行
     if workspace.status != "active":
-        if cc_config.ALLOW_AUTO_START_SANDBOX:
-            return [start_cc_sandbox]
-        return []
+        methods: List = [start_cc_sandbox] if cc_config.ALLOW_AUTO_START_SANDBOX else []
+        methods.extend(_registration_methods())
+        return methods
 
     # 状态3：沙盒正常运行
-    return [
+    methods = [
         delegate_to_cc,
         cancel_cc_task,
         get_cc_context,
@@ -2448,3 +2882,5 @@ async def _collect_cc_methods(ctx: schemas.AgentCtx) -> List:
         upload_file_to_cc,
         download_file_from_cc,
     ]
+    methods.extend(_registration_methods())
+    return methods

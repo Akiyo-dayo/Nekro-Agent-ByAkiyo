@@ -161,6 +161,14 @@ class DomainJoinPreviewResponse(BaseModel):
     alias_conflicts: List[str] = Field(default_factory=list)
     alias_rewrites: List[str] = Field(default_factory=list)
     person_rows: int
+    # 入组后立刻对组内其他实例可见的域行段落、隔离中的段落，以及只在自己的频道注入的
+    # 摘要份数（按「频道 + 人设」计，不是版本数）。
+    memory_paragraphs: int = 0
+    memory_quarantined: int = 0
+    memory_summaries: int = 0
+    # 入组后域书与个人书立刻对组内其它实例的频道生效，本实例名下有多少本也要先说清楚。
+    worldbook_books: int = 0
+    worldbook_entries: int = 0
     blockers: List[str] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
     can_migrate: bool = True
@@ -359,6 +367,8 @@ class OrphanCleanupResponse(BaseModel):
     ok: bool = True
     affection: int = 0
     affection_event: int = 0
+    # 连带软删的关系里程碑段落数。人设已经不在，这些段落本来也召回不到。
+    milestones: int = 0
 
 
 ORPHAN_POLICY_NOTE = (
@@ -698,6 +708,11 @@ async def get_domain_join_preview(
         alias_conflicts=preview.alias_conflicts,
         alias_rewrites=preview.alias_rewrites,
         person_rows=preview.person_rows,
+        memory_paragraphs=preview.memory_paragraphs,
+        memory_quarantined=preview.memory_quarantined,
+        memory_summaries=preview.memory_summaries,
+        worldbook_books=preview.worldbook_books,
+        worldbook_entries=preview.worldbook_entries,
         blockers=preview.blockers,
         notes=preview.notes,
         can_migrate=preview.can_migrate,
@@ -1094,4 +1109,5 @@ async def cleanup_identity_orphans(
         ok=True,
         affection=counts["affection"],
         affection_event=counts["affection_event"],
+        milestones=counts["milestones"],
     )

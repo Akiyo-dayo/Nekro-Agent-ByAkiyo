@@ -587,6 +587,23 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
                         {item}
                       </Typography>
                     ))}
+                    {/* 记忆的可见范围是入组后立刻改变的事实，所以由前端固定说明一次；
+                        后端 notes 随时可能调整措辞，这一条不该跟着分叉 */}
+                    {/* 世界书条数那句由后端 notes 在有书时直接给出（域书与个人书入组后
+                        对组内其它实例生效），这里不再重复一行 */}
+                    <Typography variant="body2">
+                      {t('domain.joinMemoryLine', {
+                        paragraphs: joinPreviewMutation.data.memory_paragraphs,
+                        summaries: joinPreviewMutation.data.memory_summaries,
+                      })}
+                    </Typography>
+                    {joinPreviewMutation.data.memory_quarantined > 0 && (
+                      <Typography variant="body2">
+                        {t('domain.joinMemoryQuarantined', {
+                          count: joinPreviewMutation.data.memory_quarantined,
+                        })}
+                      </Typography>
+                    )}
                   </Stack>
                 </Alert>
                 {/* 并入只在「自成一域 → 组域」这一个方向上合法；已在组域时

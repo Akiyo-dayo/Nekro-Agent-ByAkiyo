@@ -1,0 +1,168 @@
+{
+  "title": "SSH Gateway",
+  "subtitle": "Platform owners see the gateway state, every server credential and the global audit here. Changes are made on the Servers tab of the owning workspace.",
+  "settingsCategory": "CC Workspace",
+  "actions": {
+    "refresh": "Refresh",
+    "openSettings": "Open system settings",
+    "import": "Import from workspace resources",
+    "loadMore": "Load more",
+    "showInput": "Show input",
+    "hideInput": "Hide input",
+    "openWorkspace": "Open the workspace Servers tab"
+  },
+  "status": {
+    "title": "Gateway state",
+    "state": "State",
+    "reason": "Reason",
+    "listenAddresses": "Listen addresses",
+    "port": "Port",
+    "connections": "Connections",
+    "channels": "Channels",
+    "runningLeases": "Running leases",
+    "configHint": "Change the switch, owner allowlist and user allowlist in system settings (SSH_GATEWAY_ENABLED, SSH_GATEWAY_OWNER_ACCOUNTS, SSH_GATEWAY_USER_ACCOUNTS)",
+    "states": {
+      "off": "Off",
+      "starting": "Starting",
+      "running": "Running",
+      "unavailable": "Unavailable",
+      "tripped": "Tripped"
+    },
+    "emptyValue": "—"
+  },
+  "credentials": {
+    "title": "All credentials",
+    "subtitle": "Read-only. Add, edit or delete from the Servers tab of the owning workspace.",
+    "empty": "No server credentials yet",
+    "emptyHint": "Create one on a workspace Servers tab, or import from workspace resources.",
+    "columns": {
+      "alias": "Alias",
+      "workspace": "Workspace",
+      "owner": "Owner",
+      "address": "Host:port",
+      "username": "Login",
+      "status": "Status",
+      "secret": "Secret state",
+      "hostKeys": "Host fingerprint",
+      "lastUsed": "Last used",
+      "source": "Source"
+    },
+    "owner": {
+      "platform": "Platform",
+      "user": "User {{account}}"
+    },
+    "ownerNotWhitelisted": "The credential owner is not on the allowlist, so this cannot be used yet",
+    "status": {
+      "active": "Active",
+      "disabled": "Disabled",
+      "suspended": "Suspended",
+      "auth_failed": "Auth failed"
+    },
+    "statusReason": "Reason: {{reason}}",
+    "statusReasons": {
+      "auth_failed": "Authentication failed last time; update the credential before enabling it again"
+    },
+    "lastError": "Last error: {{message}}",
+    "secret": {
+      "ok": "OK",
+      "undecryptable": "The secret cannot be decrypted. Restore the original key or enter it again."
+    },
+    "hostKeys": {
+      "empty": "Recorded on first connection",
+      "count": "{{count}} recorded",
+      "entry": "Key: {{entry}}"
+    },
+    "source": {
+      "admin": "Admin",
+      "chat": "Chat",
+      "import": "Import"
+    },
+    "neverUsed": "Never used"
+  },
+  "import": {
+    "confirmTitle": "Import from workspace resources",
+    "confirmContent": "Import the three SSH templates from workspace resources as platform servers, following the current bindings. Existing resources are left untouched and already imported entries are not duplicated.",
+    "confirm": "Start import",
+    "cancel": "Cancel",
+    "running": "Importing…",
+    "resultTitle": "Import result",
+    "imported": "Imported",
+    "already": "Already imported",
+    "skipped": "Skipped",
+    "alreadyCount": "{{count}}",
+    "importedColumns": {
+      "workspace": "Workspace",
+      "alias": "Alias",
+      "resource": "Resource"
+    },
+    "skippedColumns": {
+      "resource": "Resource",
+      "workspace": "Workspace",
+      "reason": "Reason"
+    },
+    "noneImported": "No new credentials were imported this time",
+    "noneSkipped": "No resources were skipped",
+    "securityHint": "These credentials used to enter the container. Consider replacing them after the migration.",
+    "failed": "Import failed: {{message}}",
+    "workspaceValue": "Workspace {{id}}"
+  },
+  "audit": {
+    "title": "Global audit",
+    "subtitle": "All workspaces, newest first; reason codes are translated.",
+    "empty": "No audit records yet",
+    "columns": {
+      "time": "Time",
+      "workspace": "Workspace",
+      "event": "Event",
+      "decision": "Allowed / denied",
+      "reason": "Reason",
+      "credential": "Alias or credential",
+      "task": "Task",
+      "actor": "Actor",
+      "detail": "Detail",
+      "input": "Input"
+    },
+    "decision": {
+      "allowed": "Allowed",
+      "denied": "Denied"
+    },
+    "credentialFallback": "Credential {{id}}",
+    "events": {
+      "cred_create": "Create credential",
+      "cred_update": "Update credential",
+      "cred_delete": "Delete credential",
+      "cred_reveal": "Reveal secret",
+      "cred_test": "Test connection",
+      "host_key": "Host key",
+      "lease": "Lease",
+      "connect": "Connect",
+      "channel": "Channel",
+      "exec": "Exec",
+      "close": "Close",
+      "suspend": "Auto suspend",
+      "scrub": "Scrub"
+    },
+    "reasons": {
+      "gateway_off": "Gateway is off",
+      "isolation_off": "Network isolation is not active in this workspace, so server connections are unavailable",
+      "image_too_old": "The CC sandbox image is too old; ask the platform owner to upgrade",
+      "unknown_peer": "Unknown peer",
+      "bad_client_key": "Bad client key",
+      "unknown_alias": "No such alias",
+      "no_lease": "The current task has no authorization to use servers",
+      "not_covered": "This task's authorization does not cover this server",
+      "owner_changed": "The authorization basis changed (allowlist, user allowlist or instance state)",
+      "workspace_not_platform": "This workspace is no longer owned by the platform, so platform servers are suspended",
+      "row_inactive": "This credential is disabled",
+      "undecryptable": "The credential cannot be decrypted; ask the platform owner or the credential owner to fix it",
+      "target_blocked": "This server resolves to an address that is not allowed",
+      "host_key_mismatch": "The server host key does not match the recorded one; the connection was refused, please verify",
+      "upstream_auth_failed": "Login with the recorded credential failed; this credential has been paused",
+      "upstream_unreachable": "Cannot reach this server",
+      "mfa_required": "The server requires two-factor authentication, which the gateway does not support",
+      "limit_exceeded": "Connection or channel limit exceeded",
+      "channel_unsupported": "Agent forwarding and X11 forwarding are not supported",
+      "forbidden": "Forbidden"
+    }
+  }
+}

@@ -77,6 +77,7 @@ def _get_runtime_mail_settings() -> dict:
         if email_config.STATUS_MAIL_TARGETS
         else config.MAIL_TARGET
     )
+    tenant_host = False
     if sender_account:
         provider_config = _get_provider_config_for_account(sender_account)
         hostname = str(provider_config.get("smtp_host") or "")
@@ -85,6 +86,10 @@ def _get_runtime_mail_settings() -> dict:
         use_tls = str(provider_config.get("smtp_use_ssl", False)).lower() == "true"
         port = smtp_ssl_port if use_tls else smtp_port
         starttls = not use_tls
+        # 从实例转回平台方、主机没被平台方改过的账户：SMTP 主机的 DNS 可能还在租户手里，而这里经 aiosmtplib
+        # 直接按主机名连，没有「只连校验过的地址」那一层。状态邮件是平台方的运维通知，不值得为它再写一套直连，
+        # 遇到这种发件邮箱就不发（见 `send_email`）
+        tenant_host = sender_account.is_tenant_host(hostname)
     else:
         hostname = config.MAIL_HOSTNAME
         port = int(config.MAIL_PORT)
@@ -92,6 +97,7 @@ def _get_runtime_mail_settings() -> dict:
         starttls = bool(config.MAIL_STARTTLS)
 
     return {
+        "tenant_host": tenant_host,
         "enabled": enabled,
         "username": username,
         "password": password,
@@ -121,6 +127,12 @@ async def send_email(message: EmailMessage) -> None:
     
     """
     settings = _get_runtime_mail_settings()
+    if settings.get("tenant_host"):
+        logger.warning(
+            "状态邮件没有发出：选作发件人的邮箱用的是租户填的 SMTP 服务器（从实例转回平台方后还没改过）。"
+            "请在 Email 适配器页换一个发件邮箱，或把它的服务器改成平台方自己的",
+        )
+        return
     try:
         await send(
             message,

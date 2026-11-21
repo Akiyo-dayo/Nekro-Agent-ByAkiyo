@@ -12,8 +12,9 @@
 钉死五条：
 
 1. **落盘的两份文件里 0 命中真实 Key。** 这是整条改造的判据，而且必须覆盖两份文件 ——
-   `.claude/settings.json` 当前其实不被 `claude` CLI 读（cwd 是 `/workspace/default`），
-   但它照样是一个躺在容器可读目录里的凭据副本，漏掉它等于没修。
+   cc-sandbox 的 `settings.json` 与 CC 用户级设置 `.claude_home/settings.json`（容器里
+   `~/.claude/settings.json`）。早先后者写在 `.claude/settings.json`，`claude` CLI
+   从来不读（cwd 是 `/workspace/default`），现在改到 CC 一定会读的用户级位置。
 2. **`settings.json` 的形状逐字不变。** 容器里的 `nekro_cc_sandbox.settings.Settings.from_dict`
    按固定字段名读，多一层少一层都会让 CC 静默退回「没有任何 provider 配置」。
 3. **中继令牌不是全局的**：令牌里编着工作区 ID，A 的令牌换到 B 的 ID 上必须解不出授权，
@@ -30,6 +31,7 @@
 import ast
 import gzip
 import json
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +61,10 @@ from nekro_agent.services.workspace.cc_credential import (
     resolve_relay_base_url,
     resolve_relay_grant,
     resolve_workspace_credential,
+)
+from nekro_agent.services.workspace.credential_policy import (
+    METADATA_DIRECT_WITHHELD_KEY,
+    METADATA_SECRET_DELIVERED_KEY,
 )
 from nekro_agent.services.workspace.manager import WorkspaceService
 from nekro_agent.tools.redaction import REDACTED_CREDENTIAL
@@ -369,7 +375,12 @@ class TestWorkspaceCredential:
         credential = await resolve_workspace_credential(workspace, PRESET)
         assert not credential.relayed
         assert credential.base_url == UPSTREAM_BASE_URL
-        assert (await DBWorkspace.get(id=workspace.id)).metadata == {}
+        # 一条中继信息都没落库（判据是地址与令牌），但要把「这个工作区拿到过真 Key」记下来：
+        # 归属变化时靠它决定要不要停掉跑着的容器，没有它就只能靠启动复核兜底
+        metadata = (await DBWorkspace.get(id=workspace.id)).metadata
+        assert METADATA_TOKEN_KEY not in metadata
+        assert METADATA_BASE_URL_KEY not in metadata
+        assert metadata[METADATA_SECRET_DELIVERED_KEY] is True
 
         # 创建/重启拿得到地址，这时才切过去；之后的热更新沿用它，不再回退
         rotated = await resolve_workspace_credential(
@@ -401,8 +412,10 @@ class TestWorkspaceCredential:
         assert not credential.relayed
         assert credential.auth_token == PLATFORM_TOKEN
         assert credential.base_url == UPSTREAM_BASE_URL
-        # 关掉开关的部署不该被塞进任何新状态
-        assert (await DBWorkspace.get(id=workspace.id)).metadata == {}
+        # 单租户部署照旧拿真 Key，但「拿到过」这件事要留下痕迹（多租户下靠它决定停不停容器）
+        metadata = (await DBWorkspace.get(id=workspace.id)).metadata
+        assert metadata[METADATA_SECRET_DELIVERED_KEY] is True
+        assert METADATA_DIRECT_WITHHELD_KEY not in metadata
 
 
 class TestTokenLifetime:
@@ -436,17 +449,17 @@ class TestTokenLifetime:
         """吊销之后的热更新要现签一把新的，既不能复活旧令牌，也不能退回写真实 Key"""
         workspace = await make_workspace()
         first = await resolve_workspace_credential(workspace, PRESET, rotate=True)
-        metadata = dict(workspace.metadata)
-        metadata.pop(METADATA_TOKEN_KEY)
-        workspace.metadata = metadata
-        await workspace.save(update_fields=["metadata"])
+        # 令牌是受保护的键，只能按键删（整份写回 metadata 改不动它，见 `GUARDED_METADATA_KEYS`）
+        from nekro_agent.models.db_workspace import patch_workspace_metadata
+
+        await patch_workspace_metadata(workspace, drop_keys=[METADATA_TOKEN_KEY])
 
         again = await resolve_workspace_credential(workspace, PRESET)
         assert again.relayed
         assert again.auth_token != first.auth_token
         assert await resolve_relay_grant(first.auth_token) is None
 
-        WorkspaceService._write_settings_files(tmp_path, PRESET, again, "热更新")
+        WorkspaceService._write_settings_files(tmp_path, PRESET, again, "热更新", allow_platform_secrets=True)
         assert PLATFORM_TOKEN not in (tmp_path / "settings.json").read_text(encoding="utf-8")
 
 
@@ -474,7 +487,7 @@ class TestSettingsOnDisk:
     async def test_claude_settings_keeps_model_mapping_and_extra_env(self, db) -> None:
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
-        env = build_claude_settings_payload(PRESET, credential)["env"]
+        env = build_claude_settings_payload(PRESET, credential, allow_platform_secrets=True)["env"]
 
         assert env["ANTHROPIC_AUTH_TOKEN"] == credential.auth_token
         assert env["ANTHROPIC_BASE_URL"] == "http://nekro_agent:8021/api/cc-relay"
@@ -490,16 +503,139 @@ class TestSettingsOnDisk:
         """整条改造的判据：容器挂载进去的目录里 0 命中真实 Key"""
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
-        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入")
+        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入", allow_platform_secrets=True)
 
         written = sorted(path for path in tmp_path.rglob("*") if path.is_file())
         assert [path.relative_to(tmp_path).as_posix() for path in written] == [
-            ".claude/settings.json",
+            ".claude_home/settings.json",
             "settings.json",
         ]
         for path in written:
             assert PLATFORM_TOKEN not in path.read_text(encoding="utf-8")
             assert credential.auth_token in path.read_text(encoding="utf-8")
+
+    async def test_preset_tier_model_and_extra_env_reach_the_user_level_settings(
+        self,
+        db,
+        tmp_path: Path,
+    ) -> None:
+        """preset 档位的模型名与 `extra_env` 只在 CC 格式的设置里，cc-sandbox 的
+        `settings.json` 不带它们。这份设置必须落在 CC 一定会读的用户级位置
+        （`.claude_home/settings.json` → 容器 `~/.claude/settings.json`），不能再写到
+        CC 的工作目录 `/workspace/default` 之外的 `/workspace/.claude/`"""
+        preset_tier = PRESET.model_copy(
+            update={"model_type": "preset", "preset_model": "opus", "anthropic_model": "", "small_fast_model": ""}
+        )
+        workspace = await make_workspace()
+        credential = await resolve_workspace_credential(workspace, preset_tier)
+
+        WorkspaceService._write_settings_files(tmp_path, preset_tier, credential, "写入", allow_platform_secrets=True)
+
+        user_settings = json.loads((tmp_path / ".claude_home" / "settings.json").read_text(encoding="utf-8"))
+        assert user_settings["model"] == "opus"
+        assert user_settings["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+        assert user_settings["env"]["ANTHROPIC_AUTH_TOKEN"] == credential.auth_token
+        # cc-sandbox 那份不带模型名：带了就会变成 ANTHROPIC_MODEL，压过设置文件里的档位
+        sandbox_settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+        assert sandbox_settings["providers"]["anthropic"]["model"] == ""
+        assert not (tmp_path / ".claude").exists()
+
+    async def test_user_level_settings_is_overwritten_whole_and_dropped_without_a_preset(
+        self,
+        db,
+        tmp_path: Path,
+    ) -> None:
+        """整份覆盖：上一份里有、这一份预设里删掉的 `extra_env` 项不能残留；
+        没有预设时 NA 没有要下发的内容，上一份连同里面的凭据一起删掉"""
+        workspace = await make_workspace()
+        with_extra = PRESET.model_copy(update={"extra_env": {"OLD_SWITCH": "1"}})
+        credential = await resolve_workspace_credential(workspace, with_extra)
+        user_settings_path = tmp_path / ".claude_home" / "settings.json"
+
+        WorkspaceService._write_settings_files(tmp_path, with_extra, credential, "写入", allow_platform_secrets=True)
+        assert "OLD_SWITCH" in user_settings_path.read_text(encoding="utf-8")
+
+        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "热更新", allow_platform_secrets=True)
+        assert "OLD_SWITCH" not in user_settings_path.read_text(encoding="utf-8")
+        assert not user_settings_path.with_name("settings.json.tmp").exists()
+
+        WorkspaceService._write_settings_files(tmp_path, None, credential, "热更新", allow_platform_secrets=True)
+        assert not user_settings_path.exists()
+
+    @staticmethod
+    def _symlink(target: Path, link: Path) -> None:
+        try:
+            os.symlink(target, link, target_is_directory=target.is_dir())
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"建不了符号链接: {exc}")
+
+    async def test_settings_files_replaced_by_symlinks_are_not_written_through(
+        self,
+        db,
+        tmp_path: Path,
+    ) -> None:
+        """工作区目录以读写挂进容器：容器把两份设置文件换成指向宿主文件的链接，
+        NA 写设置时换掉的必须是链接本身，宿主文件原样不动"""
+        ws_dir = tmp_path / "ws"
+        (ws_dir / ".claude_home").mkdir(parents=True)
+        host_file = tmp_path / "host-file"
+        host_file.write_text("host", encoding="utf-8")
+        self._symlink(host_file, ws_dir / "settings.json")
+        self._symlink(host_file, ws_dir / ".claude_home" / "settings.json")
+        workspace = await make_workspace()
+        credential = await resolve_workspace_credential(workspace, PRESET)
+
+        WorkspaceService._write_settings_files(ws_dir, PRESET, credential, "写入", allow_platform_secrets=True)
+
+        assert host_file.read_text(encoding="utf-8") == "host"
+        for path in (ws_dir / "settings.json", ws_dir / ".claude_home" / "settings.json"):
+            assert not path.is_symlink()
+            assert credential.auth_token in path.read_text(encoding="utf-8")
+
+        # 没有预设时删掉的也是链接本身
+        (ws_dir / ".claude_home" / "settings.json").unlink()
+        self._symlink(host_file, ws_dir / ".claude_home" / "settings.json")
+        WorkspaceService._write_settings_files(ws_dir, None, credential, "热更新", allow_platform_secrets=True)
+        assert not os.path.lexists(ws_dir / ".claude_home" / "settings.json")
+        assert host_file.read_text(encoding="utf-8") == "host"
+
+    async def test_claude_home_replaced_by_a_symlink_is_rebuilt_not_followed(
+        self,
+        db,
+        tmp_path: Path,
+    ) -> None:
+        """`.claude_home -> 宿主目录`：按路径 chmod 0777 会放开宿主目录、写设置会写进宿主目录、
+        建容器时还会把它挂进容器。NA 删掉链接本身重建成目录，宿主目录不碰"""
+        ws_dir = tmp_path / "ws"
+        ws_dir.mkdir()
+        host_dir = tmp_path / "host-dir"
+        host_dir.mkdir()
+        if os.name == "posix":
+            host_dir.chmod(0o755)
+        self._symlink(host_dir, ws_dir / ".claude_home")
+        workspace = await make_workspace()
+        credential = await resolve_workspace_credential(workspace, PRESET)
+
+        WorkspaceService._write_settings_files(ws_dir, PRESET, credential, "写入", allow_platform_secrets=True)
+
+        assert list(host_dir.iterdir()) == []
+        if os.name == "posix":
+            assert (host_dir.stat().st_mode & 0o777) == 0o755
+        assert not (ws_dir / ".claude_home").is_symlink()
+        assert credential.auth_token in (ws_dir / ".claude_home" / "settings.json").read_text(encoding="utf-8")
+
+    async def test_legacy_claude_dir_replaced_by_a_symlink_is_left_alone(self, tmp_path: Path) -> None:
+        """清旧文件时 `.claude -> 宿主目录`，那边恰好也有 settings.json：一个都不删"""
+        ws_dir = tmp_path / "ws"
+        ws_dir.mkdir()
+        host_dir = tmp_path / "host-dir"
+        host_dir.mkdir()
+        (host_dir / "settings.json").write_text("host", encoding="utf-8")
+        self._symlink(host_dir, ws_dir / ".claude")
+
+        assert WorkspaceService.remove_legacy_claude_settings(ws_dir) is False
+        assert (host_dir / "settings.json").read_text(encoding="utf-8") == "host"
+        assert (ws_dir / ".claude").is_symlink()
 
     async def test_direct_mode_still_writes_the_platform_key(
         self,
@@ -511,7 +647,7 @@ class TestSettingsOnDisk:
         monkeypatch.setenv("NEKRO_CC_CREDENTIAL_MODE", "direct")
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
-        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入")
+        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入", allow_platform_secrets=True)
 
         settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
         assert settings["providers"]["anthropic"] == {

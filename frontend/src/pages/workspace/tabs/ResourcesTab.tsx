@@ -69,6 +69,18 @@ const NO_AUTOFILL_INPUT_PROPS: InputBaseComponentProps = {
   'data-1p-ignore': 'true',
 }
 
+/**
+ * 网关开启后不再注入容器的三个 SSH 模板
+ *
+ * 只在这三类资源上提示迁移路径；其它模板（数据库、通用密钥等）仍然照旧注入，
+ * 不应该跟着出现一条与它们无关的提示。
+ */
+const SSH_RESOURCE_TEMPLATE_KEYS = new Set([
+  'server_ssh_key',
+  'server_ssh_password',
+  'server_root_password',
+])
+
 function moveItem<T>(items: T[], fromIndex: number, toIndex: number) {
   const next = [...items]
   const [moved] = next.splice(fromIndex, 1)
@@ -417,6 +429,14 @@ function ResourceEditorDialog({
                   {t('detail.resources.editor.templateAction')}
                 </ActionButton>
               </Box>
+
+              {form.template_key && SSH_RESOURCE_TEMPLATE_KEYS.has(form.template_key) && (
+                <Alert severity="info" sx={{ py: 0.25 }}>
+                  <Typography variant="body2">
+                    {t('detail.resources.sshGatewayHint')}
+                  </Typography>
+                </Alert>
+              )}
 
               <Grid container spacing={1.5}>
                 <Grid size={{ xs: 12, md: 6 }}>
@@ -878,6 +898,14 @@ function ResourceCard({
             </Box>
           </Box>
 
+          {resource.template_key && SSH_RESOURCE_TEMPLATE_KEYS.has(resource.template_key) && (
+            <Alert severity="info" sx={{ py: 0.25 }}>
+              <Typography variant="caption">
+                {t('detail.resources.sshGatewayHint')}
+              </Typography>
+            </Alert>
+          )}
+
           <Grid container spacing={1.5}>
             <Grid size={{ xs: 12, lg: 6 }}>
               <Stack spacing={1}>
@@ -993,6 +1021,14 @@ function MountedResourceCard({
               {t('detail.resources.actions.unmount')}
             </ActionButton>
           </Box>
+
+          {resource.template_key && SSH_RESOURCE_TEMPLATE_KEYS.has(resource.template_key) && (
+            <Alert severity="info" sx={{ py: 0.25 }}>
+              <Typography variant="caption">
+                {t('detail.resources.sshGatewayHint')}
+              </Typography>
+            </Alert>
+          )}
 
           <Grid container spacing={1.25}>
             <Grid size={{ xs: 12, md: 6 }}>
@@ -1613,6 +1649,8 @@ export default function ResourcesTab({ workspace }: { workspace?: WorkspaceDetai
       </Box>
 
       {secretHealthAlert}
+
+      <Alert severity="info">{t('detail.resources.tenantBindHint')}</Alert>
 
       <Grid container spacing={2}>
         <Grid size={{ xs: 12, xl: 5 }}>

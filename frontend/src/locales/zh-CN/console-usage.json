@@ -53,6 +53,7 @@
     "plugin": "插件调用",
     "plugin_generate": "插件代码生成",
     "model_test": "连通性测试",
+    "prompt_trial": "提示词试发",
     "command": "聊天命令",
     "unattributed": "未归属"
   },

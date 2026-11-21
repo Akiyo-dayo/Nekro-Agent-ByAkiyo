@@ -57,6 +57,7 @@ from nekro_agent.services.command.schemas import (
     CommandResponse,
 )
 from nekro_agent.services.imagecard import fonts_available
+from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND
 from nekro_agent.services.imagecard.affection_rank import (
     MAX_ENTRIES,
     RankView,
@@ -308,12 +309,16 @@ async def send_affection_rank(_ctx: AgentCtx, chat_key: str, highlight_user_id: 
     view, subtitle = await _build_view(db_chat_channel, highlight_userid=highlight_user_id)
 
     if not fonts_available():
-        await _ctx.ms.send_text(chat_key, _text_fallback(view, subtitle), _ctx)
+        # 走插件推送方法：发送前再判一次插件在当前频道是否生效（方法能被调用通常已经生效，
+        # 但发送发生在渲染之后，中途被关掉时不能硬发）
+        if not await plugin.send_text(chat_key, _text_fallback(view, subtitle), _ctx):
+            raise ValueError(CHANNEL_NOT_FOUND)
         return f"环境缺少中文字体，已改为发送文本榜单（共 {len(view.rows)} 人）"
 
     image = await asyncio.to_thread(render_rank_card, view, subtitle=subtitle)
     sandbox_path = await _ctx.fs.mixed_forward_file(image, file_name=f"affection_rank_{int(time.time())}.png")
-    await _ctx.ms.send_image(chat_key, sandbox_path, _ctx)
+    if not await plugin.send_image(chat_key, sandbox_path, _ctx):
+        raise ValueError(CHANNEL_NOT_FOUND)
     return f"已发送好感度排行榜图片，共 {len(view.rows)} 人上榜，近{config.ACTIVE_DAYS}天活跃 {view.total_active} 人"
 
 

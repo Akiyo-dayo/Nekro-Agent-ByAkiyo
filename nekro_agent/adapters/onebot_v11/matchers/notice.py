@@ -9,6 +9,12 @@ from nonebot.matcher import Matcher
 
 from nekro_agent.adapters.onebot_v11.core.channel import ADAPTER_KEY
 from nekro_agent.adapters.onebot_v11.core.instance import resolve_instance_key, set_current_instance
+from nekro_agent.adapters.onebot_v11.tools.bot_membership import (
+    handle_bot_left_group,
+    is_bot_self_join,
+    is_bot_self_leave,
+    restore_after_bot_returned,
+)
 from nekro_agent.adapters.onebot_v11.tools.onebot_util import (
 
     get_chat_info_old,
@@ -274,16 +280,36 @@ async def _(_: Matcher, event: NoticeEvent, bot: Bot):
     # `notice.notify.input_status`，带 user_id 而 group_id=0）。它们既不可能被下面六个
     # 处理器中的任何一个匹配上，又会在解析/查库这两步抛异常 —— 而 nonebot 会把它翻译成
     # 一整条 `Running Matcher(...) failed` 的 ERROR + traceback。实测真号上两分钟刷了 44 条。
+    #
+    # 另一类是**根本不带群号**的通知：协议端自己的状态通知（`notice.bot_status.offline`，
+    # 掉线时一次来好几条）、好友消息撤回之类。它们不指向任何群，不该进按群解析频道这条路，
+    # 在这里先分流掉。群号为 0 的那类仍由下面 try 里的守卫处理。
+    if getattr(event, "group_id", None) is None:
+        logger.debug(
+            f"跳过不带群号的通知事件: notice_type={getattr(event, 'notice_type', '')} "
+            f"sub_type={getattr(event, 'sub_type', '')}",
+        )
+        return
     try:
         chat_key, chat_type = await get_chat_info_old(event=event, bot=bot)
         db_chat_channel: DBChatChannel = await DBChatChannel.get_channel(chat_key=chat_key)
     except ValueError as e:
         logger.debug(f"跳过不指向已知会话的通知事件: {e}")
         return
+
+    event_dict = dict(event)
+    if is_bot_self_leave(event_dict, bot.self_id):
+        # Bot 自己离群：既不按「成员退出群聊」推系统消息，也不触发 Agent——群里已经发不出任何东西了。
+        # 不受 SESSION_GROUP_LEAVE_NOTICE_ENABLED 控制：那个开关管的是「要不要告诉 Agent 有人退群」
+        await handle_bot_left_group(db_chat_channel, event_dict)
+        return
+    if is_bot_self_join(event_dict, bot.self_id):
+        await restore_after_bot_returned(db_chat_channel, "Bot 重新入群")
+        # 不 return：入群通知照旧往下走（欢迎开关开着时照常推送）
+
     adapter: OnebotV11Adapter = db_chat_channel.adapter.cast(OnebotV11Adapter)
     result = await notice_manager.handle(event, bot, db_chat_channel)
     if not result:
-        event_dict = dict(event)
         logger.debug(
             f"收到未处理的通知类型: {event_dict}\n"
             f"notice_type: {event_dict.get('notice_type')}\n"

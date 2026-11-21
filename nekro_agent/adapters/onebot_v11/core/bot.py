@@ -19,15 +19,22 @@ from typing import List
 from nonebot import get_bots
 from nonebot.adapters.onebot.v11 import Bot as OneBotV11Bot
 
+from nekro_agent.services.channel_delivery import ChannelUndeliverableError, UndeliverableReason
+
 from .channel import parse_instance_key
 from .instance import get_current_instance, lookup_cached_account_id, resolve_account_id
 
 
-class BotInstanceOfflineError(RuntimeError):
+class BotInstanceOfflineError(RuntimeError, ChannelUndeliverableError):
     """目标账号的协议端未连接
 
     出站时绝不允许回落到其他账号：宁可显式失败，也不能让消息从错误的账号发出去。
+
+    同时是 `ChannelUndeliverableError`：消息服务不必认识 OneBot 适配器，
+    也能识别出「这条消息确定发不出去」，从而不再补发注定失败的失败回执。
     """
+
+    undeliverable_reason = UndeliverableReason.INSTANCE_OFFLINE
 
     def __init__(self, target: str):
         self.target = target

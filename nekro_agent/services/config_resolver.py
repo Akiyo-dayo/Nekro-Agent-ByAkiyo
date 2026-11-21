@@ -159,6 +159,45 @@ class ConfigResolver:
                 return layer
         return None
 
+    async def layered_values(
+        self,
+        chat_key: str,
+        field_name: str,
+        instance_key: Optional[str] = None,
+    ) -> List[Tuple[str, Any]]:
+        """某个字段在频道视角下**逐层**的原始取值，从低到高排列
+
+        高级槽位的 `{{original}}` 要把每一层的文字按顺序串起来，光有最终生效值不够。
+        返回的第一项永远是全局值，之后只列真正命中了覆盖（`enable_<字段>` 为真）的层；
+        层名直接用 `ConfigLayer` 的值，与溯源接口对外暴露的标识是同一套。
+
+        优先级不在这里重写：`_resolve_layers` 已经按频道 > 实例 > 适配器 > 全局排好，
+        反过来遍历就是低到高。两份顺序各写一遍，迟早有一处把 `{{original}}` 串错层。
+        """
+        layers = await self._resolve_layers(chat_key, instance_key)
+        values: List[Tuple[str, Any]] = [(ConfigLayer.SYSTEM.value, getattr(system_config, field_name))]
+        for layer, overrides in reversed(layers.overrides):
+            if getattr(overrides, f"enable_{field_name}", False):
+                values.append((layer.value, getattr(overrides, field_name)))
+        return values
+
+    def instance_layered_values(
+        self,
+        adapter_key: str,
+        instance_key: str,
+        field_name: str,
+    ) -> List[Tuple[str, Any]]:
+        """实例视角（不含频道层）的逐层取值，从低到高
+
+        给没有频道的场景用：预览、试发之外的后台拼装只有实例对。与
+        `instance_field_source` 共用 `_instance_layers`，顺序同 `layered_values`。
+        """
+        values: List[Tuple[str, Any]] = [(ConfigLayer.SYSTEM.value, getattr(system_config, field_name))]
+        for layer, overrides in reversed(self._instance_layers(adapter_key, instance_key)):
+            if getattr(overrides, f"enable_{field_name}", False):
+                values.append((layer.value, getattr(overrides, field_name)))
+        return values
+
     def _merge(self, overrides: List[Tuple[ConfigLayer, ConfigBase]]) -> Dict[str, Any]:
         """全局配置为基础，按优先级从高到低套用各层覆盖"""
         effective_config_data = system_config.model_dump()

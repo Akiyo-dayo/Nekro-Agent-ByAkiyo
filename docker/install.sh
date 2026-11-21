@@ -378,8 +378,9 @@ compose_v2_command() {
 # （Dockerfile 与入口脚本会以 root 在容器里执行），同样不能放开。qbob 容器入口本身就把数据目录
 # 收紧到 0700，这里只是不让重跑脚本把它重新放开。
 open_data_dir_permissions() {
-    sudo find "$1/" -type d \( -name 'qbob_data' -o -name 'qbob_state' -o -name 'qbob' \) -prune -o ! -type l ! -name 'nekro-agent.model-groups-handwritten-keys.*' ! -name 'credential_secret.key' ! -name '.env' -exec chmod 777 {} +
-    sudo find "$1/" -maxdepth 1 -type f \( -name 'credential_secret.key' -o -name '.env' \) -exec chmod 600 {} +
+    # 邮箱账户引用的密钥 `email_account_ref.key`（应用创建时 0600，不随 JWT 轮换）与上面的主密钥同样排除、同样收紧
+    sudo find "$1/" -type d \( -name 'qbob_data' -o -name 'qbob_state' -o -name 'qbob' \) -prune -o ! -type l ! -name 'nekro-agent.model-groups-handwritten-keys.*' ! -name 'credential_secret.key' ! -name 'email_account_ref.key' ! -name '.env' -exec chmod 777 {} +
+    sudo find "$1/" -maxdepth 1 -type f \( -name 'credential_secret.key' -o -name 'email_account_ref.key' -o -name '.env' \) -exec chmod 600 {} +
     sudo find "$1/" -maxdepth 1 -type d \( -name 'qbob_data' -o -name 'qbob_state' \) -exec chmod -R go-rwx {} +
 }
 

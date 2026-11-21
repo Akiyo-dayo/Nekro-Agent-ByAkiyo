@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from tortoise.queryset import QuerySet
 
 from nekro_agent.core.core_utils import ConfigBase
+from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_user import DBUser
 
@@ -18,8 +19,15 @@ from nekro_agent.models.db_user import DBUser
 #   是"这个字段引用了模型组"与"这个身份能不能选它"的唯一判定，通用配置写入闸门用的是同一对。
 from nekro_agent.routers.chat_channel import assert_channel_accessible, visible_channels
 from nekro_agent.routers.config import _mask_config_items, restore_masked_credentials
-from nekro_agent.schemas.errors import NotFoundError, PluginLoadError, PluginNotFoundError, ValidationError
+from nekro_agent.schemas.errors import (
+    NotFoundError,
+    PermissionDeniedError,
+    PluginLoadError,
+    PluginNotFoundError,
+    ValidationError,
+)
 from nekro_agent.schemas.tenant import CREDENTIAL_MASK
+from nekro_agent.services.config_service import ConfigService
 from nekro_agent.services.model_group_service import (
     assert_model_group_selectable,
     iter_model_group_ref_fields,
@@ -40,7 +48,7 @@ from nekro_agent.services.plugin.manager import (
     update_plugin_activation_strategy,
     update_plugin_call_priority,
 )
-from nekro_agent.services.plugin.scope import OverrideScope, VisibilitySource
+from nekro_agent.services.plugin.scope import OverrideScope, VisibilitySource, resolve_scoped_config
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import assert_instance_accessible, get_tenant_scope
@@ -63,18 +71,24 @@ _PLUGIN_ERROR_TEXT_FIELDS = ("description", "errorMessage")
 async def assert_plugin_scope_accessible(user: DBUser, instance_key: str, chat_key: str = "") -> None:
     """校验当前身份能否操作某个作用域下的插件设置
 
-    平台方不受限；租户传入他人（或不存在）的 `instance_key` / `chat_key` 一律 404，
-    两者对外不可区分。
+    租户传入他人（或不存在）的 `instance_key` / `chat_key` 一律 404，两者对外不可区分。
 
     `chat_key` 必须单独校验：会话级覆盖落在 `chat_key` 这一层（见 `plugin/scope.py` 的
     三层优先级），只校验 `instance_key` 等于让租户拿自己的实例标识当通行证，
     去改别人频道里的插件可见性。
+
+    **平台方不受归属限制，但实例（与频道）必须存在**：插件设置按实例标识 / 会话标识存在文件里，
+    对一个已经删掉的标识写进去的设置，会被以后用同一个标识新建的实例（可能归别的租户）直接读到。
+    新建实例前虽有兜底清扫，但不该靠它去清一份明知没有主人的设置。
     """
-    if get_tenant_scope(user) is None:
-        return
     await assert_instance_accessible(user, instance_key)
-    if chat_key:
-        await assert_channel_accessible(user, chat_key)
+    if not chat_key:
+        return
+    if get_tenant_scope(user) is None:
+        if not await DBChatChannel.filter(chat_key=chat_key).exists():
+            raise NotFoundError(resource="聊天频道")
+        return
+    await assert_channel_accessible(user, chat_key)
 
 
 async def accessible_plugin_data(user: DBUser, plugin_key: str) -> QuerySet[DBPluginData]:
@@ -142,6 +156,96 @@ async def restore_masked_plugin_config(plugin_key: str, instance_key: str, confi
             continue
         restored[key] = json.dumps(restore_masked_credentials(parsed, current.get(key)), ensure_ascii=False)
     return restored
+
+
+class _UnparseableSubmittedValue:
+    """提交值按配置类型解析不了时的哨兵
+
+    平台方专属项要判"和当前生效值是否不同"；解析不了的值当然不是同一个值，
+    但也不该在这里抛 500——交给后面的保存步骤给出正常的参数错误。
+    """
+
+
+_UNPARSEABLE_SUBMITTED_VALUE = _UnparseableSubmittedValue()
+
+
+def _submitted_plugin_value(config_cls: type[ConfigBase], current_config: ConfigBase, field_name: str, raw_value: str) -> Any:
+    """按配置服务同一套类型转换把提交串变成实际值
+
+    直接复用 `ConfigService.set_config_value`：布尔/整数/字符串/JSON 的解析口径与真正
+    落盘时完全一致，避免权限判定用一套解析、保存用另一套。
+    """
+    draft = config_cls.model_validate(current_config.model_dump())
+    success, _message = ConfigService.set_config_value(draft, field_name, raw_value)
+    if not success:
+        return _UNPARSEABLE_SUBMITTED_VALUE
+    return getattr(draft, field_name)
+
+
+def _int_raise_denied(before: int, after: int, inherited: int) -> bool:
+    """整数型上限项：这次写入是否把这一层的生效值抬高了
+
+    与 `routers/config.py` 的 `_int_raise_denied` 同一规则：`after > max(before, inherited)`
+    时拒绝。上限由平台方定的全局值或本实例原来的生效值决定，租户只能往下调；
+    调低以后可以回到全局值，但不能超过它。
+    """
+    return after > max(before, inherited)
+
+
+async def _assert_tenant_plugin_config_writes(plugin_key: str, instance_key: str, configs: Dict[str, str]) -> None:
+    """租户写插件实例覆盖时的「平台方专属」与「只能调低」两道判据
+
+    插件实例覆盖只落"与全局值不同的字段"，没有核心配置那种覆盖开关，所以判据简化为：
+
+    - `platform_only`：提交里带了它，且解析后的值与本实例**当前生效值**不同 → 403。
+      整页保存把原值带回来不算修改；读接口照常返回，前端显示为只读。
+    - `tenant_may_only_lower`：`before` = 本实例当前生效值，`inherited` = 全局值，
+      `after` = 提交值（没提交就等于 `before`）。bool 只许从开改到关；
+      int 按 :func:`_int_raise_denied` 判。
+
+    调用点已经在 `get_tenant_scope(...) is not None` 这一支里，平台方与未启用多租户的
+    部署不会走到这里。
+    """
+    plugin = plugin_collector.get_plugin(plugin_key)
+    if plugin is None or plugin.config_class is ConfigBase:
+        return
+
+    global_config = plugin.get_global_config()
+    effective = resolve_scoped_config(plugin.key, plugin.config_class, global_config, instance_key)
+    global_values = global_config.model_dump()
+
+    for field_name, field in plugin.config_class.model_fields.items():
+        extra = field.json_schema_extra if isinstance(field.json_schema_extra, dict) else {}
+        platform_only = bool(extra.get("platform_only"))
+        only_lower = bool(extra.get("tenant_may_only_lower"))
+        if not platform_only and not only_lower:
+            continue
+
+        before = getattr(effective, field_name)
+        submitted = (
+            _submitted_plugin_value(plugin.config_class, effective, field_name, configs[field_name])
+            if field_name in configs
+            else before
+        )
+        if submitted is _UNPARSEABLE_SUBMITTED_VALUE:
+            # 解析不了的值会在保存时得到正常的参数错误；这里不抢先判成越权
+            continue
+
+        if platform_only and field_name in configs and submitted != before:
+            raise PermissionDeniedError(
+                detail=f"配置项 {plugin_key}.{field_name} 属于平台方权限边界，租户身份不可修改",
+            )
+
+        if not only_lower or field_name not in configs:
+            continue
+
+        if field.annotation is bool:
+            if submitted and not before:
+                raise PermissionDeniedError(detail=f"配置项 {field_name} 租户只能调低，不能调高")
+        elif field.annotation is int:
+            inherited = int(global_values.get(field_name, before))
+            if _int_raise_denied(int(before), int(submitted), inherited):
+                raise PermissionDeniedError(detail=f"配置项 {field_name} 租户只能调低，不能调高")
 
 
 async def assert_tenant_may_select_model_groups(user: DBUser, plugin_key: str, configs: Dict[str, str]) -> None:
@@ -461,6 +565,7 @@ async def save_plugin_instance_config_handler(
         # 否则一次无意的保存就会给该实例落一条 `********` 的覆盖，把插件配坏。
         # 掩码可能整值命中，也可能嵌在复杂字段里，两种都要还原。
         configs = await restore_masked_plugin_config(plugin_key, instance_key, configs)
+        await _assert_tenant_plugin_config_writes(plugin_key, instance_key, configs)
         await assert_tenant_may_select_model_groups(_current_user, plugin_key, configs)
 
     success, error = await save_plugin_instance_config(plugin_key, instance_key, configs)

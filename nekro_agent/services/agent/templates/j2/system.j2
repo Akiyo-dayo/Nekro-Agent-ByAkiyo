@@ -1,8 +1,13 @@
-{% macro system_prompt(stable_static, channel_static, runtime_dynamic, affection_prompt, plugins_prompt) %}
+{% macro system_prompt(stable_static, channel_static, runtime_dynamic, affection_prompt, plugins_prompt, worldbook_prompt="", auxiliary_prompt="", ops_prompt="") %}
 {{ stable_static }}
 
 {{ channel_static }}
-{% if affection_prompt %}
+{% if auxiliary_prompt %}
+## Additional Instructions
+{{ auxiliary_prompt }}
+{% endif %}{% if worldbook_prompt %}
+{{ worldbook_prompt }}
+{% endif %}{% if affection_prompt %}
 {{ affection_prompt }}
 {% endif %}
 {{ runtime_dynamic }}
@@ -11,4 +16,7 @@
 <plugins>
 {{ plugins_prompt }}
 </plugins>
+{%- if ops_prompt %}
+{{ ops_prompt }}
+{%- endif %}
 {% endmacro %}

@@ -40,6 +40,7 @@ import KnowledgeTab from './tabs/KnowledgeTab'
 import ExtensionsTab from './tabs/ExtensionsTab'
 import MCPTab from './tabs/MCPTab'
 import ResourcesTab from './tabs/ResourcesTab'
+import ServersTab from './tabs/ServersTab'
 import PromptTab from './tabs/PromptTab'
 import ConfigTab from './tabs/ConfigTab'
 
@@ -280,6 +281,7 @@ export default function WorkspaceDetailPage() {
             <Tab label={t('detail.tabs.extensions')} />
             <Tab label={t('detail.tabs.mcp')} />
             <Tab label={t('detail.tabs.resources')} />
+            <Tab label={t('detail.tabs.servers')} />
             <Tab label={t('detail.tabs.prompt')} />
             <Tab label={t('detail.tabs.config')} />
           </PageTabs>
@@ -345,8 +347,9 @@ export default function WorkspaceDetailPage() {
           {activeTab === 5 && <ExtensionsTab workspace={workspace} onNavigateToComm={handleNavigateToComm} />}
           {activeTab === 6 && <MCPTab workspace={workspace} />}
           {activeTab === 7 && <ResourcesTab workspace={workspace} />}
-          {activeTab === 8 && <PromptTab workspace={workspace} />}
-          {activeTab === 9 && (
+          {activeTab === 8 && <ServersTab workspace={workspace} />}
+          {activeTab === 9 && <PromptTab workspace={workspace} />}
+          {activeTab === 10 && (
             <ConfigTab workspace={workspace} onDeleted={() => navigate(workspaceListPath())} />
           )}
         </motion.div>

@@ -1,14 +1,16 @@
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import ValidationError
+from tortoise.transactions import in_transaction
 
 from nekro_agent.adapters import load_adapter_config, loaded_adapters
+from nekro_agent.adapters.email.base import CUSTOM_PROVIDER_KEY, EMAIL_PROVIDER_CONFIGS
 from nekro_agent.adapters.email.clients.oauth import build_oauth_authorize_url, exchange_oauth_code
 from nekro_agent.adapters.email.config import EmailAccount
-
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import OsEnv
 from nekro_agent.models.db_user import DBUser
@@ -42,9 +44,11 @@ def get_email_adapter():
 async def require_platform_mailbox_admin(_owner: DBUser = Depends(require_platform_owner())) -> DBUser:
     """本 router 的统一门槛：平台方 **且** 至少 `Role.Admin`
 
-    与 `routers/email.py` 那四条读接口逐字同一档 —— 那边写成
-    `@require_role(Role.Admin)` + `Depends(require_platform_owner())`，这里因为要一次覆盖
-    整个 router（`APIRouter(dependencies=...)` 用不了装饰器）才收成一个依赖。
+    与 `routers/email.py` 那四条读接口同一档：那边是 `@require_role(Role.Admin)` +
+    按 `(owner_adapter_key, owner_instance_key)` 收敛到某个实例；这里因为要一次覆盖
+    整个 router（`APIRouter(dependencies=...)` 用不了装饰器）才收成一个依赖，而且
+    这一族只碰**平台方自己的** `RECEIVE_ACCOUNTS`，所以额外要求平台方身份。
+    实例自有账户走 `/api/instance-email/*`，那是另一条路（`Role.Admin` + 实例作用域）。
     """
     if _owner.perm_level < Role.Admin:
         logger.debug(f"权限不足，邮箱适配器接口需要管理员: user={_owner.username}")
@@ -62,7 +66,7 @@ async def require_platform_mailbox_admin(_owner: DBUser = Depends(require_platfo
 #
 # - `GET /accounts` 读出平台方配置的全部收件账号（地址、服务器、显示名）；
 # - `POST /raw-email` 取任意邮件的**网页原文** —— 与 `GET /emails/{id}/raw-content`
-#   返回的是同一份数据，后者已收敛为平台方专属，不锁这里等于那条收敛没有发生；
+#   返回的是同一份数据，后者收敛到实例归属、不锁这里等于那条收敛没有发生；
 # - `POST/PUT/DELETE /accounts[/{index}]` 增删改收件账号，
 #   `POST /accounts/{index}/test|pull` 让服务端带着平台方凭据发起出站连接；
 # - `GET /attachments/status` 读出宿主机上的附件目录绝对路径与体量。
@@ -85,24 +89,24 @@ def _save_email_config(adapter) -> None:
     adapter.config.dump_config()
 
 
-async def _sync_runtime_account(adapter, account: EmailAccount) -> None:
-    reconnect_success = True
-    reconnect = getattr(adapter, "_reconnect_email_client", None)
-    if reconnect:
-        reconnect_success = bool(await reconnect(account))
-    mapping = getattr(adapter, "account_chat_mapping", None)
-    if not isinstance(mapping, dict):
-        return
-    if account.ENABLED and account.RECEIVE_ENABLED and reconnect_success:
-        mapping[account.USERNAME] = account.USERNAME
-    else:
-        mapping.pop(account.USERNAME, None)
+async def _assert_platform_address_available(adapter, username: str, *, ignore_username: str = "") -> None:
+    """新建 / 修改平台方账户时查「账户表里有没有同一个地址」
 
+    两处合起来必须全局唯一（同一个地址放在两处会让客户端池与附件目录分不清是谁的），
+    冲突时回与实例自有接口同一句文案——不说明被谁占用。
 
-async def _remove_runtime_account(adapter, account: EmailAccount) -> None:
-    remove = getattr(adapter, "_remove_email_client", None)
-    if remove:
-        await remove(account.USERNAME)
+    `ignore_username` 是「改自己」的情形：同一个地址改大小写或首尾空白不算冲突。
+    """
+    from nekro_agent.services.email_accounts import ADDRESS_UNAVAILABLE, assert_address_available
+
+    try:
+        await assert_address_available(
+            username,
+            ignore_platform_username=ignore_username,
+            adapter=adapter,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=ADDRESS_UNAVAILABLE) from e
 
 
 def _normalize_default_sender(accounts: List[EmailAccount], selected_index: int | None = None) -> None:
@@ -169,12 +173,24 @@ async def create_email_account(request: dict, adapter=Depends(get_email_adapter)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from e
 
+    await _assert_platform_address_available(adapter, account.USERNAME)
     accounts = _get_accounts(adapter)
     accounts.append(account)
     _normalize_default_sender(accounts, len(accounts) - 1)
     adapter.config.RECEIVE_ACCOUNTS = accounts
     _save_email_config(adapter)
-    await _sync_runtime_account(adapter, account)
+    from nekro_agent.services.email_accounts import (
+        clear_default_sender_cache,
+        purge_foreign_cache_rows,
+        sync_runtime_account,
+    )
+
+    # 新账户开始收信之前清掉这个地址下不属于平台方的残留行：同一个地址可能刚被某个实例
+    # 释放（旧账户删了、缓存行还在），不清的话新信撞上同一个 UID 会被整行改写（写侧也兜住了），
+    # 没撞上的行则会以平台方账户的名义继续占着位置
+    await purge_foreign_cache_rows(account.USERNAME, owner_adapter_key="", owner_instance_key="")
+    clear_default_sender_cache()
+    await sync_runtime_account(adapter, account)
     return {"success": True, "index": len(accounts) - 1}
 
 
@@ -197,10 +213,26 @@ async def update_email_account(index: int, request: dict, adapter=Depends(get_em
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors()) from e
 
+    await _assert_platform_address_available(
+        adapter,
+        accounts[index].USERNAME,
+        ignore_username=str(current.get("USERNAME") or ""),
+    )
     _normalize_default_sender(accounts, index)
     adapter.config.RECEIVE_ACCOUNTS = accounts
     _save_email_config(adapter)
-    await _sync_runtime_account(adapter, accounts[index])
+    from nekro_agent.services.email_accounts import (
+        clear_default_sender_cache,
+        normalize_username,
+        purge_foreign_cache_rows,
+        sync_runtime_account,
+    )
+
+    if normalize_username(accounts[index].USERNAME) != normalize_username(str(current.get("USERNAME") or "")):
+        # 地址换了：新地址下可能还留着别人的缓存行，理由与「新增」那一段相同
+        await purge_foreign_cache_rows(accounts[index].USERNAME, owner_adapter_key="", owner_instance_key="")
+    clear_default_sender_cache()
+    await sync_runtime_account(adapter, accounts[index])
     return {"success": True}
 
 
@@ -260,6 +292,178 @@ async def test_email_account(index: int, adapter=Depends(get_email_adapter)):
     return {"success": success, "message": message, "tested_at": account.LAST_TEST_TIME}
 
 
+@router.post("/accounts/{index}/to-instance")
+async def transfer_email_account_to_instance(index: int, request: dict, adapter=Depends(get_email_adapter)):
+    """把平台方的一个账户「转为实例自有」：从 `RECEIVE_ACCOUNTS` 搬进账户表
+
+    存量里有不少账户本来就是替某个租户配的（那家租户自己的客服邮箱、通知邮箱）。
+    这个动作把它们交给归属实例：该实例可以看到、可以改、由它自己的开关控制，而平台方
+    不再替它收发。
+
+    与「转回平台方」对称，几个刻意的取舍：
+
+    - **一个事务**：建账户行与把这个地址下全部缓存行的快照改成目标实例要么都成、要么都不成。
+      只成一半会留下「行归实例、缓存归平台方」的中间态，而那正好是读侧看不到、写侧会撞 UID 的形态；
+    - **不经过残留清理**：缓存行本来就是在这个地址上收的信，搬过去时它们的归属要跟着改，
+      而不是被删掉。清理由「新建账户」那条路负责，那条路的语义是「这个地址换了新主人」；
+    - **附件不搬**：目录名沿用原地址（`attachment_dir = 原地址`），文件原地不动。搬文件要
+      遍历整个目录、可能很大，而目录名本来就是按地址起的，搬过去之后语义仍然成立；
+    - **只支持授权码方式**：OAuth / 官方 API 的凭据是平台方那一整套（刷新令牌、代理、应用凭据），
+      搬进表里之后实例既没有能力维护它、也不该拿到它，直接拒绝并说明原因；
+    - **按地址认账户，下标只是定位**：请求必须带 `expected_username`（页面上看到的那个地址），与下标处的
+      账户对不上就 409。账户列表是数组，另一个平台方管理员在列表加载之后、点确认之前加了或删了一个账户，
+      同一个下标就指向了别的邮箱——这一步会把它连同授权码与整个缓存收件箱交给租户实例。写回配置时也按
+      地址在**当时的**列表里重新找，不用一开始那份快照的下标（中间有好几次等待）。
+    """
+    from nekro_agent.services import email_accounts as mail
+
+    accounts = _get_accounts(adapter)
+    _validate_index(accounts, index)
+    account = accounts[index]
+
+    expected = mail.normalize_username(str(request.get("expected_username", "") or ""))
+    if not expected:
+        raise HTTPException(status_code=400, detail="必须提供 expected_username（要转的那个邮箱地址）")
+    if expected != mail.normalize_username(account.USERNAME):
+        raise HTTPException(status_code=409, detail="账户列表已经变了，请刷新后再试")
+
+    target_adapter = str(request.get("adapter_key", "") or "").strip()
+    target_instance = str(request.get("instance_key", "") or "").strip()
+    if not target_adapter or not target_instance:
+        raise HTTPException(status_code=400, detail="必须提供 adapter_key 与 instance_key")
+
+    if account.AUTH_TYPE != "password" or account.TRANSPORT_TYPE != "imap_smtp":
+        raise HTTPException(status_code=400, detail="OAuth / API 方式的邮箱不能转为实例自有")
+
+    from nekro_agent.models.db_adapter_instance import TOMBSTONE_STATUS, DBAdapterInstance
+    from nekro_agent.models.db_email import DBEmail
+    from nekro_agent.models.db_email_account import DBEmailAccount
+
+    instance = (
+        await DBAdapterInstance.filter(adapter_key=target_adapter, instance_key=target_instance)
+        .exclude(status=TOMBSTONE_STATUS)
+        .order_by("id")
+        .first()
+    )
+    if instance is None:
+        raise HTTPException(status_code=404, detail="实例不存在")
+    try:
+        await mail.assert_instance_account_quota(target_adapter, target_instance)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    username = mail.normalize_username(account.USERNAME)
+    provider = account.EMAIL_ACCOUNT if account.EMAIL_ACCOUNT in EMAIL_PROVIDER_CONFIGS else CUSTOM_PROVIDER_KEY
+    settings: Dict[str, Any] = {}
+    if provider == CUSTOM_PROVIDER_KEY:
+        # 自定义服务商的主机端口只能存在账户自己的 `settings` 里（预设表里没有它）
+        settings = {
+            "imap_host": account.CUSTOM_IMAP_HOST,
+            "imap_port": int(account.CUSTOM_IMAP_PORT),
+            "smtp_host": account.CUSTOM_SMTP_HOST,
+            "smtp_port": int(account.CUSTOM_SMTP_PORT),
+            "smtp_ssl_port": int(account.CUSTOM_SMTP_SSL_PORT),
+            "smtp_use_ssl": bool(account.CUSTOM_SMTP_USE_SSL),
+        }
+
+    created_id: Optional[int] = None
+    try:
+        async with in_transaction():
+            # 上面有好几次等待：按地址在当时的列表里重新找，这个账户已经不在（被删、被改了地址）就 409
+            current = _get_accounts(adapter)
+            position = next(
+                (i for i, item in enumerate(current) if mail.normalize_username(item.USERNAME) == username),
+                None,
+            )
+            if position is None:
+                raise _AccountListChangedError
+            row = await DBEmailAccount.create(
+                owner_adapter_key=target_adapter,
+                owner_instance_key=target_instance,
+                username=username,
+                display_name=account.DISPLAY_NAME or "",
+                provider=provider,
+                settings=settings,
+                password=account.PASSWORD or "",
+                enabled=bool(account.ENABLED),
+                receive_enabled=bool(account.RECEIVE_ENABLED),
+                send_enabled=bool(account.SEND_ENABLED),
+                is_default_sender=bool(account.IS_DEFAULT_SENDER),
+                notify_chat_key="",
+                # 附件目录沿用原地址：文件不搬，语义也仍然成立（这个目录收的就是这个地址的信）
+                attachment_dir=username,
+                created_by="platform",
+                updated_by="platform",
+            )
+            created_id = int(row.id)
+            # 只搬**平台方名下**的缓存行（快照为空的那些）：同一个地址下若还留着别的实例的旧行（以前归某个
+            # 实例、删账户时缓存没删掉），把它们一并改到目标实例就等于把别人的信交给这个实例
+            await DBEmail.filter(account_username=username, owner_adapter_key="", owner_instance_key="").update(
+                owner_adapter_key=target_adapter,
+                owner_instance_key=target_instance,
+            )
+            # 配置的写回放在事务里：写不进去就整块回滚，不留「表里有行、配置里还有它」的两份
+            current.pop(position)
+            adapter.config.RECEIVE_ACCOUNTS = current
+            _save_email_config(adapter)
+            owner = mail.instance_owner_of(row)
+    except _AccountListChangedError as e:
+        raise HTTPException(status_code=409, detail="账户列表已经变了，请刷新后再试") from e
+    except Exception as e:
+        logger.warning(f"转为实例自有失败，已回滚: index={index} | {type(e).__name__}")
+        if created_id is not None:
+            # 事务回滚是数据库侧的事；配置对象是内存里的，必须自己复原
+            await _restore_platform_account(adapter, account, index)
+        raise HTTPException(status_code=400, detail="转换失败，配置与账户都没有改动") from e
+
+    mail.clear_default_sender_cache()
+    try:
+        await mail.remove_runtime_account(adapter, account)
+        await mail.sync_runtime_account(adapter, mail.to_runtime_account(row), owner=owner)
+    except Exception as e:  # noqa: BLE001 - 客户端改挂失败不该让「已转成」变成 500
+        logger.warning(f"转为实例自有之后的运行时客户端改挂失败: {type(e).__name__}")
+
+    logger.info(
+        f"平台方邮箱已转为实例自有: 操作人={_current_actor()}, 地址哈希={_address_hash(username)}, "
+        f"目标实例={target_adapter}/{target_instance}",
+    )
+    return {"success": True, "id": created_id, "adapter_key": target_adapter, "instance_key": target_instance}
+
+
+class _AccountListChangedError(Exception):
+    """要转的账户在写回时已经不在当时的列表里了（被删、被改了地址）"""
+
+
+async def _restore_platform_account(adapter, account: EmailAccount, index: int) -> None:
+    """把内存里的配置改回「这一个账户还在 `RECEIVE_ACCOUNTS` 里」
+
+    事务只回滚数据库；`adapter.config` 是配置对象，得自己复原，否则运行时会以为这个账户
+    已经搬走了（发信找不到它，而表里也没有）。
+    """
+    try:
+        accounts = _get_accounts(adapter)
+        known = [item.USERNAME for item in accounts]
+        if account.USERNAME not in known:
+            accounts.insert(min(index, len(accounts)), account)
+            adapter.config.RECEIVE_ACCOUNTS = accounts
+            _save_email_config(adapter)
+    except Exception as e:  # noqa: BLE001 - 尽力而为，失败已在上层记过 WARNING
+        logger.warning(f"回滚平台方邮箱配置失败: {type(e).__name__}")
+
+
+def _current_actor() -> str:
+    """日志里的操作人；这一族整组挂平台方门槛，取不到具体用户时记 platform"""
+    return "platform"
+
+
+def _address_hash(username: str) -> str:
+    """日志里的地址只留哈希：日志会被带走、被搜到，地址本身没有写进去的必要"""
+    from nekro_agent.services.email_accounts import normalize_username
+
+    digest = hashlib.sha256(normalize_username(username).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
 @router.post("/accounts/{index}/pull")
 async def pull_email_account(index: int, request: Optional[dict] = None, adapter=Depends(get_email_adapter)):
     """手动拉取指定账户的未读收件箱，并返回诊断统计。"""
@@ -302,7 +506,10 @@ async def delete_email_account(index: int, adapter=Depends(get_email_adapter)):
     _normalize_default_sender(accounts)
     adapter.config.RECEIVE_ACCOUNTS = accounts
     _save_email_config(adapter)
-    await _remove_runtime_account(adapter, removed_account)
+    from nekro_agent.services.email_accounts import clear_default_sender_cache, remove_runtime_account
+
+    clear_default_sender_cache()
+    await remove_runtime_account(adapter, removed_account)
     return {"success": True}
 
 
@@ -347,7 +554,9 @@ async def handle_oauth_callback(index: int, request: dict, adapter=Depends(get_e
     accounts[index] = account
     adapter.config.RECEIVE_ACCOUNTS = accounts
     _save_email_config(adapter)
-    await _sync_runtime_account(adapter, account)
+    from nekro_agent.services.email_accounts import sync_runtime_account
+
+    await sync_runtime_account(adapter, account)
     return {"success": True}
 
 

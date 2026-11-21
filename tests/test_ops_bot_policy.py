@@ -47,8 +47,6 @@ def build_policy(**overrides: object) -> OpsBotPolicy:
         "instance_key": OPS_INSTANCE,
         "channel_id": OPS_CHANNEL,
         "operators": frozenset({OPERATOR}),
-        "deeplink_ttl_seconds": 300,
-        "console_base_url": "https://console.example.com",
     }
     defaults.update(overrides)
     return OpsBotPolicy(**defaults)  # type: ignore[arg-type]
@@ -252,12 +250,12 @@ class TestActionCatalog:
 
     @pytest.mark.parametrize(
         "action",
-        ["enable-instance", "disable-instance", "restart-container", "suspend-tenant", "resume-tenant"],
+        ["enable-instance", "disable-instance", "restart-container", "suspend-tenant", "resume-tenant", "tools"],
     )
     def test_state_changing_actions_are_classified_as_write(self, action: str) -> None:
         """核心不变量：任何会改变系统状态的指令都必须是 WRITE
 
-        分错类的后果是这条指令会在聊天里直接执行，深链确认整个被绕过。
+        写指令走共用的执行层、写审计、回复回执；分错成 READ 就会绕过这三样。
         """
         spec = resolve_action(action)
         assert spec is not None
@@ -295,8 +293,6 @@ class TestOpsConfigIsPlatformOnly:
             "OPS_BOT_INSTANCE_KEY",
             "OPS_BOT_CHANNEL_ID",
             "OPS_BOT_OPERATORS",
-            "OPS_BOT_DEEPLINK_TTL_SECONDS",
-            "OPS_BOT_CONSOLE_BASE_URL",
         ):
             assert _is_platform_only_config("system", name), name
 

@@ -40,6 +40,11 @@ EXPECTED_INDEX_FIELDS = [
     "memory_source",
     "is_inactive",
     "event_time",
+    "adapter_key",
+    "origin_chat_key",
+    "origin_chat_type",
+    "person_accounts",
+    "payload_schema",
 ]
 
 
@@ -109,7 +114,7 @@ class FakeQdrantClient:
 async def paragraph_db():
     await Tortoise.init(
         db_url="sqlite://:memory:",
-        modules={"models": ["nekro_agent.models.db_mem_paragraph"]},
+        modules={"models": ["nekro_agent.models.db_mem_paragraph", "nekro_agent.models.db_mem_paragraph_person"]},
     )
     await Tortoise.generate_schemas()
     try:

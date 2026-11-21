@@ -1,4 +1,4 @@
-import { useEffect, useState, type ChangeEvent } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import {
   Accordion,
   AccordionDetails,
@@ -37,6 +37,7 @@ import {
   type EmailDetail,
   type EmailListResponse,
   type EmailRawContent,
+  type EmailScope,
 } from '../../../services/api/emails'
 import { emailApi, type EmailAccount } from '../../../services/api/email'
 import { CARD_VARIANTS } from '../../../theme/variants'
@@ -112,6 +113,7 @@ function DetailContent({
   rawLoading,
   isLoading,
   hasError,
+  scope,
   t,
 }: {
   detail?: EmailDetail
@@ -119,6 +121,7 @@ function DetailContent({
   rawLoading: boolean
   isLoading: boolean
   hasError: boolean
+  scope?: EmailScope
   t: (key: string, options?: Record<string, unknown>) => string
 }) {
   const [bodyView, setBodyView] = useState<'html' | 'text'>('html')
@@ -319,6 +322,7 @@ function DetailContent({
                     <AttachmentPreview
                       key={attachment.url}
                       attachment={attachment}
+                      scope={scope}
                       expanded={expandedAttachment === attachment.name}
                       onToggle={() =>
                         setExpandedAttachment(prev => (prev === attachment.name ? null : attachment.name))
@@ -340,26 +344,40 @@ function DetailContent({
   )
 }
 
-export default function EmailsPage() {
+export interface EmailsPageProps {
+  /**
+   * 看哪个实例的自有邮箱；不传是平台方邮箱（Email 适配器页，与改造前相同）
+   *
+   * 传了之后不再读平台方的账户配置（那一族接口是平台方门槛，租户读会 403），账户筛选
+   * 改用 `accountOptions`；整页嵌在邮箱页的「邮件」标签里，不再画自己的标题卡。
+   */
+  scope?: EmailScope
+  accountOptions?: { value: string; label: string }[]
+}
+
+export default function EmailsPage({ scope, accountOptions }: EmailsPageProps = {}) {
   const { t } = useTranslation('adapter')
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(25)
   const [selectedEmailId, setSelectedEmailId] = useState<number | null>(null)
   const [detailOpen, setDetailOpen] = useState(false)
   const [selectedAccount, setSelectedAccount] = useState('')
+  const embedded = Boolean(scope)
+  const scopeKey = scope ? `${scope.adapter_key}|${scope.instance_key}` : ''
 
   const { data: accountsData } = useQuery({
     queryKey: ['email-accounts'],
     queryFn: emailApi.getAccounts,
+    enabled: !embedded,
   })
 
   const { data, isLoading, error } = useQuery<EmailListResponse>({
-    queryKey: ['emails', page, rowsPerPage, selectedAccount],
+    queryKey: ['emails', scopeKey, page, rowsPerPage, selectedAccount],
     queryFn: () => emailsApi.getEmails({
       offset: page * rowsPerPage,
       limit: rowsPerPage,
       account: selectedAccount || undefined,
-    }),
+    }, scope),
     refetchInterval: 30000,
   })
 
@@ -380,14 +398,14 @@ export default function EmailsPage() {
     isLoading: detailLoading,
     error: detailError,
   } = useQuery<EmailDetail>({
-    queryKey: ['email-detail', selectedEmailId],
-    queryFn: () => emailsApi.getEmailDetail(selectedEmailId as number),
+    queryKey: ['email-detail', scopeKey, selectedEmailId],
+    queryFn: () => emailsApi.getEmailDetail(selectedEmailId as number, scope),
     enabled: selectedEmailId !== null,
   })
 
   const { data: rawContent, isLoading: rawLoading } = useQuery<EmailRawContent>({
-    queryKey: ['email-raw-content', selectedEmailId],
-    queryFn: () => emailsApi.getEmailRawContent(selectedEmailId as number),
+    queryKey: ['email-raw-content', scopeKey, selectedEmailId],
+    queryFn: () => emailsApi.getEmailRawContent(selectedEmailId as number, scope),
     enabled: selectedEmailId !== null,
   })
 
@@ -412,8 +430,14 @@ export default function EmailsPage() {
     setDetailOpen(true)
   }
 
-  const accounts: EmailAccount[] = accountsData?.accounts ?? []
-  const accountLabelMap = new Map(accounts.map(account => [account.USERNAME, account.DISPLAY_LABEL || account.USERNAME]))
+  const platformAccounts: EmailAccount[] = embedded ? [] : accountsData?.accounts ?? []
+  const filterOptions =
+    accountOptions ??
+    platformAccounts.map(account => ({
+      value: account.USERNAME,
+      label: account.DISPLAY_LABEL || account.USERNAME,
+    }))
+  const accountLabelMap = new Map(filterOptions.map(option => [option.value, option.label]))
 
   if (isLoading) {
     return (
@@ -432,28 +456,30 @@ export default function EmailsPage() {
   }
 
   return (
-    <Box sx={{ p: { xs: 1.5, md: 2 }, display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <Paper sx={{ ...CARD_VARIANTS.default.styles, p: { xs: 2, md: 2.5 } }}>
-        <Stack
-          direction={{ xs: 'column', md: 'row' }}
-          spacing={1.5}
-          alignItems={{ xs: 'flex-start', md: 'center' }}
-          justifyContent="space-between"
-        >
-          <Box>
-            <Typography variant="h5" sx={{ fontWeight: 700 }}>
-              {t('emails.title')}
-            </Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
-              {t('emails.subtitle')}
-            </Typography>
-          </Box>
-          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-            <Chip label={t('emails.total', { count: data?.pagination.total ?? 0 })} size="small" variant="outlined" />
-            <Chip label={t('emails.refreshHint')} size="small" variant="outlined" />
+    <Box sx={{ p: embedded ? 0 : { xs: 1.5, md: 2 }, display: 'flex', flexDirection: 'column', gap: 2 }}>
+      {!embedded && (
+        <Paper sx={{ ...CARD_VARIANTS.default.styles, p: { xs: 2, md: 2.5 } }}>
+          <Stack
+            direction={{ xs: 'column', md: 'row' }}
+            spacing={1.5}
+            alignItems={{ xs: 'flex-start', md: 'center' }}
+            justifyContent="space-between"
+          >
+            <Box>
+              <Typography variant="h5" sx={{ fontWeight: 700 }}>
+                {t('emails.title')}
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
+                {t('emails.subtitle')}
+              </Typography>
+            </Box>
+            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              <Chip label={t('emails.total', { count: data?.pagination.total ?? 0 })} size="small" variant="outlined" />
+              <Chip label={t('emails.refreshHint')} size="small" variant="outlined" />
+            </Stack>
           </Stack>
-        </Stack>
-      </Paper>
+        </Paper>
+      )}
 
       <Paper sx={{ ...CARD_VARIANTS.default.styles, overflow: 'hidden' }}>
         <Box sx={{ px: 2, py: 1.5 }}>
@@ -477,9 +503,9 @@ export default function EmailsPage() {
                 onChange={event => handleChangeAccount(event.target.value)}
               >
                 <MenuItem value="">{t('emails.allAccounts')}</MenuItem>
-                {accounts.map(account => (
-                  <MenuItem key={account.USERNAME} value={account.USERNAME}>
-                    {account.DISPLAY_LABEL || account.USERNAME}
+                {filterOptions.map(option => (
+                  <MenuItem key={option.value} value={option.value}>
+                    {option.label}
                   </MenuItem>
                 ))}
               </Select>
@@ -590,6 +616,7 @@ export default function EmailsPage() {
           rawLoading={rawLoading}
           isLoading={detailLoading}
           hasError={Boolean(detailError)}
+          scope={scope}
           t={t}
         />
       </NekroDialog>
@@ -597,23 +624,72 @@ export default function EmailsPage() {
   )
 }
 
+/**
+ * 把取回的附件 Blob 挂到 `img` / `iframe` 上：`blob:` 链接在 effect 里建、在清理时撤
+ *
+ * 直接写元素的 `src` 而不经 state：StrictMode 下 effect 会「挂上、清理、再挂上」，经 state 或 `useMemo`
+ * 的写法会让元素留着一个已经撤掉的链接。
+ */
+function useBlobSource<T extends HTMLImageElement | HTMLIFrameElement>(blob: Blob | undefined) {
+  const ref = useRef<T>(null)
+  useEffect(() => {
+    const element = ref.current
+    if (!element || !blob) {
+      return undefined
+    }
+    const objectUrl = URL.createObjectURL(blob)
+    element.src = objectUrl
+    return () => {
+      element.removeAttribute('src')
+      URL.revokeObjectURL(objectUrl)
+    }
+  }, [blob])
+  return ref
+}
+
 function AttachmentPreview({
   attachment,
+  scope,
   expanded,
   onToggle,
   t,
 }: {
   attachment: EmailAttachment
+  scope?: EmailScope
   expanded: boolean
   onToggle: () => void
   t: (key: string, options?: Record<string, unknown>) => string
 }) {
+  const scopeKey = [scope?.adapter_key ?? '', scope?.instance_key ?? '', attachment.url]
   const { data: textContent, isLoading } = useQuery({
-    queryKey: ['email-attachment-text', attachment.url],
-    queryFn: () => emailsApi.getAttachmentText(attachment.url),
+    queryKey: ['email-attachment-text', ...scopeKey],
+    queryFn: () => emailsApi.getAttachmentText(attachment.url, scope),
     enabled: expanded && (attachment.preview_type === 'text' || attachment.preview_type === 'markdown'),
   })
-  const accessUrl = emailsApi.getAttachmentAccessUrl(attachment.url)
+  // 图片与 PDF 带着登录头取回成 Blob 再显示：登录令牌不进任何链接（见 `emailsApi.getAttachmentBlob`）
+  const { data: blob, isLoading: blobLoading, isError: blobError } = useQuery({
+    queryKey: ['email-attachment-blob', ...scopeKey],
+    queryFn: () => emailsApi.getAttachmentBlob(attachment.url, scope),
+    enabled: expanded && (attachment.preview_type === 'image' || attachment.preview_type === 'pdf'),
+    staleTime: 5 * 60 * 1000,
+  })
+  // 收起时传 undefined：再展开时元素是新挂上的，要让 effect 重跑一遍给它设 `src`
+  const imageRef = useBlobSource<HTMLImageElement>(expanded && attachment.preview_type === 'image' ? blob : undefined)
+  const frameRef = useBlobSource<HTMLIFrameElement>(expanded && attachment.preview_type === 'pdf' ? blob : undefined)
+  const [downloading, setDownloading] = useState(false)
+  const [downloadFailed, setDownloadFailed] = useState(false)
+
+  const handleDownload = async () => {
+    setDownloading(true)
+    setDownloadFailed(false)
+    try {
+      await emailsApi.downloadAttachment(attachment.url, attachment.name, scope)
+    } catch {
+      setDownloadFailed(true)
+    } finally {
+      setDownloading(false)
+    }
+  }
 
   return (
     <Paper sx={{ ...CARD_VARIANTS.default.styles, p: 1.25 }}>
@@ -645,13 +721,21 @@ function AttachmentPreview({
 
         {expanded && (
           <Box sx={{ pt: 0.5 }}>
-            {attachment.preview_type === 'image' && (
-              <Box component="img" src={accessUrl} alt={attachment.name} sx={{ maxWidth: '100%', borderRadius: 2 }} />
+            {(attachment.preview_type === 'image' || attachment.preview_type === 'pdf') && blobLoading && (
+              <Skeleton variant="rounded" height={180} />
             )}
-            {attachment.preview_type === 'pdf' && (
+            {(attachment.preview_type === 'image' || attachment.preview_type === 'pdf') && blobError && (
+              <Typography variant="body2" color="error">
+                {t('emails.attachmentLoadFailed')}
+              </Typography>
+            )}
+            {attachment.preview_type === 'image' && blob && (
+              <Box component="img" ref={imageRef} alt={attachment.name} sx={{ maxWidth: '100%', borderRadius: 2 }} />
+            )}
+            {attachment.preview_type === 'pdf' && blob && (
               <Box
                 component="iframe"
-                src={accessUrl}
+                ref={frameRef}
                 title={attachment.name}
                 sx={{ width: '100%', minHeight: 480, border: 0, borderRadius: 2 }}
               />
@@ -669,11 +753,16 @@ function AttachmentPreview({
               )
             )}
             {attachment.preview_type === 'download' && (
-              <Typography variant="body2" color="text.secondary">
-                <a href={accessUrl} target="_blank" rel="noreferrer">
+              <Stack direction="row" spacing={1} alignItems="center">
+                <ActionButton size="small" variant="outlined" onClick={handleDownload} disabled={downloading}>
                   {t('emails.openAttachment')}
-                </a>
-              </Typography>
+                </ActionButton>
+                {downloadFailed && (
+                  <Typography variant="body2" color="error">
+                    {t('emails.attachmentLoadFailed')}
+                  </Typography>
+                )}
+              </Stack>
             )}
           </Box>
         )}

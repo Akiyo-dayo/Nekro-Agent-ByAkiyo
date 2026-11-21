@@ -57,7 +57,7 @@ from nekro_agent.services.plugin.schema import SandboxMethodType
 from nekro_agent.services.user.role import Role
 
 _REAL_SAVE_CONFIG = ConfigService.save_config
-RUN_AGENT_PATH = Path(__file__).resolve().parents[1] / "nekro_agent" / "services" / "agent" / "run_agent.py"
+ROUND_PROMPT_PATH = Path(__file__).resolve().parents[1] / "nekro_agent" / "services" / "agent" / "round_prompt.py"
 
 
 @pytest.fixture(autouse=True)
@@ -418,12 +418,13 @@ class TestRuntimeContractRules:
     def test_empty_rules_render_no_section(self) -> None:
         assert "Plugin Call Priority Rules" not in self._system_message("")
 
-    def test_run_agent_passes_the_rules_to_the_compiler(self) -> None:
-        """调用点本身：`run_agent` 组装 `PromptCompiler` 时必须把规则段传进去
+    def test_round_prompt_passes_the_rules_to_the_agent_compiler(self) -> None:
+        """调用点本身：组装 `PromptCompiler` 时必须把规则段传进去
 
         按 AST 判，不按源码字符串判：函数名同时出现在 import 行里，字符串判据恒真。
+        组装已收口到 `round_prompt.build_round_prompt`，这里跟着调用点走。
         """
-        tree = ast.parse(RUN_AGENT_PATH.read_text(encoding="utf-8"))
+        tree = ast.parse(ROUND_PROMPT_PATH.read_text(encoding="utf-8"))
         compiler_calls = [
             node
             for node in ast.walk(tree)

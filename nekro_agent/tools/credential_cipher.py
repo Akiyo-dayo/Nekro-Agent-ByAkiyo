@@ -86,6 +86,7 @@ import base64
 import os
 import secrets
 import stat
+import time
 from pathlib import Path
 from typing import Literal, NamedTuple, Optional, Tuple
 
@@ -97,6 +98,10 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import OsEnv
 
 logger = get_sub_logger("credential_cipher")
+
+# 「解不开」的 ERROR 限流：同类日志 60 秒内只记一条
+_UNDECRYPTABLE_LOG_INTERVAL_SECONDS = 60.0
+_last_undecryptable_log_at = float("-inf")
 
 # 密文信封前缀。存量明文 Key 不可能以它开头，因此"这个值是不是密文"永远是结构判定，
 # 不需要另外加一个 `is_encrypted` 布尔列（那种列一旦与实际内容不一致就是灾难）
@@ -166,9 +171,12 @@ def reset_credential_cipher_cache() -> None:
     密钥来源全部从 `OsEnv` 与数据目录在**调用时**读取
     （由环境派生的值不要在 import 期定死），测试改完 `OsEnv.DATA_DIR` /
     `OsEnv.CREDENTIAL_SECRET_KEY` 之后调一次这个函数即可。
+
+    「解不开」的 ERROR 限流计时一并复位：换了密钥是新的情况，第一次解不开要照常报出来。
     """
-    global _key_ring  # noqa: PLW0603
+    global _key_ring, _last_undecryptable_log_at  # noqa: PLW0603
     _key_ring = None
+    _last_undecryptable_log_at = float("-inf")
 
 
 def _derive_key(material: str) -> bytes:
@@ -431,11 +439,18 @@ def decrypt_credential_with_source(stored: str) -> Tuple[str, PlaintextSource]:
         if plain is not None:
             return plain, "fallback"
 
-    logger.error(
-        "模型组凭据解密失败：库里是密文，但当前密钥解不开它（密钥被换过、或密钥文件丢了）。"
-        "本次按空凭据处理——**不会**把密文当成 API Key 发给上游。"
-        "请恢复原密钥，或在后台重新填写该模型组的 API Key。",
-    )
+    # 这个函数也被资源与 SSH 服务器凭据用：文案不写死「模型组」。列表页一次会对每行每列
+    # 都解一遍，主密钥丢了时不限流会一页刷出几十条同样的 ERROR
+    global _last_undecryptable_log_at
+    now = time.monotonic()
+    if now - _last_undecryptable_log_at >= _UNDECRYPTABLE_LOG_INTERVAL_SECONDS:
+        _last_undecryptable_log_at = now
+        logger.error(
+            "凭据解密失败：库里是密文，但当前密钥解不开它（密钥被换过、或密钥文件丢了）。"
+            "本次按空凭据处理——**不会**把密文当成凭据使用。"
+            "请恢复原密钥，或在后台重新填写对应的凭据（模型组 API Key、资源、SSH 服务器）。"
+            "（同类日志 60 秒内只记一条）",
+        )
     return "", "undecryptable"
 
 

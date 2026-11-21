@@ -100,29 +100,22 @@ class ConfSetCommand(BaseCommand):
             return CmdCtl.failed(t(zh_CN=f"未知配置: `{key}`", en_US=f"Unknown config: `{key}`"))
 
         current_value = getattr(config, key)
-        if isinstance(current_value, (int, float)):
-            setattr(config, key, type(current_value)(value))
-        elif isinstance(current_value, bool):
-            if value.lower() in ("true", "1", "yes"):
-                setattr(config, key, True)
-            elif value.lower() in ("false", "0", "no"):
-                setattr(config, key, False)
-            else:
-                return CmdCtl.failed(
-                    t(
-                        zh_CN=f"布尔值只能是 `true` 或 `false`，请检查 `{key}` 的值",
-                        en_US=f"Boolean value must be `true` or `false`, check the value of `{key}`",
-                    )
-                )
-        elif isinstance(current_value, str):
-            setattr(config, key, value)
-        else:
+        # 只开放标量：列表 / 字典类配置（超级用户名单之类）不经聊天命令改，与以前一致
+        if not isinstance(current_value, (bool, int, float, str)):
             return CmdCtl.failed(
                 t(
                     zh_CN=f"不支持动态修改的配置类型 `{type(current_value)}`",
                     en_US=f"Unsupported config type for dynamic modification: `{type(current_value)}`",
                 )
             )
+
+        # 与后台保存同一套解析与校验：越界、类型不对当场拒绝，不写进运行中的配置。
+        # 以前直接 setattr 不查约束；而且先判 int 再判 bool，布尔项走的是 `bool("false") == True`
+        from nekro_agent.services.config_service import ConfigService
+
+        success, message = ConfigService.set_config_value(config, key, value)
+        if not success:
+            return CmdCtl.failed(t(zh_CN=f"设置 `{key}` 失败：{message}", en_US=f"Failed to set `{key}`: {message}"))
 
         return CmdCtl.success(
             t(zh_CN=f"已设置 `{key}` 的值为 `{value}`", en_US=f"Set `{key}` to `{value}`")

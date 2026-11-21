@@ -77,7 +77,7 @@ def retrieval_env(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
     monkeypatch.setattr(config, "MEMORY_ENABLE_SYSTEM", True)
     recorded: Dict[str, Any] = {}
 
-    async def fake_embed(_text: str) -> List[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
         return [0.1, 0.2, 0.3]
 
     async def fake_search(**kwargs: Any) -> List[Any]:

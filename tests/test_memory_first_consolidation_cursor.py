@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from nekro_agent.core.config import config
+from nekro_agent.services.memory import consolidator as consolidator_module
 from nekro_agent.services.memory.consolidator import EpisodicConsolidator
 
 WORKSPACE_ID = 4404
@@ -25,6 +26,8 @@ class _FakeMessage:
         self.id = db_id
         self.send_timestamp = 1_700_000_000 + db_id
         self.sender_id = "user-1"
+        # 闸开时沉淀会按这一批消息收集账号称呼，假消息也得带上账号列
+        self.platform_userid = "user-1"
         self.sender_name = "用户"
         self.sender_nickname = "用户"
         self.content_text = content
@@ -43,6 +46,11 @@ class _FakeChannel:
 
     def memory_state(self) -> dict[str, Any]:
         return json.loads(self.data).get("memory_state", {})
+
+
+
+async def _not_paused(_chat_key: str) -> bool:
+    return False
 
 
 def _make_harness(
@@ -77,6 +85,9 @@ def _make_harness(
         return latest
 
     monkeypatch.setattr(consolidator, "_load_channel", fake_load_channel)
+    # 频道额度的「后台暂停」判断要查库：本文件不建库，之前的用例留下的数据库配置会让它
+    # 现开一个 sqlite 连接、没人关。额度不在这里测，按「没暂停」固定住
+    monkeypatch.setattr(consolidator_module, "background_paused", _not_paused)
     monkeypatch.setattr(consolidator, "_fetch_messages", fake_fetch)
     monkeypatch.setattr(consolidator, "_store_memory", fake_store)
     monkeypatch.setattr(consolidator, "_call_llm", fake_llm)

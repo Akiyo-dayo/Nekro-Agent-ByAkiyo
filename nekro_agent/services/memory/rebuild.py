@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from tortoise.expressions import Subquery
 
 from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
@@ -13,17 +16,26 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_mem_entity import DBMemEntity
 from nekro_agent.models.db_mem_episode import DBMemEpisode
-from nekro_agent.models.db_mem_paragraph import DBMemParagraph
-from nekro_agent.models.db_mem_reinforcement_log import DBMemReinforcementLog
+from nekro_agent.models.db_mem_paragraph import DBMemParagraph, OriginKind
+from nekro_agent.models.db_mem_paragraph_person import DBMemParagraphPerson
+from nekro_agent.models.db_mem_reinforcement_log import DBMemReinforcementLog, TargetType
 from nekro_agent.models.db_mem_relation import DBMemRelation
 from nekro_agent.models.db_workspace_comm_log import DBWorkspaceCommLog
+from nekro_agent.schemas.errors import ValidationError
 from nekro_agent.services.identity_scope import resolve_preset_id
-from nekro_agent.services.memory.consolidator import consolidate_workspace
+from nekro_agent.services.memory.consolidator import (
+    ConsolidationResult,
+    advance_consolidation_cursor,
+    consolidate_workspace,
+)
 from nekro_agent.services.memory.feature_flags import (
     MemoryOperation,
     ensure_memory_system_enabled,
+    is_domain_scope_enabled,
     is_memory_system_enabled,
 )
+from nekro_agent.services.memory.instance_scope import CONSOLE_ONLY_PRESET_ID, CONSOLE_USER_CHAT_KEY
+from nekro_agent.services.memory.persons import persons_of_paragraphs
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
 from nekro_agent.services.memory.rebuild_state_store import (
     MemoryRebuildChannelsFile,
@@ -60,6 +72,21 @@ from nekro_agent.services.memory.semantic_writer import persist_cc_task_memory
 logger = get_sub_logger("memory.rebuild")
 _scheduled_jobs: set[str] = set()
 
+# 临时故障的原地重试间隔（秒）。写成模块级常量是为了让用例能把它换小，
+# 不必真的等一两分钟。
+REBUILD_TRANSIENT_RETRY_DELAYS = (30.0, 60.0, 120.0)
+# 重试等待期间查取消的间隔。取消请求通常来自后台按钮，半秒的响应足够快。
+REBUILD_CANCEL_POLL_SECONDS = 0.5
+
+# 正在做域行重建的频道。工作区重建的频道阶段与单频道重建都要登记，
+# 调度器据此暂停这个频道的实时沉淀（两边会写同一份域行，撞上就是重复）。
+_domain_channel_rebuilds: set[str] = set()
+
+
+def is_domain_channel_rebuild_running(chat_key: str) -> bool:
+    """这个频道是否正在做域行重建。"""
+    return chat_key in _domain_channel_rebuilds
+
 
 class MemoryRebuildStartResult(BaseModel):
     job_id: str
@@ -68,11 +95,23 @@ class MemoryRebuildStartResult(BaseModel):
     message: str
 
 
+class RebuildEstimate(BaseModel):
+    """单频道重建要回放多少消息、大约几次沉淀调用。"""
+
+    chat_key: str
+    message_count: int
+    estimated_calls: int
+    cutoff: str | None = None
+
+
 class MemoryRebuildResult(BaseModel):
-    job_id: str
+    job_id: str = ""
     paragraphs_deleted: int = 0
     channels_total: int = 0
     channels_completed: int = 0
+    channels_failed: int = 0
+    failed_channels: list[str] = Field(default_factory=list)
+    last_error: str | None = None
     messages_processed: int = 0
     episodic_paragraphs_created: int = 0
     semantic_tasks_replayed: int = 0
@@ -157,6 +196,8 @@ async def _reset_workspace_structured_memory(workspace_id: int) -> int:
     await DBMemRelation.filter(workspace_id=workspace_id).delete()
     await DBMemEntity.filter(workspace_id=workspace_id).delete()
     await DBMemEpisode.filter(workspace_id=workspace_id).delete()
+    # 段落的人按段落 ID 挂，先清关联行再删段落。
+    await persons_of_paragraphs(workspace_id=workspace_id).delete()
     await DBMemParagraph.filter(workspace_id=workspace_id).delete()
     await memory_qdrant_manager.delete_by_workspace(workspace_id)
     return paragraph_count
@@ -306,10 +347,9 @@ async def _ensure_initialized(
 async def _resolve_log_scope(source_chat_key: str | None, cache: dict[str, tuple[str, int]]) -> tuple[str, int]:
     """把一条 CC 通讯日志的来源频道换算成隔离标签 `(实例标识, 人设标识)`。
 
-    CC 结果有两条来源：控制台里用户直发（`source_chat_key == "__user__"`，不属于任何实例、
-    任何人设，两个都留默认值，与 `persist_cc_task_memory` 的默认行为一致），以及
-    `cc_workspace` 插件从某个频道委托出去的任务（`source_chat_key` 就是该频道的 `chat_key`，
-    见插件里的 `task_id = chat_key`）。
+    CC 结果有两条来源：控制台里用户直发（`source_chat_key == "__user__"`，不属于任何实例），
+    以及 `cc_workspace` 插件从某个频道委托出去的任务（`source_chat_key` 就是该频道的
+    `chat_key`，见插件里的 `task_id = chat_key`）。
 
     后者必须带上实例标识：重建会把这类日志**重新沉淀成语义记忆**，落成空串就等于把实例 A
     频道里 CC 产出的结论变成对该工作区所有实例可见——检索侧的实例过滤永远会放行空串
@@ -321,10 +361,15 @@ async def _resolve_log_scope(source_chat_key: str | None, cache: dict[str, tuple
     两维一起解析、一起缓存，不给"只改了一半"留位置。
 
     人设取的是**重建那一刻**频道生效的人设——日志行上没有记录当时的人设，没有第二个来源。
+
+    控制台直发的日志（`__user__`，以及空串/None 这两种"调用处本来就写成 `__user__`"的
+    同义输入）落进 `CONSOLE_ONLY_PRESET_ID`：与 `persist_cc_task_memory` 的收口一致，
+    重建出来的这批结论同样不进任何群或私聊的召回。频道行找不到时仍然落 `("", 0)`——
+    那是"不知道归属"，与控制台身份是两回事，不能混成一档。
     """
     key = (source_chat_key or "").strip()
-    if not key or key == "__user__":
-        return "", 0
+    if not key or key == CONSOLE_USER_CHAT_KEY:
+        return "", CONSOLE_ONLY_PRESET_ID
     if key in cache:
         return cache[key]
     channel = await DBChatChannel.get_or_none(chat_key=key)
@@ -430,6 +475,269 @@ async def _replay_cc_semantic_memories(state: MemoryRebuildJobState, channels_fi
     return replayed
 
 
+async def reset_domain_channel_memory(chat_key: str) -> int:
+    """删除一个频道在域分区里的结构化记忆，返回删掉的段落数。
+
+    域行的归属有两列：`workspace_id = 0` 与 `origin_chat_key`。段落、关系、实体、episode
+    都按这两列定位；「涉及的人」与强化日志没有频道列，只能跟着段落走。
+
+    删的顺序有讲究：先清指向这些段落的强化日志与「涉及的人」，再删关系 / 实体 / episode，
+    最后删段落与向量。摘要表不在这里删——重建会依次写出新版本，旧版本本来就只保留最近几份。
+
+    **好感里程碑不在删除范围内**：它们不是从消息沉淀出来的，重建回放不出来，删了就永远
+    没了。里程碑是「这段关系怎么走到今天的」唯一的一份记录，而重建只该重放对话。
+    排除条件写进同一份 `paragraph_filter`，强化日志的子查询、「涉及的人」、段落删除与
+    返回的计数因此共用一个判据——分开写迟早有一处漏掉，那处漏掉的就是「删了一半」。
+    """
+    paragraph_filter = {"workspace_id": 0, "origin_chat_key": chat_key}
+    paragraph_query = DBMemParagraph.filter(**paragraph_filter).exclude(origin_kind=OriginKind.AFFECTION)
+    paragraph_ids: list[int] = await paragraph_query.values_list("id", flat=True)
+
+    # 强化日志没有 origin_chat_key，只有 target_type + target_id；能按段落定位的只有这一档。
+    await DBMemReinforcementLog.filter(
+        workspace_id=0,
+        target_type=TargetType.PARAGRAPH,
+        target_id__in=Subquery(paragraph_query.values("id")),
+    ).delete()
+    await DBMemRelation.filter(workspace_id=0, origin_chat_key=chat_key).delete()
+    await DBMemEntity.filter(workspace_id=0, origin_chat_key=chat_key).delete()
+    await DBMemEpisode.filter(workspace_id=0, origin_chat_key=chat_key).delete()
+    # 「涉及的人」走子查询而不是把段落 ID 拼成 `IN (...)`：段落一多会超过驱动的参数上限。
+    await DBMemParagraphPerson.filter(paragraph_id__in=Subquery(paragraph_query.values("id"))).delete()
+    await paragraph_query.delete()
+    if paragraph_ids:
+        await memory_qdrant_manager.delete_paragraphs(paragraph_ids)
+    return len(paragraph_ids)
+
+
+async def _advance_live_cursor_after_rebuild(chat_key: str, upper_bound: int) -> None:
+    """频道重建完成后推进实时游标；失败只告警，不让整个重建任务失败
+
+    推不动的后果是恢复后这段消息被再沉淀一遍（重复记忆），比让一个已经完成的重建任务
+    以失败收尾更容易处理：重复的段落可以再重建一次清掉。
+    """
+    try:
+        await advance_consolidation_cursor(chat_key, upper_bound)
+    except Exception as e:
+        logger.warning(
+            f"重建完成后推进实时沉淀游标失败，恢复后这段消息可能被重复沉淀: chat_key={chat_key}, "
+            f"upper_bound={upper_bound}, error={e}",
+        )
+
+
+async def _wait_for_retry(is_cancelled: Callable[[], bool], seconds: float) -> bool:
+    """等待重试间隔，期间每 `REBUILD_CANCEL_POLL_SECONDS` 秒查一次取消。
+
+    返回 True 表示等待期间收到了取消请求。不用一个长 `asyncio.sleep`：那样取消要等到
+    整段间隔结束（最长两分钟）才生效。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, seconds)
+    while True:
+        if is_cancelled():
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(REBUILD_CANCEL_POLL_SECONDS, remaining))
+
+
+async def _consolidate_batch_with_retries(
+    workspace_id: int,
+    chat_key: str,
+    *,
+    before_cursor: int,
+    upper_bound: int,
+    channel_state: MemoryRebuildChannelState,
+    is_cancelled: Callable[[], bool],
+    on_state_change: Callable[[], None],
+) -> ConsolidationResult | None:
+    """回放一批，临时故障原地重试。
+
+    重试用尽时返回最后一次结果（`failed_reason` 非空），由调用方把这个频道标成失败；
+    等待期间被取消时返回 None。
+    """
+    attempt = 0
+    while True:
+        consolidation = await consolidate_workspace(
+            workspace_id,
+            chat_key,
+            max_message_db_id=upper_bound or None,
+            start_after_db_id=before_cursor,
+            persist_progress=False,
+        )
+        if not consolidation.failed_reason:
+            return consolidation
+        if attempt >= len(REBUILD_TRANSIENT_RETRY_DELAYS):
+            return consolidation
+
+        delay = REBUILD_TRANSIENT_RETRY_DELAYS[attempt]
+        attempt += 1
+        channel_state.last_error = consolidation.failed_reason
+        on_state_change()
+        logger.warning(
+            f"记忆重建批次临时失败，原地重试: chat_key={chat_key}, attempt={attempt}, "
+            f"delay={delay:.1f}s, reason={consolidation.failed_reason}",
+        )
+        if await _wait_for_retry(is_cancelled, delay):
+            return None
+
+
+async def _run_channel_batches(
+    chat_key: str,
+    channel_state: MemoryRebuildChannelState,
+    *,
+    workspace_id_for_rows: int,
+    is_cancelled: Callable[[], bool],
+    on_state_change: Callable[[], None],
+) -> tuple[int, int, bool]:
+    """按批回放一个频道，返回（已处理消息数, 新建段落数, 是否被取消）。
+
+    三种失败都在这里收口：
+
+    - 临时故障（`failed_reason` 非空）原地重试，仍失败就把频道标 `FAILED`；
+    - 单条记忆写库失败（`errors` 非空但 `failed_reason` 为空）只记 warning 与 `last_error`，
+      游标已推进，照常前进；
+    - 没有前进（没取到消息或游标没动）把频道标 `FAILED`。
+
+    后两种与第一种一样只影响这个频道：调用方接着处理下一个频道。
+    """
+    total_messages_processed = 0
+    total_paragraphs_created = 0
+
+    while True:
+        if is_cancelled():
+            return total_messages_processed, total_paragraphs_created, True
+
+        before_cursor = channel_state.cursor_current_db_id
+        upper_bound = channel_state.cursor_upper_bound_db_id
+        if upper_bound <= before_cursor or channel_state.message_count_total <= channel_state.message_count_processed:
+            channel_state.status = RebuildChannelStatus.COMPLETED
+            on_state_change()
+            break
+
+        channel_state.status = RebuildChannelStatus.RUNNING
+        channel_state.last_batch_started_at = utcnow_iso()
+        on_state_change()
+
+        consolidation = await _consolidate_batch_with_retries(
+            workspace_id_for_rows,
+            chat_key,
+            before_cursor=before_cursor,
+            upper_bound=upper_bound,
+            channel_state=channel_state,
+            is_cancelled=is_cancelled,
+            on_state_change=on_state_change,
+        )
+        if consolidation is None:
+            return total_messages_processed, total_paragraphs_created, True
+
+        if consolidation.failed_reason:
+            channel_state.status = RebuildChannelStatus.FAILED
+            channel_state.last_error = consolidation.failed_reason
+            channel_state.retry_count += 1
+            on_state_change()
+            break
+
+        next_cursor = max(before_cursor, consolidation.last_processed_message_db_id)
+        if consolidation.errors:
+            channel_state.last_error = "; ".join(consolidation.errors)
+            logger.warning(
+                f"记忆重建批次有单条写库失败，照常前进: chat_key={chat_key}, errors={channel_state.last_error}",
+            )
+
+        if consolidation.messages_processed <= 0 or next_cursor <= before_cursor:
+            channel_state.status = RebuildChannelStatus.FAILED
+            channel_state.last_error = "rebuild batch finished without forward progress"
+            channel_state.retry_count += 1
+            on_state_change()
+            break
+
+        channel_state.cursor_current_db_id = next_cursor
+        channel_state.message_count_processed = min(
+            channel_state.message_count_total,
+            channel_state.message_count_processed + consolidation.messages_processed,
+        )
+        channel_state.last_batch_finished_at = utcnow_iso()
+        if not consolidation.errors:
+            channel_state.last_error = None
+        total_messages_processed += consolidation.messages_processed
+        total_paragraphs_created += consolidation.paragraphs_created
+        on_state_change()
+
+        if (
+            channel_state.cursor_current_db_id >= upper_bound
+            or channel_state.message_count_processed >= channel_state.message_count_total
+        ):
+            channel_state.status = RebuildChannelStatus.COMPLETED
+            channel_state.last_batch_finished_at = utcnow_iso()
+            on_state_change()
+            break
+        await asyncio.sleep(0.05)
+
+    return total_messages_processed, total_paragraphs_created, False
+
+
+async def _rebuild_one_channel(
+    state: MemoryRebuildJobState,
+    channels_file: MemoryRebuildChannelsFile,
+    chat_key: str,
+    channel_state: MemoryRebuildChannelState,
+    *,
+    workspace_id_for_rows: int,
+) -> tuple[int, int]:
+    """回放一个频道并落下频道级结果；失败只影响这个频道。"""
+
+    def is_cancelled() -> bool:
+        return state.cancel_requested
+
+    def on_state_change() -> None:
+        _refresh_progress(state, channels_file)
+        _persist_state(state, channels_file)
+
+    processed, created, cancelled = await _run_channel_batches(
+        chat_key,
+        channel_state,
+        workspace_id_for_rows=workspace_id_for_rows,
+        is_cancelled=is_cancelled,
+        on_state_change=on_state_change,
+    )
+    if cancelled:
+        _mark_cancelled(state, channels_file)
+        return processed, created
+
+    if channel_state.status == RebuildChannelStatus.FAILED:
+        if chat_key not in state.failed_channels:
+            state.failed_channels.append(chat_key)
+        _persist_state(state, channels_file)
+        append_job_event(
+            state.job_id,
+            "channel_failed",
+            chat_key=chat_key,
+            reason=channel_state.last_error or "",
+        )
+        logger.warning(
+            f"记忆重建的某个频道失败，继续下一个频道: job={state.job_id}, chat_key={chat_key}, "
+            f"reason={channel_state.last_error}",
+        )
+    else:
+        # 实时游标推到重建覆盖到的最后一条：否则调度器恢复后会把这段消息再沉淀一遍。
+        await _advance_live_cursor_after_rebuild(chat_key, channel_state.cursor_upper_bound_db_id)
+        # 续跑时上一个进程可能已经把这个频道记进失败列表，这一轮成功了就要撤掉，
+        # 否则任务统计里会留下一个其实已经完成的频道。
+        if chat_key in state.failed_channels:
+            state.failed_channels = [item for item in state.failed_channels if item != chat_key]
+            _persist_state(state, channels_file)
+        append_job_event(
+            state.job_id,
+            "channel_completed",
+            chat_key=chat_key,
+            processed=channel_state.message_count_processed,
+            total=channel_state.message_count_total,
+        )
+    return processed, created
+
+
 async def _rebuild_channels(
     state: MemoryRebuildJobState,
     channels_file: MemoryRebuildChannelsFile,
@@ -438,10 +746,17 @@ async def _rebuild_channels(
     state.phase = RebuildJobPhase.CHANNEL_BATCH
     _persist_state(state, channels_file)
 
+    gate_open = is_domain_scope_enabled()
     total_messages_processed = 0
     total_paragraphs_created = 0
+
     for chat_key, channel_state in channels_file.channels.items():
-        if channel_state.status == RebuildChannelStatus.COMPLETED:
+        needs_domain_reset = (
+            gate_open
+            and not channel_state.domain_reset_done
+            and channel_state.message_count_processed == 0
+        )
+        if channel_state.status == RebuildChannelStatus.COMPLETED and not needs_domain_reset:
             continue
         if state.cancel_requested:
             _mark_cancelled(state, channels_file)
@@ -450,86 +765,118 @@ async def _rebuild_channels(
         state.current_chat_key = chat_key
         _persist_state(state, channels_file)
 
-        while True:
-            if state.cancel_requested:
-                _mark_cancelled(state, channels_file)
-                return total_messages_processed, total_paragraphs_created
-
-            before_cursor = channel_state.cursor_current_db_id
-            upper_bound = channel_state.cursor_upper_bound_db_id
-            if upper_bound <= before_cursor or channel_state.message_count_total <= channel_state.message_count_processed:
-                channel_state.status = RebuildChannelStatus.COMPLETED
-                break
-
-            channel_state.status = RebuildChannelStatus.RUNNING
-            channel_state.last_batch_started_at = utcnow_iso()
-            _persist_state(state, channels_file)
-
-            consolidation = await consolidate_workspace(
-                state.workspace_id,
-                chat_key,
-                max_message_db_id=upper_bound or None,
-                start_after_db_id=before_cursor,
-                persist_progress=False,
-            )
-            next_cursor = max(before_cursor, consolidation.last_processed_message_db_id)
-            if consolidation.errors:
-                channel_state.status = RebuildChannelStatus.FAILED
-                channel_state.last_error = "; ".join(consolidation.errors)
-                channel_state.retry_count += 1
+        # 闸开时频道记忆写域分区（分区 0），闸关时仍写频道绑定的工作区。
+        workspace_id_for_rows = 0 if gate_open else state.workspace_id
+        processed = 0
+        created = 0
+        if gate_open:
+            _domain_channel_rebuilds.add(chat_key)
+        try:
+            if needs_domain_reset:
+                # 每个绑定频道只删一次旧域行，删完立刻落盘标记：续跑时不会再删一次已经写出的
+                # 新行。回看窗口里一条消息都没有的频道（快照时已标 COMPLETED）也要删——
+                # 重放 0 条是对的，但留着旧域行就等于这次重建没有清掉它的记忆。
+                # `message_count_processed == 0` 挡住升级前就开始、已经回放过一部分的任务。
+                deleted = await reset_domain_channel_memory(chat_key)
+                channel_state.domain_reset_done = True
                 _persist_state(state, channels_file)
-                _mark_failed(
-                    state,
-                    code=RebuildFailureCode.CHANNEL_BATCH_FAILED,
-                    reason=f"{chat_key}: {channel_state.last_error}",
-                    channels_file=channels_file,
+                append_job_event(
+                    state.job_id,
+                    "channel_domain_reset",
+                    chat_key=chat_key,
+                    paragraphs_deleted=deleted,
                 )
-                return total_messages_processed, total_paragraphs_created
-
-            if consolidation.messages_processed <= 0 or next_cursor <= before_cursor:
-                channel_state.status = RebuildChannelStatus.FAILED
-                channel_state.last_error = "rebuild batch finished without forward progress"
-                channel_state.retry_count += 1
-                _persist_state(state, channels_file)
-                _mark_failed(
-                    state,
-                    code=RebuildFailureCode.NO_FORWARD_PROGRESS,
-                    reason=f"{chat_key}: no forward progress",
-                    channels_file=channels_file,
+                logger.info(
+                    f"记忆重建已重置频道的域行: job={state.job_id}, chat_key={chat_key}, "
+                    f"paragraphs={deleted}",
                 )
-                return total_messages_processed, total_paragraphs_created
 
-            channel_state.cursor_current_db_id = next_cursor
-            channel_state.message_count_processed = min(
-                channel_state.message_count_total,
-                channel_state.message_count_processed + consolidation.messages_processed,
-            )
-            channel_state.last_batch_finished_at = utcnow_iso()
-            channel_state.last_error = None
-            total_messages_processed += consolidation.messages_processed
-            total_paragraphs_created += consolidation.paragraphs_created
-            _refresh_progress(state, channels_file)
-            _persist_state(state, channels_file)
+            if channel_state.status != RebuildChannelStatus.COMPLETED:
+                processed, created = await _rebuild_one_channel(
+                    state,
+                    channels_file,
+                    chat_key,
+                    channel_state,
+                    workspace_id_for_rows=workspace_id_for_rows,
+                )
+        finally:
+            if gate_open:
+                _domain_channel_rebuilds.discard(chat_key)
 
-            if (
-                channel_state.cursor_current_db_id >= upper_bound
-                or channel_state.message_count_processed >= channel_state.message_count_total
-            ):
-                channel_state.status = RebuildChannelStatus.COMPLETED
-                channel_state.last_batch_finished_at = utcnow_iso()
-                _refresh_progress(state, channels_file)
-                _persist_state(state, channels_file)
-                break
-            await asyncio.sleep(0.05)
+        total_messages_processed += processed
+        total_paragraphs_created += created
+        if state.is_terminal():
+            return total_messages_processed, total_paragraphs_created
 
-        append_job_event(
-            state.job_id,
-            "channel_completed",
-            chat_key=chat_key,
-            processed=channel_state.message_count_processed,
-            total=channel_state.message_count_total,
-        )
     return total_messages_processed, total_paragraphs_created
+
+
+async def estimate_domain_channel_rebuild(chat_key: str) -> RebuildEstimate:
+    """按回看天数估算一个频道要回放多少消息、大约调几次沉淀模型。"""
+    cutoff = _get_rebuild_cutoff()
+    start_cursor = await _find_last_message_db_id_before_cutoff(chat_key, cutoff)
+    upper_bound = await _find_latest_message_db_id(chat_key)
+    message_count = await _count_channel_messages(chat_key, start_cursor, upper_bound)
+    batch_size = max(1, int(config.MEMORY_CONSOLIDATION_BATCH_SIZE))
+    return RebuildEstimate(
+        chat_key=chat_key,
+        message_count=message_count,
+        estimated_calls=math.ceil(message_count / batch_size) if message_count > 0 else 0,
+        cutoff=cutoff.isoformat() if cutoff else None,
+    )
+
+
+async def rebuild_domain_channel(chat_key: str) -> MemoryRebuildResult:
+    """按频道重建域行：删除旧域行后从回看起点回放到最新消息。
+
+    给运维命令用，不建持久化的任务文件；统计与失败信息随返回值带走。重建期间这个频道
+    登记进暂停集合，调度器会挂起它的实时沉淀。闸关时域分区不存在，直接拒绝。
+    """
+    ensure_memory_system_enabled(MemoryOperation.REBUILD)
+    if not is_domain_scope_enabled():
+        raise ValidationError(reason="记忆域分区未开启")
+
+    cutoff = _get_rebuild_cutoff()
+    start_cursor = await _find_last_message_db_id_before_cutoff(chat_key, cutoff)
+    upper_bound = await _find_latest_message_db_id(chat_key)
+    total = await _count_channel_messages(chat_key, start_cursor, upper_bound)
+    channel_state = MemoryRebuildChannelState(
+        status=RebuildChannelStatus.PENDING,
+        message_count_total=total,
+        message_count_processed=0,
+        cursor_start_db_id=start_cursor,
+        cursor_current_db_id=start_cursor,
+        cursor_upper_bound_db_id=upper_bound,
+    )
+    result = MemoryRebuildResult(job_id=f"channel:{chat_key}", channels_total=1)
+
+    def on_state_change() -> None:
+        return None
+
+    _domain_channel_rebuilds.add(chat_key)
+    try:
+        result.paragraphs_deleted = await reset_domain_channel_memory(chat_key)
+        processed, created, _cancelled = await _run_channel_batches(
+            chat_key,
+            channel_state,
+            workspace_id_for_rows=0,
+            is_cancelled=lambda: False,
+            on_state_change=on_state_change,
+        )
+    finally:
+        _domain_channel_rebuilds.discard(chat_key)
+
+    result.messages_processed = processed
+    result.episodic_paragraphs_created = created
+    result.channels_completed = 1 if channel_state.status == RebuildChannelStatus.COMPLETED else 0
+    if channel_state.status == RebuildChannelStatus.COMPLETED:
+        # 同工作区重建：实时游标推到重建覆盖到的最后一条，避免恢复后重复沉淀这段消息。
+        await _advance_live_cursor_after_rebuild(chat_key, channel_state.cursor_upper_bound_db_id)
+    if channel_state.status == RebuildChannelStatus.FAILED:
+        result.channels_failed = 1
+        result.failed_channels = [chat_key]
+        result.last_error = channel_state.last_error
+    return result
 
 
 async def rebuild_workspace_memories(job_id: str) -> MemoryRebuildResult:
@@ -560,7 +907,21 @@ async def rebuild_workspace_memories(job_id: str) -> MemoryRebuildResult:
     result.channels_completed = sum(
         1 for channel in channels_file.channels.values() if channel.status == RebuildChannelStatus.COMPLETED
     )
-    result.episodes_created = await DBMemEpisode.filter(workspace_id=state.workspace_id).count()
+    result.channels_failed = sum(
+        1 for channel in channels_file.channels.values() if channel.status == RebuildChannelStatus.FAILED
+    )
+    result.failed_channels = list(state.failed_channels)
+    # 统计要按这次实际写入的分区算：闸开时频道回放写的是域分区 0、按频道归属，
+    # 按工作区数会是 0（工作区行刚被清空）。
+    if is_domain_scope_enabled():
+        bound_chat_keys = list(channels_file.channels)
+        result.episodes_created = (
+            await DBMemEpisode.filter(workspace_id=0, origin_chat_key__in=bound_chat_keys).count()
+            if bound_chat_keys
+            else 0
+        )
+    else:
+        result.episodes_created = await DBMemEpisode.filter(workspace_id=state.workspace_id).count()
     _mark_completed(state, channels_file)
     return result
 

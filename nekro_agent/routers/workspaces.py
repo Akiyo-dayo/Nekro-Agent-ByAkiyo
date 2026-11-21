@@ -69,7 +69,6 @@ from nekro_agent.services.memory.retriever import retrieve_memories
 from nekro_agent.services.memory.semantic_writer import persist_cc_task_memory
 from nekro_agent.services.resources import workspace_resource_service
 from nekro_agent.services.runtime_state import is_shutting_down
-from nekro_agent.services.skill_scope import is_within
 from nekro_agent.services.system_broadcast import (
     WorkspaceCcActiveEvent,
     WorkspaceCcRuntimePhase,
@@ -82,7 +81,12 @@ from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import get_tenant_scope
 from nekro_agent.services.workspace.cc_credential import METADATA_TOKEN_KEY
 from nekro_agent.services.workspace.client import CCSandboxClient, CCSandboxError
-from nekro_agent.services.workspace.container import ImageNotFoundError, SandboxContainerManager
+from nekro_agent.services.workspace.container import (
+    ImageNotFoundError,
+    SandboxContainerManager,
+    WorkspaceBusyError,
+    effective_sandbox_image,
+)
 from nekro_agent.services.workspace.manager import WorkspaceService
 from nekro_agent.services.workspace.prompt_envelope import CcPromptEnvelope
 from nekro_agent.services.workspace.tenant_scope import (
@@ -250,14 +254,15 @@ def _summary(
 
     channels = channel_names or []
     display_names = channel_display_names or channels  # fallback 到 chat_key
+    sandbox_image, sandbox_version = effective_sandbox_image(ws)
     return WorkspaceSummary(
         id=ws.id,
         name=ws.name,
         description=ws.description,
         status=ws.status,
         memory_system_enabled=bool(app_config.MEMORY_ENABLE_SYSTEM),
-        sandbox_image=ws.sandbox_image or app_config.CC_SANDBOX_IMAGE,
-        sandbox_version=ws.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG,
+        sandbox_image=sandbox_image,
+        sandbox_version=sandbox_version,
         container_name=ws.container_name,
         host_port=ws.host_port,
         runtime_policy=ws.runtime_policy,
@@ -289,7 +294,10 @@ async def _build_cc_memory_handshake(workspace_id: int, instruction: str, limit:
 
     1. 全量（现取）。调用方是这个工作区的管理员，本来就能从后台读到该工作区的全部记忆；
        产出只回到他自己的控制台，不进任何 IM 频道。跨租户由 `assert_workspace_accessible`
-       挡在更外层。行为与改造前逐字一致。
+       挡在更外层。行为与改造前逐字一致。**「不进任何 IM 频道」现在是数据层的事实**：
+       这条路径产出的结论写回时落在 `CONSOLE_ONLY_PRESET_ID`（见
+       `semantic_writer.persist_cc_task_memory`），任何群和私聊的人设维过滤都匹配不到它，
+       因此进不了它们的召回；握手这一侧读全量，所以上下文照旧跟得上。
     2. 收成"无实例 + 无人设"那一档。会让控制台直发从此**读不到任何来自频道的记忆**，
        而这正是这个握手存在的意义，等于静默废掉功能。
     3. 让调用方传一个频道。控制台上没有这个概念，只能瞎编一个。
@@ -361,10 +369,6 @@ def _detail(ws: DBWorkspace, *, bound_chat_keys: "List[str] | None" = None) -> W
         cc_model_preset_id=int(cc_model_preset_id) if cc_model_preset_id is not None else None,
         primary_channel_chat_key=primary_channel_chat_key,
     )
-
-
-async def _resolve_workspace_runtime_env(workspace: DBWorkspace) -> "Dict[str, str]":
-    return await workspace_resource_service.resolve_workspace_resources_to_env(workspace.id)
 
 
 def _get_prompt_layers_metadata(workspace: DBWorkspace) -> dict[str, Any]:
@@ -542,7 +546,8 @@ async def get_workspace_overview_stats(
 
     dynamic_skill_count = len(WorkspaceService.list_dynamic_skills(workspace_id))
 
-    na_context_body, na_context_updated = WorkspaceService.read_na_context(workspace_id)
+    # 读的是容器可写目录里的文件：放进线程，不让单个文件的读卡住事件循环
+    na_context_body, na_context_updated = await asyncio.to_thread(WorkspaceService.read_na_context, workspace_id)
     na_context_preview = na_context_body[:150] if na_context_body else ""
 
     return WorkspaceOverviewStats(
@@ -571,20 +576,21 @@ async def update_workspace(
     # 就是一条「在宿主上运行任意容器镜像」的路径。两者因此与容器生命周期同级，只有平台方能动。
     #
     # 判据是「是否真的要改」而不是「有没有出现在请求体里」：配置页每次保存都会把当前值一并回传，
-    # 见到字段就拒绝会把租户的普通保存操作一起打掉。而「当前值」有两种形态 —— 列里存的空串，
-    # 与读接口回给前端的那个全局默认（`_summary` 的 `ws.sandbox_image or CC_SANDBOX_IMAGE`）。
-    # 只认列里那个的话，未显式设过镜像的工作区（列为空串）会把前端原样回传的默认值判成一次修改，
+    # 见到字段就拒绝会把租户的普通保存操作一起打掉。而「当前值」有两种形态 —— 列里存的原值
+    # （空串、列默认的 `latest`），与读接口回给前端的实际生效值（`effective_sandbox_image`）。
+    # 只认列里那个的话，未显式设过镜像的工作区会把前端原样回传的生效值判成一次修改，
     # 表现为租户改个描述就 403 —— 实测踩到过。
     tenant_scoped = get_tenant_scope(_current_user) is not None
+    effective_image, effective_version = effective_sandbox_image(ws)
+    unchanged = {
+        "sandbox_image": {ws.sandbox_image, effective_image},
+        "sandbox_version": {ws.sandbox_version, effective_version},
+    }
+    image_changed = body.sandbox_image is not None and body.sandbox_image not in unchanged["sandbox_image"]
+    version_changed = body.sandbox_version is not None and body.sandbox_version not in unchanged["sandbox_version"]
     if tenant_scoped:
-        from nekro_agent.core.config import config as app_config
-
-        unchanged = {
-            "sandbox_image": {ws.sandbox_image, ws.sandbox_image or app_config.CC_SANDBOX_IMAGE},
-            "sandbox_version": {ws.sandbox_version, ws.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG},
-        }
-        for field, submitted in (("sandbox_image", body.sandbox_image), ("sandbox_version", body.sandbox_version)):
-            if submitted is not None and submitted not in unchanged[field]:
+        for field, changed in (("sandbox_image", image_changed), ("sandbox_version", version_changed)):
+            if changed:
                 logger.warning(f"租户尝试修改工作区 {workspace_id} 的 {field}: user={_current_user.username}")
                 raise PermissionDeniedError
 
@@ -598,13 +604,15 @@ async def update_workspace(
     if body.description is not None:
         ws.description = body.description
         update_fields.append("description")
-    # 租户提交的镜像字段上面已校验过与当前值等价，这里不落地：把「跟随全局默认」的空串
-    # 写成一个具体值，会让这个工作区从此不再随平台方调整默认镜像而变。
-    if body.sandbox_image is not None and not tenant_scoped:
-        ws.sandbox_image = body.sandbox_image
+    # 与当前值等价的镜像字段一律不落地（租户的上面已经拦过，平台方的也一样）：把「跟随全局默认」
+    # 的空串或列默认值写成一个具体值，会让这个工作区从此不再随平台方调整默认镜像而变——配置页
+    # 每次保存都回传当前生效值，照写就等于每保存一次就把工作区钉死在当时的默认镜像上。
+    # 平台方要让工作区重新跟随默认，提交空串即可（与当前单独设置不等价，会落地）。
+    if image_changed and not tenant_scoped:
+        ws.sandbox_image = body.sandbox_image or ""
         update_fields.append("sandbox_image")
-    if body.sandbox_version is not None and not tenant_scoped:
-        ws.sandbox_version = body.sandbox_version
+    if version_changed and not tenant_scoped:
+        ws.sandbox_version = body.sandbox_version or ""
         update_fields.append("sandbox_version")
     if body.runtime_policy is not None:
         ws.runtime_policy = body.runtime_policy
@@ -653,8 +661,13 @@ async def delete_workspace(
 
     # 容器要**删**而不是停：工作区行一删，容器名/端口/磁盘就再没有任何产品入口能碰到。
     # 不看 `status`：库里的 status 只是最近一次已知状态，`recover_on_startup` 之外没人保证它准。
-    if ws.container_name:
+    # 不管有没有容器名都调：`remove()` 先在工作区的锁里把状态换成 `deleting`，这之后别的请求
+    # 起不来新容器；正在启停就拒绝删除。从没建过容器（没有容器名）的工作区它不碰 Docker；库里没记的
+    # 同工作区容器（并发启动、升级前留下的孤儿）它一起删，漏下的由 NA 启动时的孤儿清理收走
+    try:
         await SandboxContainerManager.remove(ws)
+    except WorkspaceBusyError as e:
+        raise ValidationError(reason=str(e)) from e
 
     # 清理工作区相关的结构化记忆
     try:
@@ -663,6 +676,7 @@ async def delete_workspace(
         from nekro_agent.models.db_mem_paragraph import DBMemParagraph
         from nekro_agent.models.db_mem_reinforcement_log import DBMemReinforcementLog
         from nekro_agent.models.db_mem_relation import DBMemRelation
+        from nekro_agent.services.memory.persons import persons_of_paragraphs
 
         await DBMemReinforcementLog.filter(workspace_id=workspace_id).delete()
         await DBMemRelation.filter(workspace_id=workspace_id).delete()
@@ -670,6 +684,8 @@ async def delete_workspace(
         # `mem_episode` 与上面四张同属记忆库，`memory/reset` 一直删着它，
         # 只有这条删除路径漏了 —— 表现是删掉工作区之后 episode 行永远留在库里。
         await DBMemEpisodeModel.filter(workspace_id=workspace_id).delete()
+        # 段落的人按段落 ID 挂，必须在段落删除之前先清掉，否则留下指不到任何段落的孤儿行。
+        await persons_of_paragraphs(workspace_id=workspace_id).delete()
         await DBMemParagraph.filter(workspace_id=workspace_id).delete()
         await memory_qdrant_manager.delete_by_workspace(workspace_id)
         logger.info(f"工作区 {workspace_id} 的记忆数据已清理")
@@ -856,6 +872,8 @@ async def start_sandbox(
         ws = await SandboxContainerManager.create_and_start(ws)
     except ImageNotFoundError as e:
         raise ValidationError(reason=f"镜像 {e.image} 在本地不存在，请先在概览页拉取镜像后再启动容器")
+    except WorkspaceBusyError as e:
+        raise ValidationError(reason=str(e)) from e
     await publish_system_event(
         WorkspaceStatusEvent(
             workspace_id=ws.id,
@@ -875,7 +893,10 @@ async def stop_sandbox(
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ActionOkResponse:
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    await SandboxContainerManager.stop(ws)
+    try:
+        await SandboxContainerManager.stop(ws)
+    except WorkspaceBusyError as e:
+        raise ValidationError(reason=str(e)) from e
     await ws.refresh_from_db()
     await publish_system_event(
         WorkspaceStatusEvent(
@@ -898,7 +919,10 @@ async def restart_sandbox(
     ws = await assert_workspace_accessible(_current_user, workspace_id)
     if not ws.container_name:
         raise ValidationError(reason="工作区尚无运行中的容器")
-    await SandboxContainerManager.restart(ws)
+    try:
+        await SandboxContainerManager.restart(ws)
+    except WorkspaceBusyError as e:
+        raise ValidationError(reason=str(e)) from e
     # restart() 内部会在健康检查失败时修改 status，需要重新查询
     await ws.refresh_from_db()
     await publish_system_event(
@@ -924,6 +948,8 @@ async def rebuild_sandbox(
         ws = await SandboxContainerManager.rebuild(ws)
     except ImageNotFoundError as e:
         raise ValidationError(reason=f"镜像 {e.image} 在本地不存在，请先在概览页拉取镜像后再重建容器")
+    except WorkspaceBusyError as e:
+        raise ValidationError(reason=str(e)) from e
     await publish_system_event(
         WorkspaceStatusEvent(
             workspace_id=ws.id,
@@ -952,11 +978,8 @@ async def check_sandbox_image(
     workspace_id: int,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ImageCheckResponse:
-    from nekro_agent.core.config import config as app_config
-
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    image_name = ws.sandbox_image or app_config.CC_SANDBOX_IMAGE
-    image_tag = ws.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG
+    image_name, image_tag = effective_sandbox_image(ws)
     image = f"{image_name}:{image_tag}"
     exists = await SandboxContainerManager.check_image_exists(image)
     return ImageCheckResponse(image=image, exists=exists)
@@ -969,11 +992,8 @@ async def pull_sandbox_image_stream(
     workspace_id: int,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> EventSourceResponse:
-    from nekro_agent.core.config import config as app_config
-
     ws = await assert_workspace_accessible(_current_user, workspace_id)
-    image_name = ws.sandbox_image or app_config.CC_SANDBOX_IMAGE
-    image_tag = ws.sandbox_version or app_config.CC_SANDBOX_IMAGE_TAG
+    image_name, image_tag = effective_sandbox_image(ws)
     image = f"{image_name}:{image_tag}"
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -1266,7 +1286,8 @@ async def get_prompt_composer(
 
     prompt_layers = _get_prompt_layers_metadata(ws)
     claude_md_extra: str = (ws.metadata or {}).get("claude_md_extra") or ""
-    na_context_body, na_context_updated = WorkspaceService.read_na_context(workspace_id)
+    # 读的是容器可写目录里的文件：放进线程，不让单个文件的读卡住事件循环
+    na_context_body, na_context_updated = await asyncio.to_thread(WorkspaceService.read_na_context, workspace_id)
 
     shared_layer = prompt_layers.get("shared_manual_rules") if isinstance(prompt_layers.get("shared_manual_rules"), dict) else {}
     na_layer = prompt_layers.get("na_manual_rules") if isinstance(prompt_layers.get("na_manual_rules"), dict) else {}
@@ -1524,39 +1545,6 @@ class DynamicSkillFileBody(BaseModel):
     content: str
 
 
-def _list_dynamic_dir(root: Any, current: Any, max_depth: int = 5) -> List[DynamicSkillDirEntry]:
-    """递归列出目录内所有文件和子目录（跳过 .git 等隐藏目录、以及指出 `root` 外的软链）
-
-    这个目录是**容器可写的**：沙盒里的 Claude Code 一句 `ln -s` 就能在里面放一条
-    指向宿主任意路径的链接（相对目标在宿主上照样解析得到）。跟着它往下走等于
-    把别的工作区 / `{DATA_DIR}/skills/local` / `configs/` 的文件名交出去，
-    判据与 `skill_scope.is_within` 是同一条。
-    """
-    entries: List[DynamicSkillDirEntry] = []
-    if max_depth <= 0:
-        return entries
-    try:
-        items = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-    except PermissionError:
-        return entries
-    for item in items:
-        if item.name.startswith("."):
-            continue
-        if item.is_symlink() and not is_within(root, item):
-            continue
-        rel = str(item.relative_to(root))
-        if item.is_dir():
-            entries.append(DynamicSkillDirEntry(name=item.name, rel_path=rel, type="dir"))
-            entries.extend(_list_dynamic_dir(root, item, max_depth - 1))
-        elif item.is_file():
-            try:
-                size = item.stat().st_size
-            except OSError:
-                size = None
-            entries.append(DynamicSkillDirEntry(name=item.name, rel_path=rel, type="file", size=size))
-    return entries
-
-
 @router.get(
     "/{workspace_id}/dynamic-skills/{dir_name}/dir",
     summary="列出动态 skill 目录内所有文件",
@@ -1568,12 +1556,14 @@ async def list_dynamic_skill_dir(
     dir_name: str,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> DynamicSkillDirResponse:
+    """这个目录是**容器可写的**：沙盒里一句 `ln -s` 就能放一条指向宿主任意路径的链接。
+    列目录、读、写都交给 `WorkspaceService` 里逐级不跟随链接的那组函数（`safe_fs`），链接一律不走、不列。
+    """
     await assert_workspace_accessible(_current_user, workspace_id)
-    skill_dir = WorkspaceService.get_workspace_skills_dir(workspace_id) / dir_name
-    if not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
+    raw = await asyncio.to_thread(WorkspaceService.list_dynamic_skill_tree, workspace_id, dir_name)
+    if raw is None:
         raise NotFoundError(resource=f"动态 skill '{dir_name}'")
-    entries = await asyncio.to_thread(_list_dynamic_dir, skill_dir, skill_dir)
-    return DynamicSkillDirResponse(entries=entries)
+    return DynamicSkillDirResponse(entries=[DynamicSkillDirEntry(**item) for item in raw])
 
 
 @router.get(
@@ -1591,17 +1581,13 @@ async def get_dynamic_skill_file(
     await assert_workspace_accessible(_current_user, workspace_id)
     if ".." in rel_path.split("/"):
         raise ValidationError(reason="路径不合法")
-    skill_dir = WorkspaceService.get_workspace_skills_dir(workspace_id) / dir_name
-    if not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
+    if not await asyncio.to_thread(WorkspaceService.is_dynamic_skill, workspace_id, dir_name):
         raise NotFoundError(resource=f"动态 skill '{dir_name}'")
-    target = skill_dir / rel_path
-    # `..` 那一层只挡字面量；容器可以在这个目录里放一条指向宿主任意路径的软链，
-    # 每一段都是合法名字。resolve 之后再判一次归属（与 `skill_scope` 同一条判据）
-    if not is_within(skill_dir, target):
+    # `..` 那一层只挡字面量；容器可以在这个目录里放一条指向宿主任意路径的软链，每一段都是
+    # 合法名字。读的时候逐级 `O_NOFOLLOW` 打开，途中任何一级是链接都当作不存在
+    content = await asyncio.to_thread(WorkspaceService.read_dynamic_skill_file, workspace_id, dir_name, rel_path)
+    if content is None:
         raise NotFoundError(resource=f"文件 '{rel_path}'")
-    if not target.exists() or not target.is_file():
-        raise NotFoundError(resource=f"文件 '{rel_path}'")
-    content = await asyncio.to_thread(target.read_text, "utf-8")
     return DynamicSkillContent(dir_name=dir_name, content=content)
 
 
@@ -1620,15 +1606,19 @@ async def save_dynamic_skill_file(
     await assert_workspace_accessible(_current_user, workspace_id)
     if ".." in body.rel_path.split("/"):
         raise ValidationError(reason="路径不合法")
-    skill_dir = WorkspaceService.get_workspace_skills_dir(workspace_id) / dir_name
-    if not WorkspaceService._is_workspace_local_dynamic_skill(skill_dir):
-        raise NotFoundError(resource=f"动态 skill '{dir_name}'")
-    target = skill_dir / body.rel_path
-    # 写这一侧比读更糟：软链指向哪儿，这次 `write_text` 就落在哪儿
-    if not is_within(skill_dir, target):
-        raise ValidationError(reason="路径不合法")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(target.write_text, body.content, "utf-8")
+    # 写这一侧比读更糟：软链指向哪儿，按路径写就落在哪儿。逐级不跟随、临时文件 + rename
+    try:
+        await asyncio.to_thread(
+            WorkspaceService.write_dynamic_skill_file,
+            workspace_id,
+            dir_name,
+            body.rel_path,
+            body.content,
+        )
+    except LookupError as e:
+        raise NotFoundError(resource=f"动态 skill '{dir_name}'") from e
+    except ValueError as e:
+        raise ValidationError(reason=str(e)) from e
     return ActionOkResponse(ok=True)
 
 
@@ -1660,6 +1650,49 @@ def _hide_web_chat_mcp(servers: List[McpServerConfig], user: DBUser) -> List[Mcp
     ]
 
 
+def _mask_mcp_for_tenant(
+    servers: List[McpServerConfig],
+    user: DBUser,
+    *,
+    drop_credentialed: bool,
+) -> List[McpServerConfig]:
+    """平台方之外看到的工作区 MCP 条目：`env` / `headers` 的值全部掩掉
+
+    库条目只有平台方能改，但租户管理员能把库里任何条目加进自己的工作区——包括带令牌与私钥的
+    那些。响应里原样返回它们，等于把平台方凭据交给每一个开了后台的租户（他会去浏览器里看）。
+    角色门槛挡不住这一条：读工作区 MCP 列表本来就是租户该有的能力。
+
+    做法与 `_hide_web_chat_mcp` 并列而不是合并：两者判的是不同的事——一个按条目身份摘整条，
+    一个按有没有凭据决定「摘整条还是掩值」。
+
+    Args:
+        servers: 待处理的条目
+        user: 当前登录身份
+        drop_credentialed: `env` / `headers` 非空的条目是否整条摘掉。「可加入」列表用它：
+            那些条目加进来也不会写进 `.mcp.json`（判据见 `manager._build_disk_mcp_config`），
+            列出来只会让用户以为能加
+    """
+    from nekro_agent.schemas.tenant import CREDENTIAL_MASK
+    from nekro_agent.services.user.tenant_perm import is_platform_owner
+
+    if is_platform_owner(user):
+        return servers
+
+    masked: List[McpServerConfig] = []
+    for server in servers:
+        if drop_credentialed and (server.env or server.headers):
+            continue
+        masked.append(
+            server.model_copy(
+                update={
+                    "env": dict.fromkeys(server.env, CREDENTIAL_MASK),
+                    "headers": dict.fromkeys(server.headers, CREDENTIAL_MASK),
+                }
+            )
+        )
+    return masked
+
+
 @router.get("/{workspace_id}/mcp/servers", summary="获取工作区已加入的 MCP 服务器列表", response_model=McpServersResponse)
 @require_role(Role.Admin)
 async def list_mcp_servers(
@@ -1669,6 +1702,7 @@ async def list_mcp_servers(
     """返回当前工作区已加入的 MCP 条目（不含全局库其他条目）"""
     ws = await assert_workspace_accessible(_current_user, workspace_id)
     servers = _hide_web_chat_mcp(await WorkspaceService.list_mcp_servers(ws), _current_user)
+    servers = _mask_mcp_for_tenant(servers, _current_user, drop_credentialed=False)
     return McpServersResponse(servers=servers)
 
 
@@ -1685,6 +1719,8 @@ async def list_available_mcp_servers(
     """供"添加 MCP 服务"对话框列出候选；已加入的不会出现在此列表里"""
     ws = await assert_workspace_accessible(_current_user, workspace_id)
     servers = _hide_web_chat_mcp(await WorkspaceService.list_available_mcp_servers(ws), _current_user)
+    # 候选里去掉带凭据的：它们加进来也不会写进 `.mcp.json`，列出来只会让人以为能加
+    servers = _mask_mcp_for_tenant(servers, _current_user, drop_credentialed=True)
     return McpServersResponse(servers=servers)
 
 
@@ -1702,14 +1738,19 @@ async def add_mcp_server_to_workspace(
     """加入语义即启用。需要 server_name 在全局库中存在，否则 400
 
     租户加不进网页聊天条目：它在候选列表里已经被摘掉，这里按「全局库中不存在」拒绝，
-    与列表侧口径一致（不额外泄露「有这么一条，但你不能用」）。
+    与列表侧口径一致（不额外泄露「有这么一条，但你不能用」）。带凭据的条目同理——候选列表
+    与已加入列表对租户都看不到它，这里按同一个「不存在」拒绝。
     """
     from nekro_agent.schemas.errors import ValidationError
 
     ws = await assert_workspace_accessible(_current_user, workspace_id)
     library = _hide_web_chat_mcp(await WorkspaceService.list_available_mcp_servers(ws), _current_user)
     library_all = _hide_web_chat_mcp(await WorkspaceService.list_mcp_servers(ws), _current_user)
-    known = {s.name for s in library + library_all}
+    # 与两个列表接口同一套过滤：网页聊天条目与带凭据的条目对租户都不在 `known` 里
+    known = {
+        s.name
+        for s in _mask_mcp_for_tenant(library + library_all, _current_user, drop_credentialed=True)
+    }
     if server_name not in known:
         raise ValidationError(reason=f"全局库中不存在名为 {server_name} 的 MCP 服务器")
     await WorkspaceService.set_mcp_server_enabled(ws, server_name, True)
@@ -2368,6 +2409,7 @@ async def reset_memory(
     from nekro_agent.models.db_mem_paragraph import DBMemParagraph
     from nekro_agent.models.db_mem_reinforcement_log import DBMemReinforcementLog
     from nekro_agent.models.db_mem_relation import DBMemRelation
+    from nekro_agent.services.memory.persons import persons_of_paragraphs
     from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
 
     await assert_workspace_accessible(_current_user, workspace_id)
@@ -2377,6 +2419,8 @@ async def reset_memory(
     await DBMemRelation.filter(workspace_id=workspace_id).delete()
     await DBMemEntity.filter(workspace_id=workspace_id).delete()
     await DBMemEpisode.filter(workspace_id=workspace_id).delete()
+    # 段落的人按段落 ID 挂，先清关联行再删段落。
+    await persons_of_paragraphs(workspace_id=workspace_id).delete()
     await DBMemParagraph.filter(workspace_id=workspace_id).delete()
     await memory_qdrant_manager.delete_by_workspace(workspace_id)
     return ActionOkResponse(message=f"结构化记忆已清空，共删除 {paragraph_count} 条段落记忆")
@@ -3306,6 +3350,7 @@ async def edit_memory(
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ActionOkResponse:
     from nekro_agent.services.memory.embedding_service import embed_text
+    from nekro_agent.services.memory.persons import build_paragraph_payload
     from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
 
     target = await _get_memory_target(_current_user, workspace_id, memory_type, memory_id)
@@ -3332,7 +3377,7 @@ async def edit_memory(
             await memory_qdrant_manager.upsert_paragraph(
                 paragraph_id=target.id,
                 embedding=embedding,
-                payload=target.to_qdrant_payload(),
+                payload=await build_paragraph_payload(target),
             )
         except Exception as e:
             logger.warning(f"编辑后刷新段落向量失败: paragraph_id={target.id}, error={e}")
@@ -3441,6 +3486,25 @@ async def user_send_to_cc(
     if ws.status != "active":
         raise ValidationError(reason="工作区未运行，无法发送指令")
 
+    # 向 CC 发消息前统一过判据：`direct` 模式下不能拿平台方凭据的工作区直接拒绝，
+    # 其余情况拿到这次要注入容器的资源环境变量。在这里就失败 = 用户看不到那句
+    # `claude` CLI 的鉴权失败，而是本部署约定好的解释。
+    from nekro_agent.services.workspace.credential_policy import (
+        PlatformCredentialWithheldError,
+        prepare_cc_dispatch,
+    )
+
+    try:
+        cc_env_vars = await prepare_cc_dispatch(ws)
+    except PlatformCredentialWithheldError as e:
+        raise ValidationError(reason=str(e)) from e
+    except Exception as e:
+        # 资源解密失败等：与插件委托路径同一口径——脱敏、记 WARNING、给明确的报错，不去调容器。
+        # 原文可能回显资源里的凭据，而响应与日志租户都可能看到
+        error_text = redact_cc_failure_text(e)
+        logger.warning(f"准备 CC 调用失败: {error_text} workspace={workspace_id}")
+        raise OperationFailedError(operation="准备 CC 调用", detail=error_text) from None
+
     # 1. 构建 prompt 封装（含记忆握手和时间注入），持久化 USER_TO_CC 并立即广播
     envelope = await _build_cc_memory_handshake(workspace_id, body.content)
     user_log = await DBWorkspaceCommLog.create(
@@ -3452,13 +3516,53 @@ async def user_send_to_cc(
     )
     await comm_broadcast.publish(workspace_id, _comm_log_to_entry(user_log))
 
-    delegated_content = envelope.to_prompt()
-
     # 2. fire-and-forget：CC 通信在后台 Task 完成，HTTP 请求立即返回
     #    所有后续事件（TOOL_CALL、TOOL_RESULT、CC_TO_NA、SYSTEM 错误）均通过 SSE 推送
     #    注意：这里不额外落库/广播 NA_TO_CC。用户直发模式不经过 NA，
     #    delegated_content 仅作为发给 CC 的内部上下文增强，前端应只看到 USER_TO_CC。
-    async def _cc_task() -> None:
+    # 网关开着时，后台直发按发起人的身份拍一张租约：只有平台方后台账号能用这个工作区上的
+    # 平台方服务器，用户服务器一律不覆盖。总开关关着时整段跳过，一次库都不查。
+    from nekro_agent.core.config import config as app_config
+
+    console_lease = None
+    if app_config.SSH_GATEWAY_ENABLED:
+        try:
+            from nekro_agent.services.ssh_gateway.authz import compute_console_coverage
+            from nekro_agent.services.ssh_gateway.lease import create_lease
+
+            console_coverage = await compute_console_coverage(workspace_id, _current_user)
+            # 每次直发一个独立的任务标识：拍新租约会结束同一标识下还没结束的旧租约，
+            # 共用 `__user__` 的话第二次直发会把第一次正在用的 SSH 连接断掉
+            console_lease = create_lease(
+                workspace_id=workspace_id,
+                task_ref=f"__user__:{user_log.id}",
+                origin="console",
+                actor=str(_current_user.username or ""),
+                actor_user_id=int(_current_user.id or 0),
+                coverage=console_coverage,
+            )
+        except Exception as e:  # noqa: BLE001 - 判据失败只该少一次授权，不该让直发失败
+            logger.warning(f"拍后台直发的 SSH 授权租约失败（本次任务不授权）: {e}")
+
+    # 拍到租约时把覆盖的别名写进发给 CC 的正文（在任务正文之后，与系统附加段同一位置）。
+    # 没拍到租约、或总开关关着时不碰信封：正文与改造前逐字一致。
+    if console_lease is not None and app_config.SSH_GATEWAY_ENABLED:
+        try:
+            from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
+
+            _aliases = sorted(
+                await DBWsSshCredential.filter(
+                    id__in=list(console_lease.credential_ids),
+                ).values_list("alias", flat=True),
+            )
+            if _aliases:
+                envelope.ssh_servers = tuple(str(alias) for alias in _aliases)
+        except Exception as e:  # noqa: BLE001 - 少一段说明不该让直发失败
+            logger.warning(f"读取后台直发的 SSH 授权服务器别名失败（本次不写授权说明）: {e}")
+
+    delegated_content = envelope.to_prompt()
+
+    async def _run_cc_task(console_lease: Any, outcome: Dict[str, str]) -> None:
         started_at = int(time.time() * 1000)
         current_tool_name: Optional[str] = None
         operation_block_count = 0
@@ -3543,8 +3647,13 @@ async def user_send_to_cc(
                     current_tool=current_tool_name,
                     queue_length=SandboxQueuedChunk.model_validate(data).queue_length,
                 ),
-                env_vars=await _resolve_workspace_runtime_env(ws),
+                env_vars=cc_env_vars or None,
             ):
+                # 第一条不是排队事件的数据到了：CC 真正开始跑这个任务，租约这时才生效
+                if console_lease is not None and getattr(console_lease, "state", "") == "queued":
+                    from nekro_agent.services.ssh_gateway.lease import mark_running
+
+                    mark_running(str(getattr(console_lease, "lease_id", "")))
                 if isinstance(chunk, dict):
                     tool_chunk = SandboxToolChunk.model_validate(chunk)
                     if tool_chunk.type in ("tool_call", "tool_result"):
@@ -3596,6 +3705,7 @@ async def user_send_to_cc(
                     )
                     chunks.append(chunk)
         except CCSandboxError as e:
+            outcome["reason"] = "failed"
             # 上游报错常回显凭据，而通讯日志与运行状态租户后台都看得到：与插件委托路径用同一个脱敏出口
             error_text = redact_cc_failure_text(e)
             err_log = await DBWorkspaceCommLog.create(
@@ -3609,6 +3719,7 @@ async def user_send_to_cc(
             await _status(False)
             return
         except Exception as e:
+            outcome["reason"] = "failed"
             error_text = redact_cc_failure_text(e)
             err_log = await DBWorkspaceCommLog.create(
                 workspace_id=workspace_id,
@@ -3642,6 +3753,22 @@ async def user_send_to_cc(
             logger.warning(f"CC 结果沉淀为语义记忆失败（可忽略）: {e}")
         await _runtime_status(phase="completed")
         await _status(False)
+
+    async def _cc_task() -> None:
+        from nekro_agent.services.ssh_gateway.lease import end_lease
+
+        outcome = {"reason": "done"}
+        try:
+            await _run_cc_task(console_lease, outcome)
+        except asyncio.CancelledError:
+            outcome["reason"] = "cancelled"
+            raise
+        except Exception:
+            outcome["reason"] = "failed"
+            raise
+        finally:
+            if console_lease is not None:
+                end_lease(console_lease.lease_id, outcome["reason"])
 
     asyncio.create_task(_cc_task())
     return {"ok": True}

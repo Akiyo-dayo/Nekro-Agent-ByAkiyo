@@ -79,6 +79,15 @@ class _FakeAdapter:
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     # 适配器实例只在放行之后的路径上才会被取，这里给个最小替身
     monkeypatch.setattr(web_routers, "_get_adapter", lambda: _FakeAdapter())
+    # 本文件不建库。之前的用例留下的数据库配置会让放行之后的业务在 TestClient 自己的线程与
+    # 事件循环里现开一个 sqlite 连接、没人关；这里让「取连接」直接报未配置，等同于没建库
+    from tortoise import connections
+    from tortoise.exceptions import ConfigurationError
+
+    def _no_database(*_args: object, **_kwargs: object) -> None:
+        raise ConfigurationError("本文件不建库")
+
+    monkeypatch.setattr(connections, "get", _no_database)
 
     app = FastAPI()
     register_exception_handlers(app)

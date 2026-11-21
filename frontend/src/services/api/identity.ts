@@ -87,6 +87,15 @@ export interface DomainJoinPreviewResponse {
   alias_rows: number
   alias_conflicts: string[]
   person_rows: number
+  /** 入组后立刻对组内其他实例可见的域行段落 */
+  memory_paragraphs: number
+  /** 其中隔离中的段落；放回之前不会被召回 */
+  memory_quarantined: number
+  /** 只在各自频道注入的摘要份数（按「频道 + 人设」计） */
+  memory_summaries: number
+  /** 入组后域书与个人书也会对组内其它实例的频道生效 */
+  worldbook_books: number
+  worldbook_entries: number
   blockers: string[]
   notes: string[]
   can_migrate: boolean

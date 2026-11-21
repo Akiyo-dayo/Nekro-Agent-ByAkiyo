@@ -19,7 +19,7 @@ from nekro_agent.adapters.interface.schemas.platform import (
 from nekro_agent.adapters.utils import adapter_utils
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
-from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.models.db_chat_channel import DBChatChannel, is_chat_key_marked_bot_not_in_group
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.agent_ctx import AgentCtx
@@ -40,12 +40,33 @@ from nekro_agent.schemas.chat_message import (
 )
 from nekro_agent.schemas.errors import AdapterUnavailableError
 from nekro_agent.schemas.signal import MsgSignal
+from nekro_agent.services import channel_quota
+from nekro_agent.services.agent.round_trigger_accounts import note_pending_trigger
 from nekro_agent.services.channel_broadcaster import channel_broadcaster
-from nekro_agent.services.memory.feature_flags import is_memory_system_enabled
+from nekro_agent.services.channel_delivery import ChannelUndeliverableError, channel_delivery_blocks
+from nekro_agent.services.memory.feature_flags import (
+    is_domain_scope_enabled,
+    is_memory_enabled_for_channel,
+    is_memory_system_enabled,
+)
 from nekro_agent.services.message_broadcaster import message_broadcaster
+from nekro_agent.services.ops_agent.policy import OpsAgentPolicy, is_operator
+from nekro_agent.services.ops_agent.triggers import (
+    TRIGGER_KIND_HUMAN,
+    TRIGGER_KIND_OTHER,
+    TRIGGER_KIND_SYSTEM_PUSH,
+    TRIGGER_KIND_UNTRUSTED_PUSH,
+    RoundTrigger,
+    round_trigger_book,
+)
 from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.quota_service import quota_service
-from nekro_agent.services.user.super_users import is_super_user, is_trusted_listed_user
+from nekro_agent.services.user.super_users import (
+    is_super_user,
+    is_trusted_listed_user,
+    is_trusted_super_user_source,
+    matches_super_users,
+)
 from nekro_agent.tools.at_markup import AT_MARKUP_PATTERN, normalize_malformed_at_markup
 from nekro_agent.tools.common_util import (
     check_content_trigger,
@@ -88,17 +109,39 @@ def _without_nul(message: ChatMessage) -> ChatMessage:
     return message.model_copy(update=changed) if changed else message
 
 
-async def _notify_memory_scheduler(chat_key: str, workspace_id: int | None, content_length: int) -> None:
-    """通知记忆调度器有新消息（非阻塞）"""
-    if workspace_id is None or not is_memory_system_enabled():
+async def _notify_memory_scheduler(channel: DBChatChannel, content_length: int) -> None:
+    """通知记忆调度器有新消息（非阻塞）
+
+    调度器需要频道对象本身：闸开后判据是频道自己的 `MEMORY_ENABLE_FOR_CHAT`，
+    分区取 `channel.workspace_id or 0`，不再要求频道绑了工作区。闸关时这里仍按旧规则
+    提前挡掉未绑工作区的频道，让调用链与改造前逐字一致。
+    """
+    if not is_domain_scope_enabled():
+        if channel.workspace_id is None or not is_memory_system_enabled():
+            return
+        try:
+            from nekro_agent.services.memory.scheduler import memory_scheduler
+
+            await memory_scheduler.on_new_message(
+                chat_key=channel.chat_key,
+                workspace_id=channel.workspace_id,
+                content_length=content_length,
+            )
+        except Exception as e:
+            logger.debug(f"记忆调度器通知失败（可忽略）: {e}")
+        return
+
+    if not await is_memory_enabled_for_channel(channel):
         return
     try:
         from nekro_agent.services.memory.scheduler import memory_scheduler
 
         await memory_scheduler.on_new_message(
-            chat_key=chat_key,
-            workspace_id=workspace_id,
+            chat_key=channel.chat_key,
+            workspace_id=0,
             content_length=content_length,
+            adapter_key=channel.adapter_key,
+            instance_key=channel.instance_key,
         )
     except Exception as e:
         logger.debug(f"记忆调度器通知失败（可忽略）: {e}")
@@ -181,8 +224,21 @@ class MessageService:
         chat_key: Optional[str] = None,
         message: Optional[ChatMessage] = None,
         ctx: Optional[AgentCtx] = None,
+        *,
+        bypass_channel_quota: bool = False,
+        trigger: Optional[RoundTrigger] = None,
     ):
-        """调度 agent 任务，实现防抖和任务控制"""
+        """调度 agent 任务，实现防抖和任务控制
+
+        Args:
+            bypass_channel_quota: 调用方**自己已经判过**频道额度时置真。
+                入站消息那条路径判完才调度，它要放行（包括豁免的人——豁免的人不受频道
+                额度约束，用量照常计入）；其余调用方留默认值，让闸门在这里生效。
+            trigger: 这次调度由什么触发。运维工具要靠它判「这一轮是不是运维人员要求的」，
+                而防抖会让多条触发并进一轮、`AgentCtx` 上记的那个人未必是本轮的人，
+                所以触发必须在**到达时**记进 `services/ops_agent/triggers.py`。
+                没传的调用记成 `other`（将来新增的调度入口至少不会冒充人类消息）。
+        """
         if not message:
             if not chat_key:
                 logger.error("调度 Agent 执行失败，目标 chat_key 为空")
@@ -198,7 +254,47 @@ class MessageService:
             logger.debug(f"实例或其所属租户已停用，跳过 Agent 调度: chat_key={chat_key}")
             return
 
+        # Bot 不在群闸门。定时提醒、插件推送、CC 结果投递这类宿主替插件发起的回合，落到 Bot
+        # 已经被移出的群里，只会调一轮模型、再被 QQ 以「你已被移出该群」拒绝。这里只读定期核对
+        # 打的标记，不停用频道。人类消息不受影响：群里有人说话本身就说明 Bot 还在，入站那一步
+        # 已经把标记改回了「在群」。
+        trigger_kind = trigger.kind if trigger is not None else TRIGGER_KIND_OTHER
+        if trigger_kind != TRIGGER_KIND_HUMAN and await is_chat_key_marked_bot_not_in_group(chat_key):
+            logger.debug(f"频道已标记 Bot 不在群，跳过 Agent 调度: chat_key={chat_key}, trigger={trigger_kind}")
+            return
+
+        # 频道每日额度暂停闸门。定时提醒、插件推送、CC 结果投递等带 `trigger_agent` 的
+        # 推送都直接走到这里（它们不过 `push_human_message` 的额度判定），暂停时内容照常
+        # 落库、但不开回合——否则一个被暂停的频道照样能为每条定时提醒烧一轮模型。
+        if not bypass_channel_quota:
+            try:
+                paused = await channel_quota.is_paused(chat_key)
+            except Exception as e:  # noqa: BLE001 - 判定失败一律放行，不能让闸门自己变成故障点
+                logger.warning(f"频道额度暂停判定失败，按未暂停处理: chat_key={chat_key} | {e}")
+                paused = False
+            if paused:
+                logger.debug(f"频道 {chat_key} 今日额度已用完（暂停中），跳过 Agent 调度")
+                return
+
         current_time = time.time()
+
+        # 触发记账。位置在上面几道闸门**之后**：被挡下的调度不会跑任何回合，记下它反而会让
+        # 「这一批触发全是运维人员」这个判据失真（一条被拦下的系统推送会把批次降级成不可用）。
+        # 两家共用一本：D6 或 SSH 网关任一开着都记。两个都关着时不记——`open_round` 关着时
+        # 也不取，记下的条目只会在本子里放到过期，开关一打开，每个频道的第一轮都会因为
+        # 「批次里有过期条目」被拒一次。
+        # 函数内导入：本模块里 `config` 这个名字到处是局部的频道配置，模块级导入全局配置会被遮蔽
+        from nekro_agent.core.config import config as _global_config
+
+        if _global_config.OPS_AGENT_TOOLS_ENABLED or _global_config.SSH_GATEWAY_ENABLED:
+            round_trigger_book.record(chat_key, trigger or RoundTrigger(kind=TRIGGER_KIND_OTHER))
+
+        # 插件日志用的「这一轮是谁叫的 Bot」另记一份，不受运维工具开关影响（见
+        # `services/agent/round_trigger_accounts.py`）。只记账号或触发种类，纯内存，失败不影响调度
+        try:
+            note_pending_trigger(chat_key, trigger or RoundTrigger(kind=TRIGGER_KIND_OTHER))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"记录触发者失败（已忽略）: chat_key={chat_key} | {e}")
 
         # 更新待处理消息和防抖计时器
         self.pending_messages[chat_key] = message
@@ -322,10 +418,18 @@ class MessageService:
             async def _notify_round_failure(notice: str) -> None:
                 """给用户一条可见回执
 
-                三个前提缺一不可：开关开着、冷却窗口过了、发送本身不能把 Agent 的失败
-                变成第二个异常（适配器此刻很可能也不可用）。
+                四个前提缺一不可：开关开着、这个频道不是确定发不出去、冷却窗口过了、
+                发送本身不能把 Agent 的失败变成第二个异常（适配器此刻很可能也不可用）。
                 """
                 if not config.SESSION_ENABLE_FAILED_LLM_FEEDBACK:
+                    return
+                blocked = channel_delivery_blocks.get(chat_key)
+                if blocked is not None:
+                    # 放在冷却闸门之前：注定发不出去的这条不该白占掉冷却窗口，
+                    # 否则频道恢复后的第一次真实失败会被静默压掉
+                    logger.info(
+                        f"[message_service] 频道 {chat_key} 当前确定发不出去（{blocked.value}），不发失败回执",
+                    )
                     return
                 if not failure_notice_throttle.should_send(chat_key, config.SESSION_FAILED_FEEDBACK_COOLDOWN_SECONDS):
                     logger.info(f"[message_service] 频道 {chat_key} 的失败回执处于冷却窗口内，本次只记日志不发送")
@@ -352,6 +456,10 @@ class MessageService:
                     except Exception as e:
                         logger.exception(f"执行失败: {e}")
                         logger.error("Failed to Run Chat Agent.")
+                        # 实例离线时 Agent 在取自身信息那一步就抛，根本没走到适配器的发送，
+                        # 所以要在这里补记一次，紧接着的失败回执才会被挡住
+                        if isinstance(e, ChannelUndeliverableError):
+                            channel_delivery_blocks.mark(chat_key, e.undeliverable_reason, str(e))
                         # 改造前只有 `AllLLMRequestsFailedError` 会有回执，其余异常（沙盒侧、
                         # 多模态结果解析 ValueError 等）一律只留一行 ERROR —— 对用户就是装死。
                         # 现在每一类都有回执，文案按类别区分，并统一过会话冷却闸门。
@@ -554,6 +662,29 @@ class MessageService:
             # 配额豁免检查（用户白名单/管理员）
             _is_quota_exempt = await is_quota_exempt(message, config)
 
+            # 频道每日额度（平台方的承诺）与下面的回复配额（租户对自己的群的自限）是**两层**：
+            # 新的一层是平台方给这个频道承诺的用量，旧的一层是租户自己设的「少说话」。
+            # 两层各管各的、都放行才回复：合并成一个判据会让两种口径（回合 vs 消息条数、
+            # 额度时区 vs UTC 零点）互相解释不清，也会改变存量部署的既有行为。
+            # 豁免的人（白名单 / 超级用户）不受这一层约束，但用量照常计入。
+            if not _is_quota_exempt:
+                # 判定本身出错（库抖动等）按「没暂停」放行，与 `schedule_agent_task` 那道闸同一口径：
+                # 额度判定不能自己变成「群友说一句话、Bot 报一个错」的故障点
+                try:
+                    status = await channel_quota.check_and_alert(db_chat_channel)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"频道额度判定失败，按未暂停处理: chat_key={message.chat_key} | {e}")
+                    status = None
+                if status is not None and status.state == channel_quota.STATE_PAUSED:
+                    logger.info(
+                        f"频道 {message.chat_key} 今日额度已用完 "
+                        f"({status.used}/{status.allowed} {status.unit})，暂停回复",
+                    )
+                    if should_notify_quota_exhausted:
+                        # 当天第一次被叫到时提示一次；并发下只有抢到条件更新的那一条会发
+                        await channel_quota.send_pause_notice_once(db_chat_channel, status)
+                    return
+
             if not _is_quota_exempt:
                 # 配额检查（使用频道级 effective config）
                 effective_config = await db_chat_channel.get_effective_config()
@@ -641,7 +772,56 @@ class MessageService:
                                 )
                             return
 
-            await self.schedule_agent_task(message=message, ctx=ctx)
+            # 本函数已经判过频道额度（上面那一段），豁免的人也要能过，所以让调度跳过它自己的闸门
+            await self.schedule_agent_task(
+                message=message,
+                ctx=ctx,
+                bypass_channel_quota=True,
+                trigger=await self._human_trigger(message, db_chat_channel),
+            )
+
+    async def _human_trigger(self, message: ChatMessage, db_chat_channel: DBChatChannel) -> RoundTrigger:
+        """入站人类消息的触发记录
+
+        `operator_trusted` 必须在这里算：来源可信与否要读**当前事件所在连接**的握手记录，
+        离开这个入站任务就算不出来了（见 `services/user/super_users.py: is_trusted_super_user_source`
+        的调用约束）。`source_trusted` 是同一个来源判定的原值，只是不要求命中运维名单——
+        网关有自己的所有者名单与用户白名单。
+
+        来源只查一次：D6 开着且命中运维名单，或网关开着且命中「所有者 ∪ 用户白名单」，
+        任一成立才查。两边都命中时也共用这一次结果；都不命中就一次都不查，存量部署
+        不为没人用的功能每条消息多付一次查库、多一个故障点。
+        """
+        sender_id = str(message.platform_userid or "") or str(message.sender_id or "")
+        adapter_key = str(db_chat_channel.adapter_key or "")
+        instance_key = str(db_chat_channel.instance_key or "")
+
+        # 函数内导入配置：`core.config` 在导入期会读环境与配置目录，模块级导入会拖慢并搅乱
+        # 只 import 这个模块的测试
+        from nekro_agent.core.config import config as _config
+
+        operator_matched = False
+        if sender_id and bool(_config.OPS_AGENT_TOOLS_ENABLED):
+            policy = OpsAgentPolicy.from_config(_config)
+            operator_matched = is_operator(policy, adapter_key, sender_id)
+
+        gateway_matched = False
+        if sender_id and bool(_config.SSH_GATEWAY_ENABLED):
+            entries = [*_config.SSH_GATEWAY_OWNER_ACCOUNTS, *_config.SSH_GATEWAY_USER_ACCOUNTS]
+            gateway_matched = matches_super_users(adapter_key, sender_id, entries)
+
+        source_trusted = False
+        if operator_matched or gateway_matched:
+            source_trusted = await is_trusted_super_user_source(adapter_key, instance_key)
+
+        return RoundTrigger(
+            kind=TRIGGER_KIND_HUMAN,
+            adapter_key=adapter_key,
+            instance_key=instance_key,
+            sender_id=sender_id,
+            operator_trusted=operator_matched and source_trusted,
+            source_trusted=source_trusted,
+        )
 
     async def record_human_message(
         self,
@@ -705,8 +885,7 @@ class MessageService:
         # 通知记忆调度器（非阻塞）
         asyncio.create_task(
             _notify_memory_scheduler(
-                chat_key=message.chat_key,
-                workspace_id=db_chat_channel.workspace_id,
+                channel=db_chat_channel,
                 content_length=len(stored_text),
             ),
         )
@@ -870,8 +1049,7 @@ class MessageService:
         # 通知记忆调度器（非阻塞）
         asyncio.create_task(
             _notify_memory_scheduler(
-                chat_key=chat_key,
-                workspace_id=db_chat_channel.workspace_id,
+                channel=db_chat_channel,
                 content_length=len(content_text),
             ),
         )
@@ -986,7 +1164,14 @@ class MessageService:
         )
 
         if trigger_agent or signal == MsgSignal.FORCE_TRIGGER:
-            await self._trigger_after_push(chat_key, db_chat_channel, ctx, signal, f"系统消息 {content_text}")
+            await self._trigger_after_push(
+                chat_key,
+                db_chat_channel,
+                ctx,
+                signal,
+                f"系统消息 {content_text}",
+                trigger_kind=TRIGGER_KIND_SYSTEM_PUSH,
+            )
 
     async def _trigger_after_push(
         self,
@@ -995,8 +1180,14 @@ class MessageService:
         ctx: AgentCtx,
         signal: MsgSignal,
         label: str,
+        *,
+        trigger_kind: str,
     ) -> None:
-        """插件推送之后触发 Agent 的闸门：频道禁用、旁观模式、插件阻止触发时都不触发"""
+        """插件推送之后触发 Agent 的闸门：频道禁用、旁观模式、插件阻止触发时都不触发
+
+        `trigger_kind` 区分「系统消息推来的」与「外部内容推来的」：两者都不是人类说的，
+        运维工具因此都不可用，但审计与排查时要分得清是哪一种。
+        """
         if not db_chat_channel.is_active:
             logger.info(f"聊天频道 {chat_key} 已被禁用，跳过本次处理...")
             return
@@ -1007,7 +1198,15 @@ class MessageService:
         if signal not in [MsgSignal.CONTINUE, MsgSignal.FORCE_TRIGGER]:
             logger.info(f"{label} 被插件阻止触发，跳过本次处理...")
             return
-        await self.schedule_agent_task(chat_key=chat_key, ctx=ctx)
+        await self.schedule_agent_task(
+            chat_key=chat_key,
+            ctx=ctx,
+            trigger=RoundTrigger(
+                kind=trigger_kind,
+                adapter_key=str(db_chat_channel.adapter_key or ""),
+                instance_key=str(db_chat_channel.instance_key or ""),
+            ),
+        )
 
     async def push_untrusted_message(
         self,
@@ -1050,7 +1249,14 @@ class MessageService:
         )
 
         if trigger_agent or signal == MsgSignal.FORCE_TRIGGER:
-            await self._trigger_after_push(chat_key, db_chat_channel, ctx, signal, f"推送的 {result.kind}")
+            await self._trigger_after_push(
+                chat_key,
+                db_chat_channel,
+                ctx,
+                signal,
+                f"推送的 {result.kind}",
+                trigger_kind=TRIGGER_KIND_UNTRUSTED_PUSH,
+            )
 
     async def push_tool_result(self, chat_key: str, result: UntrustedToolResult) -> None:
         """落一条不可信的工具结果

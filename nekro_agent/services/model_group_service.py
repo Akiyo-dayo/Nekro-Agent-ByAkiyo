@@ -69,10 +69,7 @@ Windows 上用 `icacls` 收紧 ACL——`0o600` 在那里只影响只读位；�
 from __future__ import annotations
 
 import asyncio
-import os
 import re
-import subprocess
-import sys
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -120,6 +117,10 @@ from nekro_agent.tools.credential_cipher import (
     REENCRYPT_SOURCES,
     classify_stored_credential,
     credential_cipher_status,
+)
+from nekro_agent.tools.private_file import (
+    describe_private_file_protection,
+    write_private_file,
 )
 from nekro_agent.tools.redaction import is_credential_mask, mask_credential
 
@@ -403,46 +404,10 @@ async def upgrade_credentials_report() -> CredentialUpgradeReport:
 HANDWRITTEN_KEYS_BACKUP_PREFIX = "nekro-agent.model-groups-handwritten-keys"
 
 
-def _is_windows() -> bool:
-    return sys.platform == "win32"
-
-
-def _restrict_to_current_user_windows(path: Path) -> bool:
-    """Windows：去掉继承、只授予当前用户完全控制（`icacls`），成功返回 True
-
-    `os.open(..., 0o600)` 在 Windows 上只影响只读位，文件实际继承目录的 ACL（通常 `Users` 组可读）。
-    失败（没有 `icacls`、取不到用户名、命令返回非 0）不抛：调用方据返回值在日志里如实说明，不再声称已受保护。
-    """
-    username = os.environ.get("USERNAME", "")
-    if not username:
-        return False
-    domain = os.environ.get("USERDOMAIN", "")
-    principal = f"{domain}\\{username}" if domain else username
-    try:
-        result = subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:F"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
-
-
-def _write_private_file(path: Path, content: str) -> bool:
-    """**新建**并写入一份仅属主可访问的文件，返回「访问权限是否确实收紧了」
-
-    `O_EXCL`：不覆盖已有文件。POSIX 上权限在创建那一刻就是 0600，不存在先 644 再 chmod 的窗口，返回 True；
-    Windows 上 0600 不是 ACL，写完后用 `icacls` 显式收紧，返回收紧是否成功（False = 文件继承了目录权限）。
-    """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(content)
-    if _is_windows():
-        return _restrict_to_current_user_windows(path)
-    return True
+# 仅属主可访问文件的写法与「保护到了什么程度」的说法在 `tools/private_file.py`（启动加载配置时修正
+# 非法值前备份原文件也用它）；这里沿用原来的名字，调用处与测试里的替换不用改
+_write_private_file = write_private_file
+describe_backup_protection = describe_private_file_protection
 
 
 class HandwrittenKeysBackup(NamedTuple):
@@ -450,15 +415,6 @@ class HandwrittenKeysBackup(NamedTuple):
 
     path: Path
     owner_only: bool
-
-
-def describe_backup_protection(owner_only: bool) -> str:
-    """日志里说备份文件「保护到了什么程度」的那半句：随平台与实际结果走，不写死 0600"""
-    if not _is_windows():
-        return "权限 0600，仅属主可读写"
-    if owner_only:
-        return "已用 icacls 把访问权限收紧为仅当前用户"
-    return "**Windows 上未能收紧访问权限**，文件继承了数据目录的权限，同机的其他账户可能读到它"
 
 
 def find_handwritten_keys_backups() -> List[Path]:

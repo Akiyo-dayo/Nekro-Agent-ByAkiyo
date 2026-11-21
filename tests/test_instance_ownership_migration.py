@@ -14,7 +14,7 @@
 """
 
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 from fastapi import HTTPException
@@ -480,10 +480,15 @@ class TestFailureIsolation:
 
         original = chat_key_migration.migrate_chat_key_references
 
-        async def fail_on_second_group(old_chat_key: str, new_chat_key: str, instance_key: str = "") -> Dict[str, int]:
+        async def fail_on_second_group(
+            old_chat_key: str,
+            new_chat_key: str,
+            instance_key: str = "",
+            **kwargs: Any,
+        ) -> Dict[str, int]:
             if old_chat_key == source_chat_key(OTHER_GROUP):
                 raise RuntimeError("模拟改写引用时数据库中断")
-            return await original(old_chat_key, new_chat_key, instance_key)
+            return await original(old_chat_key, new_chat_key, instance_key, **kwargs)
 
         monkeypatch.setattr(chat_key_migration, "migrate_chat_key_references", fail_on_second_group)
 
@@ -509,10 +514,10 @@ class TestFailureIsolation:
         original = chat_key_migration.migrate_chat_key_references
         broken = {"enabled": True}
 
-        async def fail_once(old_chat_key: str, new_chat_key: str, instance_key: str = "") -> Dict[str, int]:
+        async def fail_once(old_chat_key: str, new_chat_key: str, instance_key: str = "", **kwargs: Any) -> Dict[str, int]:
             if broken["enabled"] and old_chat_key == source_chat_key(OTHER_GROUP):
                 raise RuntimeError("模拟改写引用时数据库中断")
-            return await original(old_chat_key, new_chat_key, instance_key)
+            return await original(old_chat_key, new_chat_key, instance_key, **kwargs)
 
         monkeypatch.setattr(chat_key_migration, "migrate_chat_key_references", fail_once)
         first = await migrate_instance_ownership(ADAPTER, SOURCE, TARGET)

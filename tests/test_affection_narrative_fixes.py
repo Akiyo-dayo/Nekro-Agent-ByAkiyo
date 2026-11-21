@@ -237,7 +237,13 @@ class TestRunAgentWiresTheSuppression:
             if outcome is not None:
                 raise outcome
 
+        async def no_db(*_args: Any, **_kwargs: Any) -> Any:
+            return None
+
         monkeypatch.setattr(run_agent_module, "_run_agent_in_instance_scope", fake_round)
+        # 回合首尾的频道额度计数要查消息表，这组用例不建库（理由见 `test_agent_round_control._Harness.install`）
+        monkeypatch.setattr(run_agent_module, "_channel_message_marker", no_db)
+        monkeypatch.setattr(run_agent_module, "_record_round_reply", no_db)
         ctx = SimpleNamespace(db_chat_channel=SimpleNamespace(chat_key=self.CHAT_KEY, instance_key="ob10001"))
         if outcome is None:
             await run_agent_module.run_agent(self.CHAT_KEY, ctx=ctx)  # type: ignore[arg-type]

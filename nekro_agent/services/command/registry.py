@@ -147,6 +147,7 @@ class CommandRegistry:
         """执行命令 - 自动检查启用状态"""
         from nekro_agent.schemas.i18n import t
         from nekro_agent.services.command.manager import command_manager
+        from nekro_agent.services.plugin.scope import resolve_chat_plugin_instance
 
         cmd = self.resolve(request.command_name)
         if not cmd:
@@ -171,7 +172,14 @@ class CommandRegistry:
             )
             return
 
-        if not command_manager.is_command_enabled_for_meta(cmd.metadata, request.context.chat_key):
+        # 先把这个频道落到实例上，插件来源的命令还要按 会话 > 实例 > 全局 判它在当前频道生效。
+        # 多租户部署里频道行缺失时得到 `None`，按不生效处理（与「命令已禁用」同一条响应）。
+        chat_instance_key = await resolve_chat_plugin_instance(request.context.chat_key)
+        if not command_manager.is_command_enabled_for_meta(
+            cmd.metadata,
+            request.context.chat_key,
+            chat_instance_key=chat_instance_key,
+        ):
             yield CommandResponse(
                 status=CommandResponseStatus.DISABLED,
                 message=t(

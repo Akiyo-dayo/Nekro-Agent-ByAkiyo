@@ -1,0 +1,168 @@
+{
+  "title": "SSH 网关",
+  "subtitle": "平台方在这里看网关状态、全部服务器凭据与全局审计；改动去对应工作区的『服务器』页做。",
+  "settingsCategory": "CC 工作区",
+  "actions": {
+    "refresh": "刷新",
+    "openSettings": "前往系统配置",
+    "import": "从工作区资源导入",
+    "loadMore": "加载更多",
+    "showInput": "查看输入",
+    "hideInput": "收起输入",
+    "openWorkspace": "打开工作区的服务器页"
+  },
+  "status": {
+    "title": "网关状态",
+    "state": "状态",
+    "reason": "原因",
+    "listenAddresses": "监听地址",
+    "port": "端口",
+    "connections": "连接数",
+    "channels": "通道数",
+    "runningLeases": "在跑租约数",
+    "configHint": "开关、所有者名单、用户白名单在系统配置里改（SSH_GATEWAY_ENABLED、SSH_GATEWAY_OWNER_ACCOUNTS、SSH_GATEWAY_USER_ACCOUNTS）",
+    "states": {
+      "off": "未开启",
+      "starting": "启动中",
+      "running": "运行中",
+      "unavailable": "不可用",
+      "tripped": "已熔断"
+    },
+    "emptyValue": "—"
+  },
+  "credentials": {
+    "title": "全部凭据",
+    "subtitle": "只读；增删改请到对应工作区的『服务器』页。",
+    "empty": "还没有任何服务器凭据",
+    "emptyHint": "可以在工作区『服务器』页新建，或从工作区资源导入。",
+    "columns": {
+      "alias": "别名",
+      "workspace": "工作区",
+      "owner": "归属",
+      "address": "主机:端口",
+      "username": "登录账号",
+      "status": "状态",
+      "secret": "凭据状态",
+      "hostKeys": "主机指纹",
+      "lastUsed": "最近使用",
+      "source": "来源"
+    },
+    "owner": {
+      "platform": "平台方",
+      "user": "用户 {{account}}"
+    },
+    "ownerNotWhitelisted": "凭据主人不在白名单，暂时用不了",
+    "status": {
+      "active": "可用",
+      "disabled": "已停用",
+      "suspended": "已挂起",
+      "auth_failed": "认证失败"
+    },
+    "statusReason": "原因：{{reason}}",
+    "statusReasons": {
+      "auth_failed": "上次认证失败，更新凭据后才能重新启用"
+    },
+    "lastError": "最近错误：{{message}}",
+    "secret": {
+      "ok": "正常",
+      "undecryptable": "密钥解不开，请恢复原密钥或重新填写"
+    },
+    "hostKeys": {
+      "empty": "首次连接时记下",
+      "count": "已记 {{count}} 把",
+      "entry": "公钥：{{entry}}"
+    },
+    "source": {
+      "admin": "后台",
+      "chat": "聊天",
+      "import": "导入"
+    },
+    "neverUsed": "从未使用"
+  },
+  "import": {
+    "confirmTitle": "从工作区资源导入",
+    "confirmContent": "把工作区资源里三个 SSH 模板按绑定导成平台方服务器；旧资源一行不动；已导过的不会重复导。",
+    "confirm": "开始导入",
+    "cancel": "取消",
+    "running": "正在导入…",
+    "resultTitle": "导入结果",
+    "imported": "导入了",
+    "already": "已导过",
+    "skipped": "跳过",
+    "alreadyCount": "{{count}} 条",
+    "importedColumns": {
+      "workspace": "工作区",
+      "alias": "别名",
+      "resource": "资源名"
+    },
+    "skippedColumns": {
+      "resource": "资源名",
+      "workspace": "工作区",
+      "reason": "原因"
+    },
+    "noneImported": "这次没有导入新的凭据",
+    "noneSkipped": "没有跳过任何资源",
+    "securityHint": "这些凭据以前进过容器，建议迁完以后换掉",
+    "failed": "导入失败：{{message}}",
+    "workspaceValue": "工作区 {{id}}"
+  },
+  "audit": {
+    "title": "全局审计",
+    "subtitle": "不限工作区；按记录号倒序，理由码已翻成中文。",
+    "empty": "还没有审计记录",
+    "columns": {
+      "time": "时间",
+      "workspace": "工作区",
+      "event": "事件",
+      "decision": "放行 / 拒绝",
+      "reason": "理由",
+      "credential": "别名或凭据",
+      "task": "任务",
+      "actor": "操作者",
+      "detail": "详情",
+      "input": "输入"
+    },
+    "decision": {
+      "allowed": "放行",
+      "denied": "拒绝"
+    },
+    "credentialFallback": "凭据 {{id}}",
+    "events": {
+      "cred_create": "新建凭据",
+      "cred_update": "修改凭据",
+      "cred_delete": "删除凭据",
+      "cred_reveal": "查看明文",
+      "cred_test": "测试连接",
+      "host_key": "主机指纹",
+      "lease": "授权窗口",
+      "connect": "连接",
+      "channel": "通道",
+      "exec": "命令",
+      "close": "关闭",
+      "suspend": "自动挂起",
+      "scrub": "原文清理"
+    },
+    "reasons": {
+      "gateway_off": "网关没开",
+      "isolation_off": "这个工作区的网络隔离没生效，不提供服务器连接",
+      "image_too_old": "CC 沙盒镜像太旧，请平台方升级",
+      "unknown_peer": "认不出来源",
+      "bad_client_key": "客户端钥匙不对",
+      "unknown_alias": "没有这个别名",
+      "no_lease": "当前任务没有使用服务器的授权",
+      "not_covered": "本任务的授权不含这台服务器",
+      "owner_changed": "授权依据变了（名单、白名单或实例状态）",
+      "workspace_not_platform": "这个工作区不再归平台方，平台方的服务器已挂起",
+      "row_inactive": "这条凭据停用了",
+      "undecryptable": "凭据解不开，请平台方或凭据主人处理",
+      "target_blocked": "这台服务器解析到了不允许的地址",
+      "host_key_mismatch": "服务器的主机钥匙和登记的不一致，已拒绝，请核对",
+      "upstream_auth_failed": "用登记的凭据登不上，这条凭据已暂停",
+      "upstream_unreachable": "连不上这台服务器",
+      "mfa_required": "服务器要求二次验证，网关不支持",
+      "limit_exceeded": "连接或通道数超过上限",
+      "channel_unsupported": "不支持 agent 转发或 X11 转发",
+      "forbidden": "没有权限"
+    }
+  }
+}

@@ -4,12 +4,17 @@
 连接原始事件流与结构化图谱。
 """
 
+from collections.abc import Sequence
 from enum import Enum
 from typing import Any
 
 from tortoise import fields
 from tortoise.models import Model
 from tortoise.timezone import now as db_now
+
+# Qdrant payload 的结构版本。本轮新增五个键，存量点缺这些键；回填按这个版本号识别
+# 还没回填过的点（`payload_schema != 2`）。
+QDRANT_PAYLOAD_SCHEMA_VERSION = 2
 
 
 class CognitiveType(str, Enum):
@@ -38,6 +43,7 @@ class OriginKind(str, Enum):
     TASK = "task"  # CC 任务结论
     MANUAL = "manual"  # 用户/系统手动创建
     PLUGIN = "plugin"  # 第三方插件创建
+    AFFECTION = "affection"  # 好感关系里程碑（宿主按模板写的，不从消息沉淀）
 
 
 class EpisodePhase(str, Enum):
@@ -70,6 +76,15 @@ class DBMemParagraph(Model):
     # 按人设隔离**不产生副本**：一段对话在人设甲下发生就写一次、标成甲，
     # 不会因为存在人设乙而复制。
     preset_id = fields.IntField(default=0, index=True, description="人设标识；0 表示无人设档")
+
+    # 域分区的来源维：适配器 + 频道。改造前写入的存量行这两列分别是空串与空串，
+    # 工作区那条腿不引用它们，因此回填不是升级的前提。
+    adapter_key = fields.CharField(max_length=64, default="", description="来源适配器标识；空 = 未知或存量")
+    origin_chat_type = fields.CharField(
+        max_length=16,
+        default="",
+        description="来源频道类型 group / private，空 = 未知或存量",
+    )
 
     # === 记忆分类 ===
     memory_source = fields.CharField(
@@ -125,6 +140,13 @@ class DBMemParagraph(Model):
         description="半衰期（秒）",
     )
     is_inactive = fields.BooleanField(default=False, index=True, description="是否已失活")
+
+    # === 隔离（管理端）===
+    # 隔离复用 `is_inactive` 并删向量：检索出口已经按 `is_inactive` 排除，检索条件一个字
+    # 都不用改。`quarantined_at` 只用来把「隔离」与「软删」分开，二者都不注入。
+    quarantined_at = fields.DatetimeField(null=True, description="转入隔离的时间；软删时清空")
+    quarantine_reason = fields.CharField(max_length=16, default="", description="隔离原因 manual / auto_blocked")
+    blocked_round_hits = fields.IntField(default=0, description="被注入到被拦轮次里的累计次数")
 
     # === 向量索引 ===
     embedding_ref = fields.CharField(
@@ -221,6 +243,8 @@ class DBMemParagraph(Model):
             ("workspace_id", "memory_source"),
             ("workspace_id", "is_inactive"),
             ("workspace_id", "event_time"),
+            # 域分区的成员对条件（adapter_key + instance_key）与工作区腿一起出现在热路径上
+            ("workspace_id", "adapter_key", "instance_key", "preset_id"),
         ]
 
     def __str__(self) -> str:
@@ -292,9 +316,14 @@ class DBMemParagraph(Model):
             "is_frozen": self.is_frozen,
             "origin_kind": self.origin_kind.value,
             "origin_chat_key": self.origin_chat_key,
+            "adapter_key": self.adapter_key,
+            "origin_chat_type": self.origin_chat_type,
+            "quarantined_at": self.quarantined_at.isoformat() if self.quarantined_at else None,
+            "quarantine_reason": self.quarantine_reason,
+            "blocked_round_hits": self.blocked_round_hits,
         }
 
-    def to_qdrant_payload(self) -> dict[str, Any]:
+    def to_qdrant_payload(self, person_accounts: Sequence[str] = ()) -> dict[str, Any]:
         """转换为 Qdrant payload 格式
 
         `instance_key` 必须写入 payload，否则向量层无法按实例过滤，
@@ -304,6 +333,9 @@ class DBMemParagraph(Model):
         根本没有这个 key**，而 Qdrant 的 `must` 条件对"字段缺失"的 point 是**不匹配**的。
         所以检索侧对 `preset_id=0` 这一档必须写成「等于 0 **或** 字段为空」
         （见 `qdrant_manager.search`），否则升级那一刻全部存量向量集体落选 = 当场失忆。
+
+        `person_accounts` 是这一段涉及的账号，由调用方从关联表读出后传入；不传时保持
+        空数组，让不关心这一维的写入点（例如没有人的 CC 段落）无需先去查一次表。
         """
         return {
             "workspace_id": self.workspace_id,
@@ -316,4 +348,11 @@ class DBMemParagraph(Model):
             "is_inactive": self.is_inactive,
             "event_time": int(self.event_time.timestamp()) if self.event_time else None,
             "base_weight": self.base_weight,
+            # 以下五个键接在旧键之后，顺序刻意固定：`origin_chat_key` 为 None 时也要显式写出，
+            # 因为 Qdrant 的 `IsNull` 只匹配「键存在且为 null」，缺键是另一种语义。
+            "adapter_key": self.adapter_key,
+            "origin_chat_key": self.origin_chat_key,
+            "origin_chat_type": self.origin_chat_type,
+            "person_accounts": sorted(set(person_accounts)),
+            "payload_schema": QDRANT_PAYLOAD_SCHEMA_VERSION,
         }

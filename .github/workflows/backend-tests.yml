@@ -86,6 +86,8 @@ jobs:
       # 只放行两种情形：pytest 自己退出 0；或写完报告后被强杀且 pytest 自己落盘的会话状态是 0
       # （conftest 的 pytest_sessionfinish 写的，强杀之后 shell 拿到的码是杀出来的）。
       # 光看 junit 不够：pytest 被中途中断（Interrupted）时也会写出报告，里面可以一个 failure 都没有。
+      # 不退出的根因（用例里开了没关的 aiosqlite 连接，每条一个非守护线程）已由 tests/conftest.py
+      # 在会话收尾时关掉；这段强杀与判定留作保险。
       - name: Run Backend Tests
         env:
           NA_PYTEST_SESSION_STATUS_FILE: pytest-session-status.txt

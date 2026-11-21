@@ -42,7 +42,7 @@ from nekro_agent.api.plugin import (
     SandboxMethodType,
 )
 from nekro_agent.models.db_chat_channel import DBChatChannel
-from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
+from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND, require_same_tenant_chat_key
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.services.message_service import message_service
 from nekro_agent.tools.common_util import calculate_text_similarity
@@ -342,11 +342,13 @@ async def send_text_message(_ctx: AgentCtx, chat_key: str, message_text: str, tt
             raise Exception(
                 "错误:最近已发送过相同的消息.请仔细阅读最近的聊天记录,检查是否发送了重复消息.请生成更有趣的回复.如果你完全确定有必要,可以重新发送.禁止刷屏!",
             )
-        await message_service.push_system_message(
+        if not await plugin.push_system_message(
             chat_key=chat_key,
             agent_messages="系统提示:最近已发送过相同的消息.自动跳过此消息.请仔细阅读最近的聊天记录,检查是否发送了重复消息.如果你完全确定有必要,可以重新发送.禁止刷屏!",
             trigger_agent=False,
-        )
+        ):
+            # 目标频道上关掉了本插件：按「频道不存在」处理，与跨频道越权同口径
+            raise ValueError(CHANNEL_NOT_FOUND)
         return
 
     # 检查相似度(仅对超过限定字符的消息进行检查)
@@ -355,11 +357,12 @@ async def send_text_message(_ctx: AgentCtx, chat_key: str, message_text: str, tt
         if similarity > config.SIMILARITY_THRESHOLD:
             # 发送系统消息提示避免类似内容
             logger.warning(f"[{chat_key}] 检测到相似度过高的消息: {similarity:.2f}")
-            await message_service.push_system_message(
+            if not await plugin.push_system_message(
                 chat_key=chat_key,
                 agent_messages="系统提示:您发送的消息与最近发送的消息过于相似!您的回复应当保持有效性,而不是冗余和繁琐!",
                 trigger_agent=False,
-            )
+            ):
+                raise ValueError(CHANNEL_NOT_FOUND)
             break
 
     # TODO: 在这里实现实际的消息发送逻辑

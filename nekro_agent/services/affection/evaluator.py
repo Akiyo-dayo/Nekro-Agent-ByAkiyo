@@ -37,6 +37,11 @@
 但收敛之后最多也只是正常的一轮涨幅。`user_id` 必须命中本轮真实参与者，
 模型凭空写一个号码不会创建出记录。文本字段的清洗在 `store.apply_delta` 里统一做。
 
+理由与印象另外都不许抄原话：理由写进流水、回注成 `recently:`，印象回注成好感块里的那一段，
+与本轮对话任一条连续重合 `ORIGINAL_OVERLAP_CHARS` 个字就整句换成宿主文字
+（`milestones.REASON_REDACTED` / `FEELING_REDACTED`），分数照常记。与主模型调分、里程碑起因
+是同一个判据（`milestones.quotes_original`）：群友的原话不能原样存进好感记录、再一轮轮塞回提示词。
+
 ## 评估被内容审核拦下
 
 评估提示词带着每个参与者当前的描述（`current:`）。描述里一旦混进会被拦的内容，评估就会
@@ -52,6 +57,17 @@
 历史同一个判据（`/reset` 之后不再读重置前的对话）；第三项让管理员刚清掉的描述不会被旧对话
 原样写回来。筛完没有消息的参与者跳过这一轮。每个人落库前还要在行锁下复核一次：
 评估开始之后这一行有没有新的后台写入，有就丢掉这个人这一轮的结果（`store.AdminWriteGuard`）。
+
+## 主模型已经自己调过分的人不再加分
+
+主模型可以在对话里通过「好感自主调整」插件当场调分。那一轮之后跑起来的评估看的是**同一段
+对话**，再判一次就是同一件事算两遍——额度只管得住上限，管不了重复计分。因此落分之前查一次
+`store.tool_adjusted_since`（本频道、不早于本次评估最早那条消息、`source=tool` 且 `delta != 0`），
+命中就把这个人的 `delta` 记 0，`feeling` 照常更新。
+
+反过来也一样：评估先落了分、主模型随后才调分时，插件那一侧用 `store.evaluator_scored_since`
+（这个人在本频道最近一次发言之后有没有非零的评估流水）判断，命中就不再记。合起来是
+「同一段对话只记一次，谁先写算谁的」。
 """
 
 from __future__ import annotations
@@ -61,6 +77,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import json5
@@ -70,10 +87,12 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import SELF_SENT_SENDER_ID
+from nekro_agent.services.channel_quota.service import background_paused
 from nekro_agent.services.identity_scope import resolve_identity_scopes
 from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untrusted_block
 
 from .key import AffectionKey
+from .milestones import FEELING_REDACTED, REASON_REDACTED, maybe_record, quotes_original
 from .prompt import BOT_SENDER_IDS, context_floor_timestamp
 from .stage import (
     AffectionEventSource,
@@ -82,16 +101,18 @@ from .stage import (
     stage_label,
 )
 from .store import (
+    MAX_EVENT_TEXT_LENGTH,
     MAX_STATE_TEXT_LENGTH,
     REASON_BLOCKED_CLEAR,
     AdminWriteGuard,
     AffectionSnapshot,
     AffectionWriteSuperseded,
-    apply_delta,
+    apply_model_delta,
     clear_narrative,
     latest_admin_writes,
     load_snapshots,
     throttle_llm_delta,
+    tool_adjusted_since,
 )
 
 logger = get_sub_logger("affection")
@@ -200,6 +221,13 @@ def schedule_affection_evaluation(db_chat_channel: DBChatChannel, config: CoreCo
 
 async def _run_evaluation(db_chat_channel: DBChatChannel, config: CoreConfig) -> None:
     chat_key = db_chat_channel.chat_key
+    # 频道被额度暂停时这一轮不评估：评估的 token 算在这个频道头上，暂停期间继续跑等于
+    # 替客户提前花掉明天的份额。检查放在 `try` 之外，因此不会走下面那个 `finally`，
+    # 也就**不更新** `_last_evaluated_at`——否则恢复后第一次有消息时会因为节流窗口
+    # 还没过而被跳过，等于白等一个 `AFFECTION_UPDATE_MIN_INTERVAL_SECONDS`。
+    if await background_paused(chat_key):
+        logger.debug(f"频道额度已暂停，跳过本轮好感度评估: chat_key={chat_key}")
+        return
     try:
         applied = await evaluate_channel(db_chat_channel, config)
         if applied:
@@ -256,6 +284,11 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
         keys = {user_id: keys[user_id] for user_id in participants}
 
     snapshots = await load_snapshots(list(keys.values()), config.AFFECTION_CACHE_TTL_SECONDS)
+    # 这一轮评估看的是哪一段对话：最早那条的时间就是「同一段对话」的起点。
+    # 主模型在这之后已经自己调过分的人，本次评估不再加分（见下面 `tool_adjusted_since`）。
+    # `_recent_messages` 返回的是正序，第一条就是最早的；消息落库时是秒级时间戳，
+    # 换成带时区的 datetime 才能与 `create_time` 直接比。
+    since = datetime.fromtimestamp(messages[0].send_timestamp, tz=timezone.utc)
     preset = await db_chat_channel.get_preset()
     persona = getattr(preset, "content", "")[:MAX_PERSONA_LENGTH]
 
@@ -320,6 +353,12 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
     # 继续用快照里的旧分数会让递减收益按"写之前"的档位算（高分段被当成低分段，涨幅翻几倍），
     # 窗口预算那一层则由流水兜底，不受影响。
     current_scores: Dict[AffectionKey, int] = {key: snapshots[key].score for key in keys.values()}
+    # 这一轮评估最终用的那批消息正文：判理由、里程碑起因有没有抄原话，只在内存里用，
+    # 不落库、不进日志。
+    originals = [message.content_text or "" for message in messages]
+    # 主模型这一轮已经自己调过分的人：评估看的是同一段对话，再判一次就是同一件事算两遍。
+    # 额度只管得住上限，管不了「同一件事算两次」。
+    tool_adjusted: Dict[AffectionKey, bool] = {}
     for verdict in verdicts:
         user_id = str(verdict.get("user_id", "")).strip()
         key = keys.get(user_id)
@@ -338,27 +377,45 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
 
         # 先用不依赖配置的硬上限封住单轮，再叠加递减收益与滚动窗口预算：
         # 前者防的是模型被诱导给出极端值，后者防的是有人拿正常数值反复刷。
-        delta = await throttle_llm_delta(
-            key,
-            delta=clamp_delta(_as_int(verdict.get("delta")), max_delta),
-            current_score=current_scores[key],
-            limits=limits,
+        if key not in tool_adjusted:
+            tool_adjusted[key] = await tool_adjusted_since(key, chat_key=chat_key, since=since)
+            if tool_adjusted[key]:
+                logger.debug(f"本频道这段对话里模型已经自己调过分，评估只更新印象: chat_key={chat_key}, user_id={user_id}")
+        # 同一个键可能被模型给两条结果，也可能两个号解析成同一个键：只查一次、只打一条日志
+        delta = (
+            0
+            if tool_adjusted[key]
+            else await throttle_llm_delta(
+                key,
+                delta=clamp_delta(_as_int(verdict.get("delta")), max_delta),
+                current_score=current_scores[key],
+                limits=limits,
+            )
         )
         feeling = _feeling_of(verdict)
         reason = str(verdict.get("reason", "")).strip()
         if delta == 0 and not feeling:
             continue
+        # 理由写进流水、回注成 `recently:`，印象回注成好感块里那一段：抄了原话就整句换成宿主文字，
+        # 分数照常记，与主模型调分同一个判据。比的是落库后会留下的那一段（截掉的部分本来就不进库；
+        # 印象在 `_feeling_of` 里已经按落库上限截过）。
+        written_reason = (
+            REASON_REDACTED
+            if quotes_original(sanitize_inline_text(reason, MAX_EVENT_TEXT_LENGTH), originals)
+            else reason
+        )
+        written_feeling = FEELING_REDACTED if quotes_original(feeling, originals) else feeling
 
         try:
-            snapshot = await apply_delta(
+            snapshot, outcome = await apply_model_delta(
                 key,
                 delta=delta,
-                reason=reason,
+                reason=written_reason,
                 source=AffectionEventSource.LLM,
                 chat_key=db_chat_channel.chat_key,
                 nickname=participants[user_id],
-                state_text=feeling or None,
-                event_text=reason,
+                state_text=written_feeling or None,
+                event_text=written_reason,
                 # 说话的是这个号，记的是这个人。合并过之后两者不同，不留下来源账号就再也
                 # 说不清"这条是哪个号干的"（`models/db_affection.py` 的合并语义要求保留）。
                 source_platform_userid=user_id,
@@ -370,6 +427,29 @@ async def evaluate_channel(db_chat_channel: DBChatChannel, config: CoreConfig) -
             continue
         current_scores[key] = snapshot.score
         applied += 1
+        # 里程碑写在分数落库之后：`maybe_record` 自己吞掉全部异常，这里再包一层是为了
+        # 万一它哪天漏了一个，也不会连带把后面的人一起丢掉。
+        try:
+            await maybe_record(
+                key=key,
+                scope=scopes[user_id],
+                channel=db_chat_channel,
+                outcome=outcome,
+                source=AffectionEventSource.LLM,
+                # 给原句：起因自己会再判一次抄没抄（抄了就只留模板），不能把宿主那句替换文字当起因
+                reason=reason,
+                nickname=participants[user_id],
+                persona_name=getattr(preset, "name", "") or "",
+                originals=originals,
+                config=config,
+                source_account=user_id,
+            )
+        except Exception as e:
+            message = f"写好感里程碑失败（已忽略）: chat_key={chat_key}, user_id={user_id}, error={e}"
+            if _report_once(chat_key, "milestone_failed"):
+                logger.warning(message)
+            else:
+                logger.debug(message)
 
     if not applied and not superseded:
         # 模型给了结果却一个人也没落库，说明 id 对不上或额度全被吃光，两种都不该静默

@@ -31,11 +31,13 @@ import inspect
 import json
 import secrets
 from datetime import datetime
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import aiodocker
 from qdrant_client import models as qdrant_models
 from tortoise import Tortoise
+from tortoise.expressions import Q
 from tortoise.functions import Count, Max
 from tortoise.timezone import now as db_now
 from tortoise.transactions import in_transaction
@@ -47,16 +49,26 @@ from nekro_agent.core.vector_db import get_qdrant_client
 from nekro_agent.models.db_adapter_instance import TOMBSTONE_STATUS, DBAdapterInstance
 from nekro_agent.models.db_adapter_instance_event import DBAdapterInstanceEvent
 from nekro_agent.models.db_adapter_instance_session import DBAdapterInstanceSession
+from nekro_agent.models.db_channel_quota import DBChannelQuotaDaily, DBChannelQuotaPolicy
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
+from nekro_agent.models.db_email import DBEmail
+from nekro_agent.models.db_emotion_item import DBEmotionItem
+from nekro_agent.models.db_emotion_set import DBEmotionSet
+from nekro_agent.models.db_emotion_set_assignment import DBEmotionSetAssignment
 from nekro_agent.models.db_exec_code import DBExecCode
 from nekro_agent.models.db_instance_group import DBInstanceDomainBinding
+from nekro_agent.models.db_mem_channel_summary import DBMemChannelSummary
+from nekro_agent.models.db_mem_channel_summary_state import DBMemChannelSummaryState
 from nekro_agent.models.db_mem_entity import DBMemEntity
 from nekro_agent.models.db_mem_episode import DBMemEpisode
 from nekro_agent.models.db_mem_paragraph import DBMemParagraph
+from nekro_agent.models.db_mem_prompt_round import DBMemPromptRound
 from nekro_agent.models.db_mem_relation import DBMemRelation
 from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
+from nekro_agent.models.db_wb_book import DBWbBook
+from nekro_agent.models.db_wb_entry import DBWbEntry
 from nekro_agent.schemas.console import (
     ConsoleOverview,
     ContainerInfo,
@@ -74,8 +86,14 @@ from nekro_agent.schemas.errors import AppError, ConflictError, NotFoundError, V
 from nekro_agent.schemas.i18n import SupportedLang
 from nekro_agent.services.adapter_instance_service import adapter_instance_service
 from nekro_agent.services.chat_key_migration import InstanceMigrationOutcome, migrate_instance_ownership
+from nekro_agent.services.emotion_library import collect_instance_emotion_refs, purge_instance_emotions
+from nekro_agent.services.memory.persons import persons_of_paragraphs
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
 from nekro_agent.services.user.token_exposure import record_account_landing_on_tenant, record_instances_exposure
+from nekro_agent.services.worldbook import safe_regex
+
+if TYPE_CHECKING:
+    from nekro_agent.services.email_accounts import AttachmentCleanup
 
 logger = get_sub_logger("console.instance")
 
@@ -407,6 +425,35 @@ async def assert_account_unbound(adapter_key: str, account_id: str, exclude_id: 
     raise ConflictError(resource=f"账号 {account_id}（已绑定到实例 '{holder.instance_key}'，{hint}）")
 
 
+async def _sweep_settings_before_create(adapter_key: str, instance_key: str) -> None:
+    """建实例之前清掉这个标识上残留的设置；清不掉就拒绝建（见 `instance_settings.sweep_before_create`）"""
+    from nekro_agent.services.instance_settings import sweep_before_create
+
+    try:
+        await sweep_before_create(adapter_key, instance_key)
+    except Exception as e:
+        logger.error(f"新建实例 {adapter_key}/{instance_key} 之前清扫残留设置失败，不建: {type(e).__name__}: {e}")
+        raise ValidationError(
+            reason=f"这个实例标识上残留的插件设置或配置覆盖清不掉，实例没有创建，请重试: {type(e).__name__}",
+        ) from e
+
+
+async def resweep_before_handover(instance: DBAdapterInstance, action: str) -> None:
+    """协议端自动登记时没扫成（带补扫标记）的实例：交出去之前补扫，扫不掉就拒绝（见 `instance_settings.resweep_if_pending`）"""
+    from nekro_agent.services.instance_settings import resweep_if_pending
+
+    try:
+        await resweep_if_pending(instance)
+    except Exception as e:
+        logger.error(f"{action}之前补扫实例 {instance.adapter_key}/{instance.instance_key} 的残留设置失败，不做: {e}")
+        raise ValidationError(
+            reason=(
+                f"实例 '{instance.instance_key}' 登记时残留的插件设置或配置覆盖没清掉，这次补扫也没成功，"
+                f"{action}没有执行，请重试: {type(e).__name__}"
+            ),
+        ) from e
+
+
 async def create_instance(body: InstanceCreateRequest) -> DBAdapterInstance:
     """新建实例
 
@@ -433,7 +480,8 @@ async def create_instance(body: InstanceCreateRequest) -> DBAdapterInstance:
     if instance_key:
         if not is_valid_instance_key(instance_key):
             raise ValidationError(reason="实例标识仅允许小写字母、数字与下划线，且长度不超过 32")
-        if await DBAdapterInstance.filter(instance_key=instance_key).exists():
+        # 不分大小写（别的适配器可以用带大写的标识）：标识拼进设置目录名，大小写不敏感的文件系统上会撞
+        if await DBAdapterInstance.filter(instance_key__iexact=instance_key).exists():
             raise ConflictError(resource=f"实例 '{instance_key}'")
     else:
         instance_key = await generate_instance_key()
@@ -447,6 +495,10 @@ async def create_instance(body: InstanceCreateRequest) -> DBAdapterInstance:
     metadata: Dict[str, Any] = {
         METADATA_ACCESS_TOKEN: body.access_token.strip() or secrets.token_urlsafe(24),
     }
+
+    # 实例标识可以被重新认领：建之前把这个标识上残留的插件设置与配置覆盖清掉（不该有，有就记 WARNING）。
+    # 清不掉就不建——宁可让管理员看见报错，也不让新实例读到上一任主人的东西
+    await _sweep_settings_before_create(adapter_key, instance_key)
 
     instance = await DBAdapterInstance.create(
         adapter_key=adapter_key,
@@ -636,6 +688,7 @@ async def claim_instance(instance: DBAdapterInstance, display_name: str) -> DBAd
     name = display_name.strip()
     if not name:
         raise ValidationError(reason="显示名称不能为空")
+    await resweep_before_handover(instance, "认领")
 
     instance.display_name = name
     instance.enabled = True
@@ -746,12 +799,23 @@ def _warn_if_adoption_changes_the_expected_token(
 async def adopt_unclaimed_instance(
     source: DBAdapterInstance,
     target: DBAdapterInstance,
+    *,
+    delete_ssh_credentials: bool = False,
+    delete_plugin_settings: bool = False,
+    delete_config_overrides: bool = False,
+    actor: str = "",
 ) -> InstanceAdoptOutcome:
     """把未认领实例的账号与历史一并交给一个既有实例
 
     这是「有协议端连上来但没人认领」的第二条出路（第一条是
     `claim_unclaimed_as_new_instance`，把它认领成一个自己命名的新实例）。两条出路走的是
     同一段代码，差别只在目标实例是既有的还是当场新建的。
+
+    `delete_ssh_credentials` 只在两端归属不同（例如待认领行归平台方、目标归租户）时生效：
+    源实例对上用户登记的服务器凭据删除而不是跟过去，逐行留审计（`actor` 记操作人），与跨租户
+    换实例对同一条取舍。总后台的并入接口默认传真；认领为新实例时新行沿用源实例的归属，
+    这个开关不起作用。`delete_plugin_settings` / `delete_config_overrides`（源实例的插件设置与配置覆盖）
+    同一口径。
 
     ## 三步，顺序不能换
 
@@ -785,6 +849,8 @@ async def adopt_unclaimed_instance(
 
     account = source.provider_account_id.strip()
     await assert_account_can_move_to(source, target)
+    # 登记时没扫成的残留不能随迁移跟到目标实例上（同归属时设置是跟着走的）
+    await resweep_before_handover(source, "并入")
     if account and target.provider_account_id.strip() != account:
         # 并进租户实例：源实例是待认领行、没有自己的令牌，它的协议端凭的是部署级令牌，而这个协议端现在归租户了。
         # 在搬历史之前先记，记不下来就拒绝，什么都不动
@@ -792,7 +858,17 @@ async def adopt_unclaimed_instance(
             target, account, reason=f"待认领协议端并入租户实例 {target.instance_key}", refuse_on_failure=True,
         )
 
-    migration = await migrate_instance_ownership(source.adapter_key, source.instance_key, target.instance_key)
+    cross_tenant = source.tenant_id != target.tenant_id
+    migration = await migrate_instance_ownership(
+        source.adapter_key,
+        source.instance_key,
+        target.instance_key,
+        delete_ssh_credentials=delete_ssh_credentials and cross_tenant,
+        delete_plugin_settings=delete_plugin_settings and cross_tenant,
+        delete_config_overrides=delete_config_overrides and cross_tenant,
+        actor=actor,
+        ssh_delete_detail="待认领协议端并入（跨租户）",
+    )
     if migration.failed_channels:
         logger.warning(
             f"认领时有会话迁移失败，账号未过户、源实例未归档，可重跑补齐: "
@@ -881,12 +957,15 @@ async def claim_unclaimed_as_new_instance(
 
     if not is_valid_instance_key(slug):
         raise ValidationError(reason="实例标识仅允许小写字母、数字与下划线，且长度不超过 32")
-    if await DBAdapterInstance.filter(instance_key=slug).exists():
+    if await DBAdapterInstance.filter(instance_key__iexact=slug).exists():
         raise ConflictError(resource=f"实例 '{slug}'")
     # 账号冲突要在**建行之前**查出来，否则新实例已经落库、认领却抛异常，
     # 留下一个谁都不认识的空实例。新实例还不存在，所以这里用的是既有的「账号有没有被别人占着」
     # 那一支（排除源实例自己——它正是当前的持有者）
     await assert_account_unbound(source.adapter_key, source.provider_account_id.strip(), exclude_id=source.id)
+    # 源行的补扫放在建新行之前：扫不掉就别留下一个空的新实例；新行照抄源行的元数据，标记要先摘掉
+    await resweep_before_handover(source, "认领为新实例")
+    await _sweep_settings_before_create(source.adapter_key, slug)
 
     target = await DBAdapterInstance.create(
         adapter_key=source.adapter_key,
@@ -1179,7 +1258,66 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
     # 容器形态必须在**删行之前**读：删完之后库里已经没有 provider 可查了
     had_builtin_container = instance.provider.strip().lower() == InstanceProvider.BUILTIN_NAPCAT.value
 
+    from nekro_agent.models.db_affection import DBAffection, DBAffectionEvent
+    from nekro_agent.services.identity_scope import ScopeDomain
+
+    self_affection_domain = ScopeDomain.of_instance(instance.adapter_key, instance_key).as_columns()
+
+    # 频道额度：计数行的实例两列是写入时的快照、可能为空，所以按频道标识前缀删；策略的
+    # 实例层与频道层都带（适配器, 实例），频道层另按前缀兜一次。同名的新实例（可能属于另一个
+    # 租户）不该继承旧实例的额度策略，也不该在额度视图里看到旧实例那些天的用量。
+    quota_policy_condition = Q(adapter_key=instance.adapter_key, instance_key=instance_key) | Q(
+        scope="channel",
+        chat_key__startswith=chat_key_prefix,
+    )
+
+    # SSH 服务器凭据按实例对归属；平台方行没有实例对，不会被这个过滤条件碰到。
+    # 审计行不设外键、不会随删除消失，所以要在删行之前按每一行的快照写一条
+    from nekro_agent.models.db_email_account import DBEmailAccount
+    from nekro_agent.models.db_email_outbox import DBEmailOutbox
+    from nekro_agent.models.db_email_send_log import DBEmailSendLog
+    from nekro_agent.models.db_email_user_pref import DBEmailUserPref
+    from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
+    from nekro_agent.services import email_accounts as email_account_service
+    from nekro_agent.services.ssh_gateway import constants as ssh_constants
+    from nekro_agent.services.ssh_gateway.credentials import ssh_credential_service
+
+    # 实例自有邮箱：行要在事务里删，但运行时客户端必须先断开（否则连接池还挂着一条
+    # 指向已删账户的连接，之后按地址发信会打到它上面）。附件目录名与运行时账户在删行
+    # 之前取出来，删完就查不到了。
+    email_rows = await DBEmailAccount.filter(
+        owner_adapter_key=instance.adapter_key,
+        owner_instance_key=instance_key,
+    ).all()
+    email_runtime = [(row, email_account_service.to_runtime_account(row)) for row in email_rows]
+
+    # 实例名下的设置（插件的实例级 / 频道级启停与实例级配置、核心配置的实例层 / 频道层覆盖）在
+    # **改库之前**删：实例标识可以被重新认领，删库成功、删设置失败的话，同名的新实例（可能属于
+    # 另一个租户）一建出来就读到上一任主人填的东西。反过来删设置成功、改库失败只是丢了一个本来就要
+    # 删的实例的设置，重试即可。频道标识要在删频道行之前取。提交之后还会再兜一遍（见下）。
+    from nekro_agent.services import instance_settings
+
+    settings_chat_keys = await instance_settings.instance_chat_keys(instance.adapter_key, instance_key)
+    settings_counts = await instance_settings.describe_counts(instance.adapter_key, instance_key, settings_chat_keys)
+    try:
+        await instance_settings.drop_instance_settings(instance.adapter_key, instance_key, settings_chat_keys)
+    except Exception as e:
+        logger.error(f"彻底删除实例 {instance_key} 时删设置失败，实例未删除: {type(e).__name__}: {e}")
+        raise ValidationError(
+            reason=f"删除这个实例的插件设置或配置覆盖失败，实例没有删除，请重试: {type(e).__name__}",
+        ) from e
+
+    # 先断开邮箱客户端，再按缓存行算附件路径：断开之前新到的信也在清单里（要删的缓存行在事务里
+    # 就没了，所以路径在这里算好，提交之后再删文件）
+    await _disconnect_instance_mailboxes(instance, email_runtime)
+    attachment_cleanup = await email_account_service.plan_attachment_cleanup(email_rows)
+
     async with in_transaction():
+        ssh_credential_rows = await DBWsSshCredential.filter(
+            adapter_key=instance.adapter_key,
+            instance_key=instance_key,
+            owner_kind=ssh_constants.OWNER_USER,
+        ).all()
         counts: Dict[str, int] = {
             "chat_channel": await DBChatChannel.filter(adapter_key=instance.adapter_key, instance_key=instance_key).count(),
             "chat_message": await DBChatMessage.filter(adapter_key=instance.adapter_key, instance_key=instance_key).count(),
@@ -1187,6 +1325,29 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
             "plugin_data": await DBPluginData.filter(target_chat_key__startswith=chat_key_prefix).count(),
             "recurring_timer_job": await DBRecurringTimerJob.filter(chat_key__startswith=chat_key_prefix).count(),
             "mem_paragraph": await DBMemParagraph.filter(instance_key=instance_key).count(),
+            "mem_paragraph_person": await persons_of_paragraphs(instance_key=instance_key).count(),
+            "mem_channel_summary": await DBMemChannelSummary.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            "mem_channel_summary_state": await DBMemChannelSummaryState.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            "mem_prompt_round": await DBMemPromptRound.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            # 书按（适配器, 实例）归属，条目挂在书上：条目数按外键跨表数一遍，
+            # 统计与删除必须同一个口径，否则日志里的规模会与实际删掉的对不上。
+            "wb_book": await DBWbBook.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            "wb_entry": await DBWbEntry.filter(
+                book__adapter_key=instance.adapter_key,
+                book__instance_key=instance_key,
+            ).count(),
             "mem_episode": await DBMemEpisode.filter(instance_key=instance_key).count(),
             "mem_entity": await DBMemEntity.filter(instance_key=instance_key).count(),
             "mem_relation": await DBMemRelation.filter(instance_key=instance_key).count(),
@@ -1195,7 +1356,57 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
             "instance_domain_binding": await DBInstanceDomainBinding.filter(
                 adapter_key=instance.adapter_key, instance_key=instance_key,
             ).count(),
+            "channel_quota_daily": await DBChannelQuotaDaily.filter(chat_key__startswith=chat_key_prefix).count(),
+            "channel_quota_policy": await DBChannelQuotaPolicy.filter(quota_policy_condition).count(),
+            "ssh_credentials": len(ssh_credential_rows),
+            # 表情：这个实例的收集库与指向它的分配。向量点与文件按引用计数在事务之后处理
+            # （Qdrant 与文件系统都不参与事务，理由与记忆向量相同）。
+            "emotion_set": await DBEmotionSet.filter(
+                kind="collect",
+                owner_adapter_key=instance.adapter_key,
+                owner_instance_key=instance_key,
+            ).count(),
+            "emotion_item": await DBEmotionItem.filter(
+                set__kind="collect",
+                set__owner_adapter_key=instance.adapter_key,
+                set__owner_instance_key=instance_key,
+            ).count(),
+            "emotion_set_assignment": await DBEmotionSetAssignment.filter(
+                target="instance",
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            # 邮箱：实例自有的账户、这些账户收下的缓存邮件、用户邮件偏好、还没发出去的
+            # 节日邮件队列、发信记录。缓存行按**归属快照**删（`owner_*` = 这个实例对），
+            # 不看账户是否还在：账户先被删掉时那些信还在表里，只删账户就会留下一批
+            # 谁都读不到、却一直占着唯一键的行。
+            "email_account": len(email_rows),
+            "email_cache": await DBEmail.filter(
+                owner_adapter_key=instance.adapter_key,
+                owner_instance_key=instance_key,
+            ).count(),
+            "email_user_pref": await DBEmailUserPref.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            "email_outbox": await DBEmailOutbox.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            "email_send_log": await DBEmailSendLog.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            # 自成一域的好感：行与流水的域三列就是这个实例对（`domain_group_id = 0`）
+            "affection": await DBAffection.filter(**self_affection_domain).count(),
+            "affection_event": await DBAffectionEvent.filter(**self_affection_domain).count(),
+            # 插件与核心配置：有设置的插件个数、有生效覆盖的配置文件个数，文件已在事务之前删掉
+            "plugin_settings": settings_counts.plugin_settings,
+            "config_overrides": settings_counts.config_overrides,
         }
+        # 表情的向量点与文件要在删行**之前**留下引用：行删掉之后就查不出该删哪些点了。
+        # 这里只读不写，取到的列表在事务提交后交给 `emotion_library.purge_instance_emotions`。
+        emotion_ids, emotion_files = await collect_instance_emotion_refs(instance.adapter_key, instance_key)
         logger.warning(
             f"彻底删除实例 {instance_key}（adapter_key={instance.adapter_key}），级联删除统计: {counts}",
         )
@@ -1206,6 +1417,26 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         await DBMemRelation.filter(instance_key=instance_key).delete()
         await DBMemEntity.filter(instance_key=instance_key).delete()
         await DBMemEpisode.filter(instance_key=instance_key).delete()
+        # 摘要按 (适配器, 实例) 归属，频道没有对应实例时也要清掉，避免重新认领后看到旧摘要。
+        await DBMemChannelSummary.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        # 摘要暂停行与提示词明细同样按（适配器, 实例）归属：同名的新实例（可能属于另一个租户）
+        # 不该在记忆页里看到旧实例的明细，也不该继承旧实例对某个频道的「暂停自动更新」。
+        await DBMemChannelSummaryState.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBMemPromptRound.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        # 书按（适配器, 实例）归属，条目由外键级联删除。同名的新实例（可能属于另一个租户）
+        # 不该继承旧实例的书：那些书会在新实例的域里静默生效。
+        # 条目 ID 要在删之前取：删完之后查不到它们，而进程内的正则熔断表还挂着这些 ID，
+        # 留着会让下一个拿到同一主键的条目继承「已停用」的记录。
+        worldbook_entry_ids = [
+            int(entry_id)
+            for entry_id in await DBWbEntry.filter(
+                book__adapter_key=instance.adapter_key,
+                book__instance_key=instance_key,
+            ).values_list("id", flat=True)
+        ]
+        await DBWbBook.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        # 段落的人按段落 ID 挂，必须先清关联行再删段落，否则留下指不到任何段落的孤儿行。
+        await persons_of_paragraphs(instance_key=instance_key).delete()
         await DBMemParagraph.filter(instance_key=instance_key).delete()
         await DBChatMessage.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBChatChannel.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
@@ -1213,14 +1444,181 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         await DBAdapterInstanceEvent.filter(instance_id=instance.id).delete()
         # 域归属必须一起删掉：`instance_key` 是可以被重新认领的 slug（见 `claim_unclaimed_instance`），
         # 残留的绑定行会让**同名的新实例**（可能属于另一个租户）直接继承被删实例的记忆/好感域。
-        # 好感行不在本清单里、也不该在（它挂在域上而不是实例上），因此那份数据会被新实例原样读到。
+        # 组域上的好感行挂在组上、不属于这个实例，留着；但**自成一域**那一份的域三列就是这个
+        # 实例对，同名的新实例会逐列命中、把印象、称呼、近况与流水原样读出来，所以一起删掉——
+        # 与划转时勾「一并清空」（`purge_instance_domain_memory`）同一口径，流水先删、行后删。
         await DBInstanceDomainBinding.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBAffectionEvent.filter(**self_affection_domain).delete()
+        await DBAffection.filter(**self_affection_domain).delete()
+        await DBChannelQuotaDaily.filter(chat_key__startswith=chat_key_prefix).delete()
+        await DBChannelQuotaPolicy.filter(quota_policy_condition).delete()
+        # 用户登记的服务器凭据跟着实例走：实例没了，这些行再没有任何身份能用上。
+        # 先逐行写审计再删——审计存的是当时的归属快照，行删了也仍能回答"谁在什么时候删了它"。
+        # 平台方行没有实例对，不在这个过滤条件里，一行都不动。
+        for credential_row in ssh_credential_rows:
+            await ssh_credential_service._write_audit(  # noqa: SLF001 - 与凭据服务共用同一份审计写法
+                credential_row,
+                event=ssh_constants.EVENT_CRED_DELETE,
+                allowed=True,
+                actor="system",
+                detail="实例被删除",
+            )
+        await DBWsSshCredential.filter(
+            adapter_key=instance.adapter_key,
+            instance_key=instance_key,
+            owner_kind=ssh_constants.OWNER_USER,
+        ).delete()
+        # 表情：删这个实例的收集库（表情行与指向它的分配随外键级联），以及平台方指向它的
+        # `instance` 分配。向量与文件在事务之后单独处理，见 `_purge_instance_emotions_after_commit`。
+        await DBEmotionSet.filter(
+            kind="collect",
+            owner_adapter_key=instance.adapter_key,
+            owner_instance_key=instance_key,
+        ).delete()
+        await DBEmotionSetAssignment.filter(
+            target="instance",
+            adapter_key=instance.adapter_key,
+            instance_key=instance_key,
+        ).delete()
+        # 邮箱：账户、缓存行快照、用户偏好、未发出的节日队列、发信记录。顺序是先删队列与
+        # 记录再删账户——外键上它们彼此没有引用，但语义上「账户没了的队列行」不该留下来。
+        await DBEmailOutbox.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBEmailSendLog.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBEmailUserPref.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBEmail.filter(
+            owner_adapter_key=instance.adapter_key,
+            owner_instance_key=instance_key,
+        ).delete()
+        await DBEmailAccount.filter(
+            owner_adapter_key=instance.adapter_key,
+            owner_instance_key=instance_key,
+        ).delete()
         await DBAdapterInstance.filter(id=instance.id).delete()
 
-    clear_instance_cache()
-    await purge_instance_vectors(instance_key)
-    await _reclaim_purged_instance_container(instance_key, had_builtin_container=had_builtin_container)
+    try:
+        clear_instance_cache()
+        # 删掉的用户服务器凭据：提交之后通知网关，用着它们的连接立刻断开、上游关掉
+        from nekro_agent.services.ssh_gateway import events as ssh_events
+
+        for credential_row in ssh_credential_rows:
+            await ssh_events.notify_credential_changed(int(credential_row.id))
+        # 好感快照有进程内缓存，删掉的行在缓存期内还会被好感块读到
+        from nekro_agent.services.affection.store import invalidate_cache as invalidate_affection_cache
+
+        invalidate_affection_cache()
+        # 额度策略在进程里有整表缓存，删了行要让它失效，否则判定还会读到被删实例的那几行
+        from nekro_agent.services.channel_quota.policy import invalidate_policy_cache
+
+        invalidate_policy_cache()
+        # 与删书接口同一个理由：外键级联删掉的条目不经过 `delete_entry`，它们在本进程正则
+        # 熔断表里的「（条目, 关键词）→ 原因」记录必须显式清掉，否则会一直指着已经不存在
+        # 的行，下一个拿到同一主键的条目会继承那条记录。
+        for worldbook_entry_id in worldbook_entry_ids:
+            safe_regex.forget_entry(worldbook_entry_id)
+        await purge_instance_vectors(instance_key)
+        # 表情的向量点与文件：行已经在上面的事务里删掉了，这里按事务里提前取好的引用清理。
+        # 放在提交之后与记忆向量同一个理由——Qdrant 与文件系统不参与数据库事务。
+        await purge_instance_emotions(
+            instance.adapter_key,
+            instance_key,
+            emotion_ids=emotion_ids,
+            file_paths=emotion_files,
+        )
+        # 邮箱：附件删掉、平台方邮箱的共享名单里去掉这个实例（运行时客户端已在删库之前断开）。
+        # 两件事都发生在事务提交之后：附件不参与数据库事务，共享名单改的是**适配器配置**
+        # （写配置文件），与数据库事务不是同一条回滚路径。
+        await _purge_instance_mailboxes_after_commit(instance, email_runtime, attachment_cleanup)
+        await _reclaim_purged_instance_container(instance_key, had_builtin_container=had_builtin_container)
+    finally:
+        # 设置再兜一遍：改库之前删过一次，但删设置与提交之间隔着好几次等待，这个窗口里有人写回的
+        # （后台页面正开着、插件在写实例级配置）会留下来。提交之后上面哪一步抛出都照样做；
+        # 失败只记警告，建同名实例之前还会再扫一次
+        await instance_settings.drop_instance_settings_quietly(instance.adapter_key, instance_key, settings_chat_keys)
     return counts
+
+
+def email_attachment_root() -> Path:
+    """附件根目录（`uploads/email_attachment/`）
+
+    口径只由服务层那一处给出（`email_accounts.email_attachment_root`）：下载、读取、删除、
+    改名都从这里走，才不会出现「写入到 A、删除时按 B 拼」这种只有一处能对上的偏差。
+    测试把它指到临时目录时改的也是服务层那一个。
+    """
+    from nekro_agent.services import email_accounts as email_account_service
+
+    return email_account_service.email_attachment_root()
+
+
+async def _disconnect_instance_mailboxes(instance: "DBAdapterInstance", runtime_accounts: List[tuple]) -> None:
+    """断开这个实例自有邮箱的运行时客户端（彻底删除时在算附件路径、删库**之前**做）
+
+    客户端还连着时会接着收信、下附件：先算路径再断开的话，这中间新到的那封的 `<UID>/` 不在
+    要删的清单里，删完还留在磁盘上；账户行删掉之后，连接池里那几条连接还会按地址发信打到已删账户上。
+    """
+    from nekro_agent.services import email_accounts as email_account_service
+
+    adapter = getattr(instance, "_email_adapter", None)
+    if adapter is None:
+        from nekro_agent.adapters import loaded_adapters
+
+        adapter = loaded_adapters.get("email")
+    if adapter is not None:
+        for _row, runtime in runtime_accounts:
+            try:
+                await email_account_service.remove_runtime_account(adapter, runtime)
+            except Exception as e:  # noqa: BLE001 - 客户端关不掉不该让删除失败
+                logger.warning(f"删除实例 {instance.instance_key} 的邮箱客户端失败: {e}")
+    email_account_service.clear_default_sender_cache()
+
+
+async def _purge_instance_mailboxes_after_commit(
+    instance: "DBAdapterInstance",
+    runtime_accounts: List[tuple],
+    attachment_cleanup: Optional[AttachmentCleanup] = None,
+) -> None:
+    """彻底删除实例之后回收邮箱侧剩下的两样东西（运行时客户端已在删库之前断开）
+
+    1. **附件**：`uploads/email_attachment/<attachment_dir>/`。`_i<数字>` 形态（实例自有账户新建时
+       的命名，表 ID 不复用）整个目录删；由平台方账户「转为实例自有」时沿用的地址目录**只删这个
+       账户被删掉的那几封**（`<目录>/<UID>/`，删完目录空了再删目录）——整个删的话，删错一次就是
+       平台方自己收件箱的附件全没了。判据与路径在 `email_accounts.plan_attachment_cleanup`；
+    2. **平台方邮箱的共享名单**：`SEND_SHARE_INSTANCES` 里点名这个实例的那一项去掉。
+       不改的话，同名的新实例（可以被重新认领）一建出来就自动拿到那份发信授权。
+    """
+    from nekro_agent.services import email_accounts as email_account_service
+
+    if attachment_cleanup is None:
+        attachment_cleanup = await email_account_service.plan_attachment_cleanup([row for row, _ in runtime_accounts])
+    email_account_service.run_attachment_cleanup(attachment_cleanup)
+
+    removed_share = revoke_platform_share_for_instance(instance.adapter_key, instance.instance_key)
+    if removed_share:
+        logger.info(
+            f"已从 {removed_share} 个平台方邮箱的共享名单里去掉实例 "
+            f"{instance.adapter_key}:{instance.instance_key}",
+        )
+
+
+def is_instance_attachment_dir(name: str) -> bool:
+    """附件目录名是不是实例自有账户的那种（`_i<数字>`）
+
+    判据只有服务层那一份（`email_accounts.is_instance_attachment_dir`），这里转一手给既有调用方。
+    """
+    from nekro_agent.services.email_accounts import is_instance_attachment_dir as _is_instance_attachment_dir
+
+    return _is_instance_attachment_dir(name)
+
+
+def revoke_platform_share_for_instance(adapter_key: str, instance_key: str) -> int:
+    """把某个实例从平台方邮箱的 `SEND_SHARE_INSTANCES` 里摘掉，返回改动的账户数
+
+    只改配置、不删账户：`all_instances` 的账户照旧对所有实例开放（那是平台方的显式选择），
+    点名的那些去掉这一项之后，同名的新实例（可以被重新认领）不会自动继承这份授权。
+    判据与写回在服务层（`rewrite_platform_share_instances`），email 适配器没加载时也照改。
+    """
+    from nekro_agent.services.email_accounts import rewrite_platform_share_instances
+
+    return rewrite_platform_share_instances(f"{adapter_key}:{instance_key}", None)
 
 
 async def _reclaim_purged_instance_container(instance_key: str, *, had_builtin_container: bool) -> None:

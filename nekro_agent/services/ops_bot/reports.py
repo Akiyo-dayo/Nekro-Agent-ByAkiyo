@@ -32,7 +32,7 @@ def _truncate_note(shown: int, total: int) -> List[str]:
     return [f"…… 另有 {total - shown} 条，请在总后台查看"]
 
 
-async def render_overview() -> str:
+async def render_overview(target: str = "") -> str:  # noqa: ARG001 - 统一的渲染函数签名，本指令不使用参数
     """总览
 
     「未绑定账号」必须与「离线」分开列出，理由与总后台首页同一条：它们是两种不同的处置。
@@ -56,7 +56,7 @@ async def render_overview() -> str:
     )
 
 
-async def render_instances() -> str:
+async def render_instances(target: str = "") -> str:  # noqa: ARG001 - 统一的渲染函数签名
     """实例列表与在线状态"""
     from nekro_agent.services.console.instance_manager import list_instances
 
@@ -73,7 +73,7 @@ async def render_instances() -> str:
     return "\n".join(lines)
 
 
-async def render_health() -> str:
+async def render_health(target: str = "") -> str:  # noqa: ARG001 - 统一的渲染函数签名
     """探活结果与掉线时长"""
     from nekro_agent.services.console.instance_health import instance_health_service
 
@@ -91,7 +91,7 @@ async def render_health() -> str:
     return "\n".join(lines)
 
 
-async def render_tenants() -> str:
+async def render_tenants(target: str = "") -> str:  # noqa: ARG001 - 统一的渲染函数签名
     """租户概览"""
     from nekro_agent.models.db_adapter_instance import DBAdapterInstance
     from nekro_agent.models.db_tenant import DBTenant
@@ -112,7 +112,7 @@ async def render_tenants() -> str:
     return "\n".join(lines)
 
 
-async def render_errors() -> str:
+async def render_errors(target: str = "") -> str:  # noqa: ARG001 - 统一的渲染函数签名
     """近期错误摘要
 
     取的是内存日志环，与 WebUI 的日志页同源。只读 ERROR/CRITICAL，
@@ -136,10 +136,31 @@ async def render_errors() -> str:
     return "\n".join(lines)
 
 
+async def render_audit(target: str = "") -> str:
+    """最近的运维操作记录
+
+    条数与 `ops_audit_recent` 同口径：默认 10、最多 20；行格式也共用
+    `services/ops_agent/audit.py` 的格式化函数，两条通道看到的是同一套文字。
+    """
+    from nekro_agent.services.ops_agent.audit import (
+        DEFAULT_RECENT_LINES,
+        MAX_RECENT_LINES,
+        format_ops_event_lines,
+        list_ops_events,
+    )
+
+    text = str(target or "").strip()
+    limit = int(text) if text.isdigit() else DEFAULT_RECENT_LINES
+    limit = max(1, min(MAX_RECENT_LINES, limit))
+    _, rows = await list_ops_events(limit=limit)
+    return format_ops_event_lines(rows)
+
+
 READ_RENDERERS = {
     "overview": render_overview,
     "instances": render_instances,
     "health": render_health,
     "tenants": render_tenants,
     "errors": render_errors,
+    "audit": render_audit,
 }

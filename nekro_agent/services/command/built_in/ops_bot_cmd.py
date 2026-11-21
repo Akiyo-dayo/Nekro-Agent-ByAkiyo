@@ -29,8 +29,9 @@ from nekro_agent.schemas.i18n import i18n_text
 from nekro_agent.services.command.base import BaseCommand, CommandMetadata, CommandPermission
 from nekro_agent.services.command.ctl import CmdCtl
 from nekro_agent.services.command.schemas import Arg, CommandExecutionContext, CommandResponse
-from nekro_agent.services.ops_bot.actions import OPS_ACTIONS, OpsActionKind, parse_ops_command
-from nekro_agent.services.ops_bot.deeplink import issue_ops_deeplink, normalize_ttl_seconds
+from nekro_agent.services.ops_agent.audit import close_ops_event, open_ops_event
+from nekro_agent.services.ops_agent.receipt import format_receipt
+from nekro_agent.services.ops_bot.actions import OPS_ACTIONS, OpsActionKind, execute_write_action, parse_ops_command
 from nekro_agent.services.ops_bot.policy import (
     OpsAccessDecision,
     OpsBotPolicy,
@@ -51,17 +52,6 @@ DENY_MESSAGES = {
     OpsAccessDecision.UNTRUSTED_SOURCE: "运维频道所在的实例不是平台方可信的来源（见启动日志里的超级用户来源告警）",
 }
 
-CONSOLE_CONFIRM_PATH = "/console/ops-confirm"
-
-
-def build_confirm_url(base_url: str, token: str) -> str:
-    """拼出确认链接
-
-    未配置后台地址时给相对路径而不是猜一个域名：猜错会把运维人员引到一个
-    并不存在的站点上，而相对路径至少能让人知道该去后台的哪一页。
-    """
-    return f"{base_url}{CONSOLE_CONFIRM_PATH}?token={token}"
-
 
 def render_help() -> str:
     """按读/写分组列出全部指令"""
@@ -72,7 +62,7 @@ def render_help() -> str:
             "[运维 Bot]",
             "只读指令（直接返回结果）:",
             *read_lines,
-            "写操作（只返回确认链接，需在总后台确认后执行）:",
+            "写操作（直接执行，结果在本频道回执）:",
             *write_lines,
         ],
     )
@@ -86,10 +76,10 @@ class OpsBotCommand(BaseCommand):
         return CommandMetadata(
             name="na_ops",
             aliases=[],
-            description="运维 Bot：查询总后台状态，写操作返回确认链接",
+            description="运维 Bot：查询总后台状态，写操作直接执行并在本频道回执",
             i18n_description=i18n_text(
-                zh_CN="运维 Bot：查询总后台状态，写操作返回确认链接",
-                en_US="Ops Bot: query console status; write operations return a confirmation link",
+                zh_CN="运维 Bot：查询总后台状态，写操作直接执行并在本频道回执",
+                en_US="Ops Bot: query console status; write operations execute immediately and reply in this channel",
             ),
             usage="na_ops <指令> [目标]",
             # 名义权限设为最高档只是为了在 WebUI 的命令列表里如实展示，
@@ -142,27 +132,38 @@ class OpsBotCommand(BaseCommand):
         spec = OPS_ACTIONS[parsed.action]
         if spec.kind is OpsActionKind.READ:
             logger.info(f"运维只读指令: action={parsed.action} user={context.user_id}")
-            yield CmdCtl.success(await READ_RENDERERS[parsed.action]())
+            yield CmdCtl.success(await READ_RENDERERS[parsed.action](parsed.target))
             return
 
-        # 写操作在这里**不执行**，只签发一条一次性确认链接
+        # 写操作直接执行，结果就是回执正文；命令自己的回复即回执，不再另发一条。
+        # 与 Agent 工具同一条规矩：执行前先记一行，记不进去就不执行。
         policy = OpsBotPolicy.from_config(config)
-        token, _payload = issue_ops_deeplink(
-            action=spec.name,
-            target=parsed.target,
-            issuer_user_id=context.user_id,
-            issuer_chat_key=context.chat_key,
-            ttl_seconds=policy.deeplink_ttl_seconds,
+        event_id = await open_ops_event(
+            grant=None,
+            tool=f"na_ops:{parsed.action}",
+            args={"target": parsed.target},
+            operator=context.user_id,
+            adapter_key=policy.adapter_key,
+            instance_key=policy.instance_key,
+            chat_key=context.chat_key,
+            source="na_ops",
         )
-        yield CmdCtl.success(
-            "\n".join(
-                [
-                    "[需要在总后台确认]",
-                    f"操作: {spec.summary}",
-                    f"目标: {parsed.target}",
-                    f"有效期: {normalize_ttl_seconds(policy.deeplink_ttl_seconds)} 秒，仅可使用一次",
-                    "该操作不会在聊天里执行。请用平台方账号打开下面的链接，看清内容后确认：",
-                    build_confirm_url(policy.console_base_url, token),
-                ],
-            ),
+        if event_id is None:
+            yield CmdCtl.failed("运维审计暂时写不进去，这次没有执行，请稍后再试或回后台操作。")
+            return
+
+        try:
+            outcome = await execute_write_action(parsed.action, parsed.target)
+        except Exception as exc:  # noqa: BLE001 - 异常原文不上聊天，也不进审计
+            await close_ops_event(event_id, outcome="failed", error_type=type(exc).__name__)
+            yield CmdCtl.failed("运维操作执行失败，请稍后重试或回后台操作。")
+            return
+
+        receipt = format_receipt(outcome, [context.user_id], record_id=event_id)
+        await close_ops_event(
+            event_id,
+            outcome="executed" if outcome.ok else "failed",
+            reason="" if outcome.ok else outcome.error_category,
+            summary=receipt.removeprefix("【运维】"),
         )
+        yield CmdCtl.success(receipt) if outcome.ok else CmdCtl.failed(receipt)

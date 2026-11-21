@@ -88,6 +88,31 @@ def _sort_plugin_units_for_cache(units: List[PluginPromptRenderUnit]) -> List[Pl
     )
 
 
+def _inject_plugin_names(units: List[PluginPromptRenderUnit], plugins: List[NekroPlugin]) -> List[str]:
+    """这一轮会真正调用 `render_inject_prompt` 的插件名
+
+    `render_inject_prompt` 是插件自己的代码，预览时不能调用（不保证没有副作用）。
+    占位里只列名字，管理员据此知道「真跑这一轮时这里会多出哪些插件的内容」。
+    状态不是 `active` / `always_awake` 的插件本来就不会被注入，不列。
+    """
+    plugin_map = {plugin.module_name: plugin for plugin in plugins}
+    names: List[str] = []
+    for unit in units:
+        if unit.state not in ("active", "always_awake"):
+            continue
+        plugin = plugin_map.get(unit.module_name)
+        if plugin is not None and plugin.prompt_inject_method is not None:
+            names.append(plugin.name)
+    return names
+
+
+def _dry_run_runtime_prompt(names: List[str]) -> str:
+    """预览时替代插件动态注入的占位；没有插件可注入时是空串（与真实一轮一致）"""
+    if not names:
+        return ""
+    return f"[插件动态注入：预览不执行（{'、'.join(names)}）]"
+
+
 async def render_plugin_prompt_unit(unit: PluginPromptRenderUnit) -> str:
     return await _render_plugin_prompt(unit)
 
@@ -119,7 +144,12 @@ async def _enrich_units_with_inject(
     return result
 
 
-async def render_plugins_prompt_legacy(plugins: List[NekroPlugin], ctx: AgentCtx) -> RenderedPluginPrompts:
+async def render_plugins_prompt_legacy(
+    plugins: List[NekroPlugin],
+    ctx: AgentCtx,
+    *,
+    call_inject: bool = True,
+) -> RenderedPluginPrompts:
     units: List[PluginPromptRenderUnit] = []
     for plugin in plugins:
         if len(plugin.support_adapter) != 0 and ctx.adapter_key not in plugin.support_adapter:
@@ -136,10 +166,13 @@ async def render_plugins_prompt_legacy(plugins: List[NekroPlugin], ctx: AgentCtx
             ),
         )
     units = _sort_plugin_units_for_cache(units)
-    runtime_units = await _enrich_units_with_inject(units, plugins, ctx)
+    if call_inject:
+        runtime_prompt = _render_plugin_runtime_prompt(await _enrich_units_with_inject(units, plugins, ctx))
+    else:
+        runtime_prompt = _dry_run_runtime_prompt(_inject_plugin_names(units, plugins))
     return RenderedPluginPrompts(
         system_prompt="\n\n".join([await _render_plugin_prompt(unit) for unit in units]),
-        runtime_prompt=_render_plugin_runtime_prompt(runtime_units),
+        runtime_prompt=runtime_prompt,
     )
 
 
@@ -147,6 +180,8 @@ async def render_plugins_prompt(
     plugins: List[NekroPlugin],
     ctx: AgentCtx,
     activation_enabled: bool = True,
+    *,
+    call_inject: bool = True,
 ) -> RenderedPluginPrompts:
     """渲染插件提示词
 
@@ -156,14 +191,21 @@ async def render_plugins_prompt(
             而不是进程内全部启用的插件，否则实例级的插件分控不会体现在提示词里。
         ctx: Agent 上下文
         activation_enabled: 是否启用激活策略披露模式
+        call_inject: 是否调用插件的 `render_inject_prompt`。预览 / 试发传 `False`：
+            那是插件自己的代码、不保证没有副作用，换成一行列出插件名的占位。
     """
     if not activation_enabled:
-        return await render_plugins_prompt_legacy(plugins, ctx)
+        return await render_plugins_prompt_legacy(plugins, ctx, call_inject=call_inject)
 
     units = await build_prompt_disclosure_view(plugins, ctx)
     units = _sort_plugin_units_for_cache(units)
-    runtime_units = await _enrich_units_with_inject(units, plugins, ctx, states={"active", "always_awake"})
+    if call_inject:
+        runtime_prompt = _render_plugin_runtime_prompt(
+            await _enrich_units_with_inject(units, plugins, ctx, states={"active", "always_awake"}),
+        )
+    else:
+        runtime_prompt = _dry_run_runtime_prompt(_inject_plugin_names(units, plugins))
     return RenderedPluginPrompts(
         system_prompt="\n\n".join([await _render_plugin_prompt(unit) for unit in units]),
-        runtime_prompt=_render_plugin_runtime_prompt(runtime_units),
+        runtime_prompt=runtime_prompt,
     )

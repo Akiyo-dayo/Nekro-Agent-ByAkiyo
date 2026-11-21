@@ -50,7 +50,8 @@ KEY_GHOST = "onebot_v11-inst1-group_99999"
 
 SECRET_OF_B = "TENANT-B-PRIVATE-SECRET-4711"
 
-# 漫游检索只看会话起点之后的消息，时间戳要落在"现在"之后
+# 漫游检索只看会话起点之后的消息，时间戳要落在"现在"之后。
+# 这里只是收集时的初值；每条用例在 `db` 夹具里按运行时刻重取（#195）
 T0 = int(time.time()) + 1_000
 TEXT_OF_A = "tenant-a-lunch-plan"
 
@@ -61,6 +62,11 @@ def ctx_of(chat_key: Optional[str]) -> AgentCtx:
 
 @pytest.fixture
 async def db():
+    # #195：会话起点是下面建频道的时刻。T0 若沿用收集时的值，全量跑得久时（收集后超过约
+    # 1000 秒才轮到这里）它会早于会话起点，种进去的消息全被漫游检索筛掉，用例随机变红。
+    # 所以每条用例开跑时重取一次，保证消息时间永远晚于本条用例的会话起点。
+    global T0
+    T0 = int(time.time()) + 1_000
     await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["nekro_agent.models"]})
     await Tortoise.generate_schemas()
     try:
@@ -664,11 +670,64 @@ class TestOutboundActionsStopAtTheTenantBoundary:
         with pytest.raises(ValueError, match=CHANNEL_NOT_FOUND):
             await email_utils.send_email_attachment(ctx_of(KEY_A1), "me@example.com", "1", "a.txt", KEY_B)
 
+    async def test_send_email_attachment_stops_when_the_plugin_is_off_in_the_target_channel(
+        self, db, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """附件投递走插件推送方法：目标频道上关掉 email_utils 时按「频道不存在」回答
+
+        与跨租户越权同口径：模型分不出「没开」和「无权」，也就不会靠重试去撞。
+        """
+        from types import SimpleNamespace
+
+        from nekro_agent.adapters.email.config import EmailAccount
+        from nekro_agent.api import message as message_api
+        from nekro_agent.core.config import config as core_config
+        from nekro_agent.services import email_accounts
+        from plugins.builtin import email_utils
+
+        attachment = tmp_path / "a.txt"
+        attachment.write_text("hi", encoding="utf-8")
+        # 账户要先过会话的可读集合（平台方会话也一样）：把它配成一个平台方邮箱，
+        # 这条用例要看的是后面那一步——目标频道上插件关着
+        platform_config = SimpleNamespace(RECEIVE_ACCOUNTS=[EmailAccount(USERNAME="me@example.com", ENABLED=True)])
+        monkeypatch.setattr(email_accounts, "_load_platform_config", lambda adapter=None: platform_config)
+        # 转发前先核对这封信与附件在缓存里
+        from nekro_agent.models.db_email import DBEmail
+
+        await DBEmail.create(
+            account_username="me@example.com",
+            email_uid="1",
+            subject="s",
+            sender="x@example.com",
+            recipients="[]",
+            body_text="",
+            has_attachments=True,
+            attachment_names='["a.txt"]',
+        )
+        monkeypatch.setattr(email_utils, "_ensure_attachment_path", lambda *_a, **_k: attachment)
+        monkeypatch.setattr(email_utils, "USER_UPLOAD_DIR", str(tmp_path / "uploads"))
+        monkeypatch.setattr(
+            core_config,
+            "PLUGIN_ENABLED",
+            [key for key in core_config.PLUGIN_ENABLED if key != email_utils.plugin.key],
+        )
+        sent: List[str] = []
+
+        async def fake_send_file(chat_key: str, *_args: Any, **_kwargs: Any) -> None:
+            sent.append(chat_key)
+
+        monkeypatch.setattr(message_api, "send_file", fake_send_file)
+        # 平台方频道（租户会话读不到平台方邮箱，会在碰文件之前就返回「账户不存在」）
+        with pytest.raises(ValueError, match=CHANNEL_NOT_FOUND):
+            await email_utils.send_email_attachment(ctx_of(KEY_P), "me@example.com", "1", "a.txt", KEY_P)
+        assert sent == [], "插件没开就不该真的把附件发出去"
+
 
 @pytest.fixture
 def draw_spies(monkeypatch: pytest.MonkeyPatch):
     """绘图插件的两个出口（生成、发图）换成记账替身：越权的调用一次绘图额度都不该花"""
     from nekro_agent.api import message as message_api
+    from nekro_agent.core.config import config as core_config
     from plugins.builtin.draw import handlers
 
     generated: List[str] = []
@@ -690,6 +749,9 @@ def draw_spies(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(AgentCtx, "fs", property(lambda _self: SimpleNamespace(mixed_forward_file=fake_forward)))
     monkeypatch.setattr(handlers.config, "ENABLE_MULTI_IMAGE", True)
     monkeypatch.setattr(handlers, "_supports_multi_image_draw", lambda: True)
+    # 发图现在走插件推送方法：目标频道上绘图插件没开就返回 False、按「频道不存在」处理。
+    # 这些用例测的是租户边界，不是插件开关，所以让它在全局开着，否则允许的调用也发不出去。
+    monkeypatch.setattr(core_config, "PLUGIN_ENABLED", [*core_config.PLUGIN_ENABLED, handlers.plugin.key])
     return handlers, generated, sent
 
 

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from jinja2 import Environment
 
@@ -44,8 +44,14 @@ class PromptCompiler:
         chat_key_rules: str,
         enable_at: bool,
         affection_prompt: str = "",
+        worldbook_prompt: str = "",
+        auxiliary_prompt: str = "",
+        ops_prompt: str = "",
     ):
         self.affection_prompt = affection_prompt
+        self.worldbook_prompt = worldbook_prompt
+        self.auxiliary_prompt = auxiliary_prompt
+        self.ops_prompt = ops_prompt
         self.platform_name = platform_name
         self.bot_platform_id = bot_platform_id
         self.chat_preset = chat_preset
@@ -80,8 +86,11 @@ class PromptCompiler:
                 stable_static=segments.stable_static,
                 channel_static=segments.channel_static,
                 runtime_dynamic=segments.runtime_dynamic,
+                worldbook_prompt=self.worldbook_prompt,
+                auxiliary_prompt=self.auxiliary_prompt,
                 affection_prompt=self.affection_prompt,
                 plugins_prompt=self.plugins_prompt,
+                ops_prompt=self.ops_prompt,
             ),
             default_env,
         )
@@ -140,6 +149,9 @@ class PromptCompiler:
         one_time_code: str,
         config: CoreConfig,
         model_group: ModelConfigGroup,
+        dry_run: bool = False,
+        extra_history_lines: Optional[List[str]] = None,
+        hidden_book_ids: Optional[Set[int]] = None,
     ) -> OpenAIChatMessage:
         return OpenAIChatMessage.from_template("user", HistoryFirstStart(enable_cot=self.enable_cot), default_env).extend(
             await render_history_data(
@@ -149,5 +161,8 @@ class PromptCompiler:
                 plugin_injected_prompt=self.plugins_runtime_prompt,
                 model_group=model_group,
                 config=config,
+                dry_run=dry_run,
+                extra_history_lines=extra_history_lines,
+                hidden_book_ids=hidden_book_ids,
             ),
         )

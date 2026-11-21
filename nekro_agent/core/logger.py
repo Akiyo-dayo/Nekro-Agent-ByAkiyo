@@ -25,6 +25,7 @@ from typing import (
 from loguru import logger
 
 from .config import config
+from .core_utils import recorded_config_repairs
 from .os_env import (
     APP_LOG_DIR,
     FACTORY_DEFAULT_POSTGRES_PASSWORD,
@@ -632,6 +633,11 @@ else:
 
 for _factory_default_alert in audit_factory_default_credentials():
     logger.warning(_factory_default_alert)
+
+# 全局配置在本模块之前加载：那时日志处理器还没配好，修正非法值的 ERROR 只打到了 stderr。
+# 这里按配好的处理器补记一遍，让它进应用日志文件与后台的日志页。
+for _config_repair in recorded_config_repairs():
+    logger.error(f"{_config_repair.describe()}（启动加载时修正，此处补记）")
 
 
 async def get_log_records(

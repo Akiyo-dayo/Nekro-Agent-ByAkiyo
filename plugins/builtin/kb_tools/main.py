@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 import json
+from pathlib import Path
+import tempfile
 from typing import Any, List
 
 from nekro_agent.api.plugin import SandboxMethodType
@@ -17,6 +20,7 @@ from nekro_agent.schemas.kb import (
     KBChunkContextResponse,
     KBSourceFileResponse,
 )
+from nekro_agent.services.kb import kb_files
 from nekro_agent.services.kb.document_service import (
     get_document,
     list_documents,
@@ -681,11 +685,23 @@ async def get_workspace_kb_source_file_tool(
     if document is None:
         raise ValueError(f"未找到知识库文档 {document_id}")
 
-    source_file = WorkspaceService.resolve_kb_source_path(workspace.id, document.source_path)
-    if not source_file.exists():
-        raise ValueError(f"知识库源文件不存在: {document.source_path}")
-
-    sandbox_file_path = await _ctx.fs.mixed_forward_file(source_file, file_name=document.file_name)
+    # 源文件在容器可写的 CC 工作区里：先不跟随链接地复制到 NA 自己的临时目录，再转发副本。
+    # 直接按路径转发会跟着容器放的链接，把宿主上的任意文件复制进主沙盒
+    with tempfile.TemporaryDirectory(prefix="nekro-kb-forward-") as staging_dir:
+        staged = Path(staging_dir) / (Path(document.file_name).name or "source")
+        try:
+            copied = await asyncio.to_thread(
+                kb_files.copy_to,
+                workspace.id,
+                kb_files.SOURCE,
+                document.source_path,
+                staged,
+            )
+        except ValueError:
+            copied = False
+        if not copied:
+            raise ValueError(f"知识库源文件不存在: {document.source_path}")
+        sandbox_file_path = await _ctx.fs.mixed_forward_file(staged, file_name=document.file_name)
     payload = KBSourceFileResponse(
         document_id=document.id,
         title=document.title,

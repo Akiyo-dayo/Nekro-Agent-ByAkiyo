@@ -94,6 +94,17 @@ class DBAffection(Model):
     last_interact_at = fields.DatetimeField(null=True, description="最近互动时间")
     last_chat_key = fields.CharField(max_length=256, default="", description="最近互动的会话标识")
 
+    # 关系里程碑的引用（新的在前，最多 5 条）。存对象而不是段落 ID，是因为判据要用到
+    # 「从哪个阶段到哪个阶段、什么时候写的」这三样：段落正文是给人看的，阶段与时间只在这里。
+    # 元素形状：`{"paragraph_id": 12, "event_id": 34, "from": "friendly", "to": "close",
+    # "at": "2026-11-10T08:00:00+00:00"}`。段落本身在 `mem_paragraph` 里，删了段落这里不改，
+    # 读侧按段落是否有效自然过滤。
+    milestone_refs = fields.JSONField(default=list, description="最近的关系里程碑引用（新的在前，最多 5 条）")
+
+    # 模型给这个人起的称呼。本轮只加列，读写逻辑在下一轮；加在这里是为了让迁移一次到位，
+    # 免得两轮各改一次表。
+    call_name = fields.CharField(max_length=64, default="", description="模型给这个人起的称呼（不可信内容）")
+
     create_time = fields.DatetimeField(auto_now_add=True, description="创建时间")
     update_time = fields.DatetimeField(auto_now=True, description="更新时间")
 
@@ -150,6 +161,12 @@ class DBAffectionEvent(Model):
     # 流水是账本（滚动窗口额度从它算），删行会改掉别人的额度，也抹掉了「这里删过东西」的痕迹。
     deleted_at = fields.DatetimeField(null=True, description="理由被删除的时间；NULL 表示没删过")
     deleted_by = fields.CharField(max_length=128, default="", description="删除理由的操作者用户名")
+
+    # 这条流水生成的关系里程碑段落。它是段落归属的唯一依据：重置、孤儿人设清理、后台删一条
+    # 里程碑都按「这一行这个人的流水生成过它」找段落（`milestone_refs` 只留最近几条）；
+    # 同时它也是「同一条流水只会生成一段」的查重键。判据要用的「从 / 到 / 时间」在
+    # `DBAffection.milestone_refs` 上，不在这里。
+    memory_paragraph_id = fields.IntField(null=True, index=True, description="这条流水生成的关系里程碑段落 ID")
 
     create_time = fields.DatetimeField(auto_now_add=True, index=True, description="创建时间")
 

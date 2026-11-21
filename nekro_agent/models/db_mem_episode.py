@@ -37,6 +37,12 @@ class DBMemEpisode(Model):
     # 按人设隔离**不产生副本**：一段对话在人设甲下发生就写一次、标成甲，
     # 不会因为存在人设乙而复制。
     preset_id = fields.IntField(default=0, index=True, description="人设标识；0 表示无人设档")
+    adapter_key = fields.CharField(max_length=64, default="", description="来源适配器标识；空 = 未知或存量")
+    origin_chat_type = fields.CharField(
+        max_length=16,
+        default="",
+        description="来源频道类型 group / private，空 = 未知或存量",
+    )
     origin_chat_key = fields.CharField(
         max_length=256,
         null=True,
@@ -52,6 +58,10 @@ class DBMemEpisode(Model):
     phase_mapping = fields.JSONField(default=dict, description="阶段到段落 ID 的映射")
     base_weight = fields.FloatField(default=1.0, description="Episode 基础权重")
     is_inactive = fields.BooleanField(default=False, index=True, description="是否已失活")
+    # 隔离复用 `is_inactive` 并删向量，判据与段落一致；episode 不挂向量，所以这里只影响注入。
+    quarantined_at = fields.DatetimeField(null=True, description="转入隔离的时间；软删时清空")
+    quarantine_reason = fields.CharField(max_length=16, default="", description="隔离原因 manual / auto_blocked")
+    blocked_round_hits = fields.IntField(default=0, description="被注入到被拦轮次里的累计次数")
     embedding_ref = fields.CharField(max_length=64, null=True, index=True, description="预留向量引用")
     create_time = fields.DatetimeField(auto_now_add=True, description="创建时间")
     update_time = fields.DatetimeField(auto_now=True, description="更新时间")
@@ -83,6 +93,9 @@ class DBMemEpisode(Model):
             "phase_mapping": self.phase_mapping,
             "base_weight": self.base_weight,
             "is_inactive": self.is_inactive,
+            "quarantined_at": self.quarantined_at.isoformat() if self.quarantined_at else None,
+            "quarantine_reason": self.quarantine_reason,
+            "blocked_round_hits": self.blocked_round_hits,
             "create_time": self.create_time.isoformat(),
             "update_time": self.update_time.isoformat(),
         }

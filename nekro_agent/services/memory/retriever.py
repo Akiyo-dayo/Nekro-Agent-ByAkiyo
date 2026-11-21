@@ -7,10 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from tortoise.expressions import Q
 
@@ -18,7 +17,7 @@ from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_mem_entity import DBMemEntity
 from nekro_agent.models.db_mem_episode import DBMemEpisode
-from nekro_agent.models.db_mem_paragraph import CognitiveType, DBMemParagraph
+from nekro_agent.models.db_mem_paragraph import CognitiveType, DBMemParagraph, OriginKind
 from nekro_agent.models.db_mem_reinforcement_log import (
     DBMemReinforcementLog,
     TargetType,
@@ -39,6 +38,7 @@ from nekro_agent.services.memory.recall_contract import (
     MemoryKnowledgeHint,
     MemoryTypeHint,
 )
+from nekro_agent.services.memory.scope_condition import MemTable
 from nekro_agent.services.memory.text_terms import extract_query_terms, lexical_coverage
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
@@ -141,15 +141,6 @@ class MemoryRetriever:
         self.workspace_id = workspace_id
         self.scope = scope
 
-    @property
-    def _scope_filter(self) -> dict[str, Any]:
-        """隔离维度的查询过滤条件（域 + 人设），未设限的维度不出现在条件里。
-
-        注意：域换算出的允许集合里会包含空串，以保证升级前写入、`instance_key`
-        为空的存量记忆仍可召回（`instance_scope.LEGACY_INSTANCE_KEY`）。
-        """
-        return self.scope.as_filter()
-
     async def retrieve(
         self,
         query: str,
@@ -160,6 +151,9 @@ class MemoryRetriever:
         record_access: bool = True,
         time_from: datetime | None = None,
         time_to: datetime | None = None,
+        exclude_origin_kinds: Collection[OriginKind] = (),
+        *,
+        requester: tuple[str, str] | None = None,
     ) -> RetrievalResult:
         """检索相关记忆
 
@@ -170,6 +164,13 @@ class MemoryRetriever:
             cognitive_type: 可选，过滤认知类型
             include_inactive: 是否包含已失活记忆
             record_access: 是否记录访问日志
+            exclude_origin_kinds: 回表时排除这些来源的段落。只给**自动注入**用：好感里程碑
+                已经在好感块里出现过一次，记忆块再出现一次就是同一件事说两遍；而
+                `memory_tools` 走的 `retrieve_memories` 不传它，用户问「我们是怎么熟起来的」
+                时照样搜得到。向量那一侧不排除（payload 里没有 origin_kind，加键要升版本并
+                回填存量点），代价是偶尔有一两个候选位被里程碑占掉。
+            requester: 发起方的 `(adapter_key, instance_key)`，只用于把 embedding 用量
+                归到租户；不传与改造前相同，不参与任何过滤条件。
 
         Returns:
             检索结果
@@ -199,7 +200,10 @@ class MemoryRetriever:
         # 生成查询向量
         t0 = time.perf_counter()
         try:
-            query_embedding = await embed_text(query)
+            if requester is None:
+                query_embedding = await embed_text(query)
+            else:
+                query_embedding = await embed_text(query, requester=requester)
         except Exception as e:
             logger.warning(f"查询向量化失败: {e}")
             return RetrievalResult(
@@ -229,11 +233,20 @@ class MemoryRetriever:
         paragraph_candidates: dict[int, RetrievedMemory] = {}
         paragraph_ids = [r["id"] for r in search_results]
 
-        paragraphs = await DBMemParagraph.filter(
-            id__in=paragraph_ids,
+        paragraph_query = self.scope.apply(
+            DBMemParagraph.filter(id__in=paragraph_ids),
+            MemTable.PARAGRAPH,
             workspace_id=self.workspace_id,
-            **self._scope_filter,
-        ).all()
+        )
+        if not include_inactive:
+            # 回表时以库里的 is_inactive 为准：隔离 / 软删后删点失败时，点和它 payload 里的
+            # is_inactive=false 都还在，向量通道照样命中；只靠向量库的过滤，这条记忆会被注入。
+            paragraph_query = paragraph_query.filter(is_inactive=False)
+        if exclude_origin_kinds:
+            paragraph_query = paragraph_query.exclude(
+                origin_kind__in=[kind.value for kind in exclude_origin_kinds],
+            )
+        paragraphs = await paragraph_query.all()
         paragraph_map = {p.id: p for p in paragraphs}
 
         for result in search_results:
@@ -369,11 +382,10 @@ class MemoryRetriever:
         for term in terms[:5]:
             entity_query |= Q(canonical_name__icontains=term) | Q(name__icontains=term)
 
-        matched_entities = await DBMemEntity.filter(
-            entity_query,
+        matched_entities = await self.scope.apply(
+            DBMemEntity.filter(entity_query, is_inactive=False),
+            MemTable.ENTITY,
             workspace_id=self.workspace_id,
-            is_inactive=False,
-            **self._scope_filter,
         ).limit(config.MEMORY_RETRIEVAL_RELATION_MATCH_LIMIT)
         entity_map = {entity.id: entity for entity in matched_entities}
         matched_ids = list(entity_map.keys())
@@ -387,10 +399,10 @@ class MemoryRetriever:
         if not relation_query.children:
             return []
 
-        relation_qs = DBMemRelation.filter(
-            relation_query,
+        relation_qs = self.scope.apply(
+            DBMemRelation.filter(relation_query),
+            MemTable.RELATION,
             workspace_id=self.workspace_id,
-            **self._scope_filter,
         )
         if not include_inactive:
             relation_qs = relation_qs.filter(is_inactive=False)
@@ -402,10 +414,10 @@ class MemoryRetriever:
             relation.object_entity_id for relation in relations if relation.object_entity_id not in entity_map
         }
         if missing_entity_ids:
-            extra_entities = await DBMemEntity.filter(
-                id__in=list(missing_entity_ids),
+            extra_entities = await self.scope.apply(
+                DBMemEntity.filter(id__in=list(missing_entity_ids)),
+                MemTable.ENTITY,
                 workspace_id=self.workspace_id,
-                **self._scope_filter,
             )
             entity_map.update({entity.id: entity for entity in extra_entities})
 
@@ -486,7 +498,11 @@ class MemoryRetriever:
         for term in terms[:4]:
             query_q |= Q(title__icontains=term) | Q(narrative_summary__icontains=term)
 
-        episode_qs = DBMemEpisode.filter(workspace_id=self.workspace_id, **self._scope_filter)
+        episode_qs = self.scope.apply(
+            DBMemEpisode.filter(),
+            MemTable.EPISODE,
+            workspace_id=self.workspace_id,
+        )
         if not include_inactive:
             episode_qs = episode_qs.filter(is_inactive=False)
         if time_from:
@@ -584,17 +600,17 @@ class MemoryRetriever:
                     # 强化会写库，必须复用与检索一致的隔离条件（工作区 + 实例），
                     # 否则同 ID 的其他工作区/实例记忆会被误强化。
                     target = (
-                        await DBMemRelation.get_or_none(
-                            id=mem.target_id,
+                        await self.scope.apply(
+                            DBMemRelation.filter(id=mem.target_id),
+                            MemTable.RELATION,
                             workspace_id=self.workspace_id,
-                            **self._scope_filter,
-                        )
+                        ).first()
                         if is_relation
-                        else await DBMemParagraph.get_or_none(
-                            id=mem.target_id,
+                        else await self.scope.apply(
+                            DBMemParagraph.filter(id=mem.target_id),
+                            MemTable.PARAGRAPH,
                             workspace_id=self.workspace_id,
-                            **self._scope_filter,
-                        )
+                        ).first()
                     )
                     # 冷却窗口内不重复写库，避免高频会话把强化变成写放大。
                     # 与 compute_effective_weight 一致地用时间戳比较，规避时区表示差异。
@@ -654,11 +670,10 @@ class MemoryRetriever:
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        paragraphs = await DBMemParagraph.filter(
+        paragraphs = await self.scope.apply(
+            DBMemParagraph.filter(event_time__gte=cutoff, is_inactive=False),
+            MemTable.PARAGRAPH,
             workspace_id=self.workspace_id,
-            event_time__gte=cutoff,
-            is_inactive=False,
-            **self._scope_filter,
         ).order_by("-event_time").limit(limit)
 
         return [
@@ -689,6 +704,7 @@ async def retrieve_memories(
     time_to: datetime | None = None,
     *,
     scope: MemoryScope,
+    requester: tuple[str, str] | None = None,
 ) -> list[RetrievedMemory]:
     """便捷函数：检索记忆
 
@@ -696,9 +712,16 @@ async def retrieve_memories(
         scope: 本次检索的可见范围（域 + 人设），**必填**。
             由 `instance_scope.resolve_memory_scope(channel)` 产生；确实要看
             整个工作区的管理端调用方显式传 `MemoryScope.unrestricted()`。
+        requester: 发起方的 `(adapter_key, instance_key)`，只影响 embedding 用量归属。
     """
     retriever = MemoryRetriever(workspace_id, scope=scope)
-    result = await retriever.retrieve(query, limit=limit, time_from=time_from, time_to=time_to)
+    result = await retriever.retrieve(
+        query,
+        limit=limit,
+        time_from=time_from,
+        time_to=time_to,
+        requester=requester,
+    )
     return result.memories
 
 
@@ -718,6 +741,8 @@ async def retrieve_memories_batch(
     *,
     scope: MemoryScope,
     record_access: bool = True,
+    requester: tuple[str, str] | None = None,
+    exclude_origin_kinds: Collection[OriginKind] = (),
 ) -> list[list[RetrievedMemory]]:
     """并发执行多条检索，返回与 `requests` **同序**的结果列表。
 
@@ -734,6 +759,9 @@ async def retrieve_memories_batch(
     `round_recall.commit_round_recall` 在主对话成功返回后补记一次。这样一轮主对话迭代
     几次也只算一次，被拦下的轮次则完全不强化。
 
+    `exclude_origin_kinds` 原样透传给每条检索，只有自动注入链路会传
+    `{affection}`（理由见 `MemoryRetriever.retrieve` 的同名参数）。
+
     单条 query 失败不连坐：该条回空列表，其余照常返回（记忆注入是风味不是功能，
     读路径 fail-open 是硬要求）。
     """
@@ -749,6 +777,8 @@ async def retrieve_memories_batch(
                 time_from=request.time_from,
                 time_to=request.time_to,
                 record_access=False,
+                requester=requester,
+                exclude_origin_kinds=exclude_origin_kinds,
             )
             for retriever, request in zip(retrievers, requests, strict=True)
         ),
@@ -776,8 +806,15 @@ async def compile_memories_for_context(
     recall_query: MemoryRecallQuery,
     memories: list[RetrievedMemory],
     max_length: int = 2000,
+    *,
+    included: list[tuple[str, int, int]] | None = None,
 ) -> str:
-    """将检索候选编排为真正用于 prompt 注入的上下文块。"""
+    """将检索候选编排为真正用于 prompt 注入的上下文块。
+
+    `included` 不为 `None` 时，把**真正拼进返回文字**的每条记忆按
+    `(source_type, target_id, 这一条渲染出来的字数)` 追加进去。预算把某一条截掉时
+    它不会出现在列表里：调用方据此记录「模型这一轮实际看到了什么」。
+    """
     if not memories:
         logger.debug("记忆上下文编排跳过: 输入 memories 为空")
         return ""
@@ -816,6 +853,9 @@ async def compile_memories_for_context(
                 break
             lines.append(line)
             current_length += len(line) + 1
+            if included is not None:
+                # 只在这里记：上一行的预算判断已经把「没进文字的条目」挡在外面。
+                included.append((mem.source_type, mem.target_id, len(line)))
 
     context = "\n".join(lines)
     query_preview = recall_query.query_text.strip().replace("\n", " ")[:120]

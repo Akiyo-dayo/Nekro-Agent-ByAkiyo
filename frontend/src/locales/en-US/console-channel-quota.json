@@ -1,0 +1,176 @@
+{
+  "title": "Channel Quota",
+  "subtitle": "The daily allowance the platform grants to every group and private chat, settled in the quota timezone.",
+  "intro": {
+    "text": "This page shows the platform's daily allowance per group / private chat. It is a separate layer from the reply quota on the ",
+    "quotaLink": "Quota page",
+    "after": " (that one is a tenant's own self-limit); both must allow a reply.",
+    "settingsHint": "Timezone, token scope and alert thresholds live under System Settings → Channel Quota."
+  },
+  "actions": {
+    "refresh": "Refresh",
+    "editPolicy": "Edit this channel's policy",
+    "bonus": "Add bonus for today",
+    "myLimit": "My limit",
+    "save": "Save",
+    "cancel": "Cancel",
+    "close": "Close"
+  },
+  "global": {
+    "title": "Global policy",
+    "subtitle": "The switch here is the master gate: while it is off no channel is limited, and the instance / channel layers can only turn something off while it is on.",
+    "enabled": "Enable channel quota",
+    "unit": "Unit",
+    "groupLimit": "Group daily limit",
+    "privateLimit": "Private chat daily limit",
+    "limitHint": "0 = unlimited",
+    "action": "Over-limit action",
+    "pauseMessage": "Pause message",
+    "pauseMessageHint": "Leave empty to use the default wording; it is sent in the Bot's voice, at most {{max}} characters.",
+    "charCount": "{{value}} / {{max}}",
+    "save": "Save global policy",
+    "saveSuccess": "Global policy saved"
+  },
+  "filters": {
+    "day": "Date",
+    "state": "State",
+    "type": "Type",
+    "tenant": "Tenant",
+    "all": "All",
+    "group": "Group",
+    "private": "Private"
+  },
+  "columns": {
+    "channel": "Channel",
+    "type": "Type",
+    "instance": "Instance",
+    "tenant": "Tenant",
+    "unit": "Unit",
+    "usage": "Used / Limit",
+    "remaining": "Remaining",
+    "progress": "Progress",
+    "state": "State",
+    "action": "Over-limit action"
+  },
+  "unit": {
+    "replies": "Replies",
+    "tokens": "Tokens"
+  },
+  "state": {
+    "disabled": "Disabled",
+    "unlimited": "Unlimited",
+    "normal": "Normal",
+    "warning": "Warned",
+    "exceeded": "Exceeded",
+    "paused": "Paused"
+  },
+  "action": {
+    "alert": "Alert only",
+    "pause": "Pause"
+  },
+  "value": {
+    "unlimited": "Unlimited",
+    "bonus": "+{{value}}",
+    "empty": "No channel matches these filters",
+    "emptyHint": "Try another date, state or type; if there is no channel at all, connect one under Instances first."
+  },
+  "detail": {
+    "title": "Channel quota detail",
+    "days7": "Last 7 days",
+    "days30": "Last 30 days",
+    "dailyTitle": "Daily usage",
+    "sceneTitle": "Tokens by scene",
+    "sceneHint": "This is what the background calls burned; it shares the ledger with the Usage page.",
+    "policyTitle": "Effective policy",
+    "columns": {
+      "day": "Date",
+      "replies": "Replies",
+      "tokensAll": "Tokens (all)",
+      "tokensReply": "Tokens (reply path)",
+      "bonus": "Bonus",
+      "scene": "Scene"
+    },
+    "scene": {
+      "chat": "Reply",
+      "history_plan": "Context planning",
+      "affection_eval": "Affection evaluation",
+      "memory_consolidate": "Memory consolidation",
+      "embedding": "Embedding",
+      "vision_describe": "Image description",
+      "plugin": "Plugin",
+      "command": "Command",
+      "other": "Other"
+    },
+    "policy": {
+      "unit": "Unit",
+      "platformLimit": "Platform limit",
+      "tenantLimit": "Tenant limit",
+      "effectiveLimit": "Effective limit",
+      "action": "Over-limit action",
+      "pauseMessage": "Pause message"
+    },
+    "noScene": "No calls recorded in this window",
+    "notSet": "Not set"
+  },
+  "policyDialog": {
+    "titleInstance": "Edit instance-level policy",
+    "titleChannel": "Edit this channel's policy",
+    "inherit": "Inherit from the layer above",
+    "inheritHint": "Choosing \"inherit\" leaves this column unset and follows the layer above; the backend only accepts null.",
+    "enabled": "Enabled",
+    "enabledOn": "On",
+    "enabledOff": "Off",
+    "unit": "Unit",
+    "groupLimit": "Group daily limit",
+    "privateLimit": "Private chat daily limit",
+    "limitHint": "0 = unlimited",
+    "action": "Over-limit action",
+    "pauseMessage": "Pause message",
+    "pauseMessageHint": "Leave empty to inherit; at most {{max}} characters.",
+    "saveSuccess": "Policy saved",
+    "limitInvalid": "Enter an integer no smaller than 0, or leave it empty to inherit",
+    "pauseTooLong": "The pause message must be at most {{max}} characters"
+  },
+  "bonusDialog": {
+    "amount": "Bonus amount",
+    "hint": "The bonus applies to today only, in the currently effective unit.",
+    "invalid": "Enter a positive integer",
+    "success": "Added {{value}}"
+  },
+  "recount": {
+    "all": "Recount this day from the ledger",
+    "channel": "Recount today from the ledger",
+    "channelTitle": "Recount from the ledger",
+    "hint": "Replies are not recomputed, only tokens. When recounting today, requests that land between the aggregation and the write are overwritten; trust the automatic reconciliation after midnight for today's numbers.",
+    "allSuccess": "Recounted {{day}} from the ledger: {{channels}} channels processed",
+    "channelSuccess": "Recounted this channel's tokens from the ledger"
+  },
+  "tenantDialog": {
+    "titleInstance": "My limit (this instance)",
+    "titleChannel": "My limit (this channel)",
+    "groupLimit": "Group daily limit",
+    "privateLimit": "Private chat daily limit",
+    "limit": "Daily limit",
+    "pauseMessage": "Pause message",
+    "pauseMessageHint": "Leave empty to use the platform's wording; at most {{max}} characters.",
+    "platformCeiling": "Platform ceiling: {{value}}",
+    "unit": "Current unit: {{unit}}",
+    "ceilingHint": "You may only lower it; the server checks it again.",
+    "clearHint": "Leave empty to clear your own value and fall back to the platform's limit.",
+    "success": "Limit saved",
+    "overCeiling": "Must not exceed the platform ceiling {{value}}",
+    "invalid": "Enter a positive integer"
+  },
+  "instanceSection": {
+    "title": "Channel quota",
+    "subtitle": "The daily allowance the platform grants to every group / private chat under this instance; the instance layer only sets the columns you change.",
+    "platformPolicy": "Instance-level policy",
+    "editPolicy": "Edit instance-level policy",
+    "myLimit": "My limit",
+    "myLimitHint": "Lower the allowance and set your own pause message on your own instance; it can never exceed the platform ceiling."
+  },
+  "statusRow": {
+    "label": "Today: {{used}} / {{limit}} ({{unit}})",
+    "unlimitedLabel": "Today: {{used}} (unlimited)"
+  }
+}

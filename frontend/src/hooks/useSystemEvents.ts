@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createSharedEventStreamManager } from '../services/api/utils/stream'
 
-export type SystemEventWorkspaceStatus = 'active' | 'stopped' | 'failed' | 'deleting'
+export type SystemEventWorkspaceStatus = 'active' | 'stopped' | 'failed' | 'deleting' | 'transitioning'
 
 interface WorkspaceStatusPayload {
   workspace_id: number

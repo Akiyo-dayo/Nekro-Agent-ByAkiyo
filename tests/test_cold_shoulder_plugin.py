@@ -567,6 +567,9 @@ class TestReplyGateWiring:
             return core_config.model_copy()
 
         monkeypatch.setattr(DBChatChannel, "get_effective_config", fake_effective)
+        # 冷处理已经接上按频道作用域判据：测试里让它在全局也开着，
+        # 否则钩子会因为「插件不在启用列表」而直接跳过，测不到冷处理本身。
+        monkeypatch.setattr(core_config, "PLUGIN_ENABLED", [*core_config.PLUGIN_ENABLED, cs.plugin.key])
         monkeypatch.setitem(plugin_collector.loaded_plugins, cs.plugin.key, cs.plugin)
 
     async def test_the_ignored_user_cannot_poke_the_bot_awake(self, db, monkeypatch: pytest.MonkeyPatch):

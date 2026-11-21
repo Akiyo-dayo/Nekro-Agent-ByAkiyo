@@ -1,0 +1,324 @@
+{
+  "title": "记忆",
+  "subtitle": "查看、筛选与维护实例里的长期记忆",
+  "scopeBanner": "记忆的可见范围跟随当前实例；切换实例后列表与筛选项会一起变化。",
+  "tabs": {
+    "items": "记忆条目",
+    "quarantine": "隔离区",
+    "summaries": "频道摘要",
+    "promptRounds": "提示词明细"
+  },
+  "kind": {
+    "paragraph": "段落",
+    "episode": "事件",
+    "relation": "关系",
+    "entity": "实体"
+  },
+  "status": {
+    "all": "全部状态",
+    "active": "生效中",
+    "quarantined": "已隔离",
+    "deleted": "已删除",
+    "pruned": "已清理",
+    "hard_deleted": "已彻底删除",
+    "unknown": "未知"
+  },
+  "partition": {
+    "all": "全部分区",
+    "domain": "域",
+    "workspace": "工作区",
+    "workspaceWithId": "工作区 #{{id}}"
+  },
+  "domain": {
+    "self": "本实例",
+    "group": "同域实例"
+  },
+  "cognitive": {
+    "episodic": "情景",
+    "semantic": "语义"
+  },
+  "knowledge": {
+    "conversation": "对话",
+    "preference": "偏好",
+    "fact": "事实",
+    "experience": "经历",
+    "decision": "决定",
+    "emotion": "情绪"
+  },
+  "origin": {
+    "message": "单条消息",
+    "consolidation": "对话沉淀",
+    "task": "委托任务",
+    "manual": "手动创建",
+    "plugin": "插件写入",
+    "affection": "好感里程碑"
+  },
+  "sort": {
+    "create_time": "创建时间",
+    "update_time": "更新时间",
+    "blocked_round_hits": "被拦次数"
+  },
+  "order": {
+    "desc": "倒序",
+    "asc": "正序"
+  },
+  "preset": {
+    "none": "默认人设",
+    "consoleOnly": "仅控制台（控制台直发 CC 的结论）"
+  },
+  "filters": {
+    "searchPlaceholder": "搜索内容或摘要",
+    "clearSearch": "清空搜索",
+    "searchTooLong": "搜索词最多 {{max}} 个字，已截断",
+    "status": "状态",
+    "channel": "来源频道",
+    "preset": "人设",
+    "allChannels": "全部频道",
+    "allPresets": "全部人设",
+    "all": "全部",
+    "partition": "分区",
+    "domain": "域",
+    "person": "涉及的人",
+    "personPlaceholder": "账号或名字",
+    "cognitive": "认知类型",
+    "knowledge": "知识类型",
+    "origin": "来源",
+    "allOrigins": "全部来源",
+    "timeFrom": "起始日期",
+    "timeTo": "截止日期",
+    "sort": "排序",
+    "order": "顺序",
+    "pageSize": "每页条数",
+    "pageSizeOption": "{{count}} 条",
+    "more": "更多筛选",
+    "moreWithCount": "更多筛选 · {{count}}",
+    "clear": "清空筛选"
+  },
+  "columns": {
+    "content": "内容",
+    "status": "状态",
+    "persons": "涉及的人",
+    "channel": "来源频道",
+    "partition": "分区",
+    "blockedHits": "被拦次数",
+    "time": "时间",
+    "type": "类型",
+    "quarantineReason": "隔离原因",
+    "quarantinedAt": "隔离时间",
+    "actions": "操作"
+  },
+  "detail": {
+    "title": "段落详情",
+    "episodeTitle": "事件详情",
+    "content": "内容",
+    "summary": "摘要",
+    "persons": "涉及的人",
+    "personsHelper": "只能填在来源频道里说过话的非 Bot 账号，保存时会校验。",
+    "channel": "来源频道",
+    "episode": "所属事件",
+    "cognitive": "认知类型",
+    "knowledge": "知识类型",
+    "baseWeight": "基础权重",
+    "reinforceCount": "强化次数",
+    "blockedHits": "被拦次数",
+    "quarantineReason": "隔离原因",
+    "quarantinedAt": "隔离时间",
+    "partition": "分区",
+    "instance": "实例",
+    "titleField": "标题",
+    "narrativeSummary": "叙事摘要",
+    "timeRange": "时间范围",
+    "openAffection": "打开好感详情",
+    "milestoneRecordNotFound": "这条里程碑所属的好感看不到或已不存在。"
+  },
+  "actions": {
+    "delete": "删除",
+    "hardDelete": "彻底删除",
+    "quarantine": "隔离",
+    "restore": "放回",
+    "freeze": "冻结",
+    "unfreeze": "解冻",
+    "protect": "保护",
+    "unprotect": "取消保护",
+    "reinforce": "强化",
+    "demote": "弱化",
+    "save": "保存编辑",
+    "saveSuccess": "已保存",
+    "deleteSuccess": "已移入「已删除」",
+    "freezeSuccess": "已冻结",
+    "unfreezeSuccess": "已解冻",
+    "protectSuccess": "已保护",
+    "unprotectSuccess": "已取消保护",
+    "reinforceSuccess": "已强化",
+    "demoteSuccess": "已弱化",
+    "quarantineSuccess": "已移入隔离区",
+    "restoreSuccess": "已放回"
+  },
+  "bulk": {
+    "previewTitle": "批量操作确认",
+    "previewLine": "将对 {{matched}} 条记忆执行「{{action}}」。",
+    "confirm": "确认执行",
+    "noMatch": "当前筛选下没有可操作的记忆，可能已被其他人处理。",
+    "cascade": "连带消失：事件 {{episodes}} 条、关系 {{relations}} 条、涉及的人 {{persons}} 个、强化日志 {{reinforcementLogs}} 条。",
+    "success": "已处理 {{affected}} 条记忆。",
+    "partial": "完成 {{affected}} 条，{{failed}} 条失败；失败的仍保留在列表里。",
+    "countChanged": "条数已经变化，已重新预览，请再确认一次。",
+    "selected": "已选 {{count}} 条",
+    "selectedAll": "已选当前筛选的全部 {{total}} 条",
+    "selectAll": "选中当前筛选的全部 {{total}} 条",
+    "selectOnlyChecked": "只保留已勾选的",
+    "hardDeleteNotes": {
+      "chatRecords": "聊天记录本身不删，这里只删记忆。",
+      "summary": "频道摘要可能也概括过这些内容，需要的话去「频道摘要」里编辑。",
+      "promptRounds": "提示词明细里引用到这些条目的地方会显示「已彻底删除」。"
+    }
+  },
+  "deleteDialog": {
+    "title": "删除这条记忆？",
+    "description": "删除后它不再被注入或检索，但仍会留在「已删除」里，之后仍可彻底删除。",
+    "confirm": "删除"
+  },
+  "hardDeleteDialog": {
+    "title": "彻底删除？",
+    "confirm": "确认彻底删除",
+    "success": "已彻底删除，连同 {{count}} 条关联记录。",
+    "successEpisode": "已彻底删除这个事件。",
+    "episodeDescription": "只删这个事件，它的成员段落保留，之后会重新聚合。"
+  },
+  "quarantine": {
+    "restoreSuccess": "已放回，会重新参与检索和注入。"
+  },
+  "quarantineReason": {
+    "manual": "手动隔离",
+    "auto_blocked": "被拦轮次自动隔离",
+    "unknown": "其他原因"
+  },
+  "trace": {
+    "button": "追溯原话",
+    "empty": "找不到原始消息（可能已被清理）。",
+    "crossChannel": "这段记忆来自另一个频道。"
+  },
+  "flags": {
+    "frozen": "已冻结",
+    "protected": "已保护"
+  },
+  "errors": {
+    "notFoundTitle": "未找到",
+    "notFoundHint": "没有这条记录，或它不在你能管理的实例里。"
+  },
+  "summaries": {
+    "columns": {
+      "channel": "频道",
+      "preset": "人设",
+      "latest": "最新版",
+      "content": "内容",
+      "versionCount": "版本数",
+      "status": "状态",
+      "updatedAt": "更新时间"
+    },
+    "source": {
+      "auto": "自动",
+      "manual": "手动编辑",
+      "rollback": "回滚"
+    },
+    "latestVersion": "第 {{version}} 版",
+    "pausedChip": "已暂停自动更新",
+    "dialog": {
+      "title": "频道摘要",
+      "pauseLabel": "暂停自动更新",
+      "pauseTooltip": "只停沉淀时的自动更新；摘要照常注入。想连注入也停，去系统设置关掉频道摘要",
+      "pausedBy": "由 {{user}} 于 {{time}} 暂停",
+      "paused": "已暂停自动更新",
+      "resumed": "已恢复自动更新",
+      "contentLabel": "最新一版的内容",
+      "charCount": "{{count}} 字",
+      "save": "保存为新版本",
+      "saveSuccess": "已存成新版本",
+      "conflict": "摘要刚被更新过，已载入最新版本",
+      "conflictReplaced": "你的改动没有保存，已替换为最新版本",
+      "discardedLabel": "你原来写的内容（已丢弃，可复制）",
+      "historyTitle": "历史版本",
+      "rollbackPrevious": "回滚到上一版",
+      "rollbackToVersion": "回滚到这一版",
+      "rollbackSuccess": "已回滚，存成了第 {{version}} 版",
+      "rollbackFrom": "回滚自第 {{version}} 版",
+      "editedBy": "由 {{user}} 编辑",
+      "version": "第 {{version}} 版",
+      "expand": "展开全文",
+      "collapse": "收起全文",
+      "untitled": "（空内容）",
+      "emptyVersions": "还没有可展示的版本。"
+    }
+  },
+  "promptRounds": {
+    "columns": {
+      "time": "时间",
+      "outcome": "结局",
+      "memory": "记忆",
+      "summary": "摘要",
+      "affection": "好感",
+      "worldbook": "世界书",
+      "renderCount": "渲染次数"
+    },
+    "outcome": {
+      "ok": "成功",
+      "blocked": "被拦",
+      "failed": "失败",
+      "cancelled": "已取消"
+    },
+    "memoryState": {
+      "injected": "{{count}} 条 · {{chars}} 字",
+      "empty": "没有可注入的",
+      "disabled": "开关关着",
+      "suppressed": "上一轮被拦，本轮不注入",
+      "error": "出错"
+    },
+    "worldbookState": {
+      "injected": "{{count}} 条 · {{chars}} 字",
+      "none": "未命中",
+      "disabled": "未开启",
+      "suppressed": "上一轮被拦，未注入参考条目",
+      "error": "出错，本轮未注入"
+    },
+    "summaryState": {
+      "injected": "第 {{version}} 版 · {{chars}} 字",
+      "none": "没有",
+      "disabled": "开关关着",
+      "suppressed": "本轮不注入"
+    },
+    "affectionShown": "{{people}} 人 · {{chars}} 字",
+    "affectionNone": "未出现",
+    "pickChannel": "先选一个频道",
+    "pickChannelHint": "提示词明细按频道记录，选一个频道后再看。",
+    "detail": {
+      "summaryLine": "冷却跳过 {{cooldownSkipped}} 条、记忆块共 {{blockChars}} 字",
+      "summaryCurrent": "摘要那一版仍是最新版",
+      "summaryOutdated": "摘要那一版之后又更新过",
+      "summaryDeleted": "摘要那一版已不在",
+      "summaryNone": "这一轮没有注入摘要",
+      "itemsTitle": "记忆条目",
+      "type": "类型",
+      "preview": "预览",
+      "status": "当前状态",
+      "chars": "字数",
+      "renders": "渲染次数",
+      "actions": "操作",
+      "noItems": "这一轮没有注入记忆条目",
+      "affectionMilestones": "注入的里程碑",
+      "quarantineSuccess": "已移入隔离区",
+      "deleteSuccess": "已移入「已删除」"
+    }
+  },
+  "empty": {
+    "itemsTitle": "还没有记忆条目",
+    "itemsHint": "换个筛选条件，或等对话里产生新的记忆后再来。",
+    "episodesTitle": "还没有事件",
+    "episodesHint": "事件由同一话题的段落聚合而来，换个筛选条件再试。",
+    "quarantineTitle": "隔离区是空的",
+    "quarantineHint": "目前没有被隔离的记忆。",
+    "summariesTitle": "还没有频道摘要",
+    "summariesHint": "开启频道摘要后，沉淀时会自动生成",
+    "promptRoundsTitle": "这个频道还没有记录",
+    "promptRoundsHint": "每轮对话结束后记一行；保留轮数在系统设置里调"
+  }
+}

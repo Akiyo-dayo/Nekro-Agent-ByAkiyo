@@ -1342,7 +1342,7 @@ class TestEverySceneHasAProducer:
       后者会把枚举定义、模型默认值、文档串全算成生产者，于是恒真。
     """
 
-    #: 唯一允许没有显式生产者的一档：它是**缺省值**（`UNATTRIBUTED_CONTEXT`），
+    #: 允许没有显式生产者的一档：它是**缺省值**（`UNATTRIBUTED_CONTEXT`），
     #: 没有任何调用方声明归属时自动落进来。下面的对照断言会确认这一点仍然成立。
     IMPLICIT = {"UNATTRIBUTED"}
 

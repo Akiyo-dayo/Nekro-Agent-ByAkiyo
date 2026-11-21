@@ -6,6 +6,7 @@ from pathlib import Path
 from posixpath import normpath
 from types import ModuleType
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Callable,
@@ -18,6 +19,7 @@ from typing import (
     Tuple,
     Type,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -38,12 +40,19 @@ from nekro_agent.services.plugin.isolation import call_plugin, release_quarantin
 from nekro_agent.services.plugin.scope import (
     current_instance_key,
     invalidate_scoped_config,
+    plugin_effective_in_chat,
     resolve_scoped_config,
 )
 from nekro_agent.services.plugin.task import TaskRunner
 from nekro_agent.tools.text_sanitize import strip_nul
 
 from .schema import PromptInjectMethod, SandboxMethod, SandboxMethodType, WebhookMethod
+
+if TYPE_CHECKING:
+    from nekro_agent.models.db_chat_channel import DBChatChannel
+    from nekro_agent.schemas.agent_message import AgentMessageSegment
+    from nekro_agent.services.ops_agent.triggers import RoundTrigger
+    from nekro_agent.tools.untrusted_content import UntrustedToolResult
 
 T = TypeVar("T", bound=ConfigBase)
 CollectMethodsFunc = Callable[[AgentCtx], Coroutine[Any, Any, List[SandboxMethod]]]
@@ -171,6 +180,10 @@ class NekroPlugin:
         self.i18n_description = i18n_description
         self.allow_sleep = allow_sleep
         self.sleep_brief = sleep_brief.strip()
+        # 能力摘要的动态来源（可选）。能力摘要会进系统提示词，而 `sleep_brief` 在构造时就定死了；
+        # 个别内置插件的措辞要随运行时开关变，又不能动开关关着时的那份文字，就设这个。
+        # `get_plugin_brief` 优先取它返回的非空文字，取不到（未设置、返回空、抛错）时回落到原来的规则。
+        self.brief_resolver: Optional[Callable[[], str]] = None
         self.webui_path = _normalize_webui_path(webui_path)
         self._is_enabled = True
         self._key = f"{self.author}.{self.module_name}"
@@ -1106,6 +1119,190 @@ class NekroPlugin:
     @property
     def store(self) -> "PluginStore":
         return PluginStore(self)
+
+    async def _allow_plugin_push(self, chat_key: str, action: str) -> bool:
+        """后台推送的统一前置判定：插件在这个频道生效、且频道没被标成 Bot 不在群，才允许往下走
+
+        进程级 `is_enabled` 只说明插件在进程里活着；租户可以在自己的实例 / 频道上关掉它。
+        后台推送、定时任务、Webhook 回调都不经过会话里的作用域过滤，必须在这里补上。
+        判不出来（多租户部署里频道行缺失）按不生效处理。
+
+        被定期核对标成「Bot 不在群」的频道同样跳过：往 Bot 已经被移出的群里推消息、发图，
+        只会被 QQ 拒绝（`你已被移出该群`），系统消息开的回合还要白调一轮模型。只读标记，
+        不停用频道；群里再有人说话，入站那一步就把标记改回「在群」。
+        """
+        if not await plugin_effective_in_chat(self.key, chat_key):
+            self.logger.debug(f"插件在频道未生效，跳过推送: plugin={self.key} chat={chat_key} action={action}")
+            return False
+        # 函数内导入：频道模型反过来依赖插件收集器，模块级导入会成环
+        from nekro_agent.models.db_chat_channel import is_chat_key_marked_bot_not_in_group
+
+        if await is_chat_key_marked_bot_not_in_group(chat_key):
+            self.logger.debug(f"频道已标记 Bot 不在群，跳过推送: plugin={self.key} chat={chat_key} action={action}")
+            return False
+        return True
+
+    async def push_system_message(
+        self,
+        chat_key: str,
+        agent_messages: Union[str, List["AgentMessageSegment"]],
+        trigger_agent: bool = False,
+        db_chat_channel: Optional["DBChatChannel"] = None,
+    ) -> bool:
+        """以插件身份推送系统消息
+
+        先判「插件在这个频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `message_service.push_system_message` 并返回 `True`（下游没有返回值；
+        需要下游结果时直接调 `message_service`，不要绕过这里的判定）。
+        """
+        if not await self._allow_plugin_push(chat_key, "push_system_message"):
+            return False
+        from nekro_agent.services.message_service import message_service
+
+        await message_service.push_system_message(
+            chat_key=chat_key,
+            agent_messages=agent_messages,
+            trigger_agent=trigger_agent,
+            db_chat_channel=db_chat_channel,
+        )
+        return True
+
+    async def push_untrusted_message(
+        self,
+        chat_key: str,
+        result: "UntrustedToolResult",
+        trigger_agent: bool = False,
+        db_chat_channel: Optional["DBChatChannel"] = None,
+    ) -> bool:
+        """以插件身份推送外部内容（不可信块）
+
+        先判「插件在这个频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `message_service.push_untrusted_message` 并返回 `True`。
+        """
+        if not await self._allow_plugin_push(chat_key, "push_untrusted_message"):
+            return False
+        from nekro_agent.services.message_service import message_service
+
+        await message_service.push_untrusted_message(
+            chat_key=chat_key,
+            result=result,
+            trigger_agent=trigger_agent,
+            db_chat_channel=db_chat_channel,
+        )
+        return True
+
+    async def schedule_agent_task(
+        self,
+        chat_key: Optional[str] = None,
+        message: Optional[ChatMessage] = None,
+        ctx: Optional[AgentCtx] = None,
+        *,
+        bypass_channel_quota: bool = False,
+        trigger: Optional["RoundTrigger"] = None,
+    ) -> bool:
+        """以插件身份调度一轮 Agent
+
+        先判「插件在目标频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `message_service.schedule_agent_task` 并返回 `True`。
+        目标频道优先取 `message.chat_key`，没有消息时取 `chat_key`，与下游一致。
+        """
+        target_chat_key = (message.chat_key if message is not None else None) or chat_key or ""
+        if not await self._allow_plugin_push(target_chat_key, "schedule_agent_task"):
+            return False
+        from nekro_agent.services.message_service import message_service
+
+        await message_service.schedule_agent_task(
+            chat_key=chat_key,
+            message=message,
+            ctx=ctx,
+            bypass_channel_quota=bypass_channel_quota,
+            trigger=trigger,
+        )
+        return True
+
+    async def send_text(
+        self,
+        chat_key: str,
+        message: str,
+        ctx: AgentCtx,
+        *,
+        record: bool = True,
+        ref_msg_id: Optional[str] = None,
+    ) -> bool:
+        """以插件身份往频道发文本
+
+        先判「插件在这个频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `nekro_agent.api.message.send_text` 并返回 `True`。
+        """
+        if not await self._allow_plugin_push(chat_key, "send_text"):
+            return False
+        from nekro_agent.api.message import send_text
+
+        await send_text(chat_key, message, ctx, record=record, ref_msg_id=ref_msg_id)
+        return True
+
+    async def send_image(
+        self,
+        chat_key: str,
+        image_path: str,
+        ctx: AgentCtx,
+        *,
+        record: bool = True,
+        ref_msg_id: Optional[str] = None,
+    ) -> bool:
+        """以插件身份往频道发图片
+
+        先判「插件在这个频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `nekro_agent.api.message.send_image` 并返回 `True`。
+        """
+        if not await self._allow_plugin_push(chat_key, "send_image"):
+            return False
+        from nekro_agent.api.message import send_image
+
+        await send_image(chat_key, image_path, ctx, record=record, ref_msg_id=ref_msg_id)
+        return True
+
+    async def send_file(
+        self,
+        chat_key: str,
+        file_path: str,
+        ctx: AgentCtx,
+        *,
+        record: bool = True,
+        ref_msg_id: Optional[str] = None,
+    ) -> bool:
+        """以插件身份往频道发文件
+
+        先判「插件在这个频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `nekro_agent.api.message.send_file` 并返回 `True`。
+        """
+        if not await self._allow_plugin_push(chat_key, "send_file"):
+            return False
+        from nekro_agent.api.message import send_file
+
+        await send_file(chat_key, file_path, ctx, record=record, ref_msg_id=ref_msg_id)
+        return True
+
+    async def send_segments(
+        self,
+        chat_key: str,
+        segments: List["AgentMessageSegment"],
+        ctx: AgentCtx,
+        *,
+        record: bool = True,
+        ref_msg_id: Optional[str] = None,
+    ) -> bool:
+        """以插件身份往频道发图文混合消息
+
+        先判「插件在这个频道是否生效」，不生效直接返回 `False`、不调下游。
+        生效时转给 `nekro_agent.api.message.send_segments` 并返回 `True`。
+        """
+        if not await self._allow_plugin_push(chat_key, "send_segments"):
+            return False
+        from nekro_agent.api.message import send_segments
+
+        await send_segments(chat_key, segments, ctx, record=record, ref_msg_id=ref_msg_id)
+        return True
 
     def _update_plugin_type(self, is_builtin: bool, is_package: bool) -> None:
         if is_builtin:

@@ -36,15 +36,18 @@ AI 可以通过以下方法操作白板：
 import asyncio
 import base64
 import contextlib
+import hashlib
+import hmac
 import json
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
-import aiofiles
 import magic
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -58,8 +61,21 @@ from nekro_agent.api.plugin import (
 )
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core.logger import logger
+from nekro_agent.schemas.errors import NotFoundError
+from nekro_agent.services.plugin.route_auth import (
+    PluginRouteScope,
+    plugin_route_scope,
+    resolve_plugin_route_scope,
+)
+from nekro_agent.services.plugin.scope import is_plugin_active
+from nekro_agent.services.resource_scope import resolve_session_owner
 from nekro_agent.services.runtime_state import is_shutting_down
 from nekro_agent.tools.path_convertor import is_url_path
+from nekro_agent.tools.sandbox_shared_files import (
+    UnsafeSharedFileError,
+    host_file_is_regular,
+    read_host_file_bytes,
+)
 
 plugin = NekroPlugin(
     name="直播白板演示插件",
@@ -164,6 +180,7 @@ class WhiteboardConfig(ConfigBase):
 
 # 获取配置
 config = plugin.get_config(WhiteboardConfig)
+store = plugin.store
 
 
 # 全局状态管理
@@ -188,15 +205,147 @@ class WhiteboardState(BaseModel):
     last_update: float = Field(default_factory=time.time)
 
 
+# 每块板一个状态。键是 `(adapter_key, instance_key)`：同一实例标识可以出现在两个适配器下、
+# 分属两个租户，只按 instance_key 分会把两块板并成一块。空对 `("", "")` 是单租户部署
+# （或解析不了归属但部署里没有租户）用的全局板。
+_board_states: Dict[Tuple[str, str], WhiteboardState] = {}
+# 每块板上一次是哪个租户在用（None = 平台方）。实例划给别的租户之后，上一任留在板上的内容不能给新主人看。
+# 不放进 `WhiteboardState`：那个模型会整份推给浏览器
+_board_tenants: Dict[Tuple[str, str], Optional[int]] = {}
+# 会话方法在"多租户部署且解析不出归属"时返回给模型的话
+BOARD_UNAVAILABLE_MESSAGE = "白板在当前频道不可用"
+_VIEW_TOKEN_STORE_PREFIX = "view_token:"
+# 事件流连着的时候多久复核一次授权（见 `_still_authorized`）
+_REAUTHORIZE_SECONDS = 30.0
+
+
+def _board_key(adapter_key: str, instance_key: str) -> Tuple[str, str]:
+    """把实例对规整成白板字典的键"""
+    return (adapter_key or "", instance_key or "")
+
+
+def _get_board_state(board_key: Tuple[str, str]) -> WhiteboardState:
+    """取一块板的状态；第一次访问时按默认布局建空板"""
+    state = _board_states.get(board_key)
+    if state is None:
+        state = WhiteboardState(layout=config.DEFAULT_LAYOUT)
+        _board_states[board_key] = state
+    return state
+
+
+def _board_state_for_tenant(board_key: Tuple[str, str], tenant_id: Optional[int]) -> WhiteboardState:
+    """取板的状态；这块板换了租户（实例被划转）就先换成一块空板"""
+    if board_key in _board_tenants and _board_tenants[board_key] != tenant_id:
+        _board_states.pop(board_key, None)
+    _board_tenants[board_key] = tenant_id
+    return _get_board_state(board_key)
+
+
+async def _board_owner(board_key: Tuple[str, str]) -> Tuple[bool, Optional[int]]:
+    """这块板所属实例此刻在不在、归哪个租户；全局板 `("", "")` 不属于任何实例"""
+    adapter_key, instance_key = board_key
+    if not adapter_key and not instance_key:
+        return True, None
+    from nekro_agent.models.db_adapter_instance import TOMBSTONE_STATUS, DBAdapterInstance
+
+    row = (
+        await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=instance_key)
+        .exclude(status=TOMBSTONE_STATUS)
+        .order_by("id")
+        .first()
+    )
+    return (row is not None, row.tenant_id if row is not None else None)
+
+
+async def _still_authorized(
+    board_key: Tuple[str, str],
+    view: Optional[str],
+    owner_at_connect: Tuple[bool, Optional[int]],
+) -> bool:
+    """连着的事件流是否仍然有权看这块板
+
+    授权只在连上那一刻判过；之后实例被划给别的租户、被删除，或只读链接被重置，已经连着的浏览器
+    （拿只读链接的、登录着的前租户成员）还会一直收到这块板的更新。所以连着的时候定期复核：实例还在且
+    归属没变；用只读令牌连的，令牌仍是当前那一枚。
+    """
+    if await _board_owner(board_key) != owner_at_connect:
+        return False
+    if view:
+        expected = await _load_view_token(board_key)
+        if not expected or not hmac.compare_digest(expected.encode("utf-8"), view.encode("utf-8")):
+            return False
+    return True
+
+
+async def _session_board(ctx: AgentCtx) -> Optional[Tuple[Tuple[str, str], WhiteboardState]]:
+    """解析当前会话属于哪块板
+
+    - 解析得出：用频道的 `(adapter_key, instance_key)`，平台方实例也各自一块板；
+    - 解析不出、部署里没有租户：按平台方对待，用全局板 `("", "")`，与改造前一致；
+    - 解析不出、部署里有租户：fail-closed，调用方返回不可用 / 注入空串。
+
+    身份只认 `resolve_session_owner` 里的 `from_chat_key`：模型传入的 `chat_key` 是敌对的，
+    不能拿来决定写哪块板。
+    """
+    owner = await resolve_session_owner(ctx)
+    if owner.resolved:
+        board_key = _board_key(owner.adapter_key, owner.instance_key)
+        return board_key, _board_state_for_tenant(board_key, owner.tenant_id)
+    if owner.platform:
+        # 单租户部署：没有租户边界可越，维持"一块全局板"的旧行为
+        return ("", ""), _get_board_state(("", ""))
+    return None
+
+
+def _view_token_store_key(adapter_key: str, instance_key: str) -> str:
+    """只读令牌在插件存储里的键
+
+    不带 `chat_key`：这是**每块板一份**的令牌，不是某个频道的状态；键里带实例对的哈希，
+    避免把可能含特殊字符的标识直接拼进存储键。
+    """
+    digest = hashlib.sha256(f"{adapter_key or ''}\x00{instance_key or ''}".encode("utf-8")).hexdigest()[:32]
+    return f"{_VIEW_TOKEN_STORE_PREFIX}{digest}"
+
+
+async def _load_view_token(board_key: Tuple[str, str]) -> Optional[str]:
+    return await store.get(store_key=_view_token_store_key(*board_key))
+
+
+async def _get_or_create_view_token(board_key: Tuple[str, str]) -> str:
+    """第一次被已登录管理员要链接时生成，此后一直复用直到主动轮换"""
+    token = await _load_view_token(board_key)
+    if token:
+        return token
+    token = secrets.token_urlsafe(32)
+    await store.set(store_key=_view_token_store_key(*board_key), value=token)
+    return token
+
+
+def _build_view_link(board_key: Tuple[str, str], token: str) -> str:
+    """相对路径的只读链接；由页面自行拼 origin，部署在子路径下也不会断"""
+    adapter_key, instance_key = board_key
+    query = urlencode(
+        {
+            "adapter_key": adapter_key,
+            "instance_key": instance_key,
+            "view": token,
+        },
+    )
+    return f"/plugins/{plugin.key}/?{query}"
+
+
 # 白板客户端类
 class WhiteboardClient:
     """白板SSE客户端"""
 
-    def __init__(self, client_id: str):
+    def __init__(self, client_id: str, view_token: Optional[str] = None):
         self.client_id = client_id
         self.is_alive = True
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
         self.last_heartbeat = time.time()
+        # 凭只读令牌连进来的连接记下令牌，轮换时只断开"凭旧令牌"的那一批；
+        # 凭票据 / 登录态连进来的连接没有这个值，不受轮换影响
+        self.view_token = view_token
 
     async def send_event(self, data: Dict[str, Any]) -> None:
         """发送事件到客户端"""
@@ -220,10 +369,14 @@ class WhiteboardClient:
 
 # 客户端管理器
 class WhiteboardClientManager:
-    """白板客户端管理器"""
+    """按板分组的白板客户端管理器
+
+    广播只能发给同一块板的连接：把客户端混在一个字典里，租户 A 的修改就会推到租户 B
+    的直播画面上。清理循环与关停仍然覆盖所有板。
+    """
 
     def __init__(self):
-        self.clients: Dict[str, WhiteboardClient] = {}
+        self.clients: Dict[Tuple[str, str], Dict[str, WhiteboardClient]] = {}
         self.cleanup_task: Optional[asyncio.Task] = None
         self.is_shutting_down = False
 
@@ -233,96 +386,136 @@ class WhiteboardClientManager:
             self.cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def stop(self) -> None:
-        """停止客户端管理器"""
+        """停止客户端管理器，断开所有板上的全部连接"""
         self.is_shutting_down = True
 
-        # 标记所有客户端为非活跃
-        for client in self.clients.values():
-            client.is_alive = False
+        for board_clients in self.clients.values():
+            for client in board_clients.values():
+                client.is_alive = False
 
-        # 取消清理任务
         if self.cleanup_task:
             self.cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.cleanup_task
             self.cleanup_task = None
 
-        # 清空客户端列表
         self.clients.clear()
 
     async def _cleanup_loop(self) -> None:
-        """定期清理过期客户端"""
+        """定期清理过期客户端，覆盖所有板"""
         try:
             while not self.is_shutting_down:
                 await asyncio.sleep(30)  # 每30秒检查一次
 
-                expired_clients = []
-                for client_id, client in self.clients.items():
-                    if client.is_expired():
-                        expired_clients.append(client_id)
-
-                for client_id in expired_clients:
-                    client = self.clients.pop(client_id, None)
-                    if client:
-                        client.is_alive = False
-                        logger.info(f"清理过期的白板 SSE 客户端: {client_id}")
+                for board_key in list(self.clients):
+                    board_clients = self.clients.get(board_key)
+                    if not board_clients:
+                        self.clients.pop(board_key, None)
+                        continue
+                    expired_clients = [
+                        client_id for client_id, client in board_clients.items() if client.is_expired()
+                    ]
+                    for client_id in expired_clients:
+                        client = board_clients.pop(client_id, None)
+                        if client:
+                            client.is_alive = False
+                            logger.info(f"清理过期的白板 SSE 客户端: {board_key}/{client_id}")
 
         except asyncio.CancelledError:
             pass
 
-    def register_client(self, client_id: str) -> WhiteboardClient:
-        """注册新客户端"""
-        client = WhiteboardClient(client_id)
-        self.clients[client_id] = client
+    def register_client(
+        self,
+        board_key: Tuple[str, str],
+        client_id: str,
+        *,
+        view_token: Optional[str] = None,
+    ) -> WhiteboardClient:
+        """注册新客户端到指定板"""
+        client = WhiteboardClient(client_id, view_token=view_token)
+        self.clients.setdefault(board_key, {})[client_id] = client
         return client
 
-    def unregister_client(self, client_id: str) -> None:
-        """注销客户端"""
-        client = self.clients.pop(client_id, None)
+    def unregister_client(self, board_key: Tuple[str, str], client_id: str) -> None:
+        """注销指定板上的客户端"""
+        board_clients = self.clients.get(board_key)
+        if not board_clients:
+            return
+        client = board_clients.pop(client_id, None)
         if client:
             client.is_alive = False
+        if not board_clients:
+            self.clients.pop(board_key, None)
 
-    async def broadcast(self, data: Dict[str, Any]) -> None:
-        """广播消息到所有客户端"""
+    async def broadcast(self, board_key: Tuple[str, str], data: Dict[str, Any]) -> None:
+        """广播消息到**这一块板**的客户端"""
         if self.is_shutting_down:
             return
 
+        board_clients = self.clients.get(board_key)
+        if not board_clients:
+            return
+
         dead_clients = []
-        for client_id, client in self.clients.items():
+        for client_id, client in list(board_clients.items()):
             if not client.is_alive or client.is_expired():
                 dead_clients.append(client_id)
                 continue
 
             await client.send_event(data)
 
-        # 清理失效客户端
         for client_id in dead_clients:
-            self.unregister_client(client_id)
+            self.unregister_client(board_key, client_id)
 
-    def get_client_count(self) -> int:
-        """获取当前客户端数量"""
-        return len(self.clients)
+    async def broadcast_all(self, data: Dict[str, Any]) -> None:
+        """向所有板广播（仅用于关停通知）"""
+        for board_key in list(self.clients):
+            await self.broadcast(board_key, data)
+
+    def disconnect_view_token(self, board_key: Tuple[str, str], token: Optional[str]) -> int:
+        """断开凭某个只读令牌连着的全部连接
+
+        轮换后旧链接必须立刻失效：只换存储里的值不够，已经建立的事件流会继续推送内容。
+        返回断开的连接数，便于日志与测试。
+        """
+        if not token:
+            return 0
+        board_clients = self.clients.get(board_key)
+        if not board_clients:
+            return 0
+        matched = [client_id for client_id, client in board_clients.items() if client.view_token == token]
+        for client_id in matched:
+            client = board_clients.pop(client_id, None)
+            if client:
+                client.is_alive = False
+        if not board_clients:
+            self.clients.pop(board_key, None)
+        return len(matched)
+
+    def get_client_count(self, board_key: Optional[Tuple[str, str]] = None) -> int:
+        """获取当前客户端数量；不传板键时统计所有板"""
+        if board_key is None:
+            return sum(len(board_clients) for board_clients in self.clients.values())
+        return len(self.clients.get(board_key, {}))
 
 
-# 全局管理器和状态
+# 全局管理器。每块板的状态在 `_board_states` 里，客户端也按板分组。
 client_manager = WhiteboardClientManager()
-whiteboard_state = WhiteboardState()
 
 
-async def broadcast_to_sse(data: Dict[str, Any]) -> None:
-    """向所有 SSE 连接广播数据"""
-    await client_manager.broadcast(data)
+async def broadcast_to_sse(board_key: Tuple[str, str], data: Dict[str, Any]) -> None:
+    """向指定板的 SSE 连接广播数据"""
+    await client_manager.broadcast(board_key, data)
 
 
 async def close_all_sse_connections() -> None:
-    """关闭所有SSE连接"""
+    """关闭所有板上的 SSE 连接"""
     logger.info(f"开始关闭 {client_manager.get_client_count()} 个SSE连接")
 
-    # 向所有客户端发送关闭信号
-    if client_manager.clients:
+    if client_manager.get_client_count():
         try:
             await asyncio.wait_for(
-                client_manager.broadcast({"type": "server_shutdown"}),
+                client_manager.broadcast_all({"type": "server_shutdown"}),
                 timeout=0.5,
             )
         except asyncio.TimeoutError:
@@ -330,13 +523,41 @@ async def close_all_sse_connections() -> None:
 
     # 等待连接自然关闭
     for _ in range(5):  # 最多等待0.5秒
-        if not client_manager.clients:
+        if not client_manager.get_client_count():
             break
         await asyncio.sleep(0.1)
 
     # 强制关闭所有剩余连接
     await client_manager.stop()
     logger.info("所有SSE连接已关闭")
+
+
+async def _authorize_events_request(request: Request) -> Tuple[Tuple[str, str], Optional[str]]:
+    """事件流的第一道闸：先鉴权，再允许推送任何内容
+
+    - 带 `view`：只读令牌必须与**这块板**存储里的令牌逐字相同，且插件在这个实例上生效。
+      令牌不对、板不存在、插件关着，全部回同一个 404，不让人从错误里分辨实例是否存在。
+    - 不带 `view`：走插件路由鉴权零件（允许短时效票据）。
+    """
+    adapter_key = request.query_params.get("adapter_key") or ""
+    instance_key = request.query_params.get("instance_key") or ""
+    board_key = _board_key(adapter_key, instance_key)
+
+    view = request.query_params.get("view")
+    if view:
+        expected = await _load_view_token(board_key)
+        # 按字节比：`compare_digest` 对含非 ASCII 字符的 str 会抛 TypeError，
+        # 那样一个乱填的 `view` 就能把这里变成 500，而不是与其余情形同一句 404
+        if (
+            not expected
+            or not hmac.compare_digest(expected.encode("utf-8"), view.encode("utf-8"))
+            or not is_plugin_active(plugin.key, instance_key)
+        ):
+            raise NotFoundError(resource=f"实例 '{instance_key}'")
+        return board_key, view
+
+    scope = await resolve_plugin_route_scope(request, plugin.key, allow_ticket=True)
+    return _board_key(scope.adapter_key, scope.instance_key), None
 
 
 @plugin.mount_router()
@@ -568,8 +789,69 @@ def create_router() -> APIRouter:
             未连接
         </div>
     </div>
+    <div id="login-hint" style="position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);display:none;background:rgba(0,0,0,0.75);padding:16px 24px;border-radius:8px;z-index:2000;">
+        请先登录 NA 后台
+    </div>
+    <div id="admin-actions" style="position:fixed;right:10px;bottom:10px;display:none;gap:8px;z-index:2000;">
+        <button id="copy-view-link" type="button">复制只读链接</button>
+        <button id="rotate-view-link" type="button">换一个令牌</button>
+    </div>
 
     <script>
+        // 插件键直接从当前路径取，避免把宿主常量拼进 HTML
+        const PLUGIN_KEY = decodeURIComponent(window.location.pathname.split('/')[2] || '');
+        const queryParams = new URLSearchParams(window.location.search);
+        const adapterKey = queryParams.get('adapter_key') || '';
+        const instanceKey = queryParams.get('instance_key') || '';
+        const viewToken = queryParams.get('view') || '';
+        const loginHint = document.getElementById('login-hint');
+        const adminActions = document.getElementById('admin-actions');
+
+        function readLoginToken() {
+            // 与 NA 前端 `auth-storage` 的持久化结构一致：{state: {token: ...}, version: ...}
+            try {
+                const raw = window.localStorage.getItem('auth-storage');
+                if (!raw) return null;
+                const parsed = JSON.parse(raw);
+                return parsed && parsed.state ? parsed.state.token : null;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function showLoginHint() {
+            loginHint.style.display = 'block';
+        }
+
+        function buildEventsUrl(view, ticket) {
+            const qs = new URLSearchParams();
+            qs.set('adapter_key', adapterKey);
+            qs.set('instance_key', instanceKey);
+            if (view) {
+                qs.set('view', view);
+            } else if (ticket) {
+                qs.set('ticket', ticket);
+            }
+            return `/plugins/${encodeURIComponent(PLUGIN_KEY)}/events?${qs.toString()}`;
+        }
+
+        async function requestRouteTicket(token) {
+            const response = await fetch('/api/plugin-route/ticket', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                    plugin_key: PLUGIN_KEY,
+                    adapter_key: adapterKey,
+                    instance_key: instanceKey,
+                }),
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return (await response.json()).ticket;
+        }
+
         class WhiteboardClient {
             constructor() {
                 this.eventSource = null;
@@ -577,25 +859,88 @@ def create_router() -> APIRouter:
                 this.maxReconnectDelay = 30000;
                 this.reconnectAttempts = 0;
                 this.maxReconnectAttempts = 50;
-                
+                // 登录态只用来换票据 / 调管理接口；只读链接打开时不需要它
+                this.adminToken = readLoginToken();
+                this.currentViewToken = viewToken;
+
                 this.whiteboard = document.getElementById('whiteboard');
                 this.statusIndicator = document.getElementById('status');
-                
+
+                this.setupAdminActions();
                 this.connect();
             }
-            
-            connect() {
-                this.updateStatus('reconnecting', '连接中...');
-                
+
+            setupAdminActions() {
+                if (!this.adminToken) return;
+                adminActions.style.display = 'flex';
+                document.getElementById('copy-view-link').addEventListener('click', () => this.copyViewLink());
+                document.getElementById('rotate-view-link').addEventListener('click', () => this.rotateViewLink());
+            }
+
+            async apiRequest(path, method) {
+                const qs = new URLSearchParams({adapter_key: adapterKey, instance_key: instanceKey});
+                const response = await fetch(`/plugins/${encodeURIComponent(PLUGIN_KEY)}${path}?${qs.toString()}`, {
+                    method,
+                    headers: {'Authorization': `Bearer ${this.adminToken}`},
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response.json();
+            }
+
+            async copyViewLink() {
                 try {
-                    this.eventSource = new EventSource('/plugins/nekro.whiteboard/events');
-                    
+                    const data = await this.apiRequest('/view-link', 'GET');
+                    await navigator.clipboard.writeText(new URL(data.url, window.location.origin).toString());
+                    alert('只读链接已复制');
+                } catch (error) {
+                    alert('获取只读链接失败，请重新登录 NA 后台');
+                }
+            }
+
+            async rotateViewLink() {
+                try {
+                    const data = await this.apiRequest('/view-link/rotate', 'POST');
+                    await navigator.clipboard.writeText(new URL(data.url, window.location.origin).toString())
+                        .catch(() => {});
+                    alert('已换新令牌，旧链接已立刻失效');
+                } catch (error) {
+                    alert('换令牌失败，请重新登录 NA 后台');
+                }
+            }
+
+            async connect() {
+                this.updateStatus('reconnecting', '连接中...');
+
+                let url;
+                if (this.currentViewToken) {
+                    // 只读链接：直接用令牌连，不读也不碰后台登录态
+                    url = buildEventsUrl(this.currentViewToken, null);
+                } else {
+                    if (!this.adminToken) {
+                        showLoginHint();
+                        this.updateStatus('disconnected', '未登录');
+                        return;
+                    }
+                    try {
+                        const ticket = await requestRouteTicket(this.adminToken);
+                        url = buildEventsUrl(null, ticket);
+                    } catch (error) {
+                        showLoginHint();
+                        this.updateStatus('disconnected', '登录状态无效');
+                        return;
+                    }
+                }
+
+                try {
+                    this.eventSource = new EventSource(url);
+
                     this.eventSource.onopen = () => {
                         this.updateStatus('connected', '已连接');
+                        loginHint.style.display = 'none';
                         this.reconnectDelay = 1000;
                         this.reconnectAttempts = 0;
                     };
-                    
+
                     this.eventSource.onmessage = (event) => {
                         try {
                             const data = JSON.parse(event.data);
@@ -604,19 +949,19 @@ def create_router() -> APIRouter:
                             console.error('解析消息失败:', error);
                         }
                     };
-                    
+
                     this.eventSource.onerror = () => {
                         this.updateStatus('disconnected', '连接断开');
                         this.eventSource.close();
                         this.scheduleReconnect();
                     };
-                    
+
                 } catch (error) {
                     console.error('连接失败:', error);
                     this.scheduleReconnect();
                 }
             }
-            
+
             scheduleReconnect() {
                 if (this.reconnectAttempts >= this.maxReconnectAttempts) {
                     this.updateStatus('disconnected', '连接失败');
@@ -813,26 +1158,36 @@ def create_router() -> APIRouter:
 
     @router.get("/events", summary="SSE 事件流")
     async def events_stream(request: Request):
-        """SSE 长连接端点"""
+        """SSE 长连接端点
+
+        第一件事是鉴权：只读令牌或短时效票据必须在这之前通过。之后只推**这块板**的
+        全量状态与后续更新，不同实例的连接互不可见。
+        """
+        board_key, view = await _authorize_events_request(request)
+        owner_at_connect = await _board_owner(board_key)
+        board_state = _board_state_for_tenant(board_key, owner_at_connect[1])
 
         async def event_generator():
-            client_id = f"whiteboard-{int(time.time() * 1000)}"
-            client = client_manager.register_client(client_id)
-            logger.info(f"新的SSE连接建立，客户端ID: {client_id}, 当前连接数: {client_manager.get_client_count()}")
+            client_id = f"whiteboard-{time.time_ns()}"
+            client = client_manager.register_client(board_key, client_id, view_token=view)
+            logger.info(
+                f"新的SSE连接建立，客户端ID: {client_id}, 板: {board_key}, 当前连接数: {client_manager.get_client_count()}",
+            )
 
             try:
                 # 发送初始连接事件
                 yield {"data": json.dumps({"type": "connected", "client_id": client_id}, ensure_ascii=False)}
 
-                # 发送初始状态
+                # 发送这块板的初始状态
                 try:
-                    initial_data = {"type": "update_state", "state": whiteboard_state.model_dump()}
+                    initial_data = {"type": "update_state", "state": board_state.model_dump()}
                     yield {"data": json.dumps(initial_data, ensure_ascii=False)}
                 except Exception as e:
                     logger.warning(f"发送初始状态失败: {e}")
 
                 # 心跳计时器
                 heartbeat_timer = 0
+                next_authorization_check = time.time() + _REAUTHORIZE_SECONDS
 
                 # 持续发送事件
                 while client.is_alive and not client_manager.is_shutting_down and not is_shutting_down():
@@ -841,6 +1196,13 @@ def create_router() -> APIRouter:
                         if await request.is_disconnected():
                             logger.info(f"客户端 {client_id} 断开连接")
                             break
+
+                        # 授权只在连上时判过：实例换了租户、被删、只读链接被重置之后，这条连接不能接着收
+                        if time.time() >= next_authorization_check:
+                            next_authorization_check = time.time() + _REAUTHORIZE_SECONDS
+                            if not await _still_authorized(board_key, view, owner_at_connect):
+                                logger.info(f"白板连接 {client_id} 的授权已失效（实例归属变了、被删或只读链接已重置），断开")
+                                break
 
                         # 发送心跳
                         if time.time() - heartbeat_timer >= 5:
@@ -876,8 +1238,11 @@ def create_router() -> APIRouter:
             except Exception as e:
                 logger.warning(f"SSE 连接错误: {e}")
             finally:
-                client_manager.unregister_client(client_id)
-                logger.info(f"SSE连接断开，客户端ID: {client_id}, 当前连接数: {client_manager.get_client_count()}")
+                client_manager.unregister_client(board_key, client_id)
+                logger.info(
+                    f"SSE连接断开，客户端ID: {client_id}, 板: {board_key}, "
+                    f"当前连接数: {client_manager.get_client_count()}",
+                )
 
         return EventSourceResponse(
             event_generator(),
@@ -892,38 +1257,70 @@ def create_router() -> APIRouter:
         )
 
     @router.get("/status", summary="获取白板状态")
-    async def get_status():
-        """获取当前白板状态"""
+    async def get_status(scope: PluginRouteScope = Depends(plugin_route_scope(plugin.key))):
+        """获取**当前实例这块板**的状态；必须登录且实例可访问"""
+        board_key = _board_key(scope.adapter_key, scope.instance_key)
+        board_state = _board_state_for_tenant(board_key, (await _board_owner(board_key))[1])
         return {
             "success": True,
             "data": {
-                "state": whiteboard_state.model_dump(),
-                "connections": client_manager.get_client_count(),
-                "last_update": datetime.fromtimestamp(whiteboard_state.last_update).isoformat(),
+                "state": board_state.model_dump(),
+                "connections": client_manager.get_client_count(board_key),
+                "last_update": datetime.fromtimestamp(board_state.last_update).isoformat(),
             },
         }
 
     @router.post("/clear", summary="清空白板")
-    async def clear_whiteboard_api():
-        """清空白板内容"""
-        global whiteboard_state
-        whiteboard_state.contents.clear()
-        whiteboard_state.last_update = time.time()
+    async def clear_whiteboard_api(scope: PluginRouteScope = Depends(plugin_route_scope(plugin.key))):
+        """只清**当前实例这块板**，且只广播给这块板的连接"""
+        board_key = _board_key(scope.adapter_key, scope.instance_key)
+        board_state = _board_state_for_tenant(board_key, (await _board_owner(board_key))[1])
+        board_state.contents.clear()
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "clear"})
+        await broadcast_to_sse(board_key, {"type": "clear"})
 
         return {"success": True, "message": "白板已清空"}
+
+    @router.get("/view-link", summary="获取这块板的只读链接")
+    async def get_view_link(scope: PluginRouteScope = Depends(plugin_route_scope(plugin.key))):
+        """已登录管理员取只读链接；第一次要时生成令牌，此后复用"""
+        board_key = _board_key(scope.adapter_key, scope.instance_key)
+        token = await _get_or_create_view_token(board_key)
+        return {"success": True, "url": _build_view_link(board_key, token)}
+
+    @router.post("/view-link/rotate", summary="轮换这块板的只读令牌")
+    async def rotate_view_link(scope: PluginRouteScope = Depends(plugin_route_scope(plugin.key))):
+        """换一个新令牌，旧令牌立刻失效，并断开凭旧令牌连着的全部事件流"""
+        board_key = _board_key(scope.adapter_key, scope.instance_key)
+        old_token = await _load_view_token(board_key)
+        token = secrets.token_urlsafe(32)
+        await store.set(store_key=_view_token_store_key(*board_key), value=token)
+        disconnected = client_manager.disconnect_view_token(board_key, old_token)
+        return {
+            "success": True,
+            "url": _build_view_link(board_key, token),
+            "disconnected": disconnected,
+        }
 
     return router
 
 
 @plugin.mount_prompt_inject_method(name="whiteboard_prompt")
 async def whiteboard_prompt(_ctx: AgentCtx) -> str:
-    """白板提示词注入"""
+    """白板提示词注入
+
+    只给**当前会话这块板**的内容；多租户部署里解析不出归属时注入空串，
+    不能让会话看到别的租户写进全局板的内容。
+    """
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return ""
+    _board, board_state = resolved
 
     # 构建当前内容摘要
     content_summary = []
-    for idx, content in enumerate(whiteboard_state.contents):
+    for idx, content in enumerate(board_state.contents):
         if content.type == "image":
             summary = f"图片 #{idx+1}: {content.title or '无标题'}"
         elif content.type == "video":
@@ -951,8 +1348,8 @@ async def whiteboard_prompt(_ctx: AgentCtx) -> str:
 🎯 直播白板演示功能状态:
 
 📋 当前白板信息:
-- 布局模式: {whiteboard_state.layout} ({layout_desc.get(whiteboard_state.layout, '未知')})
-- 最后更新: {datetime.fromtimestamp(whiteboard_state.last_update).strftime('%H:%M:%S')}
+- 布局模式: {board_state.layout} ({layout_desc.get(board_state.layout, '未知')})
+- 最后更新: {datetime.fromtimestamp(board_state.last_update).strftime('%H:%M:%S')}
 
 📄 当前展示内容:
 {content_info}
@@ -975,6 +1372,18 @@ async def whiteboard_prompt(_ctx: AgentCtx) -> str:
 - 文本内容支持HTML格式，可添加丰富的样式和格式
 - 由于你无法直接和白板交互，例如用户让你制作一个小游戏，你可以同时编写自动游玩的代码来实现
 """
+
+
+async def _read_board_file(_ctx: AgentCtx, sandbox_path: str, *, kind: str) -> bytes:
+    """把沙盒路径映射到宿主路径并读出内容（共享目录里逐级不跟随链接），超过大小上限就拒绝"""
+    host_path = Path(_ctx.fs.get_file(sandbox_path))
+    if not await asyncio.to_thread(host_file_is_regular, host_path):
+        raise FileNotFoundError(f"{kind}文件不存在: {sandbox_path}")
+    max_bytes = int(config.MAX_FILE_SIZE_MB * 1024 * 1024)
+    try:
+        return await asyncio.to_thread(read_host_file_bytes, host_path, max_bytes=max_bytes)
+    except UnsafeSharedFileError as e:
+        raise ValueError(f"{kind}文件不可读或过大（上限 {config.MAX_FILE_SIZE_MB}MB）: {sandbox_path}") from e
 
 
 @plugin.mount_sandbox_method(
@@ -1001,20 +1410,10 @@ async def display_image(
     Example:
         display_image("/shared/generated_chart.png", "数据分析图表")
     """
-    global whiteboard_state
-
-    def _validate_file_path(file_path: str) -> str:
-        """验证并处理文件路径"""
-        host_path = _ctx.fs.get_file(file_path)
-        if not Path(host_path).exists():
-            raise FileNotFoundError(f"图片文件不存在: {file_path}")
-        return str(host_path)
-
-    def _check_file_size(file_path: str) -> None:
-        """检查文件大小限制"""
-        file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
-        if file_size_mb > config.MAX_FILE_SIZE_MB:
-            raise ValueError(f"图片文件过大 ({file_size_mb:.2f}MB)，超过限制 ({config.MAX_FILE_SIZE_MB}MB)")
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     try:
         # 处理文件路径
@@ -1022,34 +1421,32 @@ async def display_image(
             # URL 直接使用
             display_url = image_path
         else:
-            # 使用 ctx.fs 方法将沙盒路径转换为宿主机路径
-            host_path = _validate_file_path(image_path)
-            _check_file_size(host_path)
-
-            # 读取文件并转换为base64 data URL
-            async with aiofiles.open(host_path, "rb") as f:
-                file_data = await f.read()
-                mime_type = magic.from_buffer(file_data, mime=True)
-                base64_data = base64.b64encode(file_data).decode("utf-8")
-                display_url = f"data:{mime_type};base64,{base64_data}"
+            # 沙盒路径转成宿主路径后，按「不跟随链接」读（共享目录在沙盒里可写），大小上限在读的时候卡
+            file_data = await _read_board_file(_ctx, image_path, kind="图片")
+            mime_type = magic.from_buffer(file_data, mime=True)
+            base64_data = base64.b64encode(file_data).decode("utf-8")
+            display_url = f"data:{mime_type};base64,{base64_data}"
 
         if clear_before:
-            whiteboard_state.contents.clear()
+            board_state.contents.clear()
 
         # 创建内容项
         content_item = ContentItem(id=f"img_{int(time.time() * 1000)}", type="image", content=display_url, title=title)
 
         # 限制内容数量
-        if len(whiteboard_state.contents) >= config.MAX_CONTENT_SIZE:
-            whiteboard_state.contents.pop(0)
+        if len(board_state.contents) >= config.MAX_CONTENT_SIZE:
+            board_state.contents.pop(0)
 
-        whiteboard_state.contents.append(content_item)
-        whiteboard_state.last_update = time.time()
+        board_state.contents.append(content_item)
+        board_state.last_update = time.time()
 
-        # 广播更新
-        await broadcast_to_sse({"type": "update_state", "state": whiteboard_state.model_dump()})
+        # 广播更新（只发给这块板）
+        await broadcast_to_sse(board_key, {"type": "update_state", "state": board_state.model_dump()})
 
-        logger.info(f"白板展示图片成功: {title or image_path}, 连接数: {client_manager.get_client_count()}")
+        logger.info(
+            f"白板展示图片成功: {title or image_path}, 板: {board_key}, "
+            f"连接数: {client_manager.get_client_count(board_key)}",
+        )
 
     except Exception as e:
         raise Exception(f"展示图片失败: {e}") from e
@@ -1078,51 +1475,38 @@ async def display_video(
     Returns:
         str: 操作结果描述
     """
-    global whiteboard_state
-
-    def _validate_video_path(file_path: str) -> str:
-        """验证并处理视频文件路径"""
-        host_path = _ctx.fs.get_file(file_path)
-        if not Path(host_path).exists():
-            raise FileNotFoundError(f"视频文件不存在: {file_path}")
-        return str(host_path)
-
-    def _check_video_size(file_path: str) -> None:
-        """检查视频文件大小限制"""
-        file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
-        if file_size_mb > config.MAX_FILE_SIZE_MB:
-            raise ValueError(f"视频文件过大 ({file_size_mb:.2f}MB)，超过限制 ({config.MAX_FILE_SIZE_MB}MB)")
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     try:
         # 处理文件路径
         if is_url_path(video_path):
             display_url = video_path
         else:
-            # 使用 ctx.fs 方法将沙盒路径转换为宿主机路径
-            host_path = _validate_video_path(video_path)
-            _check_video_size(host_path)
-
-            # 读取文件并转换为base64 data URL
-            async with aiofiles.open(host_path, "rb") as f:
-                file_data = await f.read()
-                mime_type = magic.from_buffer(file_data, mime=True)
-                base64_data = base64.b64encode(file_data).decode("utf-8")
-                display_url = f"data:{mime_type};base64,{base64_data}"
+            file_data = await _read_board_file(_ctx, video_path, kind="视频")
+            mime_type = magic.from_buffer(file_data, mime=True)
+            base64_data = base64.b64encode(file_data).decode("utf-8")
+            display_url = f"data:{mime_type};base64,{base64_data}"
 
         if clear_before:
-            whiteboard_state.contents.clear()
+            board_state.contents.clear()
 
         content_item = ContentItem(id=f"vid_{int(time.time() * 1000)}", type="video", content=display_url, title=title)
 
-        if len(whiteboard_state.contents) >= config.MAX_CONTENT_SIZE:
-            whiteboard_state.contents.pop(0)
+        if len(board_state.contents) >= config.MAX_CONTENT_SIZE:
+            board_state.contents.pop(0)
 
-        whiteboard_state.contents.append(content_item)
-        whiteboard_state.last_update = time.time()
+        board_state.contents.append(content_item)
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "update_state", "state": whiteboard_state.model_dump()})
+        await broadcast_to_sse(board_key, {"type": "update_state", "state": board_state.model_dump()})
 
-        logger.info(f"白板播放视频成功: {title or video_path}, 连接数: {client_manager.get_client_count()}")
+        logger.info(
+            f"白板播放视频成功: {title or video_path}, 板: {board_key}, "
+            f"连接数: {client_manager.get_client_count(board_key)}",
+        )
 
     except Exception as e:
         raise Exception(f"播放视频失败: {e}") from e
@@ -1154,21 +1538,24 @@ async def display_html(
     Example:
         display_html("<h1>Hello World</h1><p>这是一个示例</p>", "示例页面")
     """
-    global whiteboard_state
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     try:
         if clear_before:
-            whiteboard_state.contents.clear()
+            board_state.contents.clear()
 
         content_item = ContentItem(id=f"html_{int(time.time() * 1000)}", type="html", content=html_content, title=title)
 
-        if len(whiteboard_state.contents) >= config.MAX_CONTENT_SIZE:
-            whiteboard_state.contents.pop(0)
+        if len(board_state.contents) >= config.MAX_CONTENT_SIZE:
+            board_state.contents.pop(0)
 
-        whiteboard_state.contents.append(content_item)
-        whiteboard_state.last_update = time.time()
+        board_state.contents.append(content_item)
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "update_state", "state": whiteboard_state.model_dump()})
+        await broadcast_to_sse(board_key, {"type": "update_state", "state": board_state.model_dump()})
 
     except Exception as e:
         raise Exception(f"展示HTML内容失败: {e}") from e
@@ -1201,11 +1588,14 @@ async def display_text(
     Returns:
         str: 操作结果描述
     """
-    global whiteboard_state
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     try:
         if clear_before:
-            whiteboard_state.contents.clear()
+            board_state.contents.clear()
 
         content_item = ContentItem(
             id=f"text_{int(time.time() * 1000)}",
@@ -1215,13 +1605,13 @@ async def display_text(
             style={"font-size": font_size, "color": text_color},
         )
 
-        if len(whiteboard_state.contents) >= config.MAX_CONTENT_SIZE:
-            whiteboard_state.contents.pop(0)
+        if len(board_state.contents) >= config.MAX_CONTENT_SIZE:
+            board_state.contents.pop(0)
 
-        whiteboard_state.contents.append(content_item)
-        whiteboard_state.last_update = time.time()
+        board_state.contents.append(content_item)
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "update_state", "state": whiteboard_state.model_dump()})
+        await broadcast_to_sse(board_key, {"type": "update_state", "state": board_state.model_dump()})
 
     except Exception as e:
         raise Exception(f"显示文本失败: {e}") from e
@@ -1253,11 +1643,14 @@ async def display_link(
     Example:
         display_link("https://github.com", "GitHub首页")
     """
-    global whiteboard_state
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     try:
         if clear_before:
-            whiteboard_state.contents.clear()
+            board_state.contents.clear()
 
         content_item = ContentItem(
             id=f"webpage_{int(time.time() * 1000)}",
@@ -1266,13 +1659,13 @@ async def display_link(
             title=title,
         )
 
-        if len(whiteboard_state.contents) >= config.MAX_CONTENT_SIZE:
-            whiteboard_state.contents.pop(0)
+        if len(board_state.contents) >= config.MAX_CONTENT_SIZE:
+            board_state.contents.pop(0)
 
-        whiteboard_state.contents.append(content_item)
-        whiteboard_state.last_update = time.time()
+        board_state.contents.append(content_item)
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "update_state", "state": whiteboard_state.model_dump()})
+        await broadcast_to_sse(board_key, {"type": "update_state", "state": board_state.model_dump()})
 
     except Exception as e:
         raise Exception(f"打开网页失败: {e}") from e
@@ -1297,7 +1690,10 @@ async def set_layout(_ctx: AgentCtx, layout_mode: str) -> str:
     Example:
         set_layout("grid")  # 设置为网格布局
     """
-    global whiteboard_state
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     def _validate_layout(mode: str) -> None:
         """验证布局模式"""
@@ -1308,10 +1704,10 @@ async def set_layout(_ctx: AgentCtx, layout_mode: str) -> str:
     try:
         _validate_layout(layout_mode)
 
-        whiteboard_state.layout = layout_mode
-        whiteboard_state.last_update = time.time()
+        board_state.layout = layout_mode
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "update_state", "state": whiteboard_state.model_dump()})
+        await broadcast_to_sse(board_key, {"type": "update_state", "state": board_state.model_dump()})
 
     except Exception as e:
         raise Exception(f"设置布局失败: {e}") from e
@@ -1330,13 +1726,16 @@ async def clear_whiteboard(_ctx: AgentCtx) -> str:
     Returns:
         str: 操作结果描述
     """
-    global whiteboard_state
+    resolved = await _session_board(_ctx)
+    if resolved is None:
+        return BOARD_UNAVAILABLE_MESSAGE
+    board_key, board_state = resolved
 
     try:
-        whiteboard_state.contents.clear()
-        whiteboard_state.last_update = time.time()
+        board_state.contents.clear()
+        board_state.last_update = time.time()
 
-        await broadcast_to_sse({"type": "clear"})
+        await broadcast_to_sse(board_key, {"type": "clear"})
 
     except Exception as e:
         raise Exception(f"清空白板失败: {e}") from e
@@ -1347,8 +1746,6 @@ async def clear_whiteboard(_ctx: AgentCtx) -> str:
 @plugin.mount_cleanup_method()
 async def cleanup():
     """快速清理插件资源"""
-    global whiteboard_state, client_manager
-
     logger.info("开始快速清理白板插件资源...")
 
     try:
@@ -1361,8 +1758,8 @@ async def cleanup():
         logger.warning(f"关闭SSE连接时发生错误: {e}")
         await client_manager.stop()
 
-    # 立即重置白板状态
-    whiteboard_state = WhiteboardState()
+    # 清掉所有板的内存状态
+    _board_states.clear()
 
     logger.info("白板插件快速清理完成")
 
@@ -1370,10 +1767,9 @@ async def cleanup():
 @plugin.mount_init_method()
 async def init():
     """初始化插件"""
-    global whiteboard_state, client_manager
-
-    # 重置白板状态
-    whiteboard_state = WhiteboardState(layout=config.DEFAULT_LAYOUT)
+    # 清掉上一轮进程留下的板状态，只保留一块按默认布局的空全局板
+    _board_states.clear()
+    _board_states[("", "")] = WhiteboardState(layout=config.DEFAULT_LAYOUT)
 
     # 启动客户端管理器
     await client_manager.start()

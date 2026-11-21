@@ -1,0 +1,46 @@
+{
+  "title": "运维审计",
+  "subtitle": "运维工具与 /na_ops 的每一次调用都在执行前留痕；按记录号倒序查看，保留 365 天。",
+  "filters": {
+    "outcome": "结果",
+    "source": "来源",
+    "tool": "工具",
+    "operator": "操作人",
+    "all": "全部",
+    "toolPlaceholder": "例如 ops_find",
+    "operatorPlaceholder": "按包含匹配"
+  },
+  "actions": {
+    "refresh": "刷新",
+    "showArgs": "查看参数",
+    "hideArgs": "收起参数"
+  },
+  "columns": {
+    "id": "记录号",
+    "time": "时间",
+    "source": "来源",
+    "tool": "工具",
+    "outcome": "结果",
+    "reason": "原因",
+    "operator": "操作人",
+    "location": "地点",
+    "summary": "摘要",
+    "errorType": "异常类名",
+    "args": "参数"
+  },
+  "outcome": {
+    "pending": "执行中",
+    "executed": "已执行",
+    "refused": "被拒绝",
+    "failed": "失败"
+  },
+  "source": {
+    "agent": "Agent 工具",
+    "na_ops": "/na_ops 命令"
+  },
+  "value": {
+    "empty": "没有符合条件的记录",
+    "emptyHint": "运维工具或 /na_ops 发生调用后，记录会出现在这里。",
+    "noValue": "-"
+  }
+}

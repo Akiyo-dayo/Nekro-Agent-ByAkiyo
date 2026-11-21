@@ -47,6 +47,8 @@ export interface AffectionItem {
   stage_label: string
   /** 由 LLM 按当前人设口吻写的状态描述 */
   state_text: string
+  /** 模型给这个人起的称呼；空串 = 没有称呼（不是「还没加载」，直接按空值展示） */
+  call_name: string
   /** 最近一次变化的叙述 */
   last_event_text: string
   interaction_count: number
@@ -88,6 +90,7 @@ export interface AffectionEventItem {
    */
   source:
     | 'llm'
+    | 'tool'
     | 'manual'
     | 'reset'
     | 'merge'
@@ -128,10 +131,37 @@ export interface AffectionScopeInfo {
   alias_accounts: string[]
 }
 
+/**
+ * 一条关系里程碑
+ *
+ * 它同时是记忆段落（`origin_kind = affection`），所以带 `status`：管理员可能已经在记忆页
+ * 把它软删、隔离或清理掉了。**取值与后端 `admin_service.paragraph_status` 逐项对齐**
+ * （active / quarantined / deleted / pruned），段落被真删时后端还给 `hard_deleted`，
+ * 写它的实例已被单独划给别的租户（段落跟着实例走了）时给 `moved`——这两种都不带正文；
+ * 文案在语言包 `detail.milestonesStatus.*` 里，少一个取值就会把键名显示到页面上。
+ */
+export type AffectionMilestoneStatus =
+  | 'active'
+  | 'quarantined'
+  | 'deleted'
+  | 'pruned'
+  | 'hard_deleted'
+  | 'moved'
+
+export interface AffectionMilestoneItem {
+  paragraph_id: number
+  event_id: number
+  content: string
+  summary: string
+  event_time: string | null
+  status: AffectionMilestoneStatus
+}
+
 export interface AffectionDetail {
   item: AffectionItem
   events: AffectionEventItem[]
   scope: AffectionScopeInfo
+  milestones: AffectionMilestoneItem[]
 }
 
 export interface AffectionStageCount {
@@ -206,10 +236,20 @@ export const affectionApi = {
     return response.data
   },
 
-  /** 改写两段描述，分数不动；超长由服务端按上限截断 */
+  /** 改写两段描述与称呼，分数不动；超长由服务端按上限截断 */
   editNarrative: async (
     recordId: number,
-    body: { state_text: string; last_event_text: string },
+    body: {
+      state_text: string
+      last_event_text: string
+      /**
+       * 不传 = 不改称呼；空串 = 清掉称呼。
+       *
+       * 与后端 `AffectionNarrativeEditRequest.call_name` 同一套语义：漏传这一栏时不能
+       * 顺手把模型记下的称呼清掉，所以「编辑印象」对话框一律显式带上它。
+       */
+      call_name?: string
+    },
     instanceKey?: string
   ): Promise<AffectionItem> => {
     const response = await axios.put<AffectionItem>(`/affection/${recordId}/narrative`, body, {
@@ -226,6 +266,39 @@ export const affectionApi = {
   ): Promise<AffectionEventItem> => {
     const response = await axios.delete<AffectionEventItem>(
       `/affection/${recordId}/events/${eventId}`,
+      { params: { instance_key: instanceKey || undefined } }
+    )
+    return response.data
+  },
+
+  /**
+   * 删一条关系里程碑（软删：段落移入「已删除」，可在记忆页找回）
+   *
+   * 归属由服务端判：只有「这一份好感的某条流水生成过它」才允许删，否则 404。
+   */
+  deleteMilestone: async (
+    recordId: number,
+    paragraphId: number,
+    instanceKey?: string
+  ): Promise<{ ok: boolean }> => {
+    const response = await axios.delete<{ ok: boolean }>(
+      `/affection/${recordId}/milestones/${paragraphId}`,
+      { params: { instance_key: instanceKey || undefined } }
+    )
+    return response.data
+  },
+
+  /**
+   * 从段落编号反查它属于哪一份好感（记忆页「打开好感详情」用）
+   *
+   * 不可见或不是里程碑时服务端一律 404，调用方据此提示「看不到或已不存在」。
+   */
+  recordOfMilestone: async (
+    paragraphId: number,
+    instanceKey?: string
+  ): Promise<{ record_id: number }> => {
+    const response = await axios.get<{ record_id: number }>(
+      `/affection/milestones/${paragraphId}/record`,
       { params: { instance_key: instanceKey || undefined } }
     )
     return response.data

@@ -355,6 +355,34 @@ class FestivalGreetingConfig(ConfigBase):
         ).model_dump(),
     )
 
+    SKIP_INACTIVE_DAYS: int = Field(
+        default=30,
+        ge=0,
+        le=3650,
+        title="跳过多少天没人说话的频道",
+        description=(
+            "黑名单模式下，近 N 天里没有任何人发过消息（不算 Bot 自己和系统消息）的频道不发祝福，"
+            "0 表示不按这一条跳过。实例不在线的频道无论哪种模式都会跳过。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(
+                zh_CN="跳过多少天没人说话的频道",
+                en_US="Skip Channels Inactive For (Days)",
+            ),
+            i18n_description=i18n.i18n_text(
+                zh_CN=(
+                    "黑名单模式下，近 N 天里没有任何人发过消息（不算 Bot 自己和系统消息）的频道不发祝福，"
+                    "0 表示不按这一条跳过。实例不在线的频道无论哪种模式都会跳过。"
+                ),
+                en_US=(
+                    "In blacklist mode, skip channels where nobody has sent a message (excluding the bot "
+                    "itself and system messages) in the last N days. 0 disables this check. Channels on "
+                    "offline instances are always skipped in both modes."
+                ),
+            ),
+        ).model_dump(),
+    )
+
     # 自定义公历节日
     CUSTOM_SOLAR_FESTIVALS: List[CustomSolarFestival] = Field(
         default=[],

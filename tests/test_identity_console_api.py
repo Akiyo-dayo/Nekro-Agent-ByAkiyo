@@ -1188,7 +1188,7 @@ class TestOrphanCleanupServiceGuardStandsOnItsOwn:
 
         counts = await cleanup_orphan_preset(buckets[0])
 
-        assert counts == {"affection": 1, "affection_event": 2}
+        assert counts == {"affection": 1, "affection_event": 2, "milestones": 0}
         assert await DBAffection.filter(preset_id=4242).count() == 0
 
 

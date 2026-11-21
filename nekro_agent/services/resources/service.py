@@ -18,18 +18,28 @@
 就意味着它会进浏览器缓存、devtools、抓包与工单截图。
 编辑不受影响：掩码原样提交回来表示"保持不变"（`_restore_masked_secrets`）。
 
-**这一层关的是 HTTP 出口，不是"凭据从此受保护"。** 字段名叫 `secret_payload_encrypted`，
-但 `crypto.encrypt_secret_payload` 现在就是一句 `json.dumps` —— 落库是**明文 JSON**
-（`SecretPayloadFormat.PLAIN`，`secret-health` 里那个 `plaintext_count` 数的就是它；
-`recover_legacy_secret_payloads` 的作用正是把旧的 AES 载荷转成这个形态，前端文案也是这么写的）。
-所以 `pg_dump` / `/deployment/backup` / 直连数据库这三条路照旧拿得到原文。
+**这一层关的是 HTTP 出口，不是"凭据从此受保护"。** 落库那一列现在按
+`RESOURCE_PAYLOAD_AT_REST` 决定形态：默认 `encrypted`，`crypto.encrypt_secret_payload`
+用 `tools/credential_cipher` 的凭据主密钥把 JSON 文本封成 `nkenc1:` 信封
+（`SecretPayloadFormat.ENVELOPE`），所以 `pg_dump` / `/deployment/backup` / 直连数据库
+只拿得到密文。它**挡不住宿主被拿下**：主密钥就在同一台机器上（环境变量或数据目录里的
+密钥文件），能在这台机器上以 NA 身份执行代码的人同样能解密——威胁模型的完整口径见
+`tools/credential_cipher.py` 的模块文档，这里不复制另一份。
+
+`RESOURCE_PAYLOAD_AT_REST=plain` 是回滚开关：换回不支持信封的旧版本之前，先改成 `plain`
+重启一次，启动流程会把密文整批写回明文 JSON。`secret-health` 里 `plaintext_count`
+数的就是这种还没升级的存量明文（`EMPTY` 不再是它的一部分）。
 读这段代码时不要把掩码当成加密。
 """
 
 import re
 from collections import Counter
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Iterable
 
+from nekro_agent.core.config import config
+from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.models.db_workspace_resource import DBWorkspaceResource
 from nekro_agent.models.db_workspace_resource_binding import DBWorkspaceResourceBinding
@@ -54,13 +64,30 @@ from nekro_agent.schemas.workspace_resource import (
 )
 from nekro_agent.services.resources.crypto import (
     SecretPayloadDecodeError,
+    SecretPayloadEncryptError,
     SecretPayloadFormat,
     decode_secret_payload,
     decrypt_secret_payload,
     encrypt_secret_payload,
 )
-from nekro_agent.services.resources.registry import get_resource_template
+from nekro_agent.services.resources.registry import SSH_RESOURCE_TEMPLATE_KEYS, get_resource_template
+from nekro_agent.tools import credential_cipher
 from nekro_agent.tools.redaction import is_credential_mask
+
+logger = get_sub_logger("workspace_resources")
+
+
+@dataclass
+class ResourcePayloadUpgradeReport:
+    """启动时整批重写资源载荷的结果
+
+    `skipped` 只装"看到了但这次动不了"的行名（旧 AES、解不开、坏 JSON）。
+    把它们点出来是让人知道去恢复哪几把密钥，而不是让它们静默地留在库里。
+    """
+
+    rewritten: list[str] = dataclass_field(default_factory=list)
+    skipped: list[str] = dataclass_field(default_factory=list)
+    mode: str = "encrypted"
 
 
 class WorkspaceResourceService:
@@ -194,6 +221,42 @@ class WorkspaceResourceService:
         except ValueError:
             return {}
 
+    @staticmethod
+    def _keep_unreadable_secrets(resource: DBWorkspaceResource, fields: list[ResourceField]) -> bool:
+        """库里的密文当前密钥解不开时，这次保存要不要原样保留那一列
+
+        密文解不开（换过主密钥、密钥文件丢了）时，`_current_secret_payload` 只能给空字典，
+        提交回来的掩码就会按「清空」落库——后台随手改个名字，就把一份本来可以靠找回密钥
+        救回来的凭据永久抹掉了。模型组那边为同一件事加过保存守卫，这里照同一个口径：
+
+        - 敏感字段全是掩码（没打算动凭据）→ 原样保留那一列，只改别的字段；
+        - 一部分掩码、一部分填了新值 → 拒绝：解不开就没法把新旧值拼成一份完整载荷，
+          放行等于静默丢掉掩码的那几项；
+        - 没有掩码（全部重填或清空）→ 这是明确的覆盖指令，照常写。
+
+        只管「信封解不开」这一种。坏 JSON 之类的存量坏载荷不在此列，照旧按清空处理
+        （`/resources/secret-health` 与 `secret-purge` 就是为它们准备的）。
+        """
+        stored = resource.secret_payload_encrypted
+        if not credential_cipher.is_encrypted_envelope(stored):
+            return False
+        try:
+            decode_secret_payload(stored)
+            return False
+        except SecretPayloadDecodeError:
+            pass
+        secret_fields = [field for field in fields if field.secret]
+        masked = [field for field in secret_fields if is_credential_mask(field.value)]
+        fresh = [field for field in secret_fields if field.value and not is_credential_mask(field.value)]
+        if masked and fresh:
+            raise ValidationError(
+                reason=(
+                    f"资源“{resource.name}”的敏感字段当前密钥解不开：请先恢复原来的 NEKRO_CREDENTIAL_SECRET_KEY "
+                    "或数据目录里的 credential_secret.key，或者把全部敏感字段重新填写后再保存"
+                )
+            )
+        return bool(masked)
+
     async def _build_summary(self, resource: DBWorkspaceResource) -> WorkspaceResourceSummary:
         fields = [ResourceField.model_validate(item) for item in (resource.schema_json or [])]
         bindings = await DBWorkspaceResourceBinding.filter(resource_id=resource.id).all()
@@ -271,6 +334,12 @@ class WorkspaceResourceService:
         # 新建没有"现值"可保持，哨兵一律落成空串；不还原的话库里会存进一份字面量 `********`
         fields = self._restore_masked_secrets(fields, {})
         public_payload, secret_payload = self._split_payload(fields)
+        # 先算载荷再建行：加密不可用时抛 `SecretPayloadEncryptError`，这里转成
+        # 项目统一的 400 文案，且**不会**留下一条只写了一半的资源行
+        try:
+            secret_payload_encrypted = encrypt_secret_payload(secret_payload)
+        except SecretPayloadEncryptError as e:
+            raise ValidationError(reason=str(e)) from e
         resource = await DBWorkspaceResource.create(
             resource_key=resource_key,
             name=body.name.strip(),
@@ -280,7 +349,7 @@ class WorkspaceResourceService:
             resource_prompt=body.resource_prompt.strip(),
             schema_json=[field.model_dump(exclude={"value"}) for field in fields],
             public_payload=public_payload,
-            secret_payload_encrypted=encrypt_secret_payload(secret_payload),
+            secret_payload_encrypted=secret_payload_encrypted,
             enabled=body.enabled,
         )
         return await self._build_detail(resource)
@@ -288,10 +357,19 @@ class WorkspaceResourceService:
     async def update_resource(self, resource_id: int, body: WorkspaceResourceUpdate) -> WorkspaceResourceDetail:
         resource = await self.get_resource_or_404(resource_id)
         fields = self._prepare_fields(body.fields, template_key=body.template_key)
+        keep_stored_secrets = self._keep_unreadable_secrets(resource, fields)
         # 还原必须排在 `_prepare_fields` **之后**：库里的敏感载荷按规范化后的 `field_key` 存，
         # 规范化之前拿到的 key 可能还是空的（前端新增字段时不填），对不上就会误判成清空
         fields = self._restore_masked_secrets(fields, self._current_secret_payload(resource))
         public_payload, secret_payload = self._split_payload(fields)
+        if keep_stored_secrets:
+            secret_payload_encrypted = resource.secret_payload_encrypted
+        else:
+            # 同上：加密失败时整次更新作废，不能出现"其它字段已改、敏感字段却写不进去"
+            try:
+                secret_payload_encrypted = encrypt_secret_payload(secret_payload)
+            except SecretPayloadEncryptError as e:
+                raise ValidationError(reason=str(e)) from e
         resource.name = body.name.strip()
         resource.template_key = body.template_key
         resource.resource_note = body.resource_note.strip()
@@ -299,7 +377,7 @@ class WorkspaceResourceService:
         resource.resource_prompt = body.resource_prompt.strip()
         resource.schema_json = [field.model_dump(exclude={"value"}) for field in fields]
         resource.public_payload = public_payload
-        resource.secret_payload_encrypted = encrypt_secret_payload(secret_payload)
+        resource.secret_payload_encrypted = secret_payload_encrypted
         resource.enabled = body.enabled
         await resource.save()
         await self.refresh_related_workspace_caches(resource.id)
@@ -438,10 +516,19 @@ class WorkspaceResourceService:
         return f"NEKRO_RESOURCE_{self._slugify(resource_key, upper=True)}_{self._slugify(field_key, upper=True)}"
 
     async def check_secret_payload_health(self) -> WorkspaceResourceSecretHealthResponse:
+        """按落库形态给整张表做一次体检
+
+        计数口径与 `decode_secret_payload` 的格式一一对应：`EMPTY` 单独一档（空值不是
+        "明文"），`PLAIN` 只数非空值，信封里解不开的那些落进 `invalid_count`。
+        `stale_count` 是"下一次启动会被重写"的行数（存量明文 + 历史密钥密文）。
+        """
         resources = await DBWorkspaceResource.all().order_by("name", "id")
+        encrypted_count = 0
         plaintext_count = 0
+        empty_count = 0
         legacy_encrypted_count = 0
         invalid_count = 0
+        stale_count = 0
         issues: list[WorkspaceResourceSecretIssue] = []
 
         for resource in resources:
@@ -457,17 +544,27 @@ class WorkspaceResourceService:
                     )
                 )
                 continue
-            if result.format in (SecretPayloadFormat.EMPTY, SecretPayloadFormat.PLAIN):
+            if result.format == SecretPayloadFormat.ENVELOPE:
+                encrypted_count += 1
+            elif result.format == SecretPayloadFormat.PLAIN:
+                # `EMPTY` 已经在前面的分支里被排除；走到这里的 PLAIN 一定有取值
                 plaintext_count += 1
+            elif result.format == SecretPayloadFormat.EMPTY:
+                empty_count += 1
             elif result.format == SecretPayloadFormat.LEGACY_ENCRYPTED:
                 legacy_encrypted_count += 1
+            if result.stale:
+                stale_count += 1
 
         return WorkspaceResourceSecretHealthResponse(
             ok=invalid_count == 0,
             total=len(resources),
+            encrypted_count=encrypted_count,
             plaintext_count=plaintext_count,
+            empty_count=empty_count,
             legacy_encrypted_count=legacy_encrypted_count,
             invalid_count=invalid_count,
+            stale_count=stale_count,
             issues=issues,
         )
 
@@ -501,7 +598,18 @@ class WorkspaceResourceService:
                 )
                 continue
             if result.format == SecretPayloadFormat.LEGACY_ENCRYPTED:
-                resource.secret_payload_encrypted = encrypt_secret_payload(result.payload)
+                try:
+                    resource.secret_payload_encrypted = encrypt_secret_payload(result.payload)
+                except SecretPayloadEncryptError as e:
+                    # 旧密文还在手里，这一行没救回来：记进 issues 让人处理，绝不写空
+                    issues.append(
+                        WorkspaceResourceSecretIssue(
+                            resource_id=resource.id,
+                            resource_name=resource.name,
+                            reason=str(e),
+                        )
+                    )
+                    continue
                 await resource.save(update_fields=["secret_payload_encrypted", "update_time"])
                 recovered_count += 1
 
@@ -555,6 +663,13 @@ class WorkspaceResourceService:
         workspace = await DBWorkspace.get_or_none(id=workspace_id)
         if workspace is None:
             raise NotFoundError(resource=f"工作区 {workspace_id}")
+        # 资源就是平台方凭据：绑上以后每次向 CC 发请求都会解出字段值注入它的进程环境。
+        # 不能让这类工作区拿到，那就没有理由让平台方把绑定建起来（建了也不下发，
+        # 只会让资源页出现一条永远不生效、看不出原因的绑定）。
+        from nekro_agent.services.workspace.credential_policy import platform_credentials_allowed
+
+        if not await platform_credentials_allowed(workspace):
+            raise ValidationError(reason="租户工作区不能绑定平台方资源")
         resource = await self.get_resource_or_404(resource_id)
         conflicts = await self.check_bind_conflicts(workspace_id, resource_id)
         if conflicts:
@@ -623,7 +738,30 @@ class WorkspaceResourceService:
             await binding.save(update_fields=["sort_order", "update_time"])
         await self.refresh_workspace_cache(workspace_id)
 
-    async def resolve_workspace_resources_to_env(self, workspace_id: int) -> dict[str, str]:
+    async def resolve_workspace_resources_to_env(
+        self, workspace_id: int, *, allow_platform_secrets: bool
+    ) -> dict[str, str]:
+        """解出这个工作区该注入容器环境变量的资源字段
+
+        `allow_platform_secrets=False`（这个工作区不能拿平台方凭据）时直接返回空，
+        **一个字段都不解密**：资源就是平台方的 SSH 私钥、root 口令、数据库密码与访问令牌，
+        它们不该进租户读得到的容器进程环境（CC 的 Bash 一句 `echo` 就能拿到）。
+        判据由调用方（`credential_policy.platform_credentials_allowed`）算好传进来，
+        这里只记一条 WARNING 说明跳过了哪几条资源，不自己再判一次归属。
+        """
+        if not allow_platform_secrets:
+            bindings = await DBWorkspaceResourceBinding.filter(workspace_id=workspace_id, enabled=True).all()
+            if not bindings:
+                return {}
+            resources = await DBWorkspaceResource.filter(
+                id__in=[item.resource_id for item in bindings], enabled=True
+            ).all()
+            skipped = sorted(resource.name for resource in resources)
+            logger.warning(
+                f"工作区 {workspace_id} 不能拿平台方凭据，跳过 {len(skipped)} 条工作区资源的环境变量注入: {skipped}"
+            )
+            return {}
+
         bindings = await DBWorkspaceResourceBinding.filter(workspace_id=workspace_id, enabled=True).order_by(
             "sort_order", "id"
         )
@@ -636,6 +774,15 @@ class WorkspaceResourceService:
         for binding in bindings:
             resource = resource_map.get(binding.resource_id)
             if resource is None:
+                continue
+            # 判据是「用的哪个模板」（template_key），不是资源自己的标识：后者是管理员随手起的名字
+            if config.SSH_GATEWAY_ENABLED and resource.template_key in SSH_RESOURCE_TEMPLATE_KEYS:
+                # 网关接管 SSH 之后，这三个模板的私钥 / 口令不再进容器进程环境：
+                # 连接由 NA 里的网关拿凭据代跑，凭据留在库里。记 DEBUG 而不是 WARNING，
+                # 因为这是开启网关后的正常状态，不是配置错误。
+                logger.debug(
+                    f"SSH 网关已开启，跳过工作区 {workspace_id} 的资源 {resource.resource_key} 的环境变量注入",
+                )
                 continue
             fields = [ResourceField.model_validate(item) for item in (resource.schema_json or [])]
             try:
@@ -672,6 +819,11 @@ class WorkspaceResourceService:
         for item in bindings:
             resource = item.resource
             summary_lines.append(f"- {resource.name}: {resource.resource_note or '已挂载工作区资源'}")
+            if config.SSH_GATEWAY_ENABLED and resource.template_key in SSH_RESOURCE_TEMPLATE_KEYS:
+                # 资源说明会原样写进 CLAUDE.md。网关开启后这三个模板的「使用方式」已经由
+                # 「可用的服务器（SSH）」一节取代，旧说明只会让 CC 去找不存在的环境变量。
+                # 能力摘要仍保留名字：主 Agent 需要知道这个工作区还绑着这些资源。
+                continue
             detail = await self.get_resource_detail(resource.id)
             prompt_lines.append(f"### 资源：{detail.name}")
             for field in detail.fields:
@@ -689,13 +841,23 @@ class WorkspaceResourceService:
             if detail.resource_prompt:
                 prompt_lines.append(f"- 使用方式：{detail.resource_prompt}")
             prompt_lines.append("")
+        if len(prompt_lines) == 2:
+            # 绑定里只有被网关接管的 SSH 资源：不留下一个空标题，CLAUDE.md 里这一节整个不出现
+            return "", "\n".join(summary_lines)
         return "\n".join(prompt_lines).strip(), "\n".join(summary_lines)
 
     async def refresh_workspace_cache(self, workspace_id: int) -> None:
         workspace = await DBWorkspace.get_or_none(id=workspace_id)
         if workspace is None:
             return
+        from nekro_agent.services.workspace.credential_policy import platform_credentials_allowed
+
         prompt_text, summary_text = await self._build_workspace_prompt_section(workspace_id)
+        if not await platform_credentials_allowed(workspace):
+            # 提示词缓存会原样写进 CLAUDE.md（`_generate_claude_md_content`），而资源说明里有
+            # 非敏感字段的**取值**（主机名、端口、用户名），那份说明等同于一页平台方的资产清单。
+            # 不能拿凭据的工作区连它也不写，与"环境变量不注入"是同一条口径；摘要与计数照旧。
+            prompt_text = ""
         metadata = dict(workspace.metadata or {})
         metadata["resource_prompt_cache"] = prompt_text
         metadata["resource_summary_cache"] = summary_text
@@ -715,3 +877,77 @@ class WorkspaceResourceService:
 
 
 workspace_resource_service = WorkspaceResourceService()
+
+
+async def resources_upgrade_at_rest() -> ResourcePayloadUpgradeReport:
+    """启动时把存量资源载荷整批换成当前配置要求的形态
+
+    两种模式：
+
+    - `encrypted`（默认）：把 `PLAIN`（存量明文）与用历史密钥解开的 `ENVELOPE`
+      重写成当前主密钥的信封。没有可用密钥时**一行都不动**，只打一条 ERROR：
+      此时写不进去，硬写只会把值弄坏。
+    - `plain`：回滚专用。把解得开的 `ENVELOPE` 整批写回 JSON 明文，好让旧版本能读；
+      其余形态不动。这条路径必须配合 `RESOURCE_PAYLOAD_AT_REST=plain` 显式开启，
+      默认永远不会走到。
+
+    **解不开的行一律跳过**（旧 AES 载荷、坏 JSON、用陌生密钥写下的信封）：
+    重写它们等于把一个还可能被原密钥救回来的值彻底抹掉。这些资源名会逐个进
+    `skipped`，并在日志里点名，运维才知道该去恢复哪把密钥。
+
+    写库用 `filter(id=...).update(...)` 而不是 `save()`：重加密不是一次用户编辑，
+    不该顺手改掉 `update_time`。重写是幂等的——第二遍没有任何 `stale` 行。
+    """
+    mode = config.RESOURCE_PAYLOAD_AT_REST
+    resources = await DBWorkspaceResource.all().order_by("name", "id")
+    rewritten: list[str] = []
+    skipped: list[str] = []
+
+    if mode == "encrypted":
+        if not credential_cipher.credential_cipher_status().available:
+            logger.error(
+                "工作区资源载荷配置为 encrypted，但凭据静态加密不可用（没有可用密钥），"
+                "本次启动不重写任何存量明文。请配置 NEKRO_CREDENTIAL_SECRET_KEY 或让数据目录可写后重启。",
+            )
+            return ResourcePayloadUpgradeReport(rewritten=[], skipped=[], mode=mode)
+        for resource in resources:
+            try:
+                result = decode_secret_payload(resource.secret_payload_encrypted)
+            except Exception:
+                # 坏 JSON / 解不开的信封：保留原值，只点名
+                skipped.append(resource.name)
+                continue
+            if result.format == SecretPayloadFormat.LEGACY_ENCRYPTED:
+                # 旧 AES 载荷要的是另一把密钥，走恢复接口而不是在启动时重写
+                skipped.append(resource.name)
+                continue
+            if not result.stale:
+                continue
+            new_value = encrypt_secret_payload(result.payload)
+            await DBWorkspaceResource.filter(id=resource.id).update(secret_payload_encrypted=new_value)
+            rewritten.append(resource.name)
+        if skipped:
+            logger.error(
+                "以下工作区资源的敏感字段本次启动不会重写（请先恢复原密钥 / 用恢复接口处理旧密文，"
+                f"本次启动不会重写它们）: {skipped}",
+            )
+    else:
+        for resource in resources:
+            try:
+                result = decode_secret_payload(resource.secret_payload_encrypted)
+            except Exception:
+                continue
+            if result.format != SecretPayloadFormat.ENVELOPE:
+                continue
+            new_value = encrypt_secret_payload(result.payload)
+            await DBWorkspaceResource.filter(id=resource.id).update(secret_payload_encrypted=new_value)
+            rewritten.append(resource.name)
+        # 每次启动都提醒：plain 只该在回滚前临时开一次，开着忘关等于敏感字段一直以明文落库
+        logger.warning(
+            f"RESOURCE_PAYLOAD_AT_REST=plain（回滚模式）：本次把 {len(rewritten)} 条资源载荷写回明文。"
+            "换回旧版本后若又升级回来，请改回 encrypted 再重启",
+        )
+
+    if rewritten:
+        logger.info(f"工作区资源敏感字段已按 {mode} 模式重写 {len(rewritten)} 条")
+    return ResourcePayloadUpgradeReport(rewritten=rewritten, skipped=skipped, mode=mode)

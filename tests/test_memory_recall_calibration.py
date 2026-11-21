@@ -57,6 +57,7 @@ from nekro_agent.services.memory.text_terms import (
 WORKSPACE_ID = 4201
 MEMORY_MODELS = [
     "nekro_agent.models.db_mem_paragraph",
+    "nekro_agent.models.db_mem_paragraph_person",
     "nekro_agent.models.db_mem_entity",
     "nekro_agent.models.db_mem_relation",
     "nekro_agent.models.db_mem_episode",
@@ -141,7 +142,7 @@ async def _create_relation(subject: str, predicate: str, obj: str, paragraph_id:
 
 
 async def _retrieve(monkeypatch: pytest.MonkeyPatch, query: str, scores: dict[int, float]):
-    async def fake_embed(_text: str) -> list[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> list[float]:
         return [1.0, 0.0, 0.0, 0.0]
 
     monkeypatch.setattr(config, "MEMORY_ENABLE_SYSTEM", True)
@@ -406,7 +407,7 @@ async def test_chinese_cc_task_writes_word_sized_entities(
     或者把 `'扫码登录一直失败，qdrant'` 这种半句话登记成实体名。
     """
 
-    async def fake_embed(_text: str) -> list[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> list[float]:
         return [1.0, 0.0, 0.0, 0.0]
 
     monkeypatch.setattr(config, "MEMORY_ENABLE_SYSTEM", True)

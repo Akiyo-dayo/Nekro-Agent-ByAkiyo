@@ -29,6 +29,45 @@ from nekro_agent.services.plugin.collector import plugin_collector
 CHAT_KEY = "onebot_v11-10001-group_12345678"
 
 
+def _allow_every_plugin_push(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin: Any = None,
+    *,
+    send_image: Any = None,
+    send_text: Any = None,
+) -> None:
+    """放开插件推送方法的按频道判据（并可选地把推送转给记录函数）
+
+    本文件判的是渲染调度，不是作用域。判据本身由 `tests/test_plugin_background_scope.py`
+    覆盖；这里替换掉，避免测试替身上下文被拖进真实数据库查询。给的替身都要返回 `True`，
+    否则调用方会按「频道不存在」处理。
+    """
+    from nekro_agent.services.plugin import base as plugin_base
+
+    async def _effective(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(plugin_base, "plugin_effective_in_chat", _effective)
+    if plugin is None:
+        return
+
+    if send_image is not None:
+
+        async def _send_image(*args: Any, **kwargs: Any) -> bool:
+            await send_image(*args, **kwargs)
+            return True
+
+        monkeypatch.setattr(plugin, "send_image", _send_image)
+
+    if send_text is not None:
+
+        async def _send_text(*args: Any, **kwargs: Any) -> bool:
+            await send_text(*args, **kwargs)
+            return True
+
+        monkeypatch.setattr(plugin, "send_text", _send_text)
+
+
 def make_plugin(module_name: str) -> NekroPlugin:
     """构造一个不落盘的最小插件实例
 
@@ -246,6 +285,20 @@ class TestMessageDispatchIsolation:
         """
         registry: dict = {}
         monkeypatch.setattr(plugin_collector, "loaded_plugins", registry)
+
+        # 本文件测的是故障隔离，不测作用域：把「插件在频道生效」的判据替身成恒真，
+        # 否则这些没有频道行、也不在全局启用列表里的测试插件会被新钩子直接跳过。
+        # 判据是 `collector` 模块级名字（收集器实例上没有），所以要打在模块对象上。
+        from nekro_agent.services.plugin import collector as collector_module
+
+        async def _effective(*_args: Any, **_kwargs: Any) -> bool:
+            return True
+
+        async def _instance(_chat_key: str) -> str:
+            return ""
+
+        monkeypatch.setattr(collector_module, "plugin_effective_with_instance", _effective)
+        monkeypatch.setattr(collector_module, "resolve_chat_plugin_instance", _instance)
         return registry
 
     async def test_raising_plugin_does_not_stop_the_others(self, loaded: dict):
@@ -387,6 +440,12 @@ class TestOfflineRenderScheduling:
         monkeypatch.setattr(voice, "render_inner_voice_card", fake_render)
 
         ctx = StubCtx()
+
+        async def record_send_image(_chat_key: str, file_path: str, _ctx: Any, **_kw: Any) -> None:
+            ctx.sent.append(file_path)
+
+        _allow_every_plugin_push(monkeypatch, voice.plugin, send_image=record_send_image)
+
         await voice.render_and_send(ctx, "测试心声")  # pyright: ignore[reportArgumentType]
 
         assert len(ctx.sent) == 1, "渲染结果仍要正常发出去"
@@ -436,6 +495,12 @@ class TestOfflineRenderScheduling:
         monkeypatch.setattr(rank, "_build_view", fake_build_view)
 
         ctx = StubCtx()
+
+        async def record_send_image(_chat_key: str, file_path: str, _ctx: Any, **_kw: Any) -> None:
+            ctx.sent.append(file_path)
+
+        _allow_every_plugin_push(monkeypatch, rank.plugin, send_image=record_send_image)
+
         await rank.send_affection_rank(ctx, CHAT_KEY)  # pyright: ignore[reportArgumentType]
 
         assert len(ctx.sent) == 1

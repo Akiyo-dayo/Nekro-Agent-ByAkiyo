@@ -75,6 +75,7 @@ from __future__ import annotations
 
 from typing import Dict, List, NamedTuple, Optional, Protocol, Sequence
 
+from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_identity import DBIdentityAlias
 from nekro_agent.models.db_instance_group import SELF_DOMAIN_GROUP_ID, DBInstanceDomainBinding
@@ -255,7 +256,7 @@ async def resolve_domain_instance_keys(adapter_key: str, instance_key: str) -> O
     组成员本来是 `(adapter_key, instance_key)` 二元组，这里**刻意丢掉前一半**。
     代价是：同一个 `instance_key` 若同时存在于两个适配器下，把其中一个放进组会让另一个的记忆
     在同一工作区内一并可见。目前挡住这件事的是创建侧的**全局**重名校验
-    （`console/instance_manager.py` 认领新实例时 `filter(instance_key=slug).exists()` 不带适配器），
+    （`console/instance_manager.py` 认领新实例时 `filter(instance_key__iexact=slug).exists()` 不带适配器），
     而不是这里——数据库上的唯一键是 `(adapter_key, instance_key)`，允许重名。
     要真正按适配器隔离，得先给 `mem_*` 加列并回填，不在本轮范围内。
 
@@ -295,6 +296,43 @@ async def resolve_domain_instance_keys(adapter_key: str, instance_key: str) -> O
     if LEGACY_INSTANCE_KEY not in allowed:
         allowed.append(LEGACY_INSTANCE_KEY)
     return allowed
+
+
+async def resolve_domain_members(adapter_key: str, instance_key: str) -> tuple[tuple[str, str], ...]:
+    """把记忆域换算成「域成员对」列表：``(adapter_key, instance_key)`` 的去重排序元组。
+
+    为什么需要它：记忆行上的可见范围要按「域」而不是按单个实例过滤，而域成员是在检索
+    那一刻现算的（实例加入 / 移出组必须立刻生效，不缓存）。返回值至少含当前实例自己，
+    **永远不为空**。
+
+    成员来源有两层，取并集：
+
+    1. 实例组：``DBInstanceDomainBinding.members_of_memory_group`` 的成员；自成一域时
+       只有自己；
+    2. 旧配置 ``MEMORY_INSTANCE_SHARING_GROUPS`` 里与本实例同组的实例名。该配置只有
+       实例名、没有适配器，因此统一配上**当前频道的适配器**：创建侧对实例 slug 做了
+       全局查重，同一个 slug 不会同时出现在两个适配器下。
+
+    **不放行空串通配。** 空串在单实例适配器上是一个合法的实例标识（此时它就是「自己」），
+    但它绝不能变成「匹配所有实例」：旧配置里的空白项一律跳过，域成员对按二元组精确匹配。
+    """
+    domain = await resolve_memory_domain(adapter_key, instance_key)
+    members: list[tuple[str, str]] = []
+    if domain.is_group:
+        members.extend(await DBInstanceDomainBinding.members_of_memory_group(domain.group_id))
+    members.append((adapter_key, instance_key))
+
+    normalized_self = instance_key.strip()
+    for group_members in config.MEMORY_INSTANCE_SHARING_GROUPS.values():
+        normalized_members = [member.strip() for member in group_members]
+        if not normalized_self or normalized_self not in normalized_members:
+            continue
+        for member in normalized_members:
+            if member:
+                members.append((adapter_key, member))
+
+    # 去重 + 排序：条件树的渲染结果必须与集合的迭代顺序无关。
+    return tuple(sorted(set(members)))
 
 
 async def resolve_person_uid(domain: ScopeDomain, platform_userid: str) -> str:
@@ -508,6 +546,7 @@ __all__ = [
     "ScopeDomain",
     "resolve_affection_domain",
     "resolve_domain_instance_keys",
+    "resolve_domain_members",
     "resolve_identity_scope",
     "resolve_identity_scope_by_chat_key",
     "resolve_identity_scopes",

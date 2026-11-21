@@ -4,10 +4,10 @@
 提供插件的管理相关功能，如获取插件列表、配置管理等。
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from nekro_agent.core.config import CONFIG_PATH, config
-from nekro_agent.core.core_utils import ConfigBase
+from nekro_agent.core.core_utils import ConfigBase, validate_config_data
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.services.config_service import ConfigService
 from nekro_agent.services.plugin.call_priority import (
@@ -29,6 +29,7 @@ from nekro_agent.services.plugin.prompt_activation import (
 from nekro_agent.services.plugin.scope import (
     OverrideScope,
     PluginScopeState,
+    instance_config_path,
     is_enabled_in_any_scope,
     load_instance_config_overrides,
     resolve_scope_states,
@@ -36,6 +37,9 @@ from nekro_agent.services.plugin.scope import (
     save_instance_config_overrides,
     set_scope_override,
 )
+
+if TYPE_CHECKING:
+    from nekro_agent.services.plugin.base import NekroPlugin
 
 logger = get_sub_logger("plugin_system")
 
@@ -484,9 +488,17 @@ async def set_plugin_scope_override(
     except ValueError as e:
         return False, str(e)
 
+    error = await _sync_plugin_load_state(plugin)
+    if error:
+        return False, f"覆盖已写入，但插件加载状态同步失败: {error}"
+    return True, None
+
+
+async def _sync_plugin_load_state(plugin: "NekroPlugin") -> Optional[str]:
+    """让插件的进程级加载状态与「全局开关 ∪ 任一作用域显式启用」一致，返回失败原因（成功为 None）"""
     should_be_loaded = plugin.key in config.PLUGIN_ENABLED or is_enabled_in_any_scope(plugin.key)
     if should_be_loaded == plugin.is_enabled:
-        return True, None
+        return None
 
     from nekro_agent.services.plugin.router_manager import plugin_router_manager
 
@@ -500,9 +512,26 @@ async def set_plugin_scope_override(
         await _notify_commands_changed_after_plugin_toggle(plugin.key, plugin.name)
     except Exception as e:
         logger.exception(f"同步插件 {plugin.name} 进程级加载状态失败: {e}")
-        return False, f"覆盖已写入，但插件加载状态同步失败: {e!s}"
+        return str(e)
+    return None
 
-    return True, None
+
+async def sync_plugin_load_states(plugin_keys: Iterable[str]) -> Dict[str, str]:
+    """作用域覆盖被成批删掉 / 搬走之后，按插件逐个重同步进程级加载状态，返回失败的插件与原因
+
+    删实例、划转、迁移会删掉某个实例上「单独开着」的插件：全局关着、又没有别的作用域需要它时，
+    它在进程里还活着（回调、路由都在），要在这里下线；反过来搬过去的开关也可能需要把它拉起来。
+    插件键在设置里、插件本身没加载的跳过。
+    """
+    failures: Dict[str, str] = {}
+    for plugin_key in sorted(set(plugin_keys)):
+        plugin = plugin_collector.get_plugin(plugin_key)
+        if plugin is None:
+            continue
+        error = await _sync_plugin_load_state(plugin)
+        if error:
+            failures[plugin_key] = error
+    return failures
 
 
 async def get_plugin_instance_config(plugin_id: str, instance_key: str) -> Optional[List[Dict[str, Any]]]:
@@ -553,15 +582,21 @@ async def save_plugin_instance_config(
 
     try:
         global_config = plugin.get_global_config()
+        global_values = global_config.model_dump()
         # 在「全局值 + 已有覆盖」的副本上套用本次改动，复用配置服务的字符串解析与校验
-        draft = plugin.config_class.model_validate(
-            {**global_config.model_dump(), **load_instance_config_overrides(plugin.key, instance_key)},
+        # 磁盘上已有的覆盖里若有非法值，就近修正后再套本次改动：否则这个实例的插件配置
+        # 再也存不进去，而保存正是修好那份文件的途径。去掉的项回到全局配置的值（`fallback`），
+        # 于是下面按「与全局不同」挑覆盖时它自然不再写进覆盖文件
+        draft = validate_config_data(
+            plugin.config_class,
+            {**global_values, **load_instance_config_overrides(plugin.key, instance_key)},
+            source=f"{instance_config_path(plugin.key, instance_key)}（与全局配置合并后）",
+            fallback=global_values,
         )
         success, error_msg = ConfigService.batch_update_config(draft, configs)
         if not success:
             return False, error_msg
 
-        global_values = global_config.model_dump()
         overrides = {key: value for key, value in draft.model_dump().items() if value != global_values.get(key)}
         save_instance_config_overrides(plugin.key, instance_key, overrides)
     except ValueError as e:

@@ -8,6 +8,7 @@ import {
   Skeleton,
   Stack,
   Box,
+  Chip,
 } from '@mui/material'
 import { Group as GroupIcon, Person as PersonIcon, Circle as CircleIcon } from '@mui/icons-material'
 import type { ReactNode } from 'react'
@@ -104,6 +105,15 @@ export default function ChatChannelList({
                 <Typography variant="body2" className="font-medium truncate flex-1">
                   {getChannelDisplayName(channel)}
                 </Typography>
+                {channel.bot_membership?.status === 'not_in_group' && (
+                  <Chip
+                    label={t('list.botNotInGroupBadge')}
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                    className="flex-shrink-0"
+                  />
+                )}
                 <CircleIcon
                   sx={{
                     fontSize: 8,

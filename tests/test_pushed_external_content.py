@@ -46,9 +46,18 @@ RENDER_CONFIG = SimpleNamespace(AI_CONTEXT_LENGTH_PER_MESSAGE=100_000, AI_SHOW_R
 
 
 @pytest.fixture
-async def db():
+async def db(monkeypatch: pytest.MonkeyPatch):
+    from nekro_agent.core.config import config as core_config
+
     await Tortoise.init(db_url="sqlite://:memory:", modules={"models": ["nekro_agent.models"]})
     await Tortoise.generate_schemas()
+    # CC 与 GitHub 的推送已经改走插件方法：测试里让两个插件在全局启用，
+    # 否则「插件在频道未生效」会先把推送挡掉，测不到外部内容本身的形状。
+    monkeypatch.setattr(
+        core_config,
+        "PLUGIN_ENABLED",
+        [*core_config.PLUGIN_ENABLED, "KroMiose.cc_workspace", "KroMiose.github"],
+    )
     await DBAdapterInstance.create(
         adapter_key="onebot_v11",
         instance_key="inst1",
@@ -76,7 +85,7 @@ def triggers(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """记下 Agent 触发与 `on_system_message` 挂载点收到的文字；挂载点返回的信号可改"""
     seen = SimpleNamespace(scheduled=[], hooked=[], signal=MsgSignal.CONTINUE)
 
-    async def schedule(chat_key: Any = None, message: Any = None, ctx: Any = None) -> None:
+    async def schedule(chat_key: Any = None, message: Any = None, ctx: Any = None, **_kwargs: Any) -> None:
         seen.scheduled.append(chat_key)
 
     async def hook(_ctx: Any, text: str) -> MsgSignal:

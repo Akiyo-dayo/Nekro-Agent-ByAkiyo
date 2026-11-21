@@ -61,8 +61,8 @@ class TestGoogleSearch:
         from plugins.builtin import google_search as module
 
         monkeypatch.setattr(module, "config", SimpleNamespace(API_KEY="k", CX_KEY="c", MAX_RESULTS=5, THROTTLE_TIME=0))
-        monkeypatch.setattr(module, "_last_keyword", None)
-        monkeypatch.setattr(module, "_last_call_time", 0)
+        monkeypatch.setattr(module, "_last_keyword", {})
+        monkeypatch.setattr(module, "_last_call_time", {})
 
         def install(payload: Dict[str, Any]) -> None:
             class _Response:
@@ -177,7 +177,26 @@ class TestEmail:
         finally:
             await Tortoise.close_connections()
 
-    async def test_email_content_is_untrusted(self, db):
+    @pytest.fixture
+    def platform_account(self, monkeypatch: pytest.MonkeyPatch):
+        """账户清单现在从服务层取：这里只放一个平台方账户，会话才「看得见」这封邮件"""
+        from types import SimpleNamespace
+
+        from nekro_agent.adapters.email.config import EmailAccount
+        from nekro_agent.services import email_accounts
+
+        account = EmailAccount(
+            DISPLAY_NAME="我",
+            USERNAME="me@example.com",
+            SEND_ENABLED=True,
+            IS_DEFAULT_SENDER=True,
+        )
+        config = SimpleNamespace(RECEIVE_ACCOUNTS=[account])
+        monkeypatch.setattr(email_accounts, "_load_platform_config", lambda _adapter=None: config)
+        email_accounts.clear_default_sender_cache()
+        return account
+
+    async def test_email_content_is_untrusted(self, db, platform_account):
         from nekro_agent.models.db_email import DBEmail
         from plugins.builtin import email_utils
 
@@ -421,7 +440,7 @@ class TestEchoedModelArguments:
         from plugins.builtin import google_search as module
 
         monkeypatch.setattr(module, "config", SimpleNamespace(API_KEY="k", CX_KEY="c", MAX_RESULTS=5, THROTTLE_TIME=0))
-        monkeypatch.setattr(module, "_last_keyword", None)
+        monkeypatch.setattr(module, "_last_keyword", {})
 
         class _Client:
             def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -686,8 +705,11 @@ UNTRUSTED_AGENT_METHODS = {
     ("kb_tools/main.py", "read_workspace_kb_fulltext_tool"),
     ("kb_tools/main.py", "search_workspace_kb_tool"),
     ("memory_tools/main.py", "get_memory_detail_tool"),
+    ("memory_tools/main.py", "search_memories_tool"),
     ("memory_tools/main.py", "search_workspace_memories_tool"),
     ("memory_tools/main.py", "trace_memory_origin_tool"),
+    ("memory_tools/main.py", "trace_memory_source_tool"),
+    ("memory_tools/main.py", "view_memory_tool"),
     ("minecraft_utils.py", "execute_rcon_commands"),
     ("skill_loader/main.py", "list_skills"),
     ("skill_loader/main.py", "load_skill"),
@@ -699,10 +721,14 @@ UNTRUSTED_AGENT_METHODS = {
 # `BEHAVIOR` 方法的返回值同样经 `push_system_message` 落成 SYSTEM 消息（`routers/rpc.py`），所以同样要表态。
 # 模型传入的参数（以及别人存下的名字、外部服务报回的字段）只能经 `echo_inline` 回显，见下面的判据
 TRUSTED_SYSTEM_METHODS = {
+    ("affection_tools.py", "adjust_affection"): "宿主拼的结果行（render_adjust）：阶段名与变化量都是宿主算出的值，昵称经 echo_inline；不回显 user_id 与理由",
+    ("affection_tools.py", "set_call_name"): "宿主拼的结果行（render_call_name）：称呼与昵称都经 echo_inline；不回显 user_id",
     ("cc_workspace/main.py", "cancel_cc_task"): "宿主固定文案",
     ("cc_workspace/main.py", "create_and_bind_workspace"): "宿主固定文案与新建的工作区 ID；工作区名存之前已压成单行，回显再过 echo_inline",
     ("cc_workspace/main.py", "delegate_to_cc"): "宿主固定文案；任务描述不回显，工作区名经 echo_inline",
     ("cc_workspace/main.py", "force_cancel_cc_workspace"): "宿主固定文案；CC 容器报回的频道标识经 echo_inline",
+    ("cc_workspace/main.py", "register_ssh_server"): "宿主固定文案（chat_registration 里的判据说明与结果行）；别名、主机、登录账号经 echo_inline，指纹是宿主算出的哈希；不回显任何凭据",
+    ("cc_workspace/main.py", "remove_ssh_server"): "宿主固定文案；别名经 echo_inline",
     ("cc_workspace/main.py", "reset_cc_session"): "宿主固定文案与计数；工作区名经 echo_inline",
     ("cc_workspace/main.py", "restart_cc_sandbox"): "宿主固定文案与状态；工作区名、CC 容器报回的频道标识经 echo_inline",
     ("cc_workspace/main.py", "start_cc_sandbox"): "宿主固定文案；工作区名经 echo_inline",
@@ -710,9 +736,11 @@ TRUSTED_SYSTEM_METHODS = {
     ("cold_shoulder.py", "unignore_user"): "宿主固定文案",
     ("dice.py", "dice_roll"): "宿主随机数与固定文案；事件名经 echo_inline，难度先校验成 1~20 的数",
     ("dice.py", "probability_wheel"): "宿主随机数与固定文案；事件名、选项名、兜底事件名经 echo_inline",
-    ("email_utils.py", "get_email_accounts"): "平台方配置的账户清单，不含邮件内容",
+    ("email_utils.py", "get_email_accounts"): "会话自己能用的账户清单：显示名来自平台方配置或实例自己的账户设置，不含邮件内容",
+    ("email_utils.py", "get_my_mail_preference"): "宿主固定文案与本人自己记下的偏好；地址来自偏好行或按账号拼出的默认地址，私聊里完整、群里遮掩",
     ("github/methods.py", "subscribe_github_repo"): "宿主固定文案；仓库名、事件名、异常文本经 echo_inline",
     ("github/methods.py", "unsubscribe_github_repo"): "宿主固定文案；仓库名经 echo_inline",
+    ("message_recall.py", "recall_message"): "宿主拼的结果行：结果码、条数、时间与身份都是宿主算出的值；昵称与协议端原话经 echo_inline；不回显任何参数",
     ("note.py", "remove_note"): "宿主固定文案；笔记标题经 echo_inline",
     ("note.py", "set_note"): "只返回 True",
     ("plugin_activation.py", "activate_plugin"): "宿主渲染的插件提示词块；module_name 经 echo_inline",
@@ -869,12 +897,20 @@ class TestTrustedTextOutsideTheBlock:
         """对照组：插件推送、内核服务、路由、API 入口都确实被扫到了"""
         pushes = {key for key, _value in iter_system_pushes()}
         summaries = {key for key, _value in iter_untrusted_result_summaries()}
+        kinds = {key for key, _value in iter_untrusted_result_kinds()}
         assert ("emotion.py", "collect_emotion") in pushes
         assert ("skill_loader/main.py", "load_skill") in summaries
-        assert ("services/timer/timer_service.py", "_execute_task") in pushes
+        # 定时提醒改走不可信通道之后，`_execute_task` 不再推 SYSTEM 消息；
+        # 这里换一个确实还在推 SYSTEM 的内核调用点，保证扫描范围没有缩到只剩插件
+        assert ("services/message_service.py", "push_human_message") in pushes
         assert ("routers/chat_channel.py", "_send_message_via_webui") in pushes
         assert ("api/message.py", "push_system") in pushes
         assert ("schemas/agent_ctx.py", "push_system") in pushes
+        # 两个新的不可信构造器必须真的进了扫描范围，否则它们的摘要无人复核
+        assert ("services/timer/reminder_message.py", "build_reminder_result") in summaries
+        assert ("services/timer/reminder_message.py", "build_auto_pause_result") in summaries
+        assert ("services/timer/reminder_message.py", "build_reminder_result") in kinds
+        assert ("services/timer/reminder_message.py", "build_auto_pause_result") in kinds
 
     @pytest.mark.parametrize(
         "source",
@@ -940,9 +976,9 @@ REVIEWED_FSTRING_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
         "fallback_prob:.1f": "宿主算出的概率",
         "fallback_percentage:.1f": "宿主算出的百分比",
     },
-    ("email_utils.py", "get_email_accounts"): {
-        "display_name": "平台方配置的账户显示名",
-        "account.USERNAME": "平台方配置的邮箱地址",
+    ("email_utils.py", "get_my_mail_preference"): {
+        "address_line": "宿主拼的地址行：地址来自本人偏好行或按账号拼出的默认地址，群里那一支已经过 mask_email_address",
+        "state_line": "宿主固定文案三选一（已退订 / 已订阅 / 未订阅）",
     },
     ("plugin_activation.py", "activate_plugin"): {
         "current_rounds": "宿主存的剩余轮数",
@@ -957,9 +993,26 @@ REVIEWED_FSTRING_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
 
 # 会落成 SYSTEM 消息的 `return` 里，既不是 f-string、也不是包裹函数调用或常量的表达式，逐条审过
 REVIEWED_RETURN_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("affection_tools.py", "adjust_affection"): {
+        "render_adjust(await _adjust(_ctx, user_id, delta, reason))": "宿主拼的结果行（render_adjust），昵称已经过 echo_inline，不回显参数",
+    },
+    ("affection_tools.py", "set_call_name"): {
+        "render_call_name(await _remember_call_name(_ctx, user_id, call_name))": "宿主拼的结果行（render_call_name），称呼与昵称已经过 echo_inline，不回显参数",
+    },
     ("email_utils.py", "get_email_accounts"): {
-        "display_name or account.USERNAME or account.EMAIL_ACCOUNT": "平台方配置的账户字段（内部辅助函数的返回值）",
-        "accounts": "平台方配置的账户清单",
+        "items": "宿主拼的账户清单：每项只有显示名、引用与布尔值，或（能看地址的会话里）地址与服务商",
+    },
+    ("email_utils.py", "get_my_mail_preference"): {
+        "str(e)": "服务层抛出的固定文案（「这一轮不止一个人在说话…」/「这个会话不能设置邮件偏好」），不含外部输入",
+    },
+    ("message_recall.py", "recall_message"): {
+        "render_result(await _recall(_ctx, user_id, send_time, reason, message_id))": "宿主拼的结果行（render_result），昵称与协议端原话已经过 echo_inline，不回显参数",
+    },
+    ("cc_workspace/main.py", "register_ssh_server"): {
+        "register_from_chat(chat_key=_ctx.from_chat_key, alias=alias, host=host, username=username, password=password, private_key=private_key, passphrase=passphrase, port=port)": "services/ssh_gateway/chat_registration 拼的结果行：判据说明是固定文案，别名、主机、登录账号经 echo_inline，指纹是宿主算出的哈希；凭据从不回显",
+    },
+    ("cc_workspace/main.py", "remove_ssh_server"): {
+        "remove_from_chat(chat_key=_ctx.from_chat_key, alias=alias)": "services/ssh_gateway/chat_registration 拼的结果行：固定文案，别名经 echo_inline",
     },
 }
 
@@ -975,6 +1028,10 @@ REVIEWED_SUMMARY_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
         "health_line": "宿主固定文案与库里的状态枚举",
     },
     ("skill_loader/main.py", "list_skills"): {"len(lines)": "宿主数出来的技能数"},
+    ("services/timer/reminder_message.py", "build_reminder_result"): {
+        "lead": "宿主固定文案二选一（正常到点 / 重启补发），按 `is_misfire` 取值，不含外部输入",
+        "task_part": "空串或宿主拼的 `（任务 ID <echo_inline>）` 片段：任务标识本身在这一层已经过 `echo_inline`",
+    },
     ("video_analysis/main.py", "format_result"): {
         "meta.duration:.1f": "ffprobe 报回的时长，带 `.1f` 格式说明：只能是数值",
         "resolution": "宿主用整数宽高拼的分辨率",
@@ -987,6 +1044,12 @@ REVIEWED_SUMMARY_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
 }
 REVIEWED_SUMMARY_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
     ("basic.py", "view_str_content"): {"meta_header": "宿主算出的行数、截断说明"},
+    ("services/ops_agent/tools.py", "ops_instance_status"): {
+        "summary": "宿主拼的实例状态行：标识经 `_ident`、名字与账号经 `_name`（都是 echo_inline）回显，其余是枚举与计数；最近错误原文只进 `body`",
+    },
+    ("services/timer/reminder_message.py", "build_auto_pause_result"): {
+        "summary": "宿主固定文案加经 `echo_inline` 回显的任务标识；标题与最近错误只进 `body`",
+    },
     ("models/db_chat_message.py", "_render_segment_pieces"): {
         "_limit_body(seg.summary)": "重放库里已落的不可信段：摘要在写入时由产生它的入口给出（内置入口在本文件逐条审过），渲染时只限长",
     },
@@ -998,33 +1061,25 @@ REVIEWED_SUMMARY_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
             "宿主固定文案；技能标识已经 `_validate_skill_id` 校验成字母数字片段，剥掉的字段名是宿主自己的清单"
         ),
     },
+    ("adapters/email/adapter.py", "_build_email_notice"): {
+        "summary": (
+            "宿主固定引导语：收件账户、邮件 UID 与平台方 email 频道标识都经 `echo_inline` 回显，"
+            "发件人 / 主题 / 日期 / 附件名只进 `body`"
+        ),
+    },
 }
 
 # 插件自己 `push_system_message(...)` 推的系统消息
 REVIEWED_PUSH_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
     ("emotion.py", "collect_emotion"): {"emotion_id": "宿主按文件路径与描述算出的十六进制 ID"},
-    ("services/timer/recurring_timer_service.py", "_auto_pause_job"): {
-        "job.job_id": "仅宿主掌握的值：库里的周期任务 ID（宿主生成的四位小写字母数字）",
-        "job.title or '（无）'": (
-            "已知未修：`job.title` 由模型经内置插件 `plugins/builtin/timer.py` 的 "
-            "`create_recurring_timer` / `update_recurring_timer`（SandboxMethodType.TOOL，模型可调）写入，"
-            "第三方插件也能经 `nekro_agent/api/recurring_timer.py` 的 `create_cron_job` / `update_job` 写入；"
-            "本处把它拼进 SYSTEM 正文，写入方没有义务保证它不含指令"
-        ),
-        "job.last_error or '（无）'": (
-            "已知未修：`recurring_timer_service.py:318` 把投递 `push_system_message` 时的异常原文写进 "
-            "`job.last_error`（`str(e)`），本处再原样拼进 SYSTEM 正文；异常文本里可能带适配器/上游报回的原文"
-        ),
-    },
-    ("services/timer/timer_service.py", "_load_persisted_tasks"): {
-        "event_desc": (
-            "已知未修：`event_desc` 由模型经内置插件 `plugins/builtin/timer.py` 的 `set_timer` / `set_temp_timer`"
-            "（SandboxMethodType.TOOL，模型可调）写入，第三方插件也能经 `nekro_agent/api/timer.py` 的 "
-            "`set_timer` / `set_temp_timer` 写入；这里从持久化文件恢复后原样拼进 SYSTEM 正文"
-        ),
-    },
 }
 REVIEWED_PUSH_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
+    ("services/plugin/base.py", "push_system_message"): {
+        "agent_messages": (
+            "插件推送方法的透传：正文由调用方（插件作者）给出，本方法的职责只是先判插件在目标频道是否生效；"
+            "含外部内容时调用方应改用 push_untrusted_message"
+        ),
+    },
     ("adapters/onebot_v11/matchers/notice.py", "_"): {
         "content_text": (
             "仅宿主掌握的值：SYSTEM 分支只由 use_system_sender 为真的四个处理器走到，"
@@ -1078,22 +1133,6 @@ REVIEWED_PUSH_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
         "message": (
             "按设计：`AsyncTaskHandle.notify_agent` 的字符串老路径是第三方插件接口的既定口径，"
             "传字符串即以 SYSTEM 推送；含外部内容时应传 `UntrustedToolResult`"
-        ),
-    },
-    ("services/timer/recurring_timer_service.py", "_fire_job"): {
-        "system_message": (
-            "已知未修：`system_message` 由 `job.title` 与 `job.event_desc` 拼成（`recurring_timer_service.py:308-310`），"
-            "两者由模型经内置插件 `plugins/builtin/timer.py` 的 `create_recurring_timer` / `update_recurring_timer`"
-            "（SandboxMethodType.TOOL）写入，第三方插件也能经 `nekro_agent/api/recurring_timer.py` 的 "
-            "`create_cron_job` / `update_job` 写入"
-        ),
-    },
-    ("services/timer/timer_service.py", "_execute_task"): {
-        "system_message": (
-            "已知未修：`system_message` 由 `task.event_desc` 拼成（`timer_service.py:361`），"
-            "`event_desc` 由模型经内置插件 `plugins/builtin/timer.py` 的 `set_timer` / `set_temp_timer`"
-            "（SandboxMethodType.TOOL）写入，第三方插件也能经 `nekro_agent/api/timer.py` 的 `set_timer` / "
-            "`set_temp_timer` 写入"
         ),
     },
 }

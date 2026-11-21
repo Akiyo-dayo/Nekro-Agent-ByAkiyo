@@ -1,11 +1,14 @@
 """命令补全数据提供器"""
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
 
 from nekro_agent.schemas.i18n import SupportedLang
 from nekro_agent.services.command.base import CommandPermission
+
+# 不传实例判据时保持只判进程级的旧行为（与 `manager._UNSET` 同一约定）
+_UNSET: object = object()
 
 
 class CommandCompletionEntry(BaseModel):
@@ -26,8 +29,14 @@ class CommandCompletionProvider:
         self,
         chat_key: Optional[str] = None,
         lang: SupportedLang = SupportedLang.ZH_CN,
+        *,
+        chat_instance_key: Any = _UNSET,
     ) -> list[CommandCompletionEntry]:
-        """获取补全条目列表（已过滤禁用命令和 internal 命令）"""
+        """获取补全条目列表（已过滤禁用命令和 internal 命令）
+
+        `chat_instance_key` 由异步调用方算好传入；插件来源的命令要在这个频道生效才补全。
+        不传时与改造前相同。
+        """
         from nekro_agent.services.command.manager import command_manager
         from nekro_agent.services.command.registry import command_registry
 
@@ -38,6 +47,7 @@ class CommandCompletionProvider:
                 meta,
                 chat_key,
                 plugin_enabled_cache=plugin_enabled_cache,
+                chat_instance_key=chat_instance_key,
             ):
                 continue
             effective_permission = command_manager.get_command_permission(meta.name, meta.permission, chat_key)

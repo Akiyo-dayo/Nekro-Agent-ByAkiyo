@@ -53,8 +53,10 @@ plugin = NekroPlugin(
     sleep_brief="用于随机检定、掷骰和概率轮盘，在需要随机性、跑团或概率选择时激活。",
 )
 
-_ASSERT_DICE_NUM: int = 0
-_LOCKED_DICE_NUM: int = 0
+# 骰点预设 / 锁定按频道分开存：同一个进程可能同时服务多个租户的群，
+# 一个群的调试预设不该影响另一个群的掷骰结果。键是命令 / 掷骰所在频道的 chat_key。
+_ASSERT_DICE_NUM: Dict[str, int] = {}
+_LOCKED_DICE_NUM: Dict[str, int] = {}
 
 
 @plugin.mount_command(
@@ -77,8 +79,8 @@ async def dice_assert_cmd(
     if not 1 <= value <= 20:
         return CmdCtl.failed("骰点值应在 1 到 20 之间")
 
-    _ASSERT_DICE_NUM = value
-    return CmdCtl.success(f"掷骰检定预言: {_ASSERT_DICE_NUM}/20")
+    _ASSERT_DICE_NUM[context.chat_key] = value
+    return CmdCtl.success(f"掷骰检定预言: {value}/20")
 
 
 @plugin.mount_command(
@@ -101,8 +103,8 @@ async def dice_lock_cmd(
     if not 1 <= value <= 20:
         return CmdCtl.failed("骰点值应在 1 到 20 之间")
 
-    _LOCKED_DICE_NUM = value
-    return CmdCtl.success(f"骰点已锁定为 {_LOCKED_DICE_NUM}")
+    _LOCKED_DICE_NUM[context.chat_key] = value
+    return CmdCtl.success(f"骰点已锁定为 {value}")
 
 
 @plugin.mount_command(
@@ -114,7 +116,7 @@ async def dice_lock_cmd(
 )
 async def dice_unlock_cmd(context: CommandExecutionContext) -> CommandResponse:
     global _LOCKED_DICE_NUM
-    _LOCKED_DICE_NUM = 0
+    _LOCKED_DICE_NUM.pop(context.chat_key, None)
     return CmdCtl.success("骰点锁定已解除")
 
 
@@ -239,12 +241,14 @@ async def dice_roll(_ctx: AgentCtx, event_name: str, description: str, difficult
 
     global _ASSERT_DICE_NUM, _LOCKED_DICE_NUM
 
-    # 优先级：预言骰点 > 锁定骰点 > 随机骰点
-    if _ASSERT_DICE_NUM > 0:
-        roll_result = _ASSERT_DICE_NUM
-        _ASSERT_DICE_NUM = 0
-    elif _LOCKED_DICE_NUM > 0:
-        roll_result = _LOCKED_DICE_NUM
+    # 只读当前频道自己的预设 / 锁定：别的群的调试状态不串台。
+    # 预言骰点取用即删（只生效一次），锁定骰点保留到解除。
+    chat_key = _ctx.chat_key
+    asserted = _ASSERT_DICE_NUM.pop(chat_key, 0)
+    if asserted > 0:
+        roll_result = asserted
+    elif _LOCKED_DICE_NUM.get(chat_key, 0) > 0:
+        roll_result = _LOCKED_DICE_NUM[chat_key]
     else:
         roll_result = random.randint(1, 20)
 
@@ -366,5 +370,5 @@ async def probability_wheel(
 async def clean_up():
     """清理插件"""
     global _ASSERT_DICE_NUM, _LOCKED_DICE_NUM
-    _ASSERT_DICE_NUM = 0
-    _LOCKED_DICE_NUM = 0
+    _ASSERT_DICE_NUM.clear()
+    _LOCKED_DICE_NUM.clear()

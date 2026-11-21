@@ -1,0 +1,46 @@
+{
+  "title": "Ops Audit",
+  "subtitle": "Every ops tool and /na_ops call is recorded before it runs; newest first, kept for 365 days.",
+  "filters": {
+    "outcome": "Outcome",
+    "source": "Source",
+    "tool": "Tool",
+    "operator": "Operator",
+    "all": "All",
+    "toolPlaceholder": "e.g. ops_find",
+    "operatorPlaceholder": "Contains match"
+  },
+  "actions": {
+    "refresh": "Refresh",
+    "showArgs": "Show arguments",
+    "hideArgs": "Hide arguments"
+  },
+  "columns": {
+    "id": "Record",
+    "time": "Time",
+    "source": "Source",
+    "tool": "Tool",
+    "outcome": "Outcome",
+    "reason": "Reason",
+    "operator": "Operator",
+    "location": "Location",
+    "summary": "Summary",
+    "errorType": "Error type",
+    "args": "Arguments"
+  },
+  "outcome": {
+    "pending": "Running",
+    "executed": "Executed",
+    "refused": "Refused",
+    "failed": "Failed"
+  },
+  "source": {
+    "agent": "Agent tool",
+    "na_ops": "/na_ops command"
+  },
+  "value": {
+    "empty": "No matching records",
+    "emptyHint": "Records appear here after an ops tool or /na_ops call.",
+    "noValue": "-"
+  }
+}

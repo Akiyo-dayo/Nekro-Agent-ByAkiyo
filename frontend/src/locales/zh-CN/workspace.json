@@ -3,7 +3,8 @@
     "active": "运行中",
     "stopped": "已停止",
     "failed": "错误",
-    "deleting": "删除中"
+    "deleting": "删除中",
+    "transitioning": "启停中"
   },
   "policy": {
     "agent": "Agent",
@@ -445,6 +446,7 @@
       "extensions": "扩展能力",
       "mcp": "MCP 服务",
       "resources": "资源挂载",
+      "servers": "服务器",
       "prompt": "协作上下文",
       "config": "配置"
     },
@@ -827,6 +829,7 @@
         "headersLabel": "HTTP 请求头",
         "cancel": "取消",
         "stdioHint": "仅支持 npx / uvx 包管理器命令（CC 沙盒已预装 Node.js 20 与 astral-sh/uv），不支持引用宿主机本地文件路径",
+        "globalCredentialHint": "填了环境变量或请求头的条目不会下发给租户工作区（那些值多半是平台方的凭据）；租户工作区的「可加入」列表里也看不到它们。",
         "stdioCommandError": "仅支持 npx、uvx 命令"
       },
       "registry": {
@@ -841,6 +844,7 @@
       "autoInjectFailed": "更新自动注入配置失败：{{message}}"
     },
     "resources": {
+      "tenantBindHint": "租户工作区不能绑定平台方资源：资源里的口令与密钥只下发给归平台方的工作区。",
       "searchPlaceholder": "搜索资源名称、备注或资源标签",
       "mountsTitle": "已挂载资源",
       "mountsHint": "拖动可调整顺序。",
@@ -934,7 +938,7 @@
         "recoverAction": "使用旧密钥恢复",
         "purgeAction": "抹除失效字段",
         "recoverTitle": "使用旧密钥恢复资源",
-        "recoverContent": "请输入旧设备创建这些资源时使用的 NEKRO_JWT_SECRET_KEY。恢复成功后，旧密文会转换为当前版本可读取的明文 JSON。",
+        "recoverContent": "请输入旧设备创建这些资源时使用的 NEKRO_JWT_SECRET_KEY。恢复成功后，旧密文会用当前的凭据密钥重新加密保存。",
         "recoverConfirm": "开始恢复",
         "purgeTitle": "抹除失效敏感字段",
         "purgeContent": "此操作会清空所有当前无法解密的敏感字段值，主机、用户名、备注等非敏感信息会保留。清空后需要重新编辑资源填写密码、令牌或私钥。",
@@ -975,6 +979,234 @@
         "unmountFailed": "卸载失败：{{message}}",
         "reorderFailed": "排序失败：{{message}}",
         "workspaceRequired": "请先进入具体工作区后再执行此操作"
+      },
+      "sshGatewayHint": "SSH 网关开启后，这类资源不再注入容器；请改用工作区的『服务器』页（平台方可在 SSH 网关页一键导入）"
+    },
+    "servers": {
+      "title": "服务器",
+      "subtitle": "CC 通过 NA 内置的 SSH 网关登录这些服务器，密码与私钥不进容器。",
+      "actions": {
+        "refresh": "刷新",
+        "create": "新建服务器",
+        "edit": "编辑",
+        "delete": "删除",
+        "reveal": "显示明文",
+        "test": "测试连接",
+        "enable": "启用",
+        "disable": "停用",
+        "loadMore": "加载更多",
+        "showInput": "查看输入",
+        "hideInput": "收起输入",
+        "openSettings": "前往系统配置"
+      },
+      "columns": {
+        "alias": "别名",
+        "owner": "归属",
+        "address": "主机:端口",
+        "username": "登录账号",
+        "status": "状态",
+        "secret": "凭据状态",
+        "hostKeys": "主机指纹",
+        "lastUsed": "最近使用",
+        "source": "来源",
+        "actions": "操作",
+        "workspace": "工作区"
+      },
+      "owner": {
+        "platform": "平台方",
+        "user": "用户 {{account}}"
+      },
+      "ownerNotWhitelisted": "凭据主人不在白名单，暂时用不了",
+      "status": {
+        "active": "可用",
+        "disabled": "已停用",
+        "suspended": "已挂起",
+        "auth_failed": "认证失败"
+      },
+      "statusReason": "原因：{{reason}}",
+      "statusReasons": {
+        "auth_failed": "上次认证失败，更新凭据后才能重新启用"
+      },
+      "lastError": "最近错误：{{message}}",
+      "secret": {
+        "ok": "正常",
+        "undecryptable": "密钥解不开，请恢复原密钥或重新填写"
+      },
+      "hostKeys": {
+        "empty": "首次连接时记下",
+        "count": "已记 {{count}} 把",
+        "entry": "公钥：{{entry}}"
+      },
+      "source": {
+        "admin": "后台",
+        "chat": "聊天",
+        "import": "导入"
+      },
+      "neverUsed": "从未使用",
+      "empty": {
+        "title": "这个工作区还没有服务器",
+        "hint": "新建一台服务器后，CC 就能用 ssh 别名连接它。"
+      },
+      "gateway": {
+        "title": "SSH 网关未就绪",
+        "off": "SSH 网关未开启，可在系统配置里打开 SSH_GATEWAY_ENABLED",
+        "state": "当前状态：{{state}}",
+        "reason": "原因：{{reason}}",
+        "settingsCategory": "CC 工作区",
+        "states": {
+          "off": "未开启",
+          "starting": "启动中",
+          "running": "运行中",
+          "unavailable": "不可用",
+          "tripped": "已熔断"
+        }
+      },
+      "s3Warning": "这个工作区还绑定了 {{count}} 个频道，那些频道里的人留下的东西会在平台方服务器的授权窗口里被 CC 读到",
+      "form": {
+        "createTitle": "新建服务器",
+        "editTitle": "编辑服务器",
+        "alias": "别名",
+        "aliasHint": "小写字母、数字与连字符；CC 用 ssh 别名连接",
+        "ownerKind": "归属",
+        "ownerPlatform": "平台方",
+        "ownerUser": "用户",
+        "ownerAccount": "凭据主人账号",
+        "ownerAccountHint": "只有这个账号本人叫醒的一轮，授权窗口才覆盖它",
+        "instance": "归属实例",
+        "instanceHint": "从工作区绑定的频道里选一个实例",
+        "adapterKey": "适配器",
+        "instanceKey": "实例标识",
+        "manualInstanceHint": "没有从工作区详情里找到可用的实例对，请手动填写适配器与实例标识",
+        "host": "主机",
+        "port": "端口",
+        "username": "登录账号",
+        "password": "密码",
+        "privateKey": "私钥",
+        "passphrase": "私钥口令短语",
+        "secretKeepHint": "保持掩码表示不改变；清空表示删除这一项；填新值表示覆盖",
+        "passwordMaskedHint": "已保存密码，当前显示为掩码",
+        "privateKeyMaskedHint": "已保存私钥，当前显示为掩码",
+        "passphraseMaskedHint": "已保存口令短语，当前显示为掩码",
+        "hostKeys": "主机指纹",
+        "hostKeysHint": "每行一把，可粘贴 known_hosts 或 ssh-keyscan 的输出；留空表示首次连接时记下",
+        "note": "备注",
+        "noteOnlyHint": "用户在聊天里登记的服务器，租户只能启用、停用、改备注或删除，不能改连接信息与凭据",
+        "cancel": "取消",
+        "create": "创建",
+        "save": "保存",
+        "required": "请填写别名、主机与登录账号",
+        "portInvalid": "端口必须是 1 到 65535 之间的整数",
+        "userOwnerRequired": "选用户归属时要填凭据主人账号与实例",
+        "secretRequired": "密码与私钥至少要填一样"
+      },
+      "reveal": {
+        "title": "查看明文",
+        "warning": "每次查看都会记审计",
+        "password": "密码",
+        "privateKey": "私钥",
+        "passphrase": "口令短语",
+        "empty": "这一项为空",
+        "copy": "复制",
+        "copied": "已复制",
+        "copyFailed": "复制失败",
+        "close": "关闭"
+      },
+      "test": {
+        "title": "测试连接",
+        "running": "正在连接…",
+        "success": "连接成功",
+        "failed": "连接失败",
+        "fingerprint": "服务器主机指纹：{{fingerprint}}",
+        "pinned": "首次连接，已记下主机指纹",
+        "reason": "原因：{{reason}}",
+        "message": "说明：{{message}}",
+        "registeredKeys": "已登记的指纹",
+        "presentedKey": "服务器这次出示的指纹",
+        "accept": "接受新指纹",
+        "acceptHint": "只在你确认服务器确实换了主机钥匙时接受",
+        "acceptSuccess": "已接受新的主机指纹",
+        "close": "关闭"
+      },
+      "delete": {
+        "title": "删除服务器",
+        "content": "确定删除 {{alias}} 吗？删除后 CC 不能再用这个别名连接。",
+        "confirm": "删除"
+      },
+      "audit": {
+        "title": "审计",
+        "subtitle": "连接、命令与凭据操作都会留痕。",
+        "loadMore": "加载更多",
+        "showInput": "查看输入",
+        "hideInput": "收起输入",
+        "empty": "还没有审计记录",
+        "columns": {
+          "time": "时间",
+          "event": "事件",
+          "decision": "放行 / 拒绝",
+          "reason": "理由",
+          "credential": "别名或凭据",
+          "task": "任务",
+          "actor": "操作者",
+          "detail": "详情",
+          "workspace": "工作区",
+          "input": "输入"
+        },
+        "decision": {
+          "allowed": "放行",
+          "denied": "拒绝"
+        },
+        "credentialFallback": "凭据 {{id}}",
+        "events": {
+          "cred_create": "新建凭据",
+          "cred_update": "修改凭据",
+          "cred_delete": "删除凭据",
+          "cred_reveal": "查看明文",
+          "cred_test": "测试连接",
+          "host_key": "主机指纹",
+          "lease": "授权窗口",
+          "connect": "连接",
+          "channel": "通道",
+          "exec": "命令",
+          "close": "关闭",
+          "suspend": "自动挂起",
+          "scrub": "原文清理"
+        },
+        "reasons": {
+          "gateway_off": "网关没开",
+          "isolation_off": "这个工作区的网络隔离没生效，不提供服务器连接",
+          "image_too_old": "CC 沙盒镜像太旧，请平台方升级",
+          "unknown_peer": "认不出来源",
+          "bad_client_key": "客户端钥匙不对",
+          "unknown_alias": "没有这个别名",
+          "no_lease": "当前任务没有使用服务器的授权",
+          "not_covered": "本任务的授权不含这台服务器",
+          "owner_changed": "授权依据变了（名单、白名单或实例状态）",
+          "workspace_not_platform": "这个工作区不再归平台方，平台方的服务器已挂起",
+          "row_inactive": "这条凭据停用了",
+          "undecryptable": "凭据解不开，请平台方或凭据主人处理",
+          "target_blocked": "这台服务器解析到了不允许的地址",
+          "host_key_mismatch": "服务器的主机钥匙和登记的不一致，已拒绝，请核对",
+          "upstream_auth_failed": "用登记的凭据登不上，这条凭据已暂停",
+          "upstream_unreachable": "连不上这台服务器",
+          "mfa_required": "服务器要求二次验证，网关不支持",
+          "limit_exceeded": "连接或通道数超过上限",
+          "channel_unsupported": "不支持 agent 转发或 X11 转发",
+          "forbidden": "没有权限"
+        }
+      },
+      "notifications": {
+        "created": "服务器已创建",
+        "updated": "服务器已保存",
+        "deleted": "服务器已删除",
+        "enabled": "服务器已启用",
+        "disabled": "服务器已停用",
+        "createFailed": "创建失败：{{message}}",
+        "updateFailed": "保存失败：{{message}}",
+        "deleteFailed": "删除失败：{{message}}",
+        "toggleFailed": "切换失败：{{message}}",
+        "testFailed": "测试失败：{{message}}",
+        "revealFailed": "查看明文失败：{{message}}",
+        "acceptFailed": "接受新指纹失败：{{message}}"
       }
     },
     "prompt": {

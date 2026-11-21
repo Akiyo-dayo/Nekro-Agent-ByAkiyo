@@ -34,6 +34,9 @@ from pydantic import BaseModel, Field
 
 from nekro_agent.core.config import ModelConfigGroup
 
+# 后台账号初始口令的最小长度；平台方和租户管理员建的账号受同一条限制。
+MIN_INITIAL_PASSWORD_LENGTH = 12
+
 
 class TenantRole(str, Enum):
     """租户体系下的角色"""
@@ -117,9 +120,118 @@ class TenantInstanceBindRequest(BaseModel):
     默认值刻意是 `None` 而不是空列表：这两者在覆盖语义下的后果天差地别——显式传 `[]`
     是「解绑全部」的有意操作，而根本没带这个字段是客户端出了问题。默认成空列表会让后者
     静默变成前者，把一次失败的请求变成一次全量解绑，因此这里由路由层拒掉 `None`。
+
+    `clear_memory_and_affection` 只作用于**这次保存里改变归属**的实例（新划入的、被收回的）；
+    原样重放不改变任何实例的归属，因此不会清掉任何数据。清的是这些实例的域行记忆、摘要、
+    提示词明细、世界书、**自成一域**的好感与收集的表情，工作区行不动（它们跟着工作区走）。
+    这是真删、不可恢复。
+
+    收集的表情（`emotion_set` 里那个实例的收集库）清空的是**行、向量与文件**，收集库套组本身
+    留着一个空壳：它跟着实例走，下次会话进来还是同一个套组 ID，配置里引用的 ID 不会失效。
+    平台方指向这些实例的套组分配**每次都取消**，不受这个开关控制——划转之后实例换了主人，
+    原来「给这个实例」的授权不该自动跟过去。
+
+    `delete_ssh_credentials` 同样只作用于改变归属的实例，默认删除：凭据是「能进别人家门」
+    的东西，误跟过去比误删代价大（与邮箱划转同一条取舍）。取消勾选才让 `user` 行跟着实例走；
+    平台方行没有实例归属，不受影响。
+
+    `delete_instance_mailboxes` 默认删除：实例自己填的邮箱是**上一任主人**的收件箱
+    （密码重置、验证码、账单都在里面），跟着实例划到新租户名下等于把那些信交出去。
+    同样只作用于改变归属的实例，并在改归属之前处理。取消勾选时账户行跟着实例走，
+    新租户在后台看得见、也能改——那是一次有意识的「整个邮箱一起转交」。
+
+    `delete_plugin_settings` 默认删除：实例级与频道级的插件启停、实例级插件配置
+    （`plugin_data/<插件>/instances/<实例>/`，API Key 之类就在这里）。同样只作用于改变归属的实例，
+    在改归属之前处理；取消勾选时这些设置按实例标识存着，自然跟着实例走。
+
+    `delete_config_overrides` 默认删除：核心配置的实例层覆盖与这个实例频道上的频道层覆盖（告警
+    Webhook、对模型组的选择、提示词与输出过滤词表等）。口径与插件设置相同。
     """
 
     instance_keys: Optional[List[str]] = Field(default=None, description="该租户的完整实例集合；显式传 [] 表示解绑全部")
+    clear_memory_and_affection: bool = Field(
+        default=False,
+        description="一并清空这些实例的记忆、世界书、好感、收集的表情与用户邮件偏好；工作区行不动，不可恢复",
+    )
+    delete_ssh_credentials: bool = Field(
+        default=True,
+        description="划转时一并删除这些实例上用户登记的服务器凭据（默认删除；取消才跟着实例走）",
+    )
+    delete_instance_mailboxes: bool = Field(
+        default=True,
+        description="划转时一并删除这些实例自己填的邮箱账户（默认删除；取消才跟着实例走）",
+    )
+    delete_plugin_settings: bool = Field(
+        default=True,
+        description="划转时一并删除这些实例的插件设置：实例级与频道级启停、实例级插件配置（默认删除；取消才跟着实例走）",
+    )
+    delete_config_overrides: bool = Field(
+        default=True,
+        description="划转时一并删除这些实例的配置覆盖：核心配置的实例层与频道层覆盖（默认删除；取消才跟着实例走）",
+    )
+
+
+class TenantInstanceTransferChange(BaseModel):
+    """划转预览里的一行：一个实例的归属变化与它会带走的记忆规模
+
+    按**行**而不是按 `instance_key` 列：同名实例可以同时存在于两个适配器下，它们的
+    归属与数据是两份。`in_group` 表示保存后会被移出实例组（回到自成一域）。
+    """
+
+    adapter_key: str = Field(..., description="适配器标识")
+    instance_key: str = Field(..., description="实例标识")
+    display_name: str = Field(default="", description="实例显示名")
+    from_tenant_id: Optional[int] = Field(default=None, description="原归属租户；收回本租户实例时为本租户")
+    from_tenant_name: str = Field(default="", description="原归属租户名；划入的实例为空")
+    to_tenant_id: Optional[int] = Field(default=None, description="新归属租户；被收回的实例为空")
+    to_tenant_name: str = Field(default="", description="新归属租户名；被收回的实例为空")
+    in_group: bool = Field(default=False, description="保存后会被移出实例组")
+    memory_paragraphs: int = Field(default=0, description="域行段落数（正常状态）")
+    memory_quarantined: int = Field(default=0, description="域行段落数（隔离中）")
+    memory_summaries: int = Field(default=0, description="摘要份数，按（频道, 人设）计")
+    memory_prompt_rounds: int = Field(default=0, description="提示词明细轮数")
+    worldbook_books: int = Field(default=0, description="世界书本数，按这个实例对归属计")
+    worldbook_entries: int = Field(default=0, description="这些世界书里的条目数")
+    memory_affection_rows: int = Field(default=0, description="自成一域的好感行数")
+    memory_affection_events: int = Field(default=0, description="自成一域的好感事件数")
+    collected_emotions: int = Field(
+        default=0,
+        description="这个实例的收集库里有几条表情（保存时勾了清空就删这些；平台方给它的套组分配另算，每次都取消）",
+    )
+    channel_quota_tenant_settings: int = Field(
+        default=0,
+        description="该实例上带租户额度设置的策略行数（实例层 + 频道层，四个租户字段任一非空）；保存时这些设置会被清空",
+    )
+    ssh_credentials: int = Field(
+        default=0,
+        description="该实例对上用户登记的 SSH 服务器凭据行数；保存时默认删除，取消勾选才跟着实例走",
+    )
+    email_accounts: int = Field(
+        default=0,
+        description="该实例自己填的邮箱账户数；保存时默认删除，取消勾选才跟着实例走",
+    )
+    email_user_prefs: int = Field(
+        default=0,
+        description="该实例上的用户邮件偏好行数；勾了清空记忆时一并清空，否则跟着实例走",
+    )
+    plugin_settings: int = Field(
+        default=0,
+        description="该实例名下有设置的插件个数（实例级启停、频道级启停、实例级配置的并集）；保存时默认删除，取消勾选才跟着实例走",
+    )
+    config_overrides: int = Field(
+        default=0,
+        description="该实例名下有生效覆盖的配置文件个数（实例层 + 它的频道）；保存时默认删除，取消勾选才跟着实例走",
+    )
+
+
+class TenantInstanceTransferPreview(BaseModel):
+    """一次租户实例划转会改变哪些实例、各自带走多少记忆
+
+    只列**改变归属**的实例；原样重放（集合没变）时 `changes` 为空。预览不写任何东西，
+    `clear_memory_and_affection` 的效果由保存时的 PUT 执行。
+    """
+
+    changes: List[TenantInstanceTransferChange] = Field(default_factory=list)
 
 
 class ModelGroupInfo(BaseModel):

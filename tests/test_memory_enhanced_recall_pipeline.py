@@ -168,7 +168,7 @@ def _install_memory_fakes(
     两者都由 asyncio 就绪队列的 FIFO 语义唯一确定，不依赖任何真实耗时。
     """
 
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(text: str, **_kwargs: object) -> list[float]:
         events.append(f"embed:start:{text}")
         await asyncio.sleep(0)
         events.append(f"embed:end:{text}")
@@ -628,6 +628,8 @@ class TestInjectionUsesBatchEntryPoint:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             captured.append(list(requests))
             return [[] for _ in requests]
@@ -676,6 +678,8 @@ class TestInjectionUsesBatchEntryPoint:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             calls.append("batch")
             return [[] for _ in requests]
@@ -862,6 +866,8 @@ class TestInjectionCallSiteContract:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             captured["scope"] = scope
             captured["requests"] = list(requests)
@@ -917,6 +923,8 @@ class TestInjectionCallSiteContract:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             captured["scope"] = scope
             return [[] for _ in requests]
@@ -955,6 +963,8 @@ class TestInjectionCallSiteContract:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             captured["scope"] = scope
             return [[] for _ in requests]
@@ -995,6 +1005,8 @@ class TestInjectionCallSiteContract:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             return [[boosted], [damped]]
 

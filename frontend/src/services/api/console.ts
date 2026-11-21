@@ -175,6 +175,17 @@ export interface InstanceDeleteRequest {
   confirm_instance_key?: string
 }
 
+/** 彻底删除前的影响面（#79 新增的那几样；会话、消息、记忆的级联另有总的说明） */
+export interface InstancePurgePreview {
+  email_accounts: number
+  email_user_prefs: number
+  collected_emotions: number
+  /** 本实例名下有设置的插件个数（实例级启停、频道级启停、实例级配置的并集） */
+  plugin_settings?: number
+  /** 本实例名下有生效覆盖的配置文件个数（核心配置的实例层 + 它的频道） */
+  config_overrides?: number
+}
+
 /**
  * 认领实例（协议端自行连入但尚未在后台登记）
  *
@@ -191,6 +202,12 @@ export interface InstanceClaimRequest {
 export interface InstanceAdoptRequest {
   source_instance_key: string
   confirm_source_instance_key: string
+  /** 两端归属不同时一并删除源实例上用户登记的服务器凭据；后端默认 true */
+  delete_ssh_credentials?: boolean
+  /** 两端归属不同时一并删除源实例的插件设置；后端默认 true */
+  delete_plugin_settings?: boolean
+  /** 两端归属不同时一并删除源实例的配置覆盖；后端默认 true */
+  delete_config_overrides?: boolean
 }
 
 /**
@@ -294,12 +311,26 @@ export interface InstanceMigrationPreview {
   residues: InstanceMigrationResidueItem[]
   /** 执行前需要知道的风险提示 */
   warnings: string[]
+  /** 源实例与目标实例归属不同（租户与租户、租户与平台方） */
+  cross_tenant?: boolean
+  /** 源实例上用户登记的服务器凭据行数；跨租户时默认删除，取消勾选才跟到目标实例 */
+  ssh_credentials?: number
+  /** 源实例名下有设置的插件个数；跨租户时默认删除，取消勾选才跟到目标实例 */
+  plugin_settings?: number
+  /** 源实例名下有生效覆盖的配置文件个数；跨租户时默认删除，取消勾选才跟到目标实例 */
+  config_overrides?: number
 }
 
 /** 执行历史归属迁移；`confirm_source_instance_key` 必须回填源实例标识 */
 export interface InstanceMigrationRequest {
   source_instance_key: string
   confirm_source_instance_key: string
+  /** 只在跨租户时生效；默认删除，传 false 才让凭据跟到目标实例 */
+  delete_ssh_credentials?: boolean
+  /** 只在跨租户时生效；默认删除，传 false 才让插件设置跟到目标实例 */
+  delete_plugin_settings?: boolean
+  /** 只在跨租户时生效；默认删除，传 false 才让配置覆盖跟到目标实例 */
+  delete_config_overrides?: boolean
 }
 
 /** 历史归属迁移的执行结果 */
@@ -504,6 +535,12 @@ export const consoleApi = {
   /** 更新实例可变属性 */
   async updateInstance(instanceKey: string, data: InstanceUpdateRequest): Promise<InstanceInfo> {
     const response = await axios.patch<InstanceInfo>(instancePath(instanceKey), data)
+    return response.data
+  },
+
+  /** 彻底删除前的影响面：本实例自己的邮箱、用户邮件偏好与收集库表情（平台方专属） */
+  async getPurgePreview(instanceKey: string): Promise<InstancePurgePreview> {
+    const response = await axios.get<InstancePurgePreview>(`${instancePath(instanceKey)}/purge-preview`)
     return response.data
   },
 

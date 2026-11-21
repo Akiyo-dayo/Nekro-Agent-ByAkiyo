@@ -67,6 +67,16 @@ CC 仍然能读到中继令牌（它就在 `settings.json` 与子进程环境里
 - `NEKRO_CC_CREDENTIAL_MODE`：`relay`（默认）或 `direct`（改造前的行为，真 Key 进容器）。
   部署确实无法让工作区容器回连 NA 时才用 `direct`。
 - `NEKRO_CC_RELAY_BASE_URL`：容器视角下的中继地址，留空则自动推导（见 `resolve_relay_base_url`）。
+
+## 多租户部署下 `direct` 只对能拿平台方凭据的工作区生效
+
+`direct` 的语义是「把平台方真实 `auth_token` 写进容器」，而多租户部署里有一部分工作区是
+租户的（或曾经归过租户）——对它们下发真 Key 等于把平台方凭据交给租户会话。所以
+`direct` 分支先过 `credential_policy.platform_credentials_allowed()`：判据不过的工作区拿到
+空凭据并记 `cc_direct_withheld`，由调用方在 CC 调用前给出清楚的报错；判据通过时照旧写
+真 Key 并记 `cc_platform_secret_delivered`。`relay` 模式不受影响（容器里只有本工作区的中继
+令牌）。判据本体与其余三条平台方凭据（工作区资源、MCP 凭据、`extra_env`）见
+`services/workspace/credential_policy.py`。
 """
 
 from __future__ import annotations
@@ -240,8 +250,38 @@ async def resolve_workspace_credential(
         auth_token=cc_preset.auth_token if cc_preset else "",
         relayed=False,
     )
-    if credential_mode() != "relay":
+
+    async def _direct_credential() -> WorkspaceCredential:
+        """`direct` 档下该给这个工作区的凭据
+
+        判据不过时不发真 Key（空凭据 + `cc_direct_withheld` 标记），由 CC 调用前的
+        `prepare_cc_dispatch` 给出清楚的报错——多租户部署里租户的工作区正是这一档。
+        """
+        from nekro_agent.services.workspace.credential_policy import (
+            METADATA_DIRECT_WITHHELD_KEY,
+            platform_credentials_allowed,
+        )
+
+        if not await platform_credentials_allowed(workspace):
+            metadata = dict(workspace.metadata or {})
+            if not metadata.get(METADATA_DIRECT_WITHHELD_KEY):
+                metadata[METADATA_DIRECT_WITHHELD_KEY] = True
+                workspace.metadata = metadata
+                await workspace.save(update_fields=["metadata", "update_time"])
+            return WorkspaceCredential(base_url="", auth_token="", relayed=False)
+
+        metadata = dict(workspace.metadata or {})
+        if metadata.pop(METADATA_DIRECT_WITHHELD_KEY, None) is not None:
+            workspace.metadata = metadata
+            await workspace.save(update_fields=["metadata", "update_time"])
+        if direct.auth_token:
+            from nekro_agent.services.workspace.credential_policy import mark_platform_secret_delivered
+
+            await mark_platform_secret_delivered(workspace)
         return direct
+
+    if credential_mode() != "relay":
+        return await _direct_credential()
 
     metadata = dict(workspace.metadata or {})
     token = metadata.get(METADATA_TOKEN_KEY)
@@ -258,24 +298,40 @@ async def resolve_workspace_credential(
         # 隔离生效的部署里发往宿主的包被守卫一律挡掉，等于把一个正在跑的容器就地写死，
         # 而且这个地址会落进 metadata、连重启都修不回来。
         # 保持它改造前的形态，等下一次创建/重启（那时才拿得到真实地址）再切到中继。
+        #
+        # 这条路径同样会把真 Key 写出去，所以判据一样要过：不能拿凭据的工作区拿空值，
+        # 那次热更新只能等容器重建（重建时走得通中继，不再需要这个回落）。
+        from nekro_agent.services.workspace.credential_policy import (
+            mark_platform_secret_delivered,
+            platform_credentials_allowed,
+        )
+
+        if not await platform_credentials_allowed(workspace):
+            logger.warning(
+                f"工作区 {workspace.id} 不能拿平台方凭据，热更新不写直连凭据："
+                "这个旧容器要重建才能用中继"
+            )
+            return WorkspaceCredential(base_url="", auth_token="", relayed=False)
         logger.debug(f"工作区 {workspace.id} 尚无中继落点，热更新沿用改造前的直连凭据")
+        if direct.auth_token:
+            await mark_platform_secret_delivered(workspace)
         return direct
 
-    changed = False
+    updates: Dict[str, Any] = {}
     if rotate or not isinstance(token, str) or parse_relay_token(token) is None:
         token = build_relay_token(workspace.id)
-        metadata[METADATA_TOKEN_KEY] = token
-        changed = True
+        updates[METADATA_TOKEN_KEY] = token
     if controller_address or host_address or not isinstance(base_url, str) or not base_url:
         resolved = resolve_relay_base_url(controller_address, host_address)
         if resolved != base_url:
             base_url = resolved
-            metadata[METADATA_BASE_URL_KEY] = base_url
-            changed = True
+            updates[METADATA_BASE_URL_KEY] = base_url
 
-    if changed:
-        workspace.metadata = metadata
-        await workspace.save(update_fields=["metadata", "update_time"])
+    if updates:
+        # 按键写：令牌是受保护的键（`GUARDED_METADATA_KEYS`），别处整份写回 metadata 改不回旧值
+        from nekro_agent.models.db_workspace import patch_workspace_metadata
+
+        await patch_workspace_metadata(workspace, set_keys=updates)
 
     return WorkspaceCredential(base_url=str(base_url), auth_token=str(token), relayed=True)
 
@@ -303,22 +359,53 @@ def build_settings_payload(credential: WorkspaceCredential, model: str, timeout_
 def build_claude_settings_payload(
     cc_preset: "CCModelPresetItem",
     credential: WorkspaceCredential,
+    *,
+    allow_platform_secrets: bool,
 ) -> Dict[str, Any]:
-    """生成 `.claude/settings.json` 内容，并把其中的凭据换成中继的那一对
+    """生成 CC 用户级设置（`~/.claude/settings.json`）的内容，并把其中的凭据换成中继的那一对
 
-    这份文件当前其实是死的：`claude` CLI 的 cwd 是 `/workspace/default`，
-    项目级设置只会从那里的 `.claude/` 读，而这份写在 `/workspace/.claude/`。
-    但它照样是一个躺在容器可读目录里的凭据副本，所以一并换掉。
+    preset 档位的 `model`、`extra_env`、手动档的小模型与别名映射只在这份文件里——cc-sandbox
+    自己的 `settings.json` 只翻译地址、令牌、手动档模型名、超时四项。早先它写在
+    `/workspace/.claude/`，而 `claude` CLI 的 cwd 是 `/workspace/default`，项目级设置只从
+    那里的 `.claude/` 读，所以这些设置从来没生效过；现在写成用户级，CC 每次启动都读。
 
-    **未覆盖**：预设的 `extra_env` 原样透传。运维若把别的凭据塞进 `extra_env`，
-    那一份仍然会进容器——它不在本模块的判据范围内。
+    **`extra_env` 里像凭据的项**（键名含 `TOKEN` / `KEY` / `SECRET` / `PASSWORD`，
+    判据见 `core.cc_model_presets.is_secret_env_key`）：`allow_platform_secrets=False` 时
+    整项去掉——它们是平台方塞进预设的凭据，与工作区资源、MCP 凭据同一条口径。
+    其余项（`model` 档位、`CLAUDE_CODE_*` 这类开关）照写，去掉不影响 CC 的功能。
+    `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 两项始终按 `credential` 覆盖写入：
+    它们是这份文件的主要用途，取值由 `resolve_workspace_credential` 按同一条判据算好。
     """
+    from nekro_agent.core.cc_model_presets import is_secret_env_key
+
     payload = dict(cc_preset.to_config_json())
     env = dict(payload.get("env") or {})
+    if not allow_platform_secrets:
+        env = {key: value for key, value in env.items() if not is_secret_env_key(key)}
     env["ANTHROPIC_BASE_URL"] = credential.base_url
     env["ANTHROPIC_AUTH_TOKEN"] = credential.auth_token
     payload["env"] = env
     return payload
+
+
+# CC 用户级设置里始终按 `credential` 覆盖写入的两项：真 Key 由
+# `resolve_workspace_credential` 在交出去的那一刻自己记「下发过」，不算 `extra_env` 带来的凭据
+CREDENTIAL_OVERRIDE_ENV_KEYS = frozenset({"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"})
+
+
+def claude_settings_carries_platform_secret(payload: Dict[str, Any]) -> bool:
+    """这份 CC 用户级设置里有没有写出 `extra_env` 带来的平台方凭据
+
+    只看真正要落盘的那份 payload：键名像凭据（`is_secret_env_key`）且值非空的项才算，
+    `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 两项除外（见上）。调用方据此记
+    「下发过平台方凭据」，归属变化时撤销那一步才知道要重写这份文件、停掉容器。
+    """
+    from nekro_agent.core.cc_model_presets import is_secret_env_key
+
+    env = payload.get("env") or {}
+    return any(
+        is_secret_env_key(key) and bool(value) for key, value in env.items() if key not in CREDENTIAL_OVERRIDE_ENV_KEYS
+    )
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,8 @@ import {
   Checkbox,
   Chip,
   CircularProgress,
+  FormControlLabel,
+  Stack,
   SxProps,
   Table,
   TableBody,
@@ -28,6 +30,7 @@ import {
   TableRow,
   Theme,
   Typography,
+  useMediaQuery,
   useTheme,
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -35,6 +38,7 @@ import { useTranslation } from 'react-i18next'
 import SaveRoundedIcon from '@mui/icons-material/SaveRounded'
 import UndoRoundedIcon from '@mui/icons-material/UndoRounded'
 import ActionButton from '../../../components/common/ActionButton'
+import NekroDialog from '../../../components/common/NekroDialog'
 import SearchField from '../../../components/common/SearchField'
 import SegmentedControl from '../../../components/common/SegmentedControl'
 import { SimpleTooltip } from '../../../components/common/ThemedTooltip'
@@ -45,6 +49,7 @@ import {
   TENANT_QUERY_KEYS,
   isTenantEndpointUnavailable,
   tenantApi,
+  type TenantInstanceTransferChange,
 } from '../../../services/api/tenant'
 
 /** 归属筛选。平台方划归实例时问的就是这四个问题之一 */
@@ -62,6 +67,7 @@ const isOwnedByOtherTenant = (instance: InstanceInfo, tenantId: number): boolean
 
 export default function TenantInstanceBinder({ tenantId }: { tenantId: number }) {
   const theme = useTheme()
+  const isMobile = useMediaQuery(theme.breakpoints.down('sm'))
   const notification = useNotification()
   const queryClient = useQueryClient()
   const { t } = useTranslation('tenant')
@@ -71,6 +77,27 @@ export default function TenantInstanceBinder({ tenantId }: { tenantId: number })
   const [draftSelection, setDraftSelection] = useState<string[] | null>(null)
   const [search, setSearch] = useState('')
   const [ownershipFilter, setOwnershipFilter] = useState<OwnershipFilter>('all')
+  /** 预览回来的改变归属的实例；非 null 时确认框打开 */
+  const [transferChanges, setTransferChanges] = useState<
+    TenantInstanceTransferChange[] | null
+  >(null)
+  const [clearMemory, setClearMemory] = useState(false)
+  /** 服务器凭据默认随划转删除：误跟过去比误删代价大 */
+  const [deleteSshCredentials, setDeleteSshCredentials] = useState(true)
+  const [deleteInstanceMailboxes, setDeleteInstanceMailboxes] = useState(true)
+  /** 插件设置（实例级与频道级启停、实例级配置）同样默认随划转删除 */
+  const [deletePluginSettings, setDeletePluginSettings] = useState(true)
+  /** 核心配置的实例层 / 频道层覆盖：口径与插件设置相同 */
+  const [deleteConfigOverrides, setDeleteConfigOverrides] = useState(true)
+
+  /** 确认框关闭或重开时，几个勾选框都回到默认（删除） */
+  const resetTransferChoices = () => {
+    setClearMemory(false)
+    setDeleteSshCredentials(true)
+    setDeleteInstanceMailboxes(true)
+    setDeletePluginSettings(true)
+    setDeleteConfigOverrides(true)
+  }
 
   const instancesQuery = useQuery({
     queryKey: TENANT_QUERY_KEYS.instances,
@@ -151,16 +178,83 @@ export default function TenantInstanceBinder({ tenantId }: { tenantId: number })
     selectableVisible.length > 0 && selectedVisibleCount === selectableVisible.length
 
   const bindMutation = useMutation({
-    mutationFn: () => tenantApi.bindInstances(tenantId, selection),
-    onSuccess: () => {
-      notification.success(t('instances.saveSuccess'))
+    mutationFn: (payload: {
+      clearMemory: boolean
+      deleteSshCredentials: boolean
+      deleteInstanceMailboxes: boolean
+      deletePluginSettings: boolean
+      deleteConfigOverrides: boolean
+    }) =>
+      tenantApi.bindInstances(
+        tenantId,
+        selection,
+        payload.clearMemory,
+        payload.deleteSshCredentials,
+        payload.deleteInstanceMailboxes,
+        payload.deletePluginSettings,
+        payload.deleteConfigOverrides
+      ),
+    onSuccess: (_data, payload) => {
+      notification.success(
+        payload.clearMemory
+          ? t('instances.transfer.clearedSuccess', {
+              count: transferChanges?.length ?? 0,
+            })
+          : t('instances.saveSuccess')
+      )
       setDraftSelection(null)
+      setTransferChanges(null)
+      resetTransferChoices()
       void queryClient.invalidateQueries({ queryKey: TENANT_QUERY_KEYS.instances })
       void queryClient.invalidateQueries({ queryKey: TENANT_QUERY_KEYS.tenant(tenantId) })
       void queryClient.invalidateQueries({ queryKey: TENANT_QUERY_KEYS.tenants })
     },
     onError: (error: Error) => notification.error(error.message),
   })
+
+  const previewMutation = useMutation({
+    mutationFn: () => tenantApi.previewInstanceBinding(tenantId, selection),
+    onSuccess: result => {
+      // 集合没变就是原样重放：直接保存，不删任何东西
+      if (result.changes.length === 0) {
+        bindMutation.mutate({
+          clearMemory: false,
+          deleteSshCredentials: true,
+          deleteInstanceMailboxes: true,
+          deletePluginSettings: true,
+          deleteConfigOverrides: true,
+        })
+        return
+      }
+      resetTransferChoices()
+      setTransferChanges(result.changes)
+    },
+    // 预览失败就不打开确认框、也不保存：没看清影响面之前不动数据
+    onError: (error: Error) => notification.error(error.message),
+  })
+
+  const closeTransferDialog = () => {
+    if (bindMutation.isPending) return
+    setTransferChanges(null)
+    resetTransferChoices()
+  }
+
+  /** 只有确实有凭据行时才需要问这一句；都为 0 时请求体仍按默认删除发送 */
+  const hasSshCredentials = (transferChanges ?? []).some(
+    change => change.ssh_credentials > 0
+  )
+  /** 同上：确实有实例自有邮箱时才问「一并删除」；都为 0 时请求体仍按默认删除发送 */
+  const hasInstanceMailboxes = (transferChanges ?? []).some(
+    change => (change.email_accounts ?? 0) > 0
+  )
+  /** 同上：确实有插件设置时才问；都为 0 时请求体仍按默认删除发送 */
+  const hasPluginSettings = (transferChanges ?? []).some(
+    change => (change.plugin_settings ?? 0) > 0
+  )
+  /** 同上：确实有配置覆盖时才问 */
+  const hasConfigOverrides = (transferChanges ?? []).some(
+    change => (change.config_overrides ?? 0) > 0
+  )
 
   const toggleInstance = (instanceKey: string) => {
     const next = new Set(selection)
@@ -238,7 +332,9 @@ export default function TenantInstanceBinder({ tenantId }: { tenantId: number })
           tone="ghost"
           size="small"
           startIcon={<UndoRoundedIcon />}
-          disabled={!hasPendingChanges || bindMutation.isPending}
+          disabled={
+            !hasPendingChanges || bindMutation.isPending || previewMutation.isPending
+          }
           onClick={() => setDraftSelection(null)}
         >
           {t('actions.resetSelection')}
@@ -246,9 +342,17 @@ export default function TenantInstanceBinder({ tenantId }: { tenantId: number })
         <ActionButton
           tone="primary"
           size="small"
-          startIcon={<SaveRoundedIcon />}
-          disabled={!hasPendingChanges || bindMutation.isPending}
-          onClick={() => bindMutation.mutate()}
+          startIcon={
+            previewMutation.isPending || bindMutation.isPending ? (
+              <CircularProgress size={16} />
+            ) : (
+              <SaveRoundedIcon />
+            )
+          }
+          disabled={
+            !hasPendingChanges || bindMutation.isPending || previewMutation.isPending
+          }
+          onClick={() => previewMutation.mutate()}
         >
           {t('actions.bindInstances')}
         </ActionButton>
@@ -459,6 +563,360 @@ export default function TenantInstanceBinder({ tenantId }: { tenantId: number })
           )}
         </Box>
       </Box>
+
+      <NekroDialog
+        open={transferChanges !== null}
+        onClose={closeTransferDialog}
+        title={t('instances.transfer.title')}
+        maxWidth="md"
+        actions={
+          <>
+            <ActionButton
+              tone="ghost"
+              onClick={closeTransferDialog}
+              disabled={bindMutation.isPending}
+            >
+              {t('instances.transfer.cancel')}
+            </ActionButton>
+            <ActionButton
+              tone={clearMemory ? 'danger' : 'primary'}
+              disabled={bindMutation.isPending}
+              onClick={() =>
+                bindMutation.mutate({
+                  clearMemory,
+                  deleteSshCredentials,
+                  deleteInstanceMailboxes,
+                  deletePluginSettings,
+                  deleteConfigOverrides,
+                })
+              }
+            >
+              {bindMutation.isPending ? (
+                <CircularProgress size={18} />
+              ) : clearMemory ? (
+                t('instances.transfer.saveAndClear')
+              ) : (
+                t('instances.transfer.save')
+              )}
+            </ActionButton>
+          </>
+        }
+      >
+        <Stack spacing={2}>
+          <Typography variant="body2">
+            {t('instances.transfer.description')}
+          </Typography>
+
+          <Box sx={{ overflowX: 'auto', width: '100%' }}>
+            <Table size="small" sx={{ minWidth: isMobile ? 760 : 560 }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.instance')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.ownership')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.memory')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.summaries')}
+                  </TableCell>
+                  {!isMobile && (
+                    <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                      {t('instances.transfer.columns.worldbook')}
+                    </TableCell>
+                  )}
+                  {!isMobile && (
+                    <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                      {t('instances.transfer.columns.promptRounds')}
+                    </TableCell>
+                  )}
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.sshCredentials')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.mailAndEmotion')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.pluginSettings')}
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                    {t('instances.transfer.columns.affection')}
+                  </TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {(transferChanges ?? []).map(change => (
+                  <TableRow key={`${change.adapter_key}:${change.instance_key}`}>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2" fontWeight={600}>
+                        {change.display_name || change.instance_key}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ display: 'block' }}
+                      >
+                        {change.adapter_key} · {change.instance_key}
+                      </Typography>
+                      {change.in_group && (
+                        <Chip
+                          size="small"
+                          label={t('instances.transfer.inGroup')}
+                          sx={CHIP_VARIANTS.getCustomColorChip(
+                            theme.palette.warning.main,
+                            true
+                          )}
+                        />
+                      )}
+                      {/* 旧租户在这个实例上设的额度与暂停提示保存即清除，与下面那个
+                          「一并清空记忆」的勾选框无关，所以提示写在这一行自己身上 */}
+                      {change.channel_quota_tenant_settings > 0 && (
+                        <Typography
+                          variant="caption"
+                          color="warning.main"
+                          sx={{ display: 'block', mt: 0.5 }}
+                        >
+                          {t('instances.transfer.channelQuotaCleared', {
+                            count: change.channel_quota_tenant_settings,
+                          })}
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2" sx={{ whiteSpace: 'nowrap' }}>
+                        {change.from_tenant_name || t('instances.unassigned')} →{' '}
+                        {change.to_tenant_name || t('instances.unassigned')}
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {t('instances.transfer.memoryCount', {
+                          count: change.memory_paragraphs,
+                        })}
+                      </Typography>
+                      {change.memory_quarantined > 0 && (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ display: 'block' }}
+                        >
+                          {t('instances.transfer.memoryQuarantined', {
+                            count: change.memory_quarantined,
+                          })}
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {t('instances.transfer.summaryCount', {
+                          count: change.memory_summaries,
+                        })}
+                      </Typography>
+                    </TableCell>
+                    {!isMobile && (
+                      <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                        <Typography variant="body2">
+                          {change.worldbook_books === 0 &&
+                          change.worldbook_entries === 0
+                            ? '—'
+                            : t('instances.transfer.worldbookLine', {
+                                books: change.worldbook_books,
+                                entries: change.worldbook_entries,
+                              })}
+                        </Typography>
+                      </TableCell>
+                    )}
+                    {!isMobile && (
+                      <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                        <Typography variant="body2">
+                          {t('instances.transfer.promptRoundCount', {
+                            count: change.memory_prompt_rounds,
+                          })}
+                        </Typography>
+                      </TableCell>
+                    )}
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {change.ssh_credentials === 0
+                          ? '—'
+                          : t('instances.transfer.sshCredentialCount', {
+                              count: change.ssh_credentials,
+                            })}
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {t('instances.transfer.mailAndEmotionLine', {
+                          mailboxes: change.email_accounts ?? 0,
+                          prefs: change.email_user_prefs ?? 0,
+                          emotions: change.collected_emotions ?? 0,
+                        })}
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {(change.plugin_settings ?? 0) === 0
+                          ? '—'
+                          : t('instances.transfer.pluginSettingCount', {
+                              count: change.plugin_settings ?? 0,
+                            })}
+                      </Typography>
+                      {(change.config_overrides ?? 0) > 0 && (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ display: 'block' }}
+                        >
+                          {t('instances.transfer.configOverrideCount', {
+                            count: change.config_overrides ?? 0,
+                          })}
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {t('instances.transfer.affectionLine', {
+                          rows: change.memory_affection_rows,
+                          events: change.memory_affection_events,
+                        })}
+                      </Typography>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Box>
+
+          {hasSshCredentials && (
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={deleteSshCredentials}
+                    disabled={bindMutation.isPending}
+                    onChange={event => setDeleteSshCredentials(event.target.checked)}
+                  />
+                }
+                label={
+                  <Typography variant="body2">
+                    {t('instances.transfer.deleteSshCredentialsLabel')}
+                  </Typography>
+                }
+              />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', ml: 4 }}
+              >
+                {t('instances.transfer.deleteSshCredentialsHint')}
+              </Typography>
+            </Box>
+          )}
+
+          {hasInstanceMailboxes && (
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={deleteInstanceMailboxes}
+                    disabled={bindMutation.isPending}
+                    onChange={event => setDeleteInstanceMailboxes(event.target.checked)}
+                  />
+                }
+                label={
+                  <Typography variant="body2">
+                    {t('instances.transfer.deleteInstanceMailboxesLabel')}
+                  </Typography>
+                }
+              />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', ml: 4 }}
+              >
+                {t('instances.transfer.deleteInstanceMailboxesHint')}
+              </Typography>
+            </Box>
+          )}
+
+          {hasPluginSettings && (
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={deletePluginSettings}
+                    disabled={bindMutation.isPending}
+                    onChange={event => setDeletePluginSettings(event.target.checked)}
+                  />
+                }
+                label={
+                  <Typography variant="body2">
+                    {t('instances.transfer.deletePluginSettingsLabel')}
+                  </Typography>
+                }
+              />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', ml: 4 }}
+              >
+                {t('instances.transfer.deletePluginSettingsHint')}
+              </Typography>
+            </Box>
+          )}
+
+          {hasConfigOverrides && (
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={deleteConfigOverrides}
+                    disabled={bindMutation.isPending}
+                    onChange={event => setDeleteConfigOverrides(event.target.checked)}
+                  />
+                }
+                label={
+                  <Typography variant="body2">
+                    {t('instances.transfer.deleteConfigOverridesLabel')}
+                  </Typography>
+                }
+              />
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                sx={{ display: 'block', ml: 4 }}
+              >
+                {t('instances.transfer.deleteConfigOverridesHint')}
+              </Typography>
+            </Box>
+          )}
+
+          <Box>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={clearMemory}
+                  disabled={bindMutation.isPending}
+                  onChange={event => setClearMemory(event.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="body2">
+                  {t('instances.transfer.clearLabel')}
+                </Typography>
+              }
+            />
+            {clearMemory && (
+              <Alert severity="warning" sx={{ mt: 1 }}>
+                {t('instances.transfer.clearWarning')}
+              </Alert>
+            )}
+          </Box>
+        </Stack>
+      </NekroDialog>
     </Box>
   )
 }

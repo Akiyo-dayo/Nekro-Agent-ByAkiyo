@@ -75,6 +75,8 @@ class TestPlatformSegmentSequence:
     """文字与图片必须落进同一个发送请求，并保持模型给出的顺序"""
 
     async def _preprocess(self, segments: List[AgentMessageSegment], monkeypatch, tmp_path: Path):
+        # 宿主侧读文件只认共享目录与上传目录：替身把沙盒路径映射到 tmp_path，就把它当作上传目录
+        monkeypatch.setattr("nekro_agent.core.os_env.USER_UPLOAD_DIR", str(tmp_path))
         monkeypatch.setattr(
             "nekro_agent.services.chat.universal_chat_service.convert_to_host_path",
             lambda sandbox_path, chat_key, container_key=None: tmp_path / Path(sandbox_path).name,
@@ -214,6 +216,8 @@ class TestResolveMixedSegments:
     def resolve(self, monkeypatch, tmp_path: Path):
         import plugins.builtin.basic as basic
 
+        # 宿主侧读文件只认共享目录与上传目录：替身把沙盒路径映射到 tmp_path，就把它当作上传目录
+        monkeypatch.setattr("nekro_agent.core.os_env.USER_UPLOAD_DIR", str(tmp_path))
         monkeypatch.setattr(
             basic,
             "convert_to_host_path",

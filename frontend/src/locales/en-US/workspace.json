@@ -3,7 +3,8 @@
     "active": "Running",
     "stopped": "Stopped",
     "failed": "Error",
-    "deleting": "Deleting"
+    "deleting": "Deleting",
+    "transitioning": "Starting/stopping"
   },
   "policy": {
     "agent": "Agent",
@@ -445,6 +446,7 @@
       "extensions": "Extensions",
       "mcp": "MCP Services",
       "resources": "Resource Mounts",
+      "servers": "Servers",
       "prompt": "Collab Context",
       "config": "Config"
     },
@@ -827,6 +829,7 @@
         "headersLabel": "HTTP Headers",
         "cancel": "Cancel",
         "stdioHint": "Only npx / uvx package manager commands are supported (CC sandbox ships Node.js 20 and astral-sh/uv). Local file paths on the host are not supported.",
+        "globalCredentialHint": "Entries with environment variables or headers are not delivered to tenant workspaces (those values are usually the platform's credentials), and tenant workspaces do not see them in their \"can add\" list.",
         "stdioCommandError": "Only npx and uvx commands are supported"
       },
       "registry": {
@@ -841,6 +844,7 @@
       "autoInjectFailed": "Failed to update auto-inject: {{message}}"
     },
     "resources": {
+      "tenantBindHint": "Tenant workspaces cannot bind platform resources: passwords and keys in resources are delivered only to workspaces that belong to the platform.",
       "searchPlaceholder": "Search by name, note, or resource tag",
       "mountsTitle": "Mounted Resources",
       "mountsHint": "Drag to reorder.",
@@ -934,7 +938,7 @@
         "recoverAction": "Recover with old key",
         "purgeAction": "Clear invalid fields",
         "recoverTitle": "Recover Resources with Old Key",
-        "recoverContent": "Enter the NEKRO_JWT_SECRET_KEY used on the old device when these resources were created. After recovery, legacy ciphertext will be converted to plaintext JSON readable by the current version.",
+        "recoverContent": "Enter the NEKRO_JWT_SECRET_KEY used on the old device when these resources were created. After recovery, legacy ciphertext will be re-encrypted with the current credential key.",
         "recoverConfirm": "Recover",
         "purgeTitle": "Clear Invalid Sensitive Fields",
         "purgeContent": "This clears all currently unreadable sensitive field values. Non-sensitive data such as hosts, usernames, and notes will be kept. You will need to edit the resources again to fill passwords, tokens, or private keys.",
@@ -975,6 +979,234 @@
         "unmountFailed": "Unmount failed: {{message}}",
         "reorderFailed": "Reorder failed: {{message}}",
         "workspaceRequired": "Open a workspace before performing this action"
+      },
+      "sshGatewayHint": "Once the SSH gateway is on, resources of this kind are no longer injected into the container. Use the workspace Servers tab instead; platform owners can also import them from the SSH Gateway page."
+    },
+    "servers": {
+      "title": "Servers",
+      "subtitle": "CC reaches these servers through NA's built-in SSH gateway. Passwords and private keys never enter the container.",
+      "actions": {
+        "refresh": "Refresh",
+        "create": "New server",
+        "edit": "Edit",
+        "delete": "Delete",
+        "reveal": "Reveal secret",
+        "test": "Test connection",
+        "enable": "Enable",
+        "disable": "Disable",
+        "loadMore": "Load more",
+        "showInput": "Show input",
+        "hideInput": "Hide input",
+        "openSettings": "Open system settings"
+      },
+      "columns": {
+        "alias": "Alias",
+        "owner": "Owner",
+        "address": "Host:port",
+        "username": "Login",
+        "status": "Status",
+        "secret": "Secret state",
+        "hostKeys": "Host fingerprint",
+        "lastUsed": "Last used",
+        "source": "Source",
+        "actions": "Actions",
+        "workspace": "Workspace"
+      },
+      "owner": {
+        "platform": "Platform",
+        "user": "User {{account}}"
+      },
+      "ownerNotWhitelisted": "The credential owner is not on the allowlist, so this cannot be used yet",
+      "status": {
+        "active": "Active",
+        "disabled": "Disabled",
+        "suspended": "Suspended",
+        "auth_failed": "Auth failed"
+      },
+      "statusReason": "Reason: {{reason}}",
+      "statusReasons": {
+        "auth_failed": "Authentication failed last time; update the credential before enabling it again"
+      },
+      "lastError": "Last error: {{message}}",
+      "secret": {
+        "ok": "OK",
+        "undecryptable": "The secret cannot be decrypted. Restore the original key or enter it again."
+      },
+      "hostKeys": {
+        "empty": "Recorded on first connection",
+        "count": "{{count}} recorded",
+        "entry": "Key: {{entry}}"
+      },
+      "source": {
+        "admin": "Admin",
+        "chat": "Chat",
+        "import": "Import"
+      },
+      "neverUsed": "Never used",
+      "empty": {
+        "title": "No servers in this workspace yet",
+        "hint": "After you add a server, CC can connect to it with the ssh alias."
+      },
+      "gateway": {
+        "title": "SSH gateway not ready",
+        "off": "The SSH gateway is off. Enable SSH_GATEWAY_ENABLED in system settings.",
+        "state": "Current state: {{state}}",
+        "reason": "Reason: {{reason}}",
+        "settingsCategory": "CC Workspace",
+        "states": {
+          "off": "Off",
+          "starting": "Starting",
+          "running": "Running",
+          "unavailable": "Unavailable",
+          "tripped": "Tripped"
+        }
+      },
+      "s3Warning": "This workspace is also bound to {{count}} channels. Anything people leave in those channels can be read by CC during the authorization window for platform servers.",
+      "form": {
+        "createTitle": "New server",
+        "editTitle": "Edit server",
+        "alias": "Alias",
+        "aliasHint": "Lowercase letters, digits and hyphens; CC connects with the ssh alias",
+        "ownerKind": "Owner",
+        "ownerPlatform": "Platform",
+        "ownerUser": "User",
+        "ownerAccount": "Credential owner account",
+        "ownerAccountHint": "The credential is covered only when this account itself wakes the round",
+        "instance": "Owning instance",
+        "instanceHint": "Pick an instance from the channels bound to this workspace",
+        "adapterKey": "Adapter",
+        "instanceKey": "Instance key",
+        "manualInstanceHint": "No usable instance pair was found in the workspace detail; enter the adapter and instance key manually",
+        "host": "Host",
+        "port": "Port",
+        "username": "Login",
+        "password": "Password",
+        "privateKey": "Private key",
+        "passphrase": "Private key passphrase",
+        "secretKeepHint": "Keep the mask to leave it unchanged; clear it to remove this item; enter a new value to replace it",
+        "passwordMaskedHint": "A password is saved; the mask is shown",
+        "privateKeyMaskedHint": "A private key is saved; the mask is shown",
+        "passphraseMaskedHint": "A passphrase is saved; the mask is shown",
+        "hostKeys": "Host fingerprints",
+        "hostKeysHint": "One key per line. You can paste known_hosts or ssh-keyscan output; leave empty to record it on first connection",
+        "note": "Note",
+        "noteOnlyHint": "This server was registered in chat; a tenant can only enable, disable, edit the note or delete it, not change the connection details or credentials",
+        "cancel": "Cancel",
+        "create": "Create",
+        "save": "Save",
+        "required": "Alias, host and login are required",
+        "portInvalid": "Port must be an integer between 1 and 65535",
+        "userOwnerRequired": "User-owned credentials need an owner account and an instance",
+        "secretRequired": "Enter a password or a private key"
+      },
+      "reveal": {
+        "title": "Reveal secret",
+        "warning": "Every reveal is audited",
+        "password": "Password",
+        "privateKey": "Private key",
+        "passphrase": "Passphrase",
+        "empty": "This item is empty",
+        "copy": "Copy",
+        "copied": "Copied",
+        "copyFailed": "Copy failed",
+        "close": "Close"
+      },
+      "test": {
+        "title": "Test connection",
+        "running": "Connecting…",
+        "success": "Connection succeeded",
+        "failed": "Connection failed",
+        "fingerprint": "Server host fingerprint: {{fingerprint}}",
+        "pinned": "First connection; the host key has been recorded",
+        "reason": "Reason: {{reason}}",
+        "message": "Message: {{message}}",
+        "registeredKeys": "Recorded fingerprints",
+        "presentedKey": "Fingerprint presented by the server this time",
+        "accept": "Accept new fingerprint",
+        "acceptHint": "Accept only when you are sure the server really changed its host key",
+        "acceptSuccess": "The new host fingerprint has been accepted",
+        "close": "Close"
+      },
+      "delete": {
+        "title": "Delete server",
+        "content": "Delete {{alias}}? CC will no longer be able to connect with this alias.",
+        "confirm": "Delete"
+      },
+      "audit": {
+        "title": "Audit",
+        "subtitle": "Connections, commands and credential actions are all recorded.",
+        "loadMore": "Load more",
+        "showInput": "Show input",
+        "hideInput": "Hide input",
+        "empty": "No audit records yet",
+        "columns": {
+          "time": "Time",
+          "event": "Event",
+          "decision": "Allowed / denied",
+          "reason": "Reason",
+          "credential": "Alias or credential",
+          "task": "Task",
+          "actor": "Actor",
+          "detail": "Detail",
+          "workspace": "Workspace",
+          "input": "Input"
+        },
+        "decision": {
+          "allowed": "Allowed",
+          "denied": "Denied"
+        },
+        "credentialFallback": "Credential {{id}}",
+        "events": {
+          "cred_create": "Create credential",
+          "cred_update": "Update credential",
+          "cred_delete": "Delete credential",
+          "cred_reveal": "Reveal secret",
+          "cred_test": "Test connection",
+          "host_key": "Host key",
+          "lease": "Lease",
+          "connect": "Connect",
+          "channel": "Channel",
+          "exec": "Exec",
+          "close": "Close",
+          "suspend": "Auto suspend",
+          "scrub": "Scrub"
+        },
+        "reasons": {
+          "gateway_off": "Gateway is off",
+          "isolation_off": "Network isolation is not active in this workspace, so server connections are unavailable",
+          "image_too_old": "The CC sandbox image is too old; ask the platform owner to upgrade",
+          "unknown_peer": "Unknown peer",
+          "bad_client_key": "Bad client key",
+          "unknown_alias": "No such alias",
+          "no_lease": "The current task has no authorization to use servers",
+          "not_covered": "This task's authorization does not cover this server",
+          "owner_changed": "The authorization basis changed (allowlist, user allowlist or instance state)",
+          "workspace_not_platform": "This workspace is no longer owned by the platform, so platform servers are suspended",
+          "row_inactive": "This credential is disabled",
+          "undecryptable": "The credential cannot be decrypted; ask the platform owner or the credential owner to fix it",
+          "target_blocked": "This server resolves to an address that is not allowed",
+          "host_key_mismatch": "The server host key does not match the recorded one; the connection was refused, please verify",
+          "upstream_auth_failed": "Login with the recorded credential failed; this credential has been paused",
+          "upstream_unreachable": "Cannot reach this server",
+          "mfa_required": "The server requires two-factor authentication, which the gateway does not support",
+          "limit_exceeded": "Connection or channel limit exceeded",
+          "channel_unsupported": "Agent forwarding and X11 forwarding are not supported",
+          "forbidden": "Forbidden"
+        }
+      },
+      "notifications": {
+        "created": "Server created",
+        "updated": "Server saved",
+        "deleted": "Server deleted",
+        "enabled": "Server enabled",
+        "disabled": "Server disabled",
+        "createFailed": "Create failed: {{message}}",
+        "updateFailed": "Save failed: {{message}}",
+        "deleteFailed": "Delete failed: {{message}}",
+        "toggleFailed": "Toggle failed: {{message}}",
+        "testFailed": "Test failed: {{message}}",
+        "revealFailed": "Reveal failed: {{message}}",
+        "acceptFailed": "Accepting the new fingerprint failed: {{message}}"
       }
     },
     "prompt": {

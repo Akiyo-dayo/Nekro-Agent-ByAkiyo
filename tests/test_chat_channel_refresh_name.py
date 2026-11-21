@@ -350,6 +350,21 @@ async def test_refresh_endpoint_checks_tenant_scope(monkeypatch: pytest.MonkeyPa
     assert tried == []
 
 
+async def test_detail_carries_the_owning_instance(db: None) -> None:
+    """频道详情带上频道自己的实例
+
+    频道详情里的「记忆」标签按这个实例取摘要与提示词明细（租户身份下那两个列表接口必须带实例）；
+    前端不去解析会话标识，它的格式随适配器而定。存量的单实例频道实例段为空串。
+    """
+    channel = await make_channel(adapter_key="onebot_v11", instance_key="inst1")
+    detail = await cc_router._build_chat_channel_detail(channel)
+    assert (detail.adapter_key, detail.instance_key) == ("onebot_v11", "inst1")
+
+    legacy = await make_channel(instance_key="", channel_id="group_654321")
+    detail = await cc_router._build_chat_channel_detail(legacy)
+    assert (detail.adapter_key, detail.instance_key) == ("onebot_v11", "")
+
+
 def test_refresh_route_is_declared_admin() -> None:
     """整块频道路由的门槛是 `Role.Admin`；刷新端点不能例外"""
     import ast

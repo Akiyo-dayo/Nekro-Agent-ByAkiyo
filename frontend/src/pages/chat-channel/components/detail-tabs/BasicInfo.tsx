@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import {
+  Alert,
   Box,
   Typography,
   Stack,
@@ -41,6 +42,7 @@ import PresetSwitchConfirmDialog from '../../../../components/common/PresetSwitc
 import type { PresetSwitchImpact } from '../../../../services/api/types'
 import { useInstanceScope } from '../../../../hooks/useInstanceScope'
 import { CHANNEL_DIRECTORY_KEY, CHAT_CHANNEL_DETAIL_KEY, CHAT_CHANNEL_LIST_KEY } from '../../queryKeys'
+import ChannelQuotaStatusRow from './ChannelQuotaStatusRow'
 
 interface BasicInfoProps {
   channel: ChatChannelDetail
@@ -227,6 +229,53 @@ export default function BasicInfo({ channel }: BasicInfoProps) {
   return (
     <Box className="p-4">
       <Stack spacing={2}>
+        {/* 今日额度：功能关闭 / 无权查看 / 出错时这一行整块不渲染，见组件自身的说明 */}
+        <ChannelQuotaStatusRow chatKey={channel.chat_key} />
+        {channel.auto_disable && (
+          <Alert severity="warning">
+            <Typography variant="subtitle2">
+              {t('basicInfo.autoDisable.title', {
+                reason: t(`basicInfo.autoDisable.reasons.${channel.auto_disable.reason}`, {
+                  defaultValue: t('basicInfo.autoDisable.reasonUnknown'),
+                }),
+              })}
+            </Typography>
+            {channel.auto_disable.detail && (
+              <Typography variant="body2">{channel.auto_disable.detail}</Typography>
+            )}
+            <Typography variant="body2">
+              {t('basicInfo.autoDisable.disabledAt', {
+                time: new Date(channel.auto_disable.disabled_at * 1000).toLocaleString(),
+              })}
+            </Typography>
+            <Typography variant="caption" color="textSecondary" display="block" sx={{ mt: 1 }}>
+              {t('basicInfo.autoDisable.hint')}
+            </Typography>
+          </Alert>
+        )}
+        {channel.bot_membership?.status === 'not_in_group' && (
+          <Alert severity="info">
+            <Typography variant="subtitle2">{t('basicInfo.botMembership.notInGroupTitle')}</Typography>
+            <Typography variant="body2">
+              {t('basicInfo.botMembership.checkedAt', {
+                time: new Date(channel.bot_membership.checked_at * 1000).toLocaleString(),
+              })}
+            </Typography>
+            <Typography variant="caption" color="textSecondary" display="block" sx={{ mt: 1 }}>
+              {t('basicInfo.botMembership.hint')}
+            </Typography>
+          </Alert>
+        )}
+        {channel.bot_membership?.status === 'in_group' && (
+          <Typography variant="caption" color="textSecondary">
+            {t('basicInfo.botMembership.inGroup', {
+              time: new Date(channel.bot_membership.checked_at * 1000).toLocaleString(),
+              source: t(`basicInfo.botMembership.sources.${channel.bot_membership.source}`, {
+                defaultValue: channel.bot_membership.source,
+              }),
+            })}
+          </Typography>
+        )}
         <InfoItem
           icon={<MessageIcon color="primary" />}
           label={t('basicInfo.displayName')}

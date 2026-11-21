@@ -441,8 +441,9 @@ ensure_random_env_secret() {
 # `find "$1/"` 的结尾斜杠是有意的：`NEKRO_DATA_DIR` 本身可能是符号链接，`find 链接` 不会进入它
 # （`! -type l` 把它自己也排掉了，结果是一个文件都没 chmod），带斜杠才会先解析链接再遍历。
 open_data_dir_permissions() {
-    find "$1/" ! -type l ! -name 'nekro-agent.model-groups-handwritten-keys.*' ! -name 'credential_secret.key' ! -name '.env' -exec chmod 777 {} \;
-    find "$1/" -maxdepth 1 -type f \( -name 'credential_secret.key' -o -name '.env' \) -exec chmod 600 {} \;
+    # 邮箱账户引用的密钥 `email_account_ref.key`（应用创建时 0600，不随 JWT 轮换）与上面的主密钥同样排除、同样收紧
+    find "$1/" ! -type l ! -name 'nekro-agent.model-groups-handwritten-keys.*' ! -name 'credential_secret.key' ! -name 'email_account_ref.key' ! -name '.env' -exec chmod 777 {} \;
+    find "$1/" -maxdepth 1 -type f \( -name 'credential_secret.key' -o -name 'email_account_ref.key' -o -name '.env' \) -exec chmod 600 {} \;
 }
 
 # 配置 Docker 镜像源

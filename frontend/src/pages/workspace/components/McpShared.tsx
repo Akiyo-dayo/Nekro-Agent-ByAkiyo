@@ -105,12 +105,14 @@ export function KeyValueEditor({
 // ── ServerFormDialog ──
 
 export function ServerFormDialog({
-  open, onClose, onSubmit, onValidate, initial, title, submitLabel, t, lockName = false,
+  open, onClose, onSubmit, onValidate, initial, title, submitLabel, t, lockName = false, credentialHint,
 }: {
   open: boolean; onClose: () => void; onSubmit: (server: McpServerConfig) => void
   onValidate?: (server: McpServerConfig) => Promise<McpValidationResult>
   initial: McpServerConfig; title: string; submitLabel: string; t: (key: string) => string
   lockName?: boolean
+  /** 全局 MCP 库：填了环境变量或请求头的条目不会下发给租户工作区（服务端判），在这里先说清楚 */
+  credentialHint?: string
 }) {
   const [form, setForm] = useState<McpServerConfig>(initial)
   const [validating, setValidating] = useState(false)
@@ -238,6 +240,7 @@ export function ServerFormDialog({
               <KeyValueEditor value={form.headers ?? {}} onChange={headers => setForm(f => ({ ...f, headers }))} keyLabel="Header" valueLabel="Value" />
             </>
           )}
+          {credentialHint && <Alert severity="info" sx={{ py: 0.5 }}>{credentialHint}</Alert>}
           {validationResult && <ValidationResultPanel result={validationResult} t={t} />}
         </Stack>
       </DialogContent>
@@ -840,10 +843,10 @@ export function McpServerManager({
       <RegistryDialog open={registryOpen} onClose={() => setRegistryOpen(false)} onSelect={handleSelectRegistryItem} t={t} />
 
       {/* Add dialog */}
-      <ServerFormDialog open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleAdd} onValidate={onValidate} initial={addInitial} title={t('detail.mcp.addTitle')} submitLabel={mutating ? t('detail.mcp.adding') : t('detail.mcp.add')} t={t} />
+      <ServerFormDialog open={addOpen} onClose={() => setAddOpen(false)} onSubmit={handleAdd} onValidate={onValidate} initial={addInitial} title={t('detail.mcp.addTitle')} submitLabel={mutating ? t('detail.mcp.adding') : t('detail.mcp.add')} t={t} credentialHint={isGlobal ? t('detail.mcp.form.globalCredentialHint') : undefined} />
 
       {/* Edit dialog */}
-      <ServerFormDialog open={!!editTarget} onClose={() => setEditTarget(null)} onSubmit={handleEdit} onValidate={onValidate} initial={editTarget ?? emptyServer()} title={t('detail.mcp.editTitle')} submitLabel={mutating ? t('detail.mcp.saving') : t('detail.mcp.save')} t={t} lockName={isGlobal} />
+      <ServerFormDialog open={!!editTarget} onClose={() => setEditTarget(null)} onSubmit={handleEdit} onValidate={onValidate} initial={editTarget ?? emptyServer()} title={t('detail.mcp.editTitle')} submitLabel={mutating ? t('detail.mcp.saving') : t('detail.mcp.save')} t={t} lockName={isGlobal} credentialHint={isGlobal ? t('detail.mcp.form.globalCredentialHint') : undefined} />
 
       {/* Delete dialog */}
       <Dialog open={!!deleteTarget} onClose={() => setDeleteTarget(null)} maxWidth="xs">

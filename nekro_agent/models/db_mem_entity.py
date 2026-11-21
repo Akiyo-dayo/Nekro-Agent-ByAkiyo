@@ -50,6 +50,14 @@ class DBMemEntity(Model):
     # 不会因为存在人设乙而复制。
     preset_id = fields.IntField(default=0, index=True, description="人设标识；0 表示无人设档")
 
+    adapter_key = fields.CharField(max_length=64, default="", description="来源适配器标识；空 = 未知或存量")
+    origin_chat_key = fields.CharField(
+        max_length=256,
+        null=True,
+        index=True,
+        description="记忆产生的聊天频道标识；存量行与工作区行为空",
+    )
+
     # 实体核心信息
     entity_type = fields.CharEnumField(
         EntityType,
@@ -131,6 +139,9 @@ class DBMemEntity(Model):
         source: MemorySource = MemorySource.NA,
         instance_key: str = "",
         preset_id: int = 0,
+        adapter_key: str = "",
+        origin_chat_key: str | None = None,
+        dedup_by_origin: bool = False,
     ) -> tuple["DBMemEntity", bool]:
         """查找或创建实体
 
@@ -144,20 +155,28 @@ class DBMemEntity(Model):
         这**不违反**"按人设隔离不产生副本"：那条说的是一段对话不会因为存在别的人设而被复制，
         而实体是去重节点，同一维度上 `instance_key` 早就是这么做的。
 
+        `origin_chat_key` 只给域行（workspace_id=0）用：同名实体在不同频道是两行，
+        传了来源键且 `dedup_by_origin=True` 时去重键必须补上 (adapter_key, origin_chat_key)。
+        工作区行不传来源键、不置位，保持旧去重键、不写 `origin_chat_key`，与改造前逐字一致。
+
         Returns:
             (entity, created): 实体对象和是否新创建
         """
         canonical = name.strip().lower()
 
         # 先尝试查找已存在的实体
-        existing = await cls.filter(
-            workspace_id=workspace_id,
-            instance_key=instance_key,
-            preset_id=preset_id,
-            entity_type=entity_type,
-            canonical_name=canonical,
-            is_inactive=False,
-        ).first()
+        filters: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "instance_key": instance_key,
+            "preset_id": preset_id,
+            "entity_type": entity_type,
+            "canonical_name": canonical,
+            "is_inactive": False,
+        }
+        if dedup_by_origin:
+            filters["adapter_key"] = adapter_key
+            filters["origin_chat_key"] = origin_chat_key
+        existing = await cls.filter(**filters).first()
 
         if existing:
             existing.appearance_count += 1
@@ -169,6 +188,8 @@ class DBMemEntity(Model):
             workspace_id=workspace_id,
             instance_key=instance_key,
             preset_id=preset_id,
+            adapter_key=adapter_key,
+            origin_chat_key=origin_chat_key,
             entity_type=entity_type,
             name=name.strip(),
             canonical_name=canonical,

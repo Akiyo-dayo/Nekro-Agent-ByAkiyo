@@ -109,11 +109,18 @@ class EmbeddingService:
             logger.error(f"获取 Embedding 模型配置失败: {e}")
             raise ValueError(f"Embedding 模型组 '{self.resolved_model_group}' 配置无效") from e
 
-    async def embed_text(self, text: str) -> list[float]:
+    async def embed_text(
+        self,
+        text: str,
+        *,
+        requester: tuple[str, str] | None = None,
+    ) -> list[float]:
         """生成单条文本的向量
 
         Args:
             text: 输入文本
+            requester: 发起方的 `(adapter_key, instance_key)`；传了就带到用量流水上，
+                让这笔 `EMBEDDING` 花费能归到租户。不传与改造前完全相同（知识库等调用方不动）。
 
         Returns:
             向量列表
@@ -136,7 +143,11 @@ class EmbeddingService:
         #
         # ⚠️ 每次尝试各记一行（记账在 `gen_openai_embeddings` 里面），
         # 所以 `MAX_RETRIES` 次重试在账上是 N 行 —— 那是对的，每一次都真的打了上游。
-        usage_context = LLMUsageContext(scene=LLMUsageScene.EMBEDDING).with_model_group(
+        usage_context = LLMUsageContext(
+            scene=LLMUsageScene.EMBEDDING,
+            adapter_key=requester[0] if requester is not None else "",
+            instance_key=requester[1] if requester is not None else "",
+        ).with_model_group(
             self.resolved_model_group,
             config.MODEL_GROUPS.get(self.resolved_model_group),
         )
@@ -286,9 +297,9 @@ def get_kb_embedding_service() -> EmbeddingService:
     return service
 
 
-async def embed_text(text: str) -> list[float]:
+async def embed_text(text: str, *, requester: tuple[str, str] | None = None) -> list[float]:
     """便捷函数：生成文本向量"""
-    return await embedding_service.embed_text(text)
+    return await embedding_service.embed_text(text, requester=requester)
 
 
 async def embed_batch(texts: list[str]) -> list[list[float] | None]:

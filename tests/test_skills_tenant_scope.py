@@ -895,7 +895,7 @@ class TestPromotionCannotSmuggleContentThroughASymlink:
 
     软链是谁放进去的：`POST /workspaces/{id}/comm/send`（`Role.Admin` + 工作区作用域）
     让容器里的 CC 跑一句 `ln -s`；相对目标在宿主上照样解析得到。
-    指向 `../../{别的工作区}/.claude/settings.json` 时拿到的就是平台方的模型凭据。
+    指向 `../../{别的工作区}/.claude_home/settings.json` 时拿到的就是那个工作区的模型凭据。
 
     因此晋升必须在复制**之前**拒绝带软链的源目录，而不是指望落点判定兜住。
     """
@@ -979,15 +979,16 @@ class TestPromotionCannotSmuggleContentThroughASymlink:
         """结构契约：晋升的落点只能由 `resolve_writable_dir` 算出来
 
         这一条没法行为化 —— `dir_name` 是单个 URL 路径段，进不来 `/`，
-        而 `..` / `.` 开头在上一道 `_is_workspace_local_dynamic_skill` 就被挡了，
+        而 `..` / `.` 开头在上一道 `_valid_skill_dir_name` 就被挡了，
         所以「绕开规整器」在当前可达面上与现状等价。
         钉住它是为了让下一次放宽（比如给晋升加一个 `target_name` 参数）
         必须显式改这里，而不是悄悄多出一个写入出口。
+        落点的计算在 `_promote_from` 里（`promote_dynamic_skill` 只负责逐级打开源目录）。
         """
         import ast
         import inspect
 
-        source = inspect.getsource(WorkspaceService.promote_dynamic_skill)
+        source = inspect.getsource(WorkspaceService._promote_from)  # noqa: SLF001
         tree = ast.parse(inspect.cleandoc(source))
         assigned_from = {
             node.value.func.id
@@ -1017,7 +1018,7 @@ class TestDynamicSkillBrowsingStaysInsideTheSkillDir:
 
     这三条端点是 `Role.Admin` + 工作区作用域，租户管理员本来就够得到。
     它们此前只挡字面量 `..`，而目录是容器可写的 —— 一条相对软链在宿主上照样解析，
-    于是「读」拿到别的工作区的 `.claude/settings.json`（那里面是该工作区的中继凭据，
+    于是「读」拿到别的工作区的 `.claude_home/settings.json`（那里面是该工作区的中继凭据，
     `CC_CREDENTIAL_MODE=direct` 时干脆是真 Key），「写」则把内容落到链接指向的地方。
 
     判据与 `skill_scope.is_within` 是同一条，不另写一套。

@@ -51,6 +51,7 @@ from nekro_agent.services.space_cleanup import scanner as scanner_module
 
 MEMORY_MODULES = [
     "nekro_agent.models.db_mem_paragraph",
+    "nekro_agent.models.db_mem_paragraph_person",
     "nekro_agent.models.db_mem_relation",
     "nekro_agent.models.db_mem_entity",
     "nekro_agent.models.db_mem_reinforcement_log",

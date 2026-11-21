@@ -18,6 +18,15 @@ export interface Preset {
   owner_instance_key?: string
   /** 是否为全局共享人设（实例作用域下只读） */
   is_global?: boolean
+  /**
+   * 这个人设是否有酒馆扩展行
+   *
+   * 只要库里有扩展行就是 true，**包括 `card_spec` 为空的那种**（NA 原生人设建的扩展行）。
+   * 判断「是不是从酒馆卡导入的」要看 `card_spec`，不是这个字段。
+   */
+  has_card?: boolean
+  /** 卡片版本：`v1` / `v2` / `v3`；空串表示 NA 原生扩展行 */
+  card_spec?: string
 }
 
 export interface PresetDetail extends Preset {
@@ -49,6 +58,18 @@ export interface ActionResponse {
 
 export interface AvatarUploadResponse {
   avatar: string
+}
+
+/**
+ * 同步云端人设的结果
+ *
+ * `ok` 表示这次请求成功；`note` 是「成功但有话要说」：比如卡片信封还原不了、或者只还原了
+ * 人设与扩展行而没动人设书。空串表示没有任何要提醒的。把 `note` 当错误弹会让一次成功的
+ * 同步看起来失败，所以两者必须分开取。
+ */
+export interface PresetSyncResponse {
+  ok: boolean
+  note?: string
 }
 
 /** 某实例的默认人设（人设回退链的第二层：频道 -> 实例默认 -> 系统默认 -> 内置） */
@@ -179,8 +200,8 @@ export const presetsApi = {
     return response.data
   },
 
-  sync: async (id: number, instanceKey?: string): Promise<ActionResponse> => {
-    const response = await axios.post<ActionResponse>(`/presets/${id}/sync`, null, {
+  sync: async (id: number, instanceKey?: string): Promise<PresetSyncResponse> => {
+    const response = await axios.post<PresetSyncResponse>(`/presets/${id}/sync`, null, {
       params: { instance_key: instanceKey || undefined },
     })
     return response.data

@@ -72,17 +72,19 @@ from nekro_agent.services.user.role import Role
 # 插件路由是热挂载的动态路由，不在本表内（它们由插件隔离机制单独管辖）。
 ROUTER_MODULES: Sequence[str] = (
     "adapters", "affection", "cc_model_presets", "chat_channel", "commands", "common",
-    "config", "dashboard", "deployment", "email", "events", "kb_library", "logs", "mcp",
-    "cc_relay",
-    "plugin_editor", "plugins", "presets", "resources", "restart", "rpc", "sandbox",
-    "skills", "space_cleanup", "timers", "user", "user_manager", "webhook",
-    "workspace_kb", "workspaces",
+    "config", "dashboard", "deployment", "email", "events", "instance_email", "kb_library", "logs", "mcp",
+    "memory_admin", "cc_relay",
+    "plugin_editor", "plugin_route_ticket", "plugins", "presets", "resources", "restart", "rpc", "sandbox",
+    "skills", "space_cleanup", "ssh_gateway", "timers", "user", "user_manager", "webhook",
+    "workspace_kb", "workspaces", "worldbook", "tavern",
     "console.containers", "console.health", "console.identity", "console.instances",
+    "console.channel_quota",
     "console.model_groups",
     "console.napcat_orphans",
     "console.network_rules",
     "console.onebot_endpoint",
-    "console.ops_actions", "console.overview", "console.qbob", "console.quota", "console.tenants",
+    "console.ops_audit",
+    "console.overview", "console.qbob", "console.quota", "console.tenants",
     "console.usage",
     "cloud.announcement", "cloud.auth", "cloud.favorites", "cloud.plugins_market",
     "cloud.presets_market", "cloud.telemetry",
@@ -109,6 +111,9 @@ SCOPE_GUARDS: Set[str] = {
     # 技能库的作用域出口。它就是 `get_tenant_scope` 的一层薄封装，
     # 单列一个名字是为了让 `SKILL_LIBRARY_SCOPE_GUARDS` 能对技能这一族提出更强的要求。
     "skill_scope_of",
+    # 插件路由票据接口的作用域出口：内部依次走 `assert_instance_accessible`
+    # 与插件实例生效判定，越权按不存在。
+    "assert_plugin_route_access",
 }
 
 # 技能库那一族**额外**要求的守卫：光"至少 Role.Admin"是不够的（那正是租户管理员的等级），
@@ -334,24 +339,24 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     # 规则原文、以及同宿主上别的部署的网桥/容器名一并回显，那是宿主拓扑而不是租户资源。
     ("console.network_rules", "GET", "/network-rules/orphans"),
     ("console.network_rules", "POST", "/network-rules/orphans/cleanup"),
-    ("console.ops_actions", "POST", "/ops/actions/confirm"),
-    ("console.ops_actions", "POST", "/ops/actions/preview"),
+    # 运维审计：一行记录可能同时提到平台方的实例与某个租户的会话，不按租户分栏。
+    # 租户管理员拿到它等于拿到一份跨租户的操作清单，因此整条只挂 `require_platform_owner()`。
+    ("console.ops_audit", "GET", "/ops-audit"),
     ("console.tenants", "DELETE", "/tenants/{tenant_id}"),
     ("console.tenants", "GET", "/tenants"),
     ("console.tenants", "PATCH", "/tenants/{tenant_id}"),
     ("console.tenants", "POST", "/tenants"),
+    # 划转预览回显的是跨租户数据（原归属、目标归属与各自带走的记忆规模），
+    # 与真正执行划转的 PUT 必须同一档：否则租户管理员能借它枚举别人的实例与数据量
+    ("console.tenants", "POST", "/tenants/{tenant_id}/instances/preview"),
     ("console.tenants", "PUT", "/tenants/{tenant_id}/instances"),
     # 按组名整体覆盖/删除，不看归属；租户自建组走 `/console/model-groups`
     ("config", "DELETE", "/config/model-groups/{group_name}"),
     ("config", "POST", "/config/model-groups/{group_name}"),
-    # 收件箱是平台方自己配的邮箱账号（email 适配器的适配器层配置 `RECEIVE_ACCOUNTS`），
-    # 那是个跨租户共享的作用域，且 email 是单实例适配器 —— `DBEmail` 里没有任何一列
-    # 能把某封邮件判给某个租户，所以这一族**没有**可收敛的租户作用域，只能是平台方专属。
-    # 判据与 `config.py:_assert_config_key_accessible` 对 `system`/`adapter_*` 的判法同源。
-    ("email", "GET", "/emails"),
-    ("email", "GET", "/emails/{email_id}"),
-    ("email", "GET", "/emails/{email_id}/raw-content"),
-    ("email", "GET", "/emails/{account_username}/{email_uid}/attachments/{filename}"),
+    # 收件箱不再是平台方专属：`DBEmail` 现在带归属快照（`owner_adapter_key` /
+    # `owner_instance_key`，空 = 平台方），四条接口按 `adapter_key` + `instance_key`
+    # 收敛到某个实例，越权与不存在同一个 404。它们因此落在默认的租户作用域桶里，
+    # 由 `SCOPE_GUARDS` 里的 `assert_instance_accessible`（经 `_resolve_mailbox_scope`）认出来。
     ("deployment", "GET", "/deployment/agent-version"),
     ("deployment", "GET", "/deployment/backups"),
     ("deployment", "GET", "/deployment/capabilities"),
@@ -452,6 +457,12 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("space_cleanup", "GET", "/space-cleanup/scan/status"),
     ("space_cleanup", "POST", "/space-cleanup/cleanup/start"),
     ("space_cleanup", "POST", "/space-cleanup/scan/start"),
+    # 平台方的全局凭据列表：跨全部工作区、含租户归属的行，租户管理员永远够不到
+    ("ssh_gateway", "GET", "/ssh-gateway/credentials"),
+    # 网关状态：平台方排障入口（开关、监听地址、连接 / 通道数），租户没有可看的范围
+    ("ssh_gateway", "GET", "/ssh-gateway/status"),
+    # 存量 SSH 工作区资源导入：会新建平台方凭据行，只有平台方能触发
+    ("ssh_gateway", "POST", "/ssh-gateway/import-resources"),
     ("user", "DELETE", "/user/delete"),
     ("user_manager", "POST", "/user-manager/create"),
     ("workspaces", "GET", "/workspaces/{workspace_id}/sandbox/image/check"),
@@ -468,6 +479,14 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     ("workspaces", "POST", "/workspaces/{workspace_id}/sandbox/start"),
     ("workspaces", "POST", "/workspaces/{workspace_id}/sandbox/stop"),
     ("workspaces", "WS", "/workspaces/{workspace_id}/sandbox/terminal"),
+}
+
+# SSH 网关工作区子资源：Role.Admin + assert_workspace_accessible。单独列出来，
+# 防止以后有人顺手把它们挪进 PLATFORM_ONLY（租户管理员需要测试自己租户的服务器），
+# 或摘掉工作区守卫。它们仍按默认的 TENANT_SCOPED 结构断言检查。
+SSH_GATEWAY_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
+    ("ssh_gateway", "POST", "/workspaces/{workspace_id}/ssh-credentials/{credential_id}/test"),
+    ("ssh_gateway", "POST", "/workspaces/{workspace_id}/ssh-credentials/{credential_id}/host-keys/accept"),
 }
 
 IDENTITY_SPECIFIC: Set[Tuple[str, str, str]] = {
@@ -488,6 +507,11 @@ TENANT_AGNOSTIC: Set[Tuple[str, str, str]] = {
     ("adapters", "GET", "/adapters/{adapter_key}/status"),
     ("mcp", "GET", "/mcp/registry"),
     ("mcp", "GET", "/mcp/constraints"),
+    # 邮箱服务商预设（QQ、163、Gmail、阿里云……）编译在 `adapters/email/base.py` 里：
+    # 主机、端口、要不要 SSL 与一句"去邮箱设置里开 IMAP"的说明，人人拿到的都是同一份，
+    # 不读任何实例 / 租户数据，也没有可越权的目标标识。`require_role(Admin)` 照旧。
+    # 同族其余端点全部按实例对收敛（默认的租户作用域桶）。
+    ("instance_email", "GET", "/instance-email/providers"),
     # `/config/keys` 与 `/config/info/{config_key}` 曾登记在这里（"编译进代码的清单/静态元数据"），
     # 两条都不成立：
     # - `/config/keys` 的清单是运行时长出来的，`ConfigManager` 会把动态加载到的
@@ -501,6 +525,9 @@ TENANT_AGNOSTIC: Set[Tuple[str, str, str]] = {
     ("config", "GET", "/config/version"),
     ("config", "GET", "/config/version-info"),
     ("config", "GET", "/config/ui-onboarding-guide/status"),
+    # 输出过滤的起步词表：读随代码发布的 `starter_words.txt`，人人拿到的都是
+    # 同一份文本，不读任何实例 / 租户数据，也没有可越权的目标标识；`require_role(Admin)` 照旧。
+    ("config", "GET", "/config/output-filter/starter-words"),
     ("commands", "GET", "/commands/completions"),
     ("commands", "GET", "/commands/tools"),
     # 用量筛选器的固定取值（场景/收尾形态枚举 + 两个上限常量）。它一行数据都不读，
@@ -527,6 +554,11 @@ TENANT_AGNOSTIC: Set[Tuple[str, str, str]] = {
     # 也没有 `require_platform_owner()` 的端点时，要自己确认那句 `Role.Super`
     # 到底是门槛还是旁路。
     ("user", "PUT", "/user/password"),
+    # 界面语言的两条端点读写的都是 `_current_user` 自己那一行的 `ext_data`：请求体与路径里
+    # 都没有目标标识，平台方与只读成员走的是同一条判据，没有可越权的对象。
+    # 它们曾经不存在 —— 租户账号改语言只能打 `POST /config/batch/system`（跨租户共享作用域）然后 403。
+    ("user", "GET", "/user/me/locale"),
+    ("user", "PUT", "/user/me/locale"),
     # ── 技能库里唯一真正与租户无关的一档：**内置**技能 ──
     #
     # ⚠️ 这个注释块此前写的是「共享库的只读面：库本身就是全体共用的一份，没有'每租户一份'
@@ -849,6 +881,52 @@ USAGE_CONSOLE_TENANT_REACHABLE: Set[Tuple[str, str, str]] = {
     ("console.usage", "GET", "/usage/records"),
 }
 
+# ---------------------------------------------------------------------------
+# 频道每日额度（本轮）：`console.channel_quota` 的整表登记
+#
+# 这一族有两种写者、写同一张表的不同列：平台方写承诺，租户只能在承诺以内调低。
+# 分档错一档就等于让租户改掉平台方给他的承诺，所以逐条钉死：
+#
+# 1. 租户可达的集合固定为下面七条（读用量列表、读单频道今日状态、读历史、读/写自己名下的实例与频道额度）；
+# 2. 三层策略的读接口与临时加额不许落进默认档 —— 它们是 `require_platform_owner()`；
+# 3. 每一条租户可达端点都必须至少 `Role.Admin` 并真的解析归属。
+#
+# 行为一侧（30 层继承、暂停、租户越界 400、跨租户 404）在 `tests/test_channel_quota_*.py`。
+# ---------------------------------------------------------------------------
+
+CHANNEL_QUOTA_MODULES: Set[str] = {"console.channel_quota"}
+
+# 这一族**额外**要求的守卫：必须按当前身份解析出归属，而不是"源码里出现过 instance 这个词"。
+CHANNEL_QUOTA_SCOPE_GUARDS: Set[str] = {"assert_instance_accessible", "assert_channel_accessible", "get_tenant_scope"}
+
+CHANNEL_QUOTA_TENANT_REACHABLE: Set[Tuple[str, str, str]] = {
+    ("console.channel_quota", "GET", "/channel-quota/daily"),
+    # 频道详情页顶部那一行：单频道今天的用量与状态。与历史同一条归属校验
+    ("console.channel_quota", "GET", "/channel-quota/channels/{chat_key}/status"),
+    ("console.channel_quota", "GET", "/channel-quota/channels/{chat_key}/history"),
+    ("console.channel_quota", "GET", "/channel-quota/tenant/instance/{adapter_key}/{instance_key}"),
+    ("console.channel_quota", "PUT", "/channel-quota/tenant/instance/{adapter_key}/{instance_key}"),
+    ("console.channel_quota", "GET", "/channel-quota/tenant/channel/{chat_key}"),
+    ("console.channel_quota", "PUT", "/channel-quota/tenant/channel/{chat_key}"),
+}
+
+CHANNEL_QUOTA_PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
+    ("console.channel_quota", "GET", "/channel-quota/policy"),
+    ("console.channel_quota", "PUT", "/channel-quota/policy"),
+    ("console.channel_quota", "GET", "/channel-quota/policy/instance/{adapter_key}/{instance_key}"),
+    ("console.channel_quota", "PUT", "/channel-quota/policy/instance/{adapter_key}/{instance_key}"),
+    ("console.channel_quota", "GET", "/channel-quota/policy/channel/{chat_key}"),
+    ("console.channel_quota", "PUT", "/channel-quota/policy/channel/{chat_key}"),
+    ("console.channel_quota", "POST", "/channel-quota/channels/{chat_key}/bonus"),
+    # 按账本重算：平台方的对账动作，会覆盖计数缓存里的数字，租户不能自己做
+    ("console.channel_quota", "POST", "/channel-quota/channels/{chat_key}/recount"),
+    ("console.channel_quota", "POST", "/channel-quota/recount"),
+}
+
+# 上面那组就是登记表里的平台方专属条目。单列一份是为了让这一族的测试能整套断言，
+# 而不是在几百行的 `PLATFORM_ONLY` 里散落七条。
+PLATFORM_ONLY |= CHANNEL_QUOTA_PLATFORM_ONLY
+
 
 REGISTRY: Dict[str, Set[Tuple[str, str, str]]] = {
     "PLATFORM_ONLY": PLATFORM_ONLY,
@@ -911,6 +989,15 @@ class TestRegistryCoversTheRouteTable:
             if _categorize(route) == "TENANT_SCOPED" and not is_tenant_scoped(route)
         ]
         assert unguarded == []
+
+    def test_ssh_gateway_workspace_routes_are_tenant_scoped(self, routes: List[RouteFacts]) -> None:
+        """测试 / 接受指纹两个端点不能滑成平台方专属，也不能丢工作区守卫"""
+        by_key = {_key(route): route for route in routes}
+        for key in sorted(SSH_GATEWAY_TENANT_SCOPED):
+            assert key in by_key, f"路由不存在或路径变了: {key}"
+            assert not is_platform_only(by_key[key]), f"不能是平台方专属: {key}"
+            assert _categorize(by_key[key]) == "TENANT_SCOPED", key
+            assert is_tenant_scoped(by_key[key]), f"缺少 Role.Admin 或工作区守卫: {key}"
 
 
 class TestCategoryStructuralClaims:
@@ -1098,16 +1185,21 @@ class TestIssue29ModulesAreAuditedEndpointByEndpoint:
 # 好感度后台的整表登记。全部归**租户作用域**一类（与最早的 reset / adjust 同档）：
 # `@require_role(Role.Admin)`，先 `resolve_instance_scope`，带 `{record_id}` 的再 `_get_visible_record`，
 # 越权一律 404。只清印象、编辑印象、删流水理由三条是后加的写接口，删流水理由那条还要再在
-# 这一行那个人的流水里按 `event_id` 找——它们滑到别的桶、或者漏掉记录归属判定，都要在这里显式改一次。
+# 这一行那个人的流水里按 `event_id` 找；删关系里程碑同理，要在这一行那个人的流水里按
+# `memory_paragraph_id` 找——它们滑到别的桶、或者漏掉记录归属判定，都要在这里显式改一次。
 AFFECTION_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
     ("affection", "GET", "/affection/list"),
     ("affection", "GET", "/affection/summary"),
+    # 从里程碑段落反查它属于哪一份好感。不吃 `{record_id}`，但仍然先解析实例作用域、
+    # 再用 `_get_visible_record` 判那一行可见，所以与其余条目同档。
+    ("affection", "GET", "/affection/milestones/{paragraph_id}/record"),
     ("affection", "GET", "/affection/{record_id}"),
     ("affection", "POST", "/affection/{record_id}/adjust"),
     ("affection", "POST", "/affection/{record_id}/reset"),
     ("affection", "POST", "/affection/{record_id}/clear-narrative"),
     ("affection", "PUT", "/affection/{record_id}/narrative"),
     ("affection", "DELETE", "/affection/{record_id}/events/{event_id}"),
+    ("affection", "DELETE", "/affection/{record_id}/milestones/{paragraph_id}"),
 }
 
 
@@ -1337,6 +1429,73 @@ class TestUsageConsoleScopeIsPinned:
         by_key = {_key(route): route for route in routes}
         assert not _reaches_usage_scope_guard(by_key[("console.usage", "GET", "/usage/enums")])
         assert _reaches_usage_scope_guard(by_key[("console.usage", "GET", "/usage/summary")])
+
+
+def _reaches_channel_quota_scope_guard(route: RouteFacts) -> bool:
+    """端点是否真的按当前身份解析出了归属
+
+    写法与 `_reaches_usage_scope_guard` 同源（模块内两层展开），判据换成
+    `CHANNEL_QUOTA_SCOPE_GUARDS`。这一族的守卫大多直接写在端点里，但
+    `_visible_channels` 那一层收口也要能认出来，否则换个写法会让测试误报。
+    """
+    module = importlib.import_module(f"nekro_agent.routers.{route.module}")
+    functions = {
+        name: _source_of(member)
+        for name, member in vars(module).items()
+        if inspect.isfunction(member) and getattr(member, "__module__", "") == module.__name__
+    }
+    direct = {name for name, source in functions.items() if CHANNEL_QUOTA_SCOPE_GUARDS & _identifiers(source)}
+    indirect = {name for name, source in functions.items() if direct & _identifiers(source)}
+    return bool((CHANNEL_QUOTA_SCOPE_GUARDS | direct | indirect) & _identifiers(functions.get(route.name, "")))
+
+
+class TestChannelQuotaConsoleScopeIsPinned:
+    """频道每日额度：`console.channel_quota` 的整表登记与更强的结构要求
+
+    这一族同时有平台方与租户两组写接口，而它们写的是**同一张表的不同列**。
+    分档一旦松动，租户就能改平台方给他的额度承诺，这条承诺当场作废。
+    """
+
+    def test_tenant_reachable_set_is_exactly_the_registered_one(self, routes: List[RouteFacts]) -> None:
+        actual = {
+            _key(route)
+            for route in routes
+            if route.module in CHANNEL_QUOTA_MODULES and _categorize(route) == "TENANT_SCOPED"
+        }
+        assert actual == CHANNEL_QUOTA_TENANT_REACHABLE
+
+    def test_the_platform_owned_surface_stays_platform_only(self, routes: List[RouteFacts]) -> None:
+        """三层策略的写接口与临时加额只允许平台方
+
+        这几条全都落在 `require_platform_owner()` 上；把它们挪进默认档会要求
+        "至少 Role.Admin" —— 而那正好是租户管理员的等级。
+        """
+        by_key = {_key(route): route for route in routes}
+        for key in sorted(CHANNEL_QUOTA_PLATFORM_ONLY):
+            assert key in by_key, key
+            assert is_platform_only(by_key[key]), key
+            assert _categorize(by_key[key]) == "PLATFORM_ONLY", key
+
+    def test_every_tenant_route_really_resolves_an_ownership(self, routes: List[RouteFacts]) -> None:
+        """「至少 Role.Admin」不是作用域：租户管理员**就是** `Role.Admin`"""
+        by_key = {_key(route): route for route in routes}
+        missing = sorted(key for key in CHANNEL_QUOTA_TENANT_REACHABLE if not _reaches_channel_quota_scope_guard(by_key[key]))
+        assert missing == []
+
+    def test_every_tenant_route_requires_at_least_admin(self, routes: List[RouteFacts]) -> None:
+        by_key = {_key(route): route for route in routes}
+        for key in sorted(CHANNEL_QUOTA_TENANT_REACHABLE):
+            assert has_write_level_gate(by_key[key]), key
+
+    def test_the_scope_guard_detector_is_not_vacuous(self, routes: List[RouteFacts]) -> None:
+        """对照组：探测器不是恒真
+
+        全局策略的读接口走 `require_platform_owner()`，本来就不该有租户作用域解析，
+        它必须被判成 False——否则上面那条断言可能只是"什么都判成 True"。
+        """
+        by_key = {_key(route): route for route in routes}
+        assert not _reaches_channel_quota_scope_guard(by_key[("console.channel_quota", "GET", "/channel-quota/policy")])
+        assert _reaches_channel_quota_scope_guard(by_key[("console.channel_quota", "GET", "/channel-quota/daily")])
 
 
 def _reaches_identity_scope_guard(route: RouteFacts) -> bool:

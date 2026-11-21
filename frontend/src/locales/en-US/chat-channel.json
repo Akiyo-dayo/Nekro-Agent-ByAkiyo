@@ -12,10 +12,13 @@
     "private": "Private",
     "active": "Active",
     "observe": "Observe",
-    "inactive": "Inactive"
+    "inactive": "Inactive",
+    "botMembership": "Bot membership",
+    "botNotInGroup": "Bot not in group"
   },
   "list": {
     "empty": "No chat channels available",
+    "botNotInGroupBadge": "Bot not in group",
     "emptyOtherUnclaimed_one": "This instance owns no channel yet; {{count}} channel sits under the unclaimed instance \"{{instance}}\" — a protocol endpoint registers an instance of its own when it connects and keeps the channels. Claim it and they show up here.",
     "emptyOtherUnclaimed_other": "This instance owns no channel yet; {{count}} channels sit under the unclaimed instance \"{{instance}}\" — a protocol endpoint registers an instance of its own when it connects and keeps the channels. Claim it and they show up here.",
     "emptyOtherInstances_one": "This instance owns no channel yet; {{count}} channel sits under another instance (e.g. \"{{instance}}\"). Switch the instance scope above to see it.",
@@ -77,7 +80,57 @@
     "setPresetSuccess": "Preset {{action}}: {{name}}",
     "setPresetFailed": "Failed to set preset",
     "set": "set",
-    "clear": "cleared"
+    "clear": "cleared",
+    "autoDisable": {
+      "title": "This channel was disabled automatically: {{reason}}",
+      "reasons": {
+        "bot_left_group": "The bot is no longer in this group"
+      },
+      "reasonUnknown": "Unknown reason",
+      "disabledAt": "Disabled at: {{time}}",
+      "hint": "It will return to its previous state automatically when the bot rejoins the group or someone speaks again. Manually enabling or disabling it here stops the automatic restore."
+    },
+    "botMembership": {
+      "notInGroupTitle": "Check result: the bot is not in this group",
+      "checkedAt": "Checked at: {{time}}",
+      "hint": "This is only a marker; the channel is not disabled by it. Disable it manually if needed, or filter the channel list and disable in bulk. The marker clears automatically when the bot rejoins or someone speaks in the group again.",
+      "inGroup": "Last confirmed in group: {{time}} ({{source}})",
+      "sources": {
+        "check": "check",
+        "inbound": "new message in group"
+      }
+    }
+  },
+  "botMembership": {
+    "check": {
+      "button": "Check bot membership",
+      "dialogTitle": "Check bot group membership",
+      "dialogHint": "Fetch the group list once from the protocol endpoint and mark channels where the bot is no longer present. This only marks channels; it never disables them and sends no messages.",
+      "run": "Check now",
+      "close": "Close",
+      "results": {
+        "checked": "Check complete: the protocol endpoint returned {{groups}} groups; {{notInGroup}} of this instance's {{channels}} group channels are no longer joined by the bot ({{marked}} newly marked, {{cleared}} cleared)",
+        "offline": "The instance is offline or has no bound account; nothing was checked",
+        "call_failed": "Failed to fetch the group list from the protocol endpoint; no markers were changed: {{message}}",
+        "empty": "The protocol endpoint returned an empty group list; no markers were changed to avoid false positives",
+        "malformed": "The group list returned by the protocol endpoint has an unexpected structure; no markers were changed",
+        "incomplete": "The group list returned by the protocol endpoint looks incomplete; no markers were changed to avoid false positives: {{message}}"
+      }
+    },
+    "disable": {
+      "button": "Disable in bulk",
+      "dialogTitle": "Disable channels where the bot is not in the group",
+      "loading": "Loading preview…",
+      "count_one": "{{count}} channel will be disabled",
+      "count_other": "{{count}} channels will be disabled",
+      "empty": "No channels need to be disabled",
+      "manualHint": "This is a manual disable: the channel will not be restored automatically when the bot rejoins; enable it manually if needed",
+      "confirm": "Disable",
+      "cancel": "Cancel",
+      "done": "Disabled {{disabled}}, skipped {{skipped}}",
+      "failed": "Failed to disable channels",
+      "previewFailed": "Failed to load preview: {{message}}"
+    }
   },
   "overrideSettings": {
     "info": "Settings here will only apply to this chat channel. They have the highest priority and will override settings from adapters and system with the same name.",
@@ -100,7 +153,8 @@
       "overrideSettings": "Override Settings",
       "messageHistory": "Live Messages",
       "pluginData": "Plugin Data",
-      "commandPermissions": "Command permissions"
+      "commandPermissions": "Command permissions",
+      "memory": "Memory"
     },
     "resetDialog": {
       "title": "Confirm Reset Chat?",

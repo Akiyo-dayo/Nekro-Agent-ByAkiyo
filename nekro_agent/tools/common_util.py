@@ -69,11 +69,19 @@ _IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 _IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 # `is_global` 对这几类返回 True，而它们能绕到 IPv4 内网：地址里嵌着 IPv4（`64:ff9b::7f00:1` 经 NAT64
-# 就是 127.0.0.1，`::127.0.0.1` 是兼容格式，`2002::/16` 是 6to4），`fec0::/10` 是废弃的站点本地段。
+# 就是 127.0.0.1，`::127.0.0.1` 是兼容格式，`::ffff:0:7f00:1` 是 SIIT 的 IPv4-translated 格式，
+# `2002::/16` 是 6to4），`fec0::/10` 是废弃的站点本地段。
 # 都不是正常公网服务会用的地址，整段拒绝，要用的部署写进 DOWNLOAD_EXTRA_ALLOWED_NETWORKS。
 _DENIED_IPV6_NETWORKS: Tuple[ipaddress.IPv6Network, ...] = tuple(
-    ipaddress.IPv6Network(entry) for entry in ("::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "fec0::/10")
+    ipaddress.IPv6Network(entry)
+    for entry in ("::/96", "::ffff:0:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "fec0::/10")
 )
+
+# 透明代理的 Fake-IP 段（见 DEFAULT_EXTRA_ALLOWED_NETWORKS 的说明）。下载素材默认放行它，但**租户自填的
+# 邮件服务器**不行：连到这一段时对端永远是那个假地址，代理再按域名自己去解析——租户控制那个域名的 DNS，
+# 就能让代理替 NA 连进内网，连接后的对端核对也只看得到假地址。所以租户这一侧对它一律拒绝，
+# 不管 DOWNLOAD_EXTRA_ALLOWED_NETWORKS 里写没写它。平台方账户不受影响
+_FAKE_IP_NETWORKS: Tuple[ipaddress.IPv4Network, ...] = (ipaddress.IPv4Network("198.18.0.0/15"),)
 
 
 class UnsafeDownloadUrlError(ValueError):
@@ -134,8 +142,19 @@ def _is_denied_ipv6_form(ip: _IPAddress) -> bool:
     return ip.version == 6 and any(ip in network for network in _DENIED_IPV6_NETWORKS)
 
 
-def _is_allowed_target_ip(ip: _IPAddress) -> bool:
-    """判断出站目标 IP 是否允许访问"""
+def _is_allowed_target_ip(ip: _IPAddress, *, exclude_fake_ip: bool = False) -> bool:
+    """判断出站目标 IP 是否允许访问
+
+    `exclude_fake_ip=True`（租户自填的邮件服务器）：只认真正的公网地址——198.18.0.0/15 一律拒绝，
+    `DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 里的非公网网段也**不认**：那些网段多半是部署方的透明代理 / TUN
+    地址池或内网，连过去之后由代理按域名再解析，等于把「连到哪里」交给了租户的 DNS。
+    落在公网段里的假地址池（有的代理用 28.0.0.0/8 这类段）从地址上认不出来：开着 Fake-IP / TUN 透明代理
+    的部署，实例自填邮箱仍不安全（运维文档 §1.7 写明）。
+    """
+    if exclude_fake_ip:
+        if any(ip.version == network.version and ip in network for network in _FAKE_IP_NETWORKS):
+            return False
+        return ip.is_global and not _is_denied_ipv6_form(ip)
     if ip.is_global and not _is_denied_ipv6_form(ip):
         return True
     return any(ip.version == network.version and ip in network for network in parse_extra_allowed_networks(OsEnv.DOWNLOAD_EXTRA_ALLOWED_NETWORKS))
@@ -179,22 +198,47 @@ async def _assert_url_targets_public_network(url: str, subject: str) -> None:
         UnsafeDownloadUrlError: 协议不被允许、主机无法解析或指向非公网地址
     """
     _scheme, host, port = _split_outbound_url(url, subject)
+    await _resolve_checked_targets(host, port, subject)
+
+
+async def _resolve_checked_targets(
+    host: str,
+    port: int,
+    subject: str,
+    *,
+    exclude_fake_ip: bool = False,
+) -> Tuple[_IPAddress, ...]:
+    """解析一次主机名，逐个校验**全部**结果，返回去重后的地址（按解析顺序）
+
+    要「只解析一次、直接连校验过的那个地址」的调用方拿返回值去连（见 `resolve_tenant_host`、
+    `fetch_url_bytes`）：校验一次、连接时再解析一次，两次之间可以被 DNS 重绑。
+
+    Raises:
+        UnresolvableDownloadHostError: 解析失败
+        UnsafeDownloadUrlError: 任何一个结果不允许访问
+    """
     try:
         addr_infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError) as e:
         # UnicodeError：httpx 放行、但 getaddrinfo 的 idna 编码拒绝的主机名（空标签 `a..b`、超过 63 字符的标签），没有发出查询
         raise UnresolvableDownloadHostError(f"{subject}主机名解析失败: {host}") from e
 
+    resolved: list[_IPAddress] = []
     for addr_info in addr_infos:
         ip = _normalize_ip(addr_info[4][0])
-        if not _is_allowed_target_ip(ip):
+        if not _is_allowed_target_ip(ip, exclude_fake_ip=exclude_fake_ip):
             # 调用方普遍以 debug 级别吞掉下载异常，这里主动升级日志级别，
             # 既保证安全事件可见，也避免正常部署被拦截时无从排查
-            logger.warning(
-                f"拒绝指向非公网地址的{subject}: {host} -> {ip}"
-                f"（若这是透明代理的 Fake-IP，请把对应网段写入 NEKRO_DOWNLOAD_EXTRA_ALLOWED_NETWORKS）",
+            hint = (
+                "（租户自填的服务器不接受透明代理的 Fake-IP 段）"
+                if exclude_fake_ip and any(ip.version == n.version and ip in n for n in _FAKE_IP_NETWORKS)
+                else "（若这是透明代理的 Fake-IP，请把对应网段写入 NEKRO_DOWNLOAD_EXTRA_ALLOWED_NETWORKS）"
             )
+            logger.warning(f"拒绝指向非公网地址的{subject}: {host} -> {ip}{hint}")
             raise UnsafeDownloadUrlError(f"{subject}指向非公网地址: {host} -> {ip}")
+        if ip not in resolved:
+            resolved.append(ip)
+    return tuple(resolved)
 
 
 async def assert_download_url_safe(url: str) -> None:
@@ -234,7 +278,7 @@ def assert_connected_peer_safe(peer_ip: Optional[str]) -> None:
         raise UnsafeDownloadUrlError("下载连接的对端不是公网地址")
 
 
-def assert_tenant_connected_peer_safe(peer_ip: Optional[str]) -> None:
+def assert_tenant_connected_peer_safe(peer_ip: Optional[str], *, exclude_fake_ip: bool = False) -> None:
     """校验租户发起的连接的实际对端 IP
 
     与 `assert_connected_peer_safe` 的差别同 `assert_tenant_endpoint_url_safe` 与
@@ -242,7 +286,11 @@ def assert_tenant_connected_peer_safe(peer_ip: Optional[str]) -> None:
     对自己「允许从内网拉素材」的授权，把它顺延成「允许租户连内网」就是越权通道。
 
     `DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 仍然生效（判据沿用 `_is_allowed_target_ip`）：它显式
-    声明的是「这些非内网网段算安全」，与部署方是否允许内网下载是两件事。
+    声明的是「这些非内网网段算安全」，与部署方是否允许内网下载是两件事。`exclude_fake_ip=True`
+    时 Fake-IP 段一律拒绝（租户自填的邮件服务器，见 `_FAKE_IP_NETWORKS`）。
+
+    报错文案**不带地址**：它可能一路回到租户眼前，带上地址就等于告诉租户「NA 连上了内网的哪台机器」。
+    地址只进日志。
 
     Raises:
         UnsafeDownloadUrlError: 对端不是允许访问的地址，或取不到对端地址
@@ -251,9 +299,9 @@ def assert_tenant_connected_peer_safe(peer_ip: Optional[str]) -> None:
         ip = _normalize_ip(peer_ip or "")
     except ValueError as e:
         raise UnsafeDownloadUrlError("无法确认连接的对端地址") from e
-    if not _is_allowed_target_ip(ip):
+    if not _is_allowed_target_ip(ip, exclude_fake_ip=exclude_fake_ip):
         logger.warning(f"拒绝连接到非公网对端的租户出站连接: {ip}")
-        raise UnsafeDownloadUrlError(f"连接的对端不是公网地址: {ip}")
+        raise UnsafeDownloadUrlError("连接的对端不是公网地址")
 
 
 async def assert_tenant_endpoint_url_safe(url: str) -> None:
@@ -272,6 +320,86 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
     await _assert_url_targets_public_network(url, "接口地址")
 
 
+async def assert_tenant_host_safe(
+    host: str,
+    port: int,
+    *,
+    subject: str = "接口地址",
+    exclude_fake_ip: bool = False,
+) -> None:
+    """按「主机名 + 端口」做与 `assert_tenant_endpoint_url_safe` 完全相同的公网校验
+
+    给不是 URL 的出站连接用（邮箱的自定义 IMAP/SMTP 服务器只填主机与端口）。只做校验、不要
+    地址的调用方用它；要连接的调用方用 `resolve_tenant_host`，拿校验过的地址直接去连。
+
+    Raises:
+        UnsafeDownloadUrlError: 主机无法解析或指向非公网地址，或主机名不合法
+    """
+    await resolve_tenant_host(host, port, subject=subject, exclude_fake_ip=exclude_fake_ip)
+
+
+async def resolve_tenant_host(
+    host: str,
+    port: int,
+    *,
+    subject: str = "接口地址",
+    exclude_fake_ip: bool = False,
+) -> Tuple[str, ...]:
+    """校验租户填的「主机名 + 端口」，返回**校验过的**地址（按解析顺序，至少一个）
+
+    只解析一次：调用方必须直接连返回的地址（TLS 的 SNI 与证书主机名仍用原主机名），不能再把
+    主机名交给连接库去解析一遍——校验与连接各解析一次，两次之间可以被 DNS 重绑，NA 就真的
+    连上了内网的某个端口（哪怕之后的对端核对把它断开，「连上了」本身已经可以拿来探测内网）。
+
+    **不另写一套网段表**：判定复用 `_resolve_checked_targets` 那一份，主机名统一从
+    `httpx.URL` 的 `raw_host` 取（与 httpx 真正发起连接时的 IDNA 编码同一来源）。
+
+    主机名只许「一个裸主机名」或方括号括起来的 IPv6 字面量：带 `/`、`@`、`#`、`?`、反斜杠、
+    空白或方括号外的冒号的一律拒绝。这里校验的是 URL 解析出来的主机，而 IMAP / SMTP 客户端拿到的
+    是原字符串——`a@b` 这种写法在两边会被理解成两台不同的机器。
+
+    Args:
+        host: 主机名或 `[IPv6]`
+        port: 端口
+        subject: 出现在报错文案里的主体名
+        exclude_fake_ip: Fake-IP 段也拒绝（租户自填的邮件服务器，见 `_FAKE_IP_NETWORKS`）
+
+    Raises:
+        UnsafeDownloadUrlError: 主机无法解析或指向非公网地址，或主机名不合法
+    """
+    host_text = str(host or "").strip()
+    if not host_text:
+        raise UnsafeDownloadUrlError(f"{subject}缺少主机名")
+    # 只收 ASCII 主机名：这里按 httpx 的 IDNA 2008 编码校验，而 `smtplib` / `imaplib` 连接时 Python 按
+    # IDNA 2003 编码——`straße.x` 校验的是 `xn--strae-oqa.x`、实际连的是 `strasse.x`，两边可以解析到
+    # 完全不同的地址。国际化域名请填它的 `xn--` 形式（连接后另有对端 IP 核对兜底）
+    if not host_text.isascii():
+        raise UnsafeDownloadUrlError(f"{subject}主机名不合法（国际化域名请填 xn-- 形式）")
+    if not _BARE_HOST_PATTERN.fullmatch(host_text):
+        raise UnsafeDownloadUrlError(f"{subject}主机名不合法")
+    try:
+        target = httpx.URL(f"//{host_text}:{int(port)}")
+    except (httpx.InvalidURL, ValueError) as e:
+        raise UnsafeDownloadUrlError(f"{subject}主机名不合法") from e
+    raw_host = target.raw_host
+    if not raw_host:
+        raise UnsafeDownloadUrlError(f"{subject}缺少主机名")
+    # IPv6 字面量在 `raw_host` 里不带方括号，getaddrinfo 正要这个形态
+    ips = await _resolve_checked_targets(
+        raw_host.decode("ascii"),
+        int(port),
+        subject,
+        exclude_fake_ip=exclude_fake_ip,
+    )
+    if not ips:
+        raise UnresolvableDownloadHostError(f"{subject}主机名解析失败")
+    return tuple(str(ip) for ip in ips)
+
+
+# 裸主机名（可以是国际化域名）或 `[IPv6]`；见 `assert_tenant_host_safe`
+_BARE_HOST_PATTERN = re.compile(r"\[[0-9A-Fa-f:.]+\]|[^\s/@#?\\:\[\]]+")
+
+
 # 本二改分支自己的版本号与署名。
 #
 # **不要把它写回 `pyproject.toml` 的 `version`**：`get_app_version()` 读的那个值同时用于
@@ -282,7 +410,7 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
 # `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求触发发布的 git tag 与它一致（标签写法见 publish.yml）。
-FORK_VERSION = "0.4.5"
+FORK_VERSION = "0.4.6"
 FORK_AUTHOR = "Akiyo_dayo"
 
 # 本分支代码所基于的上游 NekroAgent 发布版，只用于署名「基于 NekroAgent 某版本」。
@@ -370,12 +498,24 @@ def compare_semver(a: str, b: str) -> int:
     return 0
 
 
-async def _fetch_following_redirects(client: httpx.AsyncClient, url: str) -> bytes:
+async def _fetch_following_redirects(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: Optional[int] = None,
+    check_peer: bool = False,
+    pin_addresses: bool = False,
+) -> bytes:
     """GET 下载正文，手动跟随跳转
+
+    `pin_addresses=True`（含首跳）：每一跳只解析一次、校验全部结果，请求直接发给校验过的那个地址
+    （见 `_pinned_download_request`），不让 httpx 再解析一遍——否则 DNS 重绑之后 NA 会真的连上内网的
+    某个端口，哪怕随后的对端核对把它断开，「连上了没有」本身已经能拿来探测内网。
 
     `url` 必须已经过 `assert_download_url_safe`（`download_file` 在重试逻辑之外校验首跳）。之后每一跳的目标
     都在发请求之前重新校验：跳转目标由对方服务器决定，跟随而不校验等于让首跳的公网地址替内网地址背书。
-    跳转响应的正文不读；只有最终那一跳的正文按 `MAX_DOWNLOAD_SIZE_BYTES` 边读边计数。
+    跳转响应的正文不读；只有最终那一跳的正文按大小上限边读边计数。上限默认 `MAX_DOWNLOAD_SIZE_BYTES`
+    （调用时才读，测试改这个模块常量照样生效）；调用方可以传更小的 `max_bytes`。
 
     时限：从首跳发出到最终响应头到达，整条链（含每一跳的校验解析）共用 `DOWNLOAD_TIMEOUT_SECONDS`，
     跳转多了不会多拿时间。读正文沿用客户端每次读的超时加大小上限，不另设总时限——有意的取舍，
@@ -387,34 +527,43 @@ async def _fetch_following_redirects(client: httpx.AsyncClient, url: str) -> byt
         httpx.HTTPStatusError: 最终响应不是 2xx（不跟随的 3xx 也走这里）
         TimeoutError: 整条链在时限内没拿到最终响应头
     """
+    limit = MAX_DOWNLOAD_SIZE_BYTES if max_bytes is None else max_bytes
     deadline = asyncio.get_running_loop().time() + DOWNLOAD_TIMEOUT_SECONDS
     current = url
     for redirects_followed in range(MAX_DOWNLOAD_REDIRECTS + 1):
         try:
             async with asyncio.timeout_at(deadline):
-                if redirects_followed:
-                    await assert_download_url_safe(current)
-                response = await client.send(client.build_request("GET", current, headers=_DOWNLOAD_REQUEST_HEADERS), stream=True)
+                if pin_addresses:
+                    request = await _pinned_download_request(client, current)
+                else:
+                    if redirects_followed:
+                        await assert_download_url_safe(current)
+                    request = client.build_request("GET", current, headers=_DOWNLOAD_REQUEST_HEADERS)
+                response = await client.send(request, stream=True)
         except httpx.InvalidURL as e:
             # httpx 不跟跳转也会按 Location 预先构造下一跳（`response.next_request`，不发出去），`javascript:alert(1)`
             # 这类目标在那里就抛 InvalidURL。确定性失败，不重试。Location 本身解析不了时 httpx 抛的是
             # RemoteProtocolError，和真正的协议错误分不开，照普通失败处理（会重试，同样什么都没发出去）
             raise UnsafeDownloadUrlError("下载链接或跳转目标不是合法的 URL") from e
         try:
+            if check_peer:
+                # 发请求前那次校验解析一次、httpx 连接时再解析一次，DNS 重绑就发生在两次之间：
+                # 以实际连上的地址为准（`check_peer` 由不走代理的调用方打开，见 `fetch_url_bytes`）
+                assert_connected_peer_safe(_response_peer_ip(response))
             if response.status_code not in _DOWNLOAD_REDIRECT_STATUS:
                 response.raise_for_status()
                 if response.headers.get("content-encoding", "").strip().lower() not in ("", "identity"):
                     raise UnsafeDownloadUrlError("下载内容带有压缩编码（请求的是 identity）")
                 declared_length = response.headers.get("content-length")
-                if declared_length and declared_length.isdigit() and int(declared_length) > MAX_DOWNLOAD_SIZE_BYTES:
+                if declared_length and declared_length.isdigit() and int(declared_length) > limit:
                     raise UnsafeDownloadUrlError(f"下载内容超过大小上限: {declared_length} bytes")
                 chunks: list[bytes] = []
                 downloaded = 0
                 # aiter_raw：不经 httpx 的解压，读进来多少就是多少
                 async for chunk in response.aiter_raw():
                     downloaded += len(chunk)
-                    if downloaded > MAX_DOWNLOAD_SIZE_BYTES:
-                        raise UnsafeDownloadUrlError(f"下载内容超过大小上限: >{MAX_DOWNLOAD_SIZE_BYTES} bytes")
+                    if downloaded > limit:
+                        raise UnsafeDownloadUrlError(f"下载内容超过大小上限: >{limit} bytes")
                     chunks.append(chunk)
                 return b"".join(chunks)
             location = response.headers.get("location")
@@ -430,6 +579,60 @@ async def _fetch_following_redirects(client: httpx.AsyncClient, url: str) -> byt
     # 并不是所有调用方都会打印下载异常，这里自己留一条；只记主机名
     logger.warning(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次，已放弃: {httpx.URL(url).host}")
     raise UnsafeDownloadUrlError(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次")
+
+
+async def fetch_url_bytes(url: str, *, max_bytes: Optional[int] = None, timeout: Optional[float] = None) -> bytes:
+    """把一个外部链接的正文读进内存（不落盘），与 `download_file` 同一套守卫
+
+    给「拿到字节自己处理」的调用方用（例如表情收集：先算内容哈希再决定存不存）：首跳过
+    `assert_download_url_safe`（拒回环 / 私有 / 链路本地等地址，按解析出的 IP 判），跳转逐跳复检，
+    只收未压缩正文，边读边按 `max_bytes`（默认 `MAX_DOWNLOAD_SIZE_BYTES`）计数。不重试：调用方多半
+    在一次模型调用里，失败直接交回比静默重试三次更好。
+
+    Args:
+        url: 外部链接（http / https）
+        max_bytes: 正文大小上限；不传用全局上限
+        timeout: 客户端每次读的超时（秒）；不传用 `DOWNLOAD_TIMEOUT_SECONDS`
+
+    Raises:
+        UnsafeDownloadUrlError: 链接或跳转目标被拒、正文带压缩编码、超过大小上限等
+        httpx.HTTPError: 网络错误或最终响应不是 2xx
+    """
+    client_timeout = DOWNLOAD_TIMEOUT_SECONDS if timeout is None else timeout
+    # `trust_env=False`：走环境代理时对端是代理，核对实际对端就没有意义了（与 video.py 同一做法）。
+    # 首跳的校验在 `_fetch_following_redirects` 里与连接共用一次解析（`pin_addresses`）
+    async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=False, trust_env=False) as client:
+        return await _fetch_following_redirects(client, url, max_bytes=max_bytes, check_peer=True, pin_addresses=True)
+
+
+async def _pinned_download_request(client: httpx.AsyncClient, url: str) -> httpx.Request:
+    """为 `url` 造一个直接发往**校验过的地址**的请求
+
+    解析一次、校验全部结果（与 `assert_download_url_safe` 同一套判据），URL 的主机换成第一个地址；
+    `Host` 头与 TLS 的 SNI / 证书主机名仍是原主机名（httpcore 的 `sni_hostname` 请求扩展），
+    所以对方看到的请求、证书校验都与直接按主机名请求一样。
+    部署方开了 `ALLOW_PRIVATE_NETWORK_DOWNLOAD` 时不做解析与换址，照原样请求。
+
+    Raises:
+        UnsafeDownloadUrlError: 链接不合法、协议不被允许、主机解析失败或指向非公网地址
+    """
+    scheme, host, port = _split_outbound_url(url, "下载链接")
+    if OsEnv.ALLOW_PRIVATE_NETWORK_DOWNLOAD:
+        return client.build_request("GET", url, headers=_DOWNLOAD_REQUEST_HEADERS)
+    ips = await _resolve_checked_targets(host, port, "下载链接")
+    if not ips:
+        raise UnresolvableDownloadHostError("下载链接主机名解析失败")
+    target = httpx.URL(url)
+    headers = {**_DOWNLOAD_REQUEST_HEADERS, "Host": target.netloc.decode("ascii")}
+    extensions = {"sni_hostname": host} if scheme == "https" else {}
+    return client.build_request("GET", target.copy_with(host=str(ips[0])), headers=headers, extensions=extensions)
+
+
+def _response_peer_ip(response: httpx.Response) -> Optional[str]:
+    """这一跳实际连上的对端 IP（取不到返回 None，由 `assert_connected_peer_safe` 按拒绝处理）"""
+    stream = response.extensions.get("network_stream")
+    address = stream.get_extra_info("server_addr") if stream is not None else None
+    return str(address[0]) if address else None
 
 
 def _upload_save_path(file_name: str, from_chat_key: str) -> Path:

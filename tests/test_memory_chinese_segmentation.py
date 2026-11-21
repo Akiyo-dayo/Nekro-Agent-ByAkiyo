@@ -571,7 +571,7 @@ async def _seed_relation() -> None:
 
 
 async def _retrieve_relation_summaries(monkeypatch: pytest.MonkeyPatch, query: str) -> list[str]:
-    async def fake_embed(_text: str) -> list[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> list[float]:
         return [1.0, 0.0, 0.0, 0.0]
 
     class _EmptyQdrant:
@@ -618,7 +618,7 @@ async def _seed_episode() -> None:
 
 
 async def _retrieve_episode_summaries(monkeypatch: pytest.MonkeyPatch, query: str) -> list[str]:
-    async def fake_embed(_text: str) -> list[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> list[float]:
         return [1.0, 0.0, 0.0, 0.0]
 
     class _EmptyQdrant:

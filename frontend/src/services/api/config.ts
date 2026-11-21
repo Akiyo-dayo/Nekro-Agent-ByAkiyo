@@ -15,6 +15,13 @@ export interface ConfigItem {
   is_hidden?: boolean
   required?: boolean // 添加必填属性
   model_type?: string
+  /**
+   * 从关切到开时先弹的确认文案
+   *
+   * 后端 `ExtraField.enable_confirm` 原样透传，键是 `zh-CN` / `en-US`。缺这个键表示
+   * 这个开关不需要确认；空对象也不弹，避免拿一个空对话框挡住保存。
+   */
+  enable_confirm?: Record<string, string> | null
 }
 
 export interface BatchUpdateConfigRequest {
@@ -35,6 +42,8 @@ export interface ModelGroupConfig {
   EXTRA_BODY?: string | null
   ENABLE_VISION?: boolean
   ENABLE_COT?: boolean
+  /** 预填方式；后端默认 off */
+  PREFILL_MODE?: 'off' | 'assistant' | 'deepseek'
 }
 
 export interface ModelTypeOption {

@@ -120,7 +120,7 @@ def _cc_prompt_cache_identity() -> Tuple[str, str]:
         raise AssertionError("没能从 cc_workspace/plugin.py 里读出 author/module_name —— 判据失效，不是产品没问题")
 
     main = ast.parse((CC_WORKSPACE_PLUGIN_DIR / "main.py").read_text(encoding="utf-8"))
-    store_keys = sorted(
+    prompt_keys = sorted(
         {
             _string_kwargs(node)["store_key"]
             for node in ast.walk(main)
@@ -130,12 +130,18 @@ def _cc_prompt_cache_identity() -> Tuple[str, str]:
             and isinstance(node.func.value, ast.Attribute)
             and node.func.value.attr == "store"
             and "store_key" in _string_kwargs(node)
+            # 只认写任务正文的那一处：插件还写了一本 SSH 授权别名（值不是 task_prompt），
+            # 它不是这份缓存的契约，不能拿来当判据。
+            and any(
+                keyword.arg == "value" and isinstance(keyword.value, ast.Name) and keyword.value.id == "task_prompt"
+                for keyword in node.keywords
+            )
         }
     )
-    if len(store_keys) != 1:
-        raise AssertionError(f"cc_workspace 插件的 store 写入点不是恰好一个，判据需要重写: {store_keys}")
+    if len(prompt_keys) != 1:
+        raise AssertionError(f"cc_workspace 插件的任务正文缓存写入点不是恰好一个，判据需要重写: {prompt_keys}")
 
-    return f"{author}.{module_name}", store_keys[0]
+    return f"{author}.{module_name}", prompt_keys[0]
 
 
 CC_WORKSPACE_PLUGIN_KEY, CC_LAST_TASK_PROMPT_KEY = _cc_prompt_cache_identity()
@@ -537,13 +543,14 @@ class TestTheRestOfTheWorkspaceCascade:
 
         assert calls["container_remove"] == [workspace.id]
 
-    async def test_a_workspace_that_never_had_a_container_skips_docker(self, client, calls) -> None:
-        """对照：没有容器名就一次 Docker 都不该碰（改前的行为逐字保留）"""
+    async def test_a_workspace_that_never_had_a_container_still_goes_through_remove(self, client, calls) -> None:
+        """没有容器名也调 `remove()`：它先在工作区的锁里把状态换成 deleting，删行之前别的请求起不来
+        新容器。没有容器名时 `remove()` 自己不碰 Docker（`test_ws_host_hardening.py` 钉着）；不 stop"""
         workspace = await DBWorkspace.create(name="never-started", description="", status="stopped")
 
         assert client.delete(f"/api/workspaces/{workspace.id}").status_code == 200
 
-        assert calls["container_remove"] == []
+        assert calls["container_remove"] == [workspace.id]
         assert calls["container_stop"] == []
 
     async def test_memory_vectors_are_still_cleaned(self, client, calls) -> None:

@@ -96,6 +96,9 @@ class MemoryRebuildChannelState(BaseModel):
     last_batch_finished_at: str | None = None
     last_error: str | None = None
     retry_count: int = 0
+    # 闸开时这个频道的旧域行是否已经删过。落盘保存：续跑时靠它避免把已经写出的新行再删一遍；
+    # 旧的状态文件没有这个键，读成 False。
+    domain_reset_done: bool = False
 
 
 class MemoryRebuildChannelsFile(BaseModel):
@@ -127,6 +130,8 @@ class MemoryRebuildJobState(BaseModel):
     failure_code: RebuildFailureCode = RebuildFailureCode.NONE
     failure_reason: str | None = None
     current_chat_key: str | None = None
+    # 频道级失败只影响这个频道，任务本身仍会走完。旧状态文件没有这个键，读进来是空列表。
+    failed_channels: list[str] = Field(default_factory=list)
     checkpoints: RebuildCheckpoints = Field(default_factory=RebuildCheckpoints)
     snapshot: RebuildSnapshot = Field(default_factory=RebuildSnapshot)
     progress: RebuildProgress = Field(default_factory=RebuildProgress)

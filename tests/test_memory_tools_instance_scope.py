@@ -156,7 +156,7 @@ async def _create_paragraph(content: str, instance_key: str, preset_id: int = 0)
 
 @pytest.fixture
 def two_instance_memories(monkeypatch: pytest.MonkeyPatch):
-    async def fake_embed(_text: str) -> list[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> list[float]:
         return [1.0, 0.0, 0.0, 0.0]
 
     monkeypatch.setattr(config, "MEMORY_ENABLE_SYSTEM", True)
@@ -284,7 +284,7 @@ class TestTheThreeExitsCarryThePresetDimensionToo:
 
     @pytest.fixture
     def two_preset_memories(self, monkeypatch: pytest.MonkeyPatch):
-        async def fake_embed(_text: str) -> list[float]:
+        async def fake_embed(_text: str, **_kwargs: object) -> list[float]:
             return [1.0, 0.0, 0.0, 0.0]
 
         monkeypatch.setattr(config, "MEMORY_ENABLE_SYSTEM", True)

@@ -1,5 +1,6 @@
 from nekro_agent.core.config import config, save_config
 from nekro_agent.core.logger import logger
+from nekro_agent.models.db_chat_channel import DefaultPreset, get_instance_default_preset
 from nekro_agent.models.db_preset import GLOBAL_PRESET_OWNER, DBPreset
 
 # 内置默认人设信息（用于全新安装时创建，以及数据库查询不到人设时的最终回退）
@@ -37,6 +38,23 @@ def _update_default_preset_id(preset_id: int) -> None:
     """更新配置中的默认人设 ID 并持久化"""
     config.AI_CHAT_DEFAULT_PRESET_ID = preset_id
     save_config()
+
+
+async def resolve_instance_preset(adapter_key: str, instance_key: str) -> "DBPreset | DefaultPreset":
+    """某个实例上生效的人设：实例默认 → 系统默认 → 内置
+
+    与 `DBChatChannel.get_preset` 的后三层完全一致，只是没有「频道自己绑的那一层」——
+    节日邮件的正文要按实例的人设写，而一个实例可能有很多频道、也可能一个都没有。
+    抽在这里而不是在插件里拼回退链：将来别处要「这个实例的人格」时不该再抄一遍。
+    """
+    instance_preset = await get_instance_default_preset(adapter_key, instance_key)
+    if instance_preset is not None:
+        return instance_preset
+    if config.AI_CHAT_DEFAULT_PRESET_ID is not None:
+        default_preset = await DBPreset.get_or_none(id=config.AI_CHAT_DEFAULT_PRESET_ID)
+        if default_preset is not None:
+            return default_preset
+    return DefaultPreset(name=DEFAULT_PRESET_NAME, content=DEFAULT_PRESET_CONTENT)
 
 
 async def init_default_preset() -> None:

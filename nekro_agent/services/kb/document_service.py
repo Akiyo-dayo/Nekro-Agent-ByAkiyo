@@ -14,6 +14,7 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_kb_document import DBKBDocument
 from nekro_agent.models.db_kb_document_reference import DBKBDocumentReference
 from nekro_agent.schemas.kb import KBDocumentListItem, KBDocumentReferences, KBReferenceItem
+from nekro_agent.services.kb import kb_files
 from nekro_agent.services.workspace.manager import WorkspaceService
 
 logger = get_sub_logger("kb.document")
@@ -148,6 +149,7 @@ def compute_sha256(content: bytes) -> str:
 
 
 def write_bytes_exclusive(target: Path, content: bytes, *, logical_path: str) -> None:
+    """在宿主侧**信得过**的路径上新建文件（全局知识库用）；工作区知识库走 `kb_files.create_exclusive`"""
     try:
         with target.open("xb") as file:
             file.write(content)
@@ -195,10 +197,8 @@ async def get_document(workspace_id: int, document_id: int) -> DBKBDocument | No
 
 
 def read_source_content(document: DBKBDocument) -> str:
-    source_path = WorkspaceService.resolve_kb_source_path(document.workspace_id, document.source_path)
-    if not source_path.exists():
-        return ""
-    return source_path.read_text(encoding="utf-8", errors="replace")
+    # 工作区知识库目录容器可写：逐级不跟随链接地读，链接当作不存在
+    return kb_files.read_text(document.workspace_id, kb_files.SOURCE, document.source_path)
 
 
 async def read_source_content_async(document: DBKBDocument) -> str:
@@ -208,10 +208,7 @@ async def read_source_content_async(document: DBKBDocument) -> str:
 def read_normalized_content(document: DBKBDocument) -> str:
     if not document.normalized_text_path:
         return ""
-    normalized_path = WorkspaceService.resolve_kb_normalized_path(document.workspace_id, document.normalized_text_path)
-    if not normalized_path.exists():
-        return ""
-    return normalized_path.read_text(encoding="utf-8", errors="replace")
+    return kb_files.read_text(document.workspace_id, kb_files.NORMALIZED, document.normalized_text_path)
 
 
 async def read_normalized_content_async(document: DBKBDocument) -> str:
@@ -240,10 +237,8 @@ async def create_text_document(
         format=format,
         category=category,
     )
-    target = WorkspaceService.resolve_kb_source_path(workspace_id, final_source_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     encoded = content.encode("utf-8")
-    write_bytes_exclusive(target, encoded, logical_path=final_source_path)
+    kb_files.create_exclusive(workspace_id, kb_files.SOURCE, final_source_path, encoded)
     _, suffix, mime_type = detect_format_and_mime(Path(final_source_path).name)
     try:
         return await DBKBDocument.create(
@@ -268,8 +263,7 @@ async def create_text_document(
             file_size=len(encoded),
         )
     except Exception:
-        if target.exists():
-            target.unlink()
+        kb_files.unlink(workspace_id, kb_files.SOURCE, final_source_path)
         raise
 
 
@@ -288,10 +282,8 @@ async def create_file_document(
     WorkspaceService.ensure_kb_dirs(workspace_id)
     original_name = upload_file.filename or f"kb-upload-{int(datetime.now().timestamp())}.txt"
     final_source_path = safe_source_path(source_path or original_name)
-    target = WorkspaceService.resolve_kb_source_path(workspace_id, final_source_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     content = await upload_file.read()
-    write_bytes_exclusive(target, content, logical_path=final_source_path)
+    kb_files.create_exclusive(workspace_id, kb_files.SOURCE, final_source_path, content)
     detected_format, suffix, mime_type = detect_format_and_mime(Path(final_source_path).name)
     try:
         return await DBKBDocument.create(
@@ -316,8 +308,7 @@ async def create_file_document(
             file_size=len(content),
         )
     except Exception:
-        if target.exists():
-            target.unlink()
+        kb_files.unlink(workspace_id, kb_files.SOURCE, final_source_path)
         raise
 
 
@@ -341,11 +332,13 @@ async def update_document_metadata(
     old_file_size = document.file_size
     old_extract_status = document.extract_status
     old_sync_status = document.sync_status
-    current_path = WorkspaceService.resolve_kb_source_path(document.workspace_id, document.source_path)
-    target_path = current_path
+    # 下面的文件操作都走 `kb_files`：工作区知识库目录容器可写，按路径读写会跟着链接走
+    workspace_id = document.workspace_id
+    current_rel = document.source_path
+    target_rel = current_rel
     original_bytes: bytes | None = None
     remove_target_on_failure = False
-    moved_paths: tuple[Path, Path] | None = None
+    moved_paths: tuple[str, str] | None = None
 
     if title is not None:
         document.title = title.strip()
@@ -373,16 +366,13 @@ async def update_document_metadata(
                 if conflict_exists:
                     raise FileExistsError(new_rel_path)
 
-                new_path = WorkspaceService.resolve_kb_source_path(document.workspace_id, new_rel_path)
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                if new_path.exists():
+                if kb_files.occupied(workspace_id, kb_files.SOURCE, new_rel_path):
                     raise FileExistsError(new_rel_path)
-                if current_path.exists():
-                    current_path.rename(new_path)
-                    moved_paths = (current_path, new_path)
-                target_path = new_path
+                if kb_files.rename(workspace_id, kb_files.SOURCE, current_rel, new_rel_path):
+                    moved_paths = (current_rel, new_rel_path)
+                target_rel = new_rel_path
                 document.source_path = new_rel_path
-                document.file_name = new_path.name
+                document.file_name = Path(new_rel_path).name
                 _, suffix, mime_type = detect_format_and_mime(document.file_name)
                 document.file_ext = suffix
                 document.mime_type = mime_type
@@ -392,11 +382,10 @@ async def update_document_metadata(
             if document.format not in TEXT_FORMATS:
                 raise ValueError("仅文本类知识文档允许直接更新正文内容")
             encoded = content.encode("utf-8")
-            if target_path.exists():
-                original_bytes = target_path.read_bytes()
-            else:
+            original_bytes = kb_files.read_bytes(workspace_id, kb_files.SOURCE, target_rel)
+            if original_bytes is None:
                 remove_target_on_failure = True
-            target_path.write_bytes(encoded)
+            kb_files.write_bytes(workspace_id, kb_files.SOURCE, target_rel, encoded)
             document.content_hash = compute_sha256(encoded)
             document.file_size = len(encoded)
             document.extract_status = "pending"
@@ -418,29 +407,31 @@ async def update_document_metadata(
         if content is not None:
             if original_bytes is not None:
                 try:
-                    target_path.write_bytes(original_bytes)
+                    kb_files.write_bytes(workspace_id, kb_files.SOURCE, target_rel, original_bytes)
                 except Exception as rollback_error:
                     logger.warning(
                         "回滚知识库文档内容失败: "
-                        f"document_id={document.id}, target_path={target_path}, action=restore_content, error={rollback_error}"
+                        f"document_id={document.id}, target_path={target_rel}, action=restore_content, error={rollback_error}"
                     )
-            elif remove_target_on_failure and target_path.exists():
+            elif remove_target_on_failure:
                 try:
-                    target_path.unlink()
+                    kb_files.unlink(workspace_id, kb_files.SOURCE, target_rel)
                 except Exception as rollback_error:
                     logger.warning(
                         "回滚知识库文档内容失败: "
-                        f"document_id={document.id}, target_path={target_path}, action=cleanup_new_file, error={rollback_error}"
+                        f"document_id={document.id}, target_path={target_rel}, action=cleanup_new_file, error={rollback_error}"
                     )
         if moved_paths is not None:
-            old_path, new_path = moved_paths
-            if new_path.exists() and not old_path.exists():
+            old_rel, new_rel = moved_paths
+            if kb_files.exists(workspace_id, kb_files.SOURCE, new_rel) and not kb_files.occupied(
+                workspace_id, kb_files.SOURCE, old_rel
+            ):
                 try:
-                    new_path.rename(old_path)
+                    kb_files.rename(workspace_id, kb_files.SOURCE, new_rel, old_rel)
                 except Exception as rollback_error:
                     logger.warning(
                         "回滚知识库文档重命名失败: "
-                        f"document_id={document.id}, old_path={old_path}, new_path={new_path}, error={rollback_error}"
+                        f"document_id={document.id}, old_path={old_rel}, new_path={new_rel}, error={rollback_error}"
                     )
         raise
     return document

@@ -16,6 +16,10 @@ from nekro_agent.adapters import get_adapter
 from nekro_agent.adapters.onebot_v11.core.bot import BotInstanceOfflineError, get_bot_by_chat_key
 from nekro_agent.adapters.onebot_v11.core.message_id import parse_message_id
 from nekro_agent.adapters.onebot_v11.tools import video as onebot_video
+from nekro_agent.adapters.onebot_v11.tools.bot_membership_check import (
+    MembershipCheckResult,
+    check_instance_membership,
+)
 from nekro_agent.adapters.onebot_v11.tools.video import (
     ADAPTER_KEY as ONEBOT_ADAPTER_KEY,
 )
@@ -38,7 +42,7 @@ from nekro_agent.models.db_announcement import (
     DBAnnouncement,
     DBAnnouncementDelivery,
 )
-from nekro_agent.models.db_chat_channel import DBChatChannel
+from nekro_agent.models.db_chat_channel import BotMembershipStatus, DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_mem_episode import DBMemEpisode
 from nekro_agent.models.db_mem_paragraph import DBMemParagraph
@@ -65,6 +69,7 @@ from nekro_agent.services.announcement import (
     announcement_service,
 )
 from nekro_agent.services.channel_broadcaster import channel_broadcaster
+from nekro_agent.services.chat_channel_service import set_channel_active
 from nekro_agent.services.command.base import CommandPermission
 from nekro_agent.services.command.manager import (
     USER_PERMISSION_SOURCE_MANUAL,
@@ -125,6 +130,14 @@ async def assert_channel_accessible(user: DBUser, chat_key: str) -> None:
         raise NotFoundError(resource="聊天频道")
 
 
+class ChatChannelBotMembership(BaseModel):
+    """频道「Bot 在不在群」标记（核对结果，不是停用状态）"""
+
+    status: str
+    checked_at: int
+    source: str
+
+
 class ChatChannelItem(BaseModel):
     id: int
     chat_key: str
@@ -137,6 +150,8 @@ class ChatChannelItem(BaseModel):
     create_time: str
     update_time: str
     last_message_time: Optional[str]
+    # 与 `auto_disable` 不同：这个标记不论频道启用与否都下发，因为它只是核对结论
+    bot_membership: Optional[ChatChannelBotMembership] = None
 
 
 class ChatChannelListResponse(BaseModel):
@@ -158,12 +173,66 @@ class ChatChannelDirectoryResponse(BaseModel):
     items: List[ChatChannelDirectoryItem]
 
 
+class ChatChannelAutoDisable(BaseModel):
+    """频道被系统自动停用的原因（只在停用着时下发）"""
+
+    reason: str
+    detail: str
+    disabled_at: int
+
+
+class BotMembershipCheckRequest(BaseModel):
+    instance_key: str
+    adapter_key: str = "onebot_v11"
+
+
+class BotMembershipDisablePreviewItem(BaseModel):
+    chat_key: str
+    channel_name: Optional[str]
+    custom_channel_name: Optional[str]
+    status: str
+    checked_at: int
+
+
+class BotMembershipDisablePreview(BaseModel):
+    count: int
+    items: List[BotMembershipDisablePreviewItem]
+
+
+class BotMembershipDisableRequest(BaseModel):
+    chat_keys: List[str]
+
+
+class BotMembershipDisableResponse(BaseModel):
+    disabled: int
+    skipped: int
+    disabled_chat_keys: List[str]
+
+
+def _bot_membership_of(channel: DBChatChannel) -> Optional[ChatChannelBotMembership]:
+    """把频道 data 里的标记转成接口模型；没有标记或内容坏掉时返回 None"""
+    info = channel.get_bot_membership_info()
+    if info is None:
+        return None
+    return ChatChannelBotMembership(
+        status=info.status.value,
+        checked_at=info.checked_at,
+        source=info.source.value,
+    )
+
+
 class ChatChannelDetail(ChatChannelItem):
     unique_users: int
     conversation_start_time: str
     preset_id: Optional[int]
     can_send: bool = False
     ai_always_include_msg_id: bool = False
+    auto_disable: Optional[ChatChannelAutoDisable] = None
+    # 频道所属实例：频道详情里的「记忆」标签要按频道自己的实例取摘要与提示词明细
+    # （租户身份下这两个列表接口必须带实例）。会话标识的格式随适配器而定，前端不该去解析它。
+    # 能走到这里的调用方已经过了频道归属判断，返回的只是它本来就能看的那个实例。
+    adapter_key: str = ""
+    instance_key: str = ""
 
 
 class ChatMessage(BaseModel):
@@ -212,9 +281,13 @@ async def get_chat_channel_list(
     chat_type: Optional[str] = None,
     status: Optional[str] = None,
     is_active: Optional[bool] = None,
+    bot_membership: Optional[str] = None,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ChatChannelListResponse:
     """获取聊天频道列表（租户只看得到自己实例下的会话）"""
+    if bot_membership not in (None, "", "not_in_group"):
+        raise ValidationError(reason="无效的 Bot 在群筛选值")
+
     query = await visible_channels(_current_user)
 
     if search:
@@ -236,6 +309,16 @@ async def get_chat_channel_list(
         query = query.filter(is_active=is_active)
 
     channels = await query.all()
+
+    # 标记在 data 这个 JSON 文本列里，无法可靠地转到 SQL 条件上，因此在 Python 里过滤。
+    # 列表本来就是一次取全量（前端 page_size 1000），过滤后 `total` 才是筛选后的真实数量。
+    if bot_membership == "not_in_group":
+        channels = [
+            channel
+            for channel in channels
+            if (info := channel.get_bot_membership_info()) is not None
+            and info.status is BotMembershipStatus.NOT_IN_GROUP
+        ]
 
     channel_info_list = []
     for channel in channels:
@@ -291,12 +374,124 @@ async def get_chat_channel_list(
                 last_message_time=(
                     info["last_message_time"].strftime("%Y-%m-%d %H:%M:%S") if info["last_message_time"] is not None else None
                 ),
+                bot_membership=_bot_membership_of(channel),
             ),
         )
 
     return ChatChannelListResponse(
         total=len(channels),
         items=result,
+    )
+
+
+# 下面三个路由必须排在 `/{chat_key}/...` 之前：否则 `bot-membership` 会被当成 chat_key 匹配走。
+@router.post("/bot-membership/check", summary="立即核对 Bot 在群")
+@require_role(Role.Admin)
+async def check_bot_membership(
+    body: BotMembershipCheckRequest,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> MembershipCheckResult:
+    """向协议端取一次群列表，核对指定实例名下的频道
+
+    只写「Bot 在不在群」标记，不会停用或启用任何频道。别人的实例与不存在的实例一律 404。
+    """
+    await assert_instance_accessible(_current_user, body.instance_key, adapter_key=body.adapter_key)
+    if body.adapter_key != "onebot_v11":
+        raise ValidationError(reason="只有 OneBot V11 实例支持核对 Bot 在群")
+
+    result = await check_instance_membership(body.instance_key)
+    logger.info(
+        f"后台手动核对 Bot 在群: 操作人={_current_user.username}, 实例={body.instance_key}, 结果={result.outcome.value}",
+    )
+    return result
+
+
+@router.get("/bot-membership/disable-preview", summary="预览批量停用 Bot 不在群的频道")
+@require_role(Role.Admin)
+async def preview_disable_not_in_group(
+    instance_key: Optional[str] = None,
+    adapter_key: str = "onebot_v11",
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> BotMembershipDisablePreview:
+    """列出当前身份看得到的、启用中且带「Bot 不在群」标记的频道"""
+    query = (await visible_channels(_current_user)).filter(is_active=True)
+    if instance_key:
+        await assert_instance_accessible(_current_user, instance_key, adapter_key=adapter_key)
+        query = query.filter(adapter_key=adapter_key, instance_key=instance_key)
+
+    channels = await query.all()
+    items: List[BotMembershipDisablePreviewItem] = []
+    for channel in channels:
+        info = channel.get_bot_membership_info()
+        if info is None or info.status is not BotMembershipStatus.NOT_IN_GROUP:
+            continue
+        items.append(
+            BotMembershipDisablePreviewItem(
+                chat_key=channel.chat_key,
+                channel_name=channel.channel_name,
+                custom_channel_name=channel.get_custom_channel_name(),
+                status=channel.channel_status,
+                checked_at=info.checked_at,
+            ),
+        )
+    items.sort(key=lambda item: item.checked_at)
+    return BotMembershipDisablePreview(count=len(items), items=items)
+
+
+@router.post("/bot-membership/disable", summary="批量停用 Bot 不在群的频道")
+@require_role(Role.Admin)
+async def disable_not_in_group(
+    body: BotMembershipDisableRequest,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> BotMembershipDisableResponse:
+    """把预览清单里的频道逐个走手动停用
+
+    手动停用会清掉自动停用标记，之后 Bot 回群也不会被自动恢复；「Bot 不在群」标记本身保留。
+    看不到的 chat_key 直接算跳过，不区分「不存在」与「不是你的」，避免把别人的频道变成可枚举的。
+    """
+    chat_keys = list(dict.fromkeys(body.chat_keys))
+    if len(chat_keys) > 2000:
+        raise ValidationError(reason="一次最多停用 2000 个频道")
+
+    channels = await (await visible_channels(_current_user)).filter(chat_key__in=chat_keys).order_by("id")
+    # 存量库里同一个 chat_key 可能残留多行：和 `DBChatChannel.get_channel` 一样取最早那行（携带绑定的原始行），
+    # 不让字典随查询顺序随机留下一行
+    channels_by_key: Dict[str, DBChatChannel] = {}
+    for channel in channels:
+        channels_by_key.setdefault(channel.chat_key, channel)
+
+    disabled = 0
+    skipped = 0
+    disabled_chat_keys: List[str] = []
+    for chat_key in chat_keys:
+        channel = channels_by_key.get(chat_key)
+        if channel is None or not channel.is_active:
+            skipped += 1
+            continue
+        info = channel.get_bot_membership_info()
+        # 预览之后 Bot 可能又回群了（入站会清标记），执行时重新校验一遍
+        if info is None or info.status is not BotMembershipStatus.NOT_IN_GROUP:
+            skipped += 1
+            continue
+        await channel.set_channel_status("disabled")
+        await channel_broadcaster.publish_update(
+            event_type="updated",
+            chat_key=channel.chat_key,
+            channel_name=channel.channel_name,
+            custom_channel_name=channel.get_custom_channel_name(),
+            is_active=channel.is_active,
+            status=channel.channel_status.value,
+        )
+        disabled += 1
+        disabled_chat_keys.append(chat_key)
+
+    logger.info(
+        f"后台批量停用 Bot 不在群的频道: 操作人={_current_user.username}, 停用={disabled}, 跳过={skipped}",
+    )
+    return BotMembershipDisableResponse(
+        disabled=disabled,
+        skipped=skipped,
+        disabled_chat_keys=disabled_chat_keys,
     )
 
 
@@ -420,6 +615,17 @@ async def _build_chat_channel_detail(channel: DBChatChannel) -> ChatChannelDetai
     except Exception:
         pass
 
+    # 只有停用着的频道才可能带自动停用标记；启用中的频道即使 data 里残留了标记也不该展示
+    auto_disable: Optional[ChatChannelAutoDisable] = None
+    if not channel.is_active:
+        auto_disable_info = channel.get_auto_disable_info()
+        if auto_disable_info is not None:
+            auto_disable = ChatChannelAutoDisable(
+                reason=auto_disable_info.reason.value,
+                detail=auto_disable_info.detail,
+                disabled_at=auto_disable_info.disabled_at,
+            )
+
     return ChatChannelDetail(
         id=channel.id,
         chat_key=channel.chat_key,
@@ -437,6 +643,10 @@ async def _build_chat_channel_detail(channel: DBChatChannel) -> ChatChannelDetai
         preset_id=channel.preset_id,
         can_send=can_send,
         ai_always_include_msg_id=ai_always_include_msg_id,
+        auto_disable=auto_disable,
+        adapter_key=channel.adapter_key or "",
+        instance_key=channel.instance_key or "",
+        bot_membership=_bot_membership_of(channel),
     )
 
 
@@ -558,15 +768,7 @@ async def set_chat_channel_active(
     if not channel:
         raise NotFoundError(resource="聊天频道")
 
-    await channel.set_channel_status("active" if is_active else "disabled")
-    await channel_broadcaster.publish_update(
-        event_type="updated",
-        chat_key=channel.chat_key,
-        channel_name=channel.channel_name,
-        custom_channel_name=channel.get_custom_channel_name(),
-        is_active=channel.is_active,
-        status=channel.channel_status,
-    )
+    await set_channel_active(channel, is_active)
     return ActionResponse(ok=True)
 
 

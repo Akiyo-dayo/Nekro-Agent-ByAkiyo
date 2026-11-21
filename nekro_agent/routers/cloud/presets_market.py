@@ -1,8 +1,11 @@
-from typing import List, Optional
+import json
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from nekro_agent.core.config import config
+from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_preset import DBPreset
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.routers.presets import (
@@ -11,12 +14,24 @@ from nekro_agent.routers.presets import (
     visible_presets,
 )
 from nekro_agent.schemas.errors import CloudServiceError, ConflictError
+from nekro_agent.schemas.tavern import CardImportOptions
+from nekro_agent.services.tavern.card_format import CardFileRejected, parse_card_object
+from nekro_agent.services.tavern.cloud import parse_envelope
+from nekro_agent.services.tavern.importer import CardExtras, PresetFields, import_parsed_card
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
-from nekro_agent.services.user.tenant_perm import get_tenant_scope, require_platform_owner
+from nekro_agent.services.user.tenant_perm import (
+    assert_instance_accessible,
+    get_tenant_scope,
+    require_platform_owner,
+)
 from nekro_agent.systems.cloud.api.preset import get_preset, list_presets, list_user_presets
 
 router = APIRouter(prefix="/cloud/presets-market", tags=["Cloud Presets Market"])
+logger = get_sub_logger("cloud.presets_market")
+
+# 信封还原失败时的响应提示；前端只读 `ok`，这句话给管理员看。
+CARD_RESTORE_FAILED_NOTE = "附带的酒馆卡数据无法还原，只导入了人设本身"
 
 
 def shows_platform_account_state(user: DBUser) -> bool:
@@ -73,6 +88,16 @@ class UserPresetListResponse(BaseModel):
 
 class ActionResponse(BaseModel):
     ok: bool = True
+
+
+class PresetDownloadResponse(BaseModel):
+    """下载云端人设的结果
+
+    前端只读 `ok`；`note` 用于说明「人设下回来了，但附带的酒馆卡数据没还原」。
+    """
+
+    ok: bool = True
+    note: str = ""
 
 
 @router.get("/list", summary="获取云端人设列表")
@@ -143,13 +168,64 @@ async def get_cloud_presets_list(
     )
 
 
+def _stored_ext_data(raw: Any) -> Any:
+    """改造前对 `extData` 的落库规则：几种「空」形态都写空对象，其余原样存
+
+    `presets.ext_data` 是 JSON 列：合法 JSON 文本原样交给列，读出来是解析后的对象；
+    不合法的文本（例如坏信封）先包成 JSON 字符串，否则列在写入时就会拒绝，回退路径
+    反而会失败。包一层后读出来仍是原来的字符串。
+    """
+    if raw in [None, "", "''", '""']:
+        return {}
+    if isinstance(raw, str):
+        try:
+            json.loads(raw)
+        except ValueError:
+            return json.dumps(raw, ensure_ascii=False)
+    return raw
+
+
+def _empty_prev_ext_data(value: Any) -> bool:
+    """信封里共享前的扩展位是不是空的；空时下载落库用空对象"""
+    return value is None or value == "" or value == {} or value == []
+
+
+async def _create_plain_preset(preset_data: Any, scope: str, content: Optional[str] = None) -> DBPreset:
+    """按改造前的规则只建 NA 人设（不建扩展行、不建人设书）
+
+    `ext_data` 先按空值建行再单独赋值：JSON 列在构造时会把合法 JSON 文本先解码一次，
+    坏信封这种「不是 JSON 的字符串」如果直接传给构造器，会在写库前就被判成非法 JSON。
+
+    `content` 是信封里的完整正文：信封能解析、只是卡片还原失败时由调用方传入。云端的
+    `content` 栏在共享时被截到 5000 字以内，用它建人设会丢掉长正文的尾部。
+    """
+    stored_ext_data = _stored_ext_data(preset_data.ext_data)
+    preset = await DBPreset.create(
+        remote_id=preset_data.id,
+        on_shared=bool(preset_data.is_owner) and not scope,
+        name=preset_data.name,
+        title=preset_data.title,
+        avatar=preset_data.avatar,
+        content=content if content is not None else preset_data.content,
+        description=preset_data.description,
+        tags=preset_data.tags,
+        author=preset_data.author,
+        ext_data=None,
+        owner_instance_key=scope,
+    )
+    if stored_ext_data is not None:
+        preset.ext_data = stored_ext_data
+        await preset.save()
+    return preset
+
+
 @router.post("/download/{remote_id}", summary="下载云端人设到本地")
 @require_role(Role.Admin)
 async def download_preset(
     remote_id: str,
     instance_key: str = Query("", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
-) -> ActionResponse:
+) -> PresetDownloadResponse:
     """下载云端人设到本地
 
     归属跟随下载时所处的作用域：在实例作用域下下载即归该实例独享，在平台方全局视图下
@@ -171,6 +247,11 @@ async def download_preset(
     /cloud/plugins-market/plugin/{module_name}` 收成平台方专属是同一条理由。
     因此实例作用域下的副本一律 `on_shared=False`（它是下载来的，不是我们发布的），
     平台方全局视图下仍按 `is_owner` 记，未启用多租户的部署逐字不变。
+
+    云端 `extData` 里若是酒馆卡信封，则走与上传导入同一套解析与落库流程：人设正文用
+    信封里的完整正文，扩展行、清理规则与人设书一起还原，知识书条目一律不可信。头像
+    按现有下载规则原样存云端值，不重新编码。信封坏了或还原失败时退回只建 NA 人设，
+    并在 `note` 里说明。
     """
     scope = await resolve_instance_scope(_current_user, instance_key)
     if await visible_presets(scope).filter(remote_id=remote_id).exists():
@@ -181,22 +262,58 @@ async def download_preset(
         raise CloudServiceError(reason=str(response.error or response.message or "未知错误"))
 
     preset_data = response.data
-    ext_data = preset_data.ext_data if preset_data.ext_data not in [None, "", "''", '""'] else {}
-    await DBPreset.create(
-        remote_id=preset_data.id,
-        on_shared=bool(preset_data.is_owner) and not scope,
-        name=preset_data.name,
-        title=preset_data.title,
-        avatar=preset_data.avatar,
-        content=preset_data.content,
-        description=preset_data.description,
-        tags=preset_data.tags,
-        author=preset_data.author,
-        ext_data=ext_data,
-        owner_instance_key=scope,
-    )
+    envelope, reason = parse_envelope(preset_data.ext_data)
+    if envelope is None:
+        if reason:
+            logger.warning(f"云端人设的扩展数据不是可用的信封: remote_id={preset_data.id}, reason={reason}")
+            await _create_plain_preset(preset_data, scope)
+            return PresetDownloadResponse(ok=True, note=CARD_RESTORE_FAILED_NOTE)
+        await _create_plain_preset(preset_data, scope)
+        return PresetDownloadResponse(ok=True)
 
-    return ActionResponse(ok=True)
+    book_owner = ("", "")
+    if scope:
+        instance = await assert_instance_accessible(_current_user, scope)
+        book_owner = (instance.adapter_key, instance.instance_key)
+    prev_ext_data = {} if _empty_prev_ext_data(envelope.prev_ext_data) else envelope.prev_ext_data
+
+    try:
+        parsed = parse_card_object(envelope.card, source_format="cloud")
+        await import_parsed_card(
+            parsed,
+            CardImportOptions(),
+            owner_instance_key=scope,
+            book_owner=book_owner,
+            username=_current_user.username,
+            template=config.TAVERN_CARD_TEMPLATE,
+            avatar=preset_data.avatar,
+            content_override=envelope.content,
+            extra=CardExtras(
+                prefill=envelope.prefill,
+                macros_enabled=envelope.macros_enabled,
+                greeting_pick=envelope.greeting_pick,
+            ),
+            preset_fields=PresetFields(
+                name=preset_data.name,
+                title=preset_data.title,
+                description=preset_data.description,
+                tags=preset_data.tags,
+                author=preset_data.author,
+                remote_id=preset_data.id,
+                on_shared=bool(preset_data.is_owner) and not scope,
+                ext_data=prev_ext_data,
+            ),
+        )
+    except CardFileRejected as exc:
+        logger.warning(f"云端人设的酒馆卡数据无法还原: remote_id={preset_data.id}, reason={exc}")
+        await _create_plain_preset(preset_data, scope, content=envelope.content)
+        return PresetDownloadResponse(ok=True, note=CARD_RESTORE_FAILED_NOTE)
+    except Exception as exc:  # noqa: BLE001 - 还原失败就退回只建人设，原因不把卡片原文带进日志
+        logger.warning(f"云端人设的酒馆卡数据无法还原: remote_id={preset_data.id}, reason={type(exc).__name__}")
+        await _create_plain_preset(preset_data, scope, content=envelope.content)
+        return PresetDownloadResponse(ok=True, note=CARD_RESTORE_FAILED_NOTE)
+
+    return PresetDownloadResponse(ok=True)
 
 
 @router.get("/user-presets", summary="获取用户上传的人设列表")

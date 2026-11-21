@@ -41,6 +41,17 @@ export interface ActionResponse {
   ok: boolean
 }
 
+/**
+ * 下载云端人设的结果
+ *
+ * 与 `presetsApi.sync` 同形：`ok` 表示下载本身成功，`note` 是「人设下回来了，但附带的
+ * 酒馆卡数据没还原」这类需要告诉用户、又不该算失败的说明。没有话要说时是空串。
+ */
+export interface PresetDownloadResponse {
+  ok: boolean
+  note?: string
+}
+
 export const presetsMarketApi = {
   /**
    * 获取云端人设列表
@@ -73,9 +84,12 @@ export const presetsMarketApi = {
 
   /**
    * 下载云端人设到本地
+   *
+   * 返回的 `note` 非空时要单独提示一次：那说的是卡片数据没还原，用户手上的这份人设
+   * 会缺后置指令、开场白之类的部分。
    */
-  downloadPreset: async (remote_id: string): Promise<ActionResponse> => {
-    const response = await axios.post<ActionResponse>(`/cloud/presets-market/download/${remote_id}`)
+  downloadPreset: async (remote_id: string): Promise<PresetDownloadResponse> => {
+    const response = await axios.post<PresetDownloadResponse>(`/cloud/presets-market/download/${remote_id}`)
     return response.data
   },
 }

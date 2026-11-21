@@ -54,6 +54,10 @@
       "modelType": "模型类型",
       "vision": "视觉能力",
       "cot": "外置思维链",
+      "prefillMode": "预填方式",
+      "prefillModeOff": "关（默认）",
+      "prefillModeAssistant": "末尾 assistant 消息（Anthropic 原生、OpenRouter 等）",
+      "prefillModeDeepseek": "DeepSeek 前缀续写（要把接口地址设成 DeepSeek 的 beta 地址）",
       "temperature": "Temperature (随机性)",
       "topP": "Top P (多样性)",
       "presencePenalty": "Presence Penalty (新话题)",
@@ -70,6 +74,7 @@
       "modelName": "若无法获取列表，请直接手动输入模型名称",
       "vision": "启用模型视觉能力。仅在确认该模型支持多模态输入时开启——对不支持的模型开启会让每一轮对话都被上游拒绝",
       "cot": "启用NA提供的思维链进行分析，如果模型原生支持请关闭",
+      "prefillMode": "只有确认这个服务支持把末尾的 assistant 消息当作回答开头时才打开。服务商拒绝时会自动去掉预填重发一次，并在一段时间内不再对这个组发预填。",
       "advanced": "高级选项",
       "expandAdvanced": "展开高级选项 ▶",
       "collapseAdvanced": "收起高级选项 ▼",
@@ -717,5 +722,27 @@
       "fetchSuccess": "已获取 {{count}} 个模型",
       "fetchFailed": "获取模型列表失败"
     }
+  },
+  "outputFilter": {
+    "title": "命中统计与起步词表",
+    "refresh": "刷新",
+    "instance": "实例",
+    "kind": "类型",
+    "rule": "规则",
+    "count": "次数",
+    "lastHitAt": "最近命中",
+    "empty": "暂无命中记录",
+    "loading": "加载中…",
+    "rejectedTitle": "以下规则未生效",
+    "starterButton": "查看起步词表",
+    "starterTitle": "起步词表",
+    "starterHint": "以下词表默认不启用，仅作参考。",
+    "starterNote": "默认不启用；复制后粘贴到「过滤词」里保存才生效",
+    "copy": "复制",
+    "copied": "已复制",
+    "pluginHint": "插件绕过框架直接连协议端发出的消息过滤不到。",
+    "kindWord": "词",
+    "kindRegex": "正则",
+    "kindError": "引擎异常"
   }
 }

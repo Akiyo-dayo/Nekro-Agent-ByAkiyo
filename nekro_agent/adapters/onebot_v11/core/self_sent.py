@@ -230,13 +230,17 @@ class SelfSentRegistry:
 self_sent_registry = SelfSentRegistry()
 
 
-def _channel_of_call(api: str, data: Mapping[str, Any]) -> Optional[str]:
+def channel_of_call(api: str, data: Mapping[str, Any]) -> Optional[str]:
     """这次 API 调用发往哪个频道，与 `self_sent_channel` 同一种写法"""
     group_id = data.get("group_id")
     user_id = data.get("user_id")
     if api in _GROUP_APIS or (api in _GROUP_OR_PRIVATE_APIS and group_id):
         return f"group_{group_id}" if group_id else None
     return f"private_{user_id}" if user_id else None
+
+
+# 出站过滤钩子与本模块共用同一条频道解析；保留旧名，避免已有调用点被迫改动
+_channel_of_call = channel_of_call
 
 
 def _uploaded_name(data: Mapping[str, Any]) -> str:

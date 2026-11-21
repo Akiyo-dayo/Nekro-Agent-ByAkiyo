@@ -445,9 +445,13 @@ export default function CloudProfile() {
           setFavoriteLocalState('preset', favorite.targetId, false)
           notification.success(t('common:messages.deleteSuccess') || '删除成功')
         } else {
-          await presetsMarketApi.downloadPreset(favorite.targetId)
+          const response = await presetsMarketApi.downloadPreset(favorite.targetId)
           setFavoriteLocalState('preset', favorite.targetId, true)
           notification.success(t('cloud:presetsMarket.obtainSuccess'))
+          // 服务端在下载时可能改写内容并回一句说明，非空就单独弹一条醒目的警告
+          if (response.note) {
+            notification.warning(response.note)
+          }
         }
         await fetchFavorites()
       } else {

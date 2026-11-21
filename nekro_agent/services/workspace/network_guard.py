@@ -292,6 +292,10 @@ class WorkspaceNetworkSpec:
             （`NEKRO_CC_CREDENTIAL_MODE=direct`，真实 Key 直接进容器，容器不需要回连）
         host_relay_addresses: NA **跑在宿主上**时，容器回连它要用的宿主地址（本网桥网关等）。
             NA 在容器里时为空 —— 那时中继走网桥内部直连，发往宿主的方向仍然一条例外都没有
+        gateway_port: 容器回连 SSH 网关时的目的端口。为 0 表示不开这个口子
+            （总开关关着，或这张网络上的网关本来就不该被容器访问）
+        host_gateway_addresses: NA **跑在宿主上**时，容器连 SSH 网关要用的宿主地址（本网桥网关）。
+            NA 在容器里时为空 —— 那时容器直连 NA 在该网桥上的地址，发往宿主的方向不开例外
         marker: 规则标记
         extra_blocked_ipv4: 运维额外声明要切断的 IPv4 目的地（典型用途是宿主对外的公网 IP）
         extra_blocked_ipv6: 同上的 IPv6 部分
@@ -304,6 +308,8 @@ class WorkspaceNetworkSpec:
     marker: str
     relay_port: int = 0
     host_relay_addresses: Tuple[str, ...] = ()
+    gateway_port: int = 0
+    host_gateway_addresses: Tuple[str, ...] = ()
     extra_blocked_ipv4: Tuple[str, ...] = ()
     extra_blocked_ipv6: Tuple[str, ...] = ()
 
@@ -328,10 +334,10 @@ def build_workspace_isolation_rules(
         按安装顺序排列的规则列表
 
     Raises:
-        WorkspaceNetworkIsolationError: 中继开着（`relay_port` 非 0）却一个可放行的地址都没有。
+        WorkspaceNetworkIsolationError: 中继或 SSH 网关开着（对应端口非 0）却一个可放行的地址都没有。
             与沙盒守卫拒绝生成「只有兜底拒绝、没有 RPC 回调放行」的规则集是同一条不变式：
             这一组的两端都是默认拒绝（转发方向的 RFC1918 DROP + 发往宿主的兜底 DROP），
-            没有放行就等于**保证**容器连不上模型中继，而且瘫得毫无线索——
+            没有放行就等于**保证**容器连不上模型中继 / SSH 网关，而且瘫得毫无线索——
             DROP 不回 RST，容器里那次请求会一直等到自己超时。装上去比装不上更糟。
     """
     if spec.relay_port and not spec.controller_addresses and not spec.host_relay_addresses:
@@ -342,6 +348,14 @@ def build_workspace_isolation_rules(
             f"拒绝生成「中继端口 {spec.relay_port} 开着、却没有任何放行地址」的工作区隔离规则集："
             "容器回连模型中继的包会落进兜底拒绝，CC 工作区的每一次模型调用都会静默等到超时。"
             "请检查工作区专用网络的网关地址是否可读（NA 跑在宿主上时中继只能经它回连）",
+        )
+    if spec.gateway_port and not spec.controller_addresses and not spec.host_gateway_addresses:
+        # 与中继同一条不变式：网关端口开着却没有一个可放行的目的地，容器里的 ssh 会一直等到
+        # 自己超时，而宿主侧只有一条 DROP 的计数，没有任何能指向原因的信号。
+        raise WorkspaceNetworkIsolationError(
+            f"拒绝生成「SSH 网关端口 {spec.gateway_port} 开着、却没有任何放行地址」的工作区隔离规则集："
+            "容器连 SSH 网关的包会落进兜底拒绝，`ssh <别名>` 会静默等到超时。"
+            "请检查工作区专用网络的网关地址是否可读（NA 跑在宿主上时网关只能经它访问）",
         )
 
     scope: List[str] = ["-i", spec.bridge_interface]
@@ -385,6 +399,14 @@ def build_workspace_isolation_rules(
         rules.append(
             make(forward_chain, [*guarded, "-d", address, "-p", "tcp", "--dport", str(spec.relay_port)], "ACCEPT"),
         )
+    for address in controllers if spec.gateway_port else ():
+        # 工作区容器 -> NA 的 SSH 网关（`services/ssh_gateway/`）。与中继那条同一种形状：
+        # 按**目的地**匹配，目的地是 NA 自己在本网桥上的地址加网关监听端口。
+        # 网桥不做源地址校验，按源放行的例外可以被容器伪造；按目的地放行伪造不出额外权限。
+        # 网关自己还要求来源地址与网关专用钥匙两样都对（`ssh_gateway/registry.py`）。
+        rules.append(
+            make(forward_chain, [*guarded, "-d", address, "-p", "tcp", "--dport", str(spec.gateway_port)], "ACCEPT"),
+        )
     rules.append(make(forward_chain, [*guarded, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED"], "ACCEPT"))
     for protocol in ("udp", "tcp"):
         # 云上部署（AWS VPC 的 x.x.0.2、GCP 的 169.254.169.254）的解析器就落在被封的网段里，
@@ -418,6 +440,12 @@ def build_workspace_isolation_rules(
             # NA 在容器里时 `host_relay_addresses` 为空，这一组一条都不生成。
             rules.append(
                 make(INPUT_CHAIN, [*guarded, "-d", address, "-p", "tcp", "--dport", str(spec.relay_port)], "ACCEPT"),
+            )
+        for address in spec.host_gateway_addresses if spec.gateway_port else ():
+            # NA 跑在宿主上的部署：容器连 SSH 网关只能走本网桥的网关，与中继那条同样收窄到
+            # 一个地址加一个端口。NA 在容器里时这个元组为空，这一组一条都不生成。
+            rules.append(
+                make(INPUT_CHAIN, [*guarded, "-d", address, "-p", "tcp", "--dport", str(spec.gateway_port)], "ACCEPT"),
             )
     if family == "ipv6":
         # NDP/ICMPv6 被拦掉的话，容器连网关都找不到，公网 IPv6 出网会一并失效
@@ -462,12 +490,14 @@ class WorkspaceNetworkPlan:
             NA 不在容器里、或未接入该网络时为空串
         host_address: 该网络的网关地址（= 宿主在这张网桥上的地址）。NA 跑在宿主上时
             容器只能经它回连中继，两者都取不到时中继地址退回 `host.docker.internal`
+        gateway_listen_address: 容器连 SSH 网关时要用的地址；隔离没生效或网关总开关关着时为空串
     """
 
     network_mode: str
     isolated: bool
     controller_address: str = ""
     host_address: str = ""
+    gateway_listen_address: str = ""
 
 
 _install_lock = asyncio.Lock()
@@ -693,6 +723,13 @@ async def prepare_workspace_network(
     host_relay_addresses: Tuple[str, ...] = (
         (network.ipv4_gateway,) if relaying and not OsEnv.RUN_IN_DOCKER and network.ipv4_gateway else ()
     )
+    # SSH 网关与中继同一套落点：NA 在容器里时容器直连 controller 地址；NA 在宿主上时走本网桥网关。
+    # 总开关关着时端口为 0，两条放行都不生成，规则集与改造前逐字一致。
+    gateway_enabled = bool(config.SSH_GATEWAY_ENABLED)
+    gateway_port = int(config.SSH_GATEWAY_PORT) if gateway_enabled else 0
+    host_gateway_addresses: Tuple[str, ...] = (
+        (network.ipv4_gateway,) if gateway_enabled and not OsEnv.RUN_IN_DOCKER and network.ipv4_gateway else ()
+    )
     # 缓存键覆盖所有会改变规则集的输入：改了工作区端口而不重装规则，NA 就再也连不上新工作区
     cache_key = (
         network.bridge_interface,
@@ -704,6 +741,10 @@ async def prepare_workspace_network(
         extra_ipv4,
         extra_ipv6,
     )
+    if gateway_enabled:
+        # 只在网关开着时把这两个输入并入签名：关着时保持改造前的缓存键逐字不变，
+        # 不因为「多带两个恒为 0/空的值」而在升级后无谓地重装一次规则。
+        cache_key += (gateway_port, host_gateway_addresses)
 
     controller_address = ""
     async with _install_lock:
@@ -725,6 +766,8 @@ async def prepare_workspace_network(
                         marker=marker,
                         relay_port=relay_port,
                         host_relay_addresses=host_relay_addresses,
+                        gateway_port=gateway_port,
+                        host_gateway_addresses=host_gateway_addresses,
                         extra_blocked_ipv4=extra_ipv4,
                         extra_blocked_ipv6=extra_ipv6,
                     )
@@ -783,11 +826,24 @@ async def prepare_workspace_network(
             partial(_verify_applied_workspace_rules, group, applied_spec, cache_key),
         )
 
+    # 隔离生效时网关的落点：NA 在容器里用它在网桥上的地址，NA 在宿主上用本网桥网关。
+    # 隔离没生效时容器根本不在工作区网络上，「按来源地址认容器」不成立，网关对它一律不提供。
+    gateway_listen_address = ""
+    if gateway_enabled and isolated:
+        gateway_listen_address = controller_address if OsEnv.RUN_IN_DOCKER else (network.ipv4_gateway or "")
+        if gateway_listen_address:
+            # 只登记地址，不在这里起监听：监督任务每拍把 `desired_listen_addresses()` 交给后端同步。
+            # 容器还没起来也要先登记，否则第一次建容器的这一拍监听不存在，CC 的 ssh 会吃一个连接拒绝。
+            from nekro_agent.services.ssh_gateway import registry as ssh_gateway_registry
+
+            ssh_gateway_registry.add_listen_address(gateway_listen_address)
+
     return WorkspaceNetworkPlan(
         network_mode=network.name,
         isolated=True,
         controller_address=controller_address,
         host_address=network.ipv4_gateway or "",
+        gateway_listen_address=gateway_listen_address,
     )
 
 

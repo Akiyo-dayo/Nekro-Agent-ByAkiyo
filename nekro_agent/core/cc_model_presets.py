@@ -14,6 +14,20 @@ CC_PRESETS_PATH = Path(OsEnv.DATA_DIR) / "configs" / "cc-model-presets.json"
 
 DEFAULT_PRESET_NAME = "default"
 
+# 键名里含这些片段的 `extra_env` 项按「像凭据」处理：脱敏时按字面量遮蔽，
+# 不下发给不能拿平台方凭据的工作区。
+SECRET_ENV_KEY_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
+
+def is_secret_env_key(key: str) -> bool:
+    """这个环境变量名看起来是不是一份凭据
+
+    判据是**名字**而不是值：值与取值形态无关（空串也可能是占位），而名字是运维唯一
+    显式表达「这一项是密钥」的地方。大小写不敏感——`apiKey` 与 `API_KEY` 是同一回事。
+    """
+    upper = str(key).upper()
+    return any(marker in upper for marker in SECRET_ENV_KEY_MARKERS)
+
 
 class CCModelPresetItem(BaseModel):
     id: int
@@ -125,7 +139,6 @@ class CCModelPresetsStore:
         只读 `_load_raw()`：`ensure_default` / `list_all` 会写文件，脱敏不能有落盘副作用。
         文件不存在时返回空集合；读文件或解析出错时记 WARNING 并返回空集合，不抛。
         """
-        secret_key_markers = ("TOKEN", "KEY", "SECRET", "PASSWORD")
         values: set[str] = set()
         try:
             raw = self._load_raw()
@@ -136,7 +149,7 @@ class CCModelPresetsStore:
                 if not isinstance(extra_env, dict):
                     continue
                 for key, value in extra_env.items():
-                    if not any(marker in str(key).upper() for marker in secret_key_markers):
+                    if not is_secret_env_key(key):
                         continue
                     text = str(value or "")
                     values.update(candidate for candidate in (text, text.strip()) if candidate)

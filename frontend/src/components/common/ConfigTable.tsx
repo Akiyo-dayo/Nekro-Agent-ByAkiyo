@@ -119,8 +119,19 @@ export interface ConfigItem {
   sub_item_name?: string
   enable_toggle?: string
   overridable?: boolean
+  /** 平台方专属：租户能看、不能改（服务端在租户写实例覆盖时同样拒绝） */
+  platform_only?: boolean
+  /** 租户只能把这一项往低调（服务端判，页面只做提示） */
+  tenant_may_only_lower?: boolean
   is_need_restart?: boolean
   category?: string
+  /**
+   * 布尔项从关切到开时的确认文案
+   *
+   * 后端 `ExtraField.enable_confirm` 原样透传到这一项；键是 `zh-CN` / `en-US`。
+   * 列表 / 字典子项的布尔不走顶层开关，不会读它。
+   */
+  enable_confirm?: Record<string, string> | null
 
   // i18n 扩展字段（可选，与后端 ExtraField 对应）
   i18n_title?: I18nDict
@@ -142,6 +153,8 @@ export interface ModelGroupConfig {
   EXTRA_BODY?: string | null
   ENABLE_VISION?: boolean
   ENABLE_COT?: boolean
+  /** 预填方式；后端默认 off，只有声明支持的服务才该改 */
+  PREFILL_MODE?: 'off' | 'assistant' | 'deepseek'
 }
 
 export interface ModelTypeOption {
@@ -871,9 +884,18 @@ interface ConfirmDialogProps {
   onConfirm: () => void
   title: string
   content: ReactNode
+  /** 确认按钮的文案；不传沿用通用的「确认」 */
+  confirmText?: string
 }
 
-const ConfirmDialog = ({ open, onClose, onConfirm, title, content }: ConfirmDialogProps) => {
+const ConfirmDialog = ({
+  open,
+  onClose,
+  onConfirm,
+  title,
+  content,
+  confirmText,
+}: ConfirmDialogProps) => {
   const { t } = useTranslation('common')
   return (
     <Dialog open={open} onClose={onClose}>
@@ -882,7 +904,7 @@ const ConfirmDialog = ({ open, onClose, onConfirm, title, content }: ConfirmDial
       <DialogActions>
         <Button onClick={onClose}>{t('actions.cancel')}</Button>
         <Button onClick={onConfirm} autoFocus>
-          {t('actions.confirm')}
+          {confirmText ?? t('actions.confirm')}
         </Button>
       </DialogActions>
     </Dialog>
@@ -964,8 +986,30 @@ export default function ConfigTable({
     [i18n.language]
   )
 
+  /**
+   * 「打开前的确认」要显示的文字
+   *
+   * 与标题、描述同一套取语言的办法：直接用界面语言取，取不到回落到中文。后端
+   * `ExtraField.enable_confirm` 只给 `zh-CN` / `en-US` 两种键，回落到中文比回落成
+   * 空串更安全——空串会让确认框变成一个只有标题的空盒子。
+   */
+  const getEnableConfirmText = useCallback(
+    (config: ConfigItem) => {
+      const text = config.enable_confirm
+      if (!text) return ''
+      return getLocalizedText(text as I18nDict, text['zh-CN'] ?? '', i18n.language)
+    },
+    [i18n.language]
+  )
+
   const [editingValues, setEditingValues] = useState<Record<string, string>>({})
   const [dirtyKeys, setDirtyKeys] = useState<Set<string>>(new Set())
+  /** 等待确认的顶层布尔开关；确认之前 editingValues 不动，取消就是什么都不发生 */
+  const [pendingOpenConfirm, setPendingOpenConfirm] = useState<{
+    key: string
+    value: string
+    text: string
+  } | null>(null)
   const [visibleSecrets, setVisibleSecrets] = useState<Record<string, boolean>>({})
   const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false)
   const [saveWarningOpen, setSaveWarningOpen] = useState(false)
@@ -1703,7 +1747,25 @@ export default function ConfigTable({
             control={
               <Switch
                 checked={rawValue === 'true'}
-                onChange={e => handleConfigChange(config.key, String(e.target.checked))}
+                onChange={e => {
+                  const nextValue = String(e.target.checked)
+                  // 只拦「关 → 开」：关掉一个高风险开关不需要再确认一次，多一步只会让人
+                  // 习惯性地连点确认。`rawValue` 取的是界面上当前显示的值（覆盖层里也
+                  // 一样），所以先关再开同样会重新弹。
+                  const confirmText =
+                    e.target.checked && rawValue !== 'true'
+                      ? getEnableConfirmText(config)
+                      : ''
+                  if (confirmText) {
+                    setPendingOpenConfirm({
+                      key: config.key,
+                      value: nextValue,
+                      text: confirmText,
+                    })
+                    return
+                  }
+                  handleConfigChange(config.key, nextValue)
+                }}
                 color="primary"
                 disabled={disabled}
               />
@@ -1896,6 +1958,8 @@ export default function ConfigTable({
                   isOverridePage && config.enable_toggle
                     ? (enableStateMap.get(config.enable_toggle) ?? false)
                     : true
+                // 平台方专属项对租户只读：服务端本来就拒，页面不给一个点了必然 403 的输入框
+                const platformLocked = !isPlatformOwner && Boolean(config.platform_only)
 
                 const mainRow = (
                   <TableRow
@@ -1917,6 +1981,7 @@ export default function ConfigTable({
                         {config.enable_toggle ? (
                           <Switch
                             checked={isEnabled}
+                            disabled={platformLocked}
                             onChange={e => {
                               handleConfigChange(
                                 config.enable_toggle as string,
@@ -2003,6 +2068,24 @@ export default function ConfigTable({
                             sx={{ ...CHIP_VARIANTS.base(isSmall) }}
                           />
                         )}
+                        {config.platform_only && (
+                          <Chip
+                            label={t('configTable.platformOnly')}
+                            size="small"
+                            color="warning"
+                            variant="outlined"
+                            sx={{ ...CHIP_VARIANTS.base(isSmall) }}
+                          />
+                        )}
+                        {config.tenant_may_only_lower && !isPlatformOwner && (
+                          <Chip
+                            label={t('configTable.tenantMayOnlyLower')}
+                            size="small"
+                            color="default"
+                            variant="outlined"
+                            sx={{ ...CHIP_VARIANTS.base(isSmall) }}
+                          />
+                        )}
                       </Stack>
                     </TableCell>
                     {showCategoryColumn && (
@@ -2043,7 +2126,7 @@ export default function ConfigTable({
                       />
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      {renderConfigInput(config, isOverridePage ? !isEnabled : false)}
+                      {renderConfigInput(config, (isOverridePage ? !isEnabled : false) || platformLocked)}
                     </TableCell>
                   </TableRow>
                 )
@@ -2116,6 +2199,23 @@ export default function ConfigTable({
           </Box>
         }
         onConfirm={() => handleSaveAllChanges(true)}
+      />
+      <ConfirmDialog
+        open={pendingOpenConfirm !== null}
+        onClose={() => setPendingOpenConfirm(null)}
+        title={t('configTable.confirmEnableTitle')}
+        content={
+          <Typography sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {pendingOpenConfirm?.text ?? ''}
+          </Typography>
+        }
+        confirmText={t('configTable.confirmEnableButton')}
+        onConfirm={() => {
+          if (pendingOpenConfirm) {
+            handleConfigChange(pendingOpenConfirm.key, pendingOpenConfirm.value)
+          }
+          setPendingOpenConfirm(null)
+        }}
       />
 
       {/* 重启系统确认对话框 */}

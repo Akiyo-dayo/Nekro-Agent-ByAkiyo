@@ -60,6 +60,8 @@ dependencies = [
     "wechatbot-sdk>=0.1.0,<1.0.0",
     "defusedxml>=0.7.1,<1.0.0",
     "jieba>=0.42.1",
+    "regex>=2024.11.6",
+    "asyncssh[bcrypt]>=2.24.1,<3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -231,7 +233,7 @@ cmd = "bash -c 'cd frontend && pnpm build'"
 
 [tool.poe.tasks.frontend-typecheck]
 help = "运行前端类型检查"
-cmd = "bash -c 'cd frontend && pnpm exec tsc --noEmit'"
+cmd = "bash -c 'cd frontend && pnpm exec tsc -p tsconfig.app.json --noEmit && pnpm exec tsc -p tsconfig.node.json --noEmit'"
 
 [tool.poe.tasks.frontend-lint]
 help = "运行前端 lint"
@@ -239,11 +241,11 @@ cmd = "bash -c 'cd frontend && pnpm exec eslint src/ --max-warnings 0'"
 
 [tool.poe.tasks.frontend-check]
 help = "运行前端检查（typecheck + lint）"
-cmd = "bash -c 'cd frontend && pnpm exec tsc --noEmit && pnpm exec eslint src/ --max-warnings 0'"
+cmd = "bash -c 'cd frontend && pnpm exec tsc -p tsconfig.app.json --noEmit && pnpm exec tsc -p tsconfig.node.json --noEmit && pnpm exec eslint src/ --max-warnings 0'"
 
 [tool.poe.tasks.frontend-check-full]
 help = "运行前端检查（typecheck + lint + build）"
-cmd = "bash -c 'cd frontend && pnpm exec tsc --noEmit && pnpm exec eslint src/ --max-warnings 0 && pnpm build'"
+cmd = "bash -c 'cd frontend && pnpm exec tsc -p tsconfig.app.json --noEmit && pnpm exec tsc -p tsconfig.node.json --noEmit && pnpm exec eslint src/ --max-warnings 0 && pnpm build'"
 
 [tool.poe.tasks.frontend-preview]
 help = "预览前端构建"

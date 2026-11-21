@@ -457,16 +457,28 @@ async def run_code_in_sandbox(
     instance_pip_cache_dir = _get_instance_pip_cache_dir(from_chat_key)
     instance_pip_cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # 共享目录按频道复用、0777 挂进沙盒：上一轮沙盒里的代码能把这两个文件换成指向宿主任意
+    # 位置的链接，按路径写就等于以 NA 的身份往那里写模型生成的内容。这里在目录句柄上写临时
+    # 文件再 rename（替换的是目录项本身），权限固定 0644，不沿用上一轮留下的那个文件的权限
+    from nekro_agent.services.workspace import safe_fs
+
     # 写入预置依赖代码
-    api_caller_file_path = Path(host_shared_dir) / API_CALLER_FILENAME
-    api_caller_file_path.write_text(
+    safe_fs.write_text(
+        host_shared_dir,
+        (API_CALLER_FILENAME,),
         await get_api_caller_code(container_key=container_key, from_chat_key=from_chat_key, ctx=ctx),
-        encoding="utf-8",
+        mode=0o644,
+        create_dirs=False,
     )
 
     # 写入要执行的代码
-    code_file_path = Path(host_shared_dir) / CODE_FILENAME
-    code_file_path.write_text(f"{CODE_PREAMBLE.strip()}\n\n{code_run_data.code_content}", encoding="utf-8")
+    safe_fs.write_text(
+        host_shared_dir,
+        (CODE_FILENAME,),
+        f"{CODE_PREAMBLE.strip()}\n\n{code_run_data.code_content}",
+        mode=0o644,
+        create_dirs=False,
+    )
 
     # 设置目录权限
     try:
@@ -618,11 +630,29 @@ async def run_code_in_sandbox(
         )
     )
 
+    # 聊天里登记过服务器时，本轮后续产生的执行记录落盘前要换成占位。没有待清理项时
+    # `apply_pending` 只查一次字典、原样返回，行为与改造前逐字一致。
+    from nekro_agent.services.ssh_gateway.scrub import apply_pending, scrub_code_files
+
+    # 共享目录里的代码文件要留到 30 分钟后才删：登记服务器的那段代码里就有凭据原文，
+    # 容器已经退出，现在就按待清理表重写一遍（没有待清理项时一个文件都不读）
+    scrub_code_files(
+        from_chat_key,
+        [Path(host_shared_dir) / CODE_FILENAME, Path(host_shared_dir) / RUN_CODE_FILENAME],
+    )
+
+    scrubbed_code = apply_pending(from_chat_key, code_run_data.code_content)
+    scrubbed_thought = apply_pending(
+        from_chat_key,
+        code_run_data.thought_chain or (llm_response.thought_chain if llm_response else ""),
+    )
+    scrubbed_output = apply_pending(from_chat_key, final_output)
+
     await DBExecCode.create(
         chat_key=from_chat_key,
-        code_text=code_run_data.code_content,
-        thought_chain=code_run_data.thought_chain or (llm_response.thought_chain if llm_response else ""),
-        outputs=final_output,
+        code_text=scrubbed_code,
+        thought_chain=scrubbed_thought,
+        outputs=scrubbed_output,
         success=stop_type
         in [
             ExecStopType.NORMAL,

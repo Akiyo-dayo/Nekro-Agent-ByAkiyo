@@ -7,7 +7,6 @@ import {
   Card,
   CardContent,
   CardActions,
-  Avatar,
   Chip,
   CircularProgress,
   Dialog,
@@ -27,6 +26,7 @@ import { favoritesApi } from '../../services/api/cloud/favorites'
 import { useSnackbar } from 'notistack'
 import PaginationStyled from '../../components/common/PaginationStyled'
 import PresetDetailDialog from '../../components/cloud/PresetDetailDialog'
+import PresetAvatar from '../../components/common/PresetAvatar'
 import { useNavigate } from 'react-router-dom'
 import { UI_STYLES } from '../../theme/themeConfig'
 import { CHIP_VARIANTS, CARD_VARIANTS } from '../../theme/variants'
@@ -114,16 +114,16 @@ const PresetCard = ({
       <CardContent sx={{ flexGrow: 1, p: { xs: 1.5, sm: 2.5 }, pb: 1 }}>
         <Box sx={{ display: 'flex', gap: { xs: 1.25, sm: 2.5 }, mb: 2, alignItems: 'flex-start' }}>
           {/* 头像 */}
-          <Avatar
+          <PresetAvatar
             src={preset.avatar}
-            alt={preset.name}
+            name={preset.name}
             variant="rounded"
             sx={{
               flexShrink: 0,
               width: { xs: 72, sm: 100 },
               height: { xs: 72, sm: 100 },
               borderRadius: 2,
-              boxShadow: '0 3px 10px rgba(0,0,0,0.1)',
+              boxShadow: theme => theme.shadows[2],
             }}
           />
 
@@ -325,6 +325,11 @@ export default function PresetsMarket() {
             p.remote_id === confirmDialog.preset?.remote_id ? { ...p, is_local: true } : p
           )
         )
+      }
+      // 下载时服务端可能改写内容并回一句说明（例如卡片字段被压平）：非空就单独弹一条警告，
+      // 混进成功提示里会被当成套话
+      if (response.note) {
+        enqueueSnackbar(response.note, { variant: 'warning', autoHideDuration: 8000 })
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)

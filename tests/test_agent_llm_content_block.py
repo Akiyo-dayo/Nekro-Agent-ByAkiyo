@@ -26,7 +26,7 @@
 - 反向对照：`finish_reason='stop'`/`'length'`/`'tool_calls'` 且正文为空时仍然是普通空响应，
   证明判据没有被吹宽成「只要有 finish_reason 就算拦截」。
 
-全部确定性：不起真网络（只替换 openai SDK 客户端与连接池）、不靠时间流逝、不做随机 fuzz。
+全部确定性：不起真网络（只替换 openai SDK 客户端与连接池，用量记账换成空操作）、不靠时间流逝、不做随机 fuzz。
 """
 
 import ast
@@ -148,6 +148,10 @@ def _install_fake_openai(monkeypatch, *, result) -> None:
 
     monkeypatch.setattr(openai_module, "AsyncOpenAI", _FakeClient)
     monkeypatch.setattr(openai_module, "_get_http_client", lambda **_kwargs: object())
+    # 用量记账换成空操作（记账本身由 `test_llm_usage_metering.py` 测）。真记账会起一个后台写库任务，
+    # 这里既不建库也不等它：用例一结束事件循环就关，写到一半的那条 INSERT 回不了结果，
+    # 会把前面用例留下的 sqlite 连接的工作线程一并弄死，后面查这条连接的用例永远等不到结果。
+    monkeypatch.setattr(openai_module, "record_llm_usage", lambda *_args, **_kwargs: None)
 
 
 # 现场逐字取回来的拒答形态：Gemini 安全拦截时 content 为 None，理由只在 finish_reason 上

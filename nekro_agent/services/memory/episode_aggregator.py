@@ -130,6 +130,8 @@ class EpisodeAggregator:
             workspace_id=self.workspace_id,
             instance_key=instance_key,
             preset_id=preset_id,
+            adapter_key=paragraphs[0].adapter_key,
+            origin_chat_type=paragraphs[0].origin_chat_type,
             origin_chat_key=paragraphs[0].origin_chat_key,
             title=title,
             narrative_summary=narrative_summary,

@@ -37,6 +37,7 @@ import OverrideSettings from './detail-tabs/OverrideSettings'
 import PluginData from './detail-tabs/PluginData'
 import CommandPermissions from './detail-tabs/CommandPermissions'
 import DangerZone from './detail-tabs/DangerZone'
+import ChannelMemoryPanel from '../../../components/memory/ChannelMemoryPanel'
 import { CARD_VARIANTS } from '../../../theme/variants'
 import { useMediaQuery } from '@mui/material'
 import { InlineTabs } from '../../../components/common/NekroTabs'
@@ -60,6 +61,7 @@ const CHAT_CHANNEL_TAB_ORDER: ChatChannelDetailTab[] = [
   'basic-info',
   'plugin-data',
   'command-permissions',
+  'memory',
 ]
 
 export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, onBack }: ChatChannelDetailProps) {
@@ -305,7 +307,8 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
         <InlineTabs
           value={currentTabIndex}
           onChange={handleTabChange}
-          variant="fullWidth"
+          variant={isMobile ? 'scrollable' : 'fullWidth'}
+          scrollButtons={isMobile ? 'auto' : undefined}
           sx={{
             '& .MuiTab-root': {
               minHeight: 56,
@@ -317,6 +320,7 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
           <Tab label={t('channelDetail.tabs.basicInfo')} />
           <Tab label={t('channelDetail.tabs.pluginData')} />
           <Tab label={t('channelDetail.tabs.commandPermissions')} />
+          <Tab label={t('channelDetail.tabs.memory')} />
         </InlineTabs>
       </Card>
 
@@ -368,6 +372,15 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
             {currentTab === 'command-permissions' && (
               <Card sx={{ ...CARD_VARIANTS.default.styles, height: '100%', minWidth: 0, overflowY: 'auto', overflowX: 'hidden' }}>
                 <CommandPermissions chatKey={chatKey} />
+              </Card>
+            )}
+            {currentTab === 'memory' && channel && (
+              <Card sx={{ ...CARD_VARIANTS.default.styles, height: '100%', minWidth: 0, overflowY: 'auto', overflowX: 'hidden' }}>
+                <ChannelMemoryPanel
+                  chatKey={chatKey}
+                  adapterKey={channel.adapter_key}
+                  instanceKey={channel.instance_key}
+                />
               </Card>
             )}
           </Box>

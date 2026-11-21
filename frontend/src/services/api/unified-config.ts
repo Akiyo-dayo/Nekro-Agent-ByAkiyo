@@ -1,6 +1,21 @@
 import axios from './axios'
-import { ConfigItem, ModelGroupConfig, ModelTypeOption } from '../../components/common/ConfigTable'
+import {
+  ConfigItem,
+  ModelGroupConfig as SharedModelGroupConfig,
+  ModelTypeOption,
+} from '../../components/common/ConfigTable'
 import type { ModelTestErrorCode } from './tenant'
+
+/**
+ * 模型组完整配置
+ *
+ * 形状与配置表共用（`ConfigTable` 里那份），这里补上只在模型组编辑里用到的
+ * 预填方式。`PREFILL_MODE` 决定请求末尾要不要跟一条 assistant 消息，落库字段名
+ * 就是它，后端默认 `off`。
+ */
+export interface ModelGroupConfig extends SharedModelGroupConfig {
+  PREFILL_MODE?: 'off' | 'assistant' | 'deepseek'
+}
 
 export interface BatchUpdateConfigRequest {
   configs: Record<string, string>

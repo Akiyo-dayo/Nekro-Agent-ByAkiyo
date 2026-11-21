@@ -169,6 +169,35 @@ def _normalize_ids(workspace_ids: Iterable[int]) -> Set[int]:
     return wanted
 
 
+def _schedule_platform_secret_revoke(workspace_ids: Iterable[int], reason: str) -> None:
+    """新置位的这些工作区，顺手把下发过的平台方凭据撤下来
+
+    归属变化时**只删文件不够**：模型 Key 已经在 `claude` 进程的环境里了，所以
+    `credential_policy` 那条路径还要停掉正在跑的容器。绑定租户频道、划转、启动扫描三处
+    都会经过 `taint_workspaces`，挂在这里就覆盖了全部归属变化路径。
+
+    同一条路径上还要挂起平台方服务器凭据（工作区变成非平台方归属的同一套处理）：
+    工作区已经不归平台方，上面那些「能登进平台方服务器」的行不该继续可用。
+    挂起只缩小权限，网关关着也做。
+
+    **绝不抛异常**：这里正在给工作区置位，撤销只是一条后续动作——为它打断置位的话，
+    归属已经变了、标记却没记下，全量重建也补不回来。导入失败同样只记 warning。
+    """
+    ids = list(workspace_ids)
+    try:
+        from nekro_agent.services.workspace.credential_policy import schedule_platform_secret_revoke
+
+        schedule_platform_secret_revoke(ids, reason=reason)
+    except Exception:  # noqa: BLE001 - 撤销失败不能打断置位
+        logger.warning(f"调度平台方凭据撤销失败（{reason}）", exc_info=True)
+    try:
+        from nekro_agent.services.ssh_gateway.suspend import schedule_platform_row_suspend
+
+        schedule_platform_row_suspend(ids, reason=reason)
+    except Exception:  # noqa: BLE001 - 挂起失败不能打断置位
+        logger.warning(f"调度平台方 SSH 服务器凭据挂起失败（{reason}）", exc_info=True)
+
+
 def taint_workspaces(
     workspace_ids: Iterable[int],
     *,
@@ -215,12 +244,14 @@ def taint_workspaces(
         if added:
             logger.warning(f"新标记 {len(added)} 个网页聊天 MCP 工作区（{reason}）：{sorted(added)}")
             _schedule_scrub(added)
+            _schedule_platform_secret_revoke(added, reason)
         return added
 
     _memory_tainted.update(wanted)
     if added:
         logger.warning(f"新标记 {len(added)} 个网页聊天 MCP 工作区（{reason}）：{sorted(added)}")
         _schedule_scrub(added)
+        _schedule_platform_secret_revoke(added, reason)
     return added
 
 
@@ -443,8 +474,10 @@ async def _scrub(workspace_ids: Iterable[int]) -> None:
             workspace = await DBWorkspace.get_or_none(id=workspace_id)
             if workspace is None:
                 continue
-            mcp_path = WorkspaceService.get_workspace_dir(workspace_id) / "default" / ".mcp.json"
-            if not mcp_path.exists():
+            # 只看「工作区目录初始化过没有」，不按路径判 `.mcp.json` 存不存在：那个判断会跟着
+            # 容器放的链接走（链接悬空就被当成没有、跳过清理）。重写本身逐级不跟随链接
+            default_dir = WorkspaceService.get_workspace_dir(workspace_id) / "default"
+            if not os.path.lexists(default_dir):
                 continue
             await WorkspaceService.sync_mcp_to_disk(workspace)
         except Exception as e:  # noqa: BLE001 - 单个工作区清理失败不拖垮其余

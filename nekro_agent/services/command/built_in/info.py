@@ -30,6 +30,7 @@ class WorkspaceSandboxDisplayStatus(StrEnum):
     STOPPED = "stopped"
     FAILED = "failed"
     DELETING = "deleting"
+    TRANSITIONING = "transitioning"
 
     QUEUED = "queued"
     RUNNING = "running"
@@ -40,7 +41,7 @@ class WorkspaceSandboxDisplayStatus(StrEnum):
     @classmethod
     def from_workspace_status(cls, status: WorkspaceStatusValue | str) -> "WorkspaceSandboxDisplayStatus | None":
         parsed = cls._try_parse(status)
-        if parsed in {cls.ACTIVE, cls.STOPPED, cls.FAILED, cls.DELETING}:
+        if parsed in {cls.ACTIVE, cls.STOPPED, cls.FAILED, cls.DELETING, cls.TRANSITIONING}:
             return parsed
         return None
 
@@ -66,6 +67,7 @@ class WorkspaceSandboxDisplayStatus(StrEnum):
             WorkspaceSandboxDisplayStatus.STOPPED: t(zh_CN="已停止", en_US="Stopped"),
             WorkspaceSandboxDisplayStatus.FAILED: t(zh_CN="执行失败", en_US="Failed"),
             WorkspaceSandboxDisplayStatus.DELETING: t(zh_CN="删除中", en_US="Deleting"),
+            WorkspaceSandboxDisplayStatus.TRANSITIONING: t(zh_CN="启停中", en_US="Starting/stopping"),
             WorkspaceSandboxDisplayStatus.QUEUED: t(zh_CN="排队中", en_US="Queued"),
             WorkspaceSandboxDisplayStatus.RUNNING: t(zh_CN="执行中", en_US="Running"),
             WorkspaceSandboxDisplayStatus.RESPONDING: t(zh_CN="回传结果", en_US="Responding"),

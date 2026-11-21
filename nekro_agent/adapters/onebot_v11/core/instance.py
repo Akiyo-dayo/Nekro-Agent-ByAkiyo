@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, Optional
 
 from tortoise.exceptions import IntegrityError
+from tortoise.expressions import Q
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import TOMBSTONE_STATUS, DBAdapterInstance
@@ -118,6 +119,15 @@ def lookup_cached_account_id(instance_key: str) -> Optional[str]:
     return _instance_to_account.get(instance_key)
 
 
+def lookup_cached_instance_key(self_id: str) -> Optional[str]:
+    """从缓存同步查出账号号码所属的实例标识，未命中返回 None
+
+    只读缓存、不做任何解析：出站钩子每发一条消息都会调用它，而 `resolve_instance_key`
+    会在账号未登记时自动建实例，出站路径不该有这种副作用。
+    """
+    return _account_to_instance.get(self_id)
+
+
 def _generate_instance_key(self_id: str) -> str:
     """为自动登记的协议端生成一个合法且稳定的实例标识
 
@@ -153,6 +163,26 @@ def _instance_key_candidates(self_id: str) -> Iterator[str]:
             yield candidate
 
 
+async def _sweep_settings_before_register(instance_key: str) -> str:
+    """登记之前清掉这个标识上残留的插件设置与配置覆盖，返回新行该带的 `metadata_json`
+
+    这条路径在入站链路的第一步：清不掉只记 ERROR、照样登记，不能因为一份残留的设置文件
+    就把协议端的消息整个挡掉。但新行带上补扫标记（`instance_settings.SWEEP_PENDING_KEY`）：
+    认领 / 并入 / 划转之前必须补扫成功，否则残留的设置会跟着实例交出去。
+    """
+    from nekro_agent.services import instance_settings
+
+    try:
+        await instance_settings.sweep_before_create(ADAPTER_KEY, instance_key)
+    except Exception as e:  # noqa: BLE001 - 入站链路不能因残留设置失败
+        logger.error(
+            f"自动登记实例 {instance_key} 之前清扫残留设置失败，照样登记、带补扫标记"
+            f"（认领 / 并入 / 划转前补扫）: {type(e).__name__}: {e}",
+        )
+        return instance_settings.sweep_pending_metadata()
+    return ""
+
+
 async def _register_unclaimed_instance(self_id: str) -> DBAdapterInstance:
     """把一个没人认领的协议端登记成待认领实例，并返回它
 
@@ -171,11 +201,19 @@ async def _register_unclaimed_instance(self_id: str) -> DBAdapterInstance:
     for candidate in _instance_key_candidates(self_id):
         existing = await DBAdapterInstance.get_or_none(adapter_key=ADAPTER_KEY, instance_key=candidate)
         if existing is None:
-            if await DBAdapterInstance.filter(instance_key=candidate).exclude(adapter_key=ADAPTER_KEY).exists():
-                # 标识已被别的适配器占用：同名实例会在只按 `instance_key` 存取的数据上串到一起
-                # （见 `AdapterInstanceService.create_instance`），退让到下一个候选
+            # `~Q(a, b)` 而不是 `.exclude(a=, b=)`：后者在 Tortoise 里生成的是 `NOT a AND NOT b`
+            if (
+                await DBAdapterInstance.filter(instance_key__iexact=candidate)
+                .filter(~Q(adapter_key=ADAPTER_KEY, instance_key=candidate))
+                .exists()
+            ):
+                # 标识已被别的适配器占用（不分大小写）：同名实例会在只按 `instance_key` 存取的数据上串到一起
+                # （见 `AdapterInstanceService.create_instance`），退让到下一个候选。
+                # 精确同一个（适配器, 标识）的那一行不算：那是并发的另一条入站消息刚建好的，要落到下面
+                # `IntegrityError` 之后的回读上——算成占用的话会退到下一个候选、给同一个账号再建一行
                 logger.warning(f"实例标识 {candidate} 已被其他适配器的实例占用，改用下一个候选标识登记账号 {self_id}")
                 continue
+            metadata_json = await _sweep_settings_before_register(candidate)
             try:
                 created = await DBAdapterInstance.create(
                     adapter_key=ADAPTER_KEY,
@@ -184,6 +222,7 @@ async def _register_unclaimed_instance(self_id: str) -> DBAdapterInstance:
                     provider="onebot_v11",
                     provider_account_id=self_id,
                     status="unclaimed",
+                    metadata_json=metadata_json,
                 )
             except IntegrityError:
                 # 并发的另一条入站消息刚用同一个标识建好了行，回读它并按下面同一套判据处理

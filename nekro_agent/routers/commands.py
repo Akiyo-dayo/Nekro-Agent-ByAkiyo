@@ -202,9 +202,17 @@ async def get_command_completions(
     """获取命令补全列表（供前端输入框使用）"""
     from nekro_agent.schemas.i18n import SupportedLang
     from nekro_agent.services.command.completion import completion_provider
+    from nekro_agent.services.plugin.scope import resolve_chat_plugin_instance
 
     target_lang = SupportedLang(lang) if lang and lang in [e.value for e in SupportedLang] else SupportedLang.ZH_CN
-    entries = await completion_provider.get_completion_entries(chat_key, lang=target_lang)
+    # 补全列表是给某个频道用的：插件来源的命令要在这个频道真的生效才补全。
+    # 没有 chat_key 时算出来是 None，按不生效处理（多租户部署 fail-closed）。
+    chat_instance_key = await resolve_chat_plugin_instance(chat_key or "")
+    entries = await completion_provider.get_completion_entries(
+        chat_key,
+        lang=target_lang,
+        chat_instance_key=chat_instance_key,
+    )
 
     if prefix:
         entries = [e for e in entries if e.name.startswith(prefix)]
@@ -362,8 +370,11 @@ async def get_agent_tools(
 ):
     """导出命令为 Agent Tool-Use 格式（OpenAI Function Calling）"""
     from nekro_agent.services.command.tool_export import agent_tool_exporter
+    from nekro_agent.services.plugin.scope import resolve_chat_plugin_instance
 
-    return agent_tool_exporter.export_tools(chat_key)
+    # Agent 在某个频道里时，插件来源的命令要在这个频道生效才该出现在工具箱里。
+    chat_instance_key = await resolve_chat_plugin_instance(chat_key or "")
+    return agent_tool_exporter.export_tools(chat_key, chat_instance_key=chat_instance_key)
 
 
 class ExecuteToolRequest(BaseModel):

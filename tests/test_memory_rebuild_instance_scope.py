@@ -21,7 +21,9 @@
 注意这不是"泄漏面变大"，是**凭空制造**：实时链路根本不会把频道来源的 CC 结果沉淀成语义记忆，
 只有重建会。改前改后的差别可以直接在 `instance_key` 列上读出来。
 
-单实例部署（`instance_key` 为空）与用户直发路径逐字不变：仍然落空串。
+单实例部署（`instance_key` 为空）的实例维逐字不变：仍然落空串。用户直发路径的实例维同样
+落空串，但人设维落进 `CONSOLE_ONLY_PRESET_ID`——那批结论只该给控制台看，见
+`persist_cc_task_memory` 的同一条收口。
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from nekro_agent.services.memory import qdrant_manager as qdrant_module
 from nekro_agent.services.memory import rebuild as rebuild_module
 from nekro_agent.services.memory import rebuild_state_store as store_module
 from nekro_agent.services.memory import semantic_writer as writer_module
+from nekro_agent.services.memory.instance_scope import CONSOLE_ONLY_PRESET_ID
 
 WORKSPACE_ID = 9401
 CHAT_A = "onebot_v11-ob9401a-group_1"
@@ -74,7 +77,7 @@ def no_vector_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
     换个地方打桩就会漏掉真正被调用的那一个。
     """
 
-    async def fake_embed(_text: str) -> List[float]:
+    async def fake_embed(_text: str, **_kwargs: object) -> List[float]:
         return [0.0, 0.0, 0.0]
 
     async def fake_upsert(**_kwargs) -> bool:
@@ -169,11 +172,15 @@ class TestResolveLogInstanceKey:
         assert await rebuild_module._resolve_log_scope(CHAT_A, cache) == (INSTANCE_A, 0)  # noqa: SLF001
 
     @pytest.mark.asyncio
-    async def test_user_pseudo_key_stays_global(self, rebuild_db, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_user_pseudo_key_lands_in_the_console_only_bucket(self, rebuild_db, monkeypatch: pytest.MonkeyPatch) -> None:
         """`__user__` 是伪键，不是频道标识：直接判定为"不属于任何实例"，**不查库**。
 
         「不查库」这条也要钉：拿伪键去查频道表恰好也查不到、返回值一模一样，
         但重建会为工作区里每一条用户直发的 CC 日志白跑一次查询（实测这个变异只靠返回值杀不掉）。
+
+        人设维落进 `CONSOLE_ONLY_PRESET_ID`：空的 `source_chat_key` 在调用处本来就会被写成
+        `__user__`，三种输入必须是同一档，否则"重建时按哪一种写法进来的"会决定这批结论
+        能不能被频道召回。
         """
 
         async def explode(*_args, **_kwargs):
@@ -181,9 +188,10 @@ class TestResolveLogInstanceKey:
 
         monkeypatch.setattr(DBChatChannel, "get_or_none", explode)
         cache: dict[str, tuple[str, int]] = {}
-        assert await rebuild_module._resolve_log_scope("__user__", cache) == ("", 0)  # noqa: SLF001
-        assert await rebuild_module._resolve_log_scope("", cache) == ("", 0)  # noqa: SLF001
-        assert await rebuild_module._resolve_log_scope(None, cache) == ("", 0)  # noqa: SLF001
+        expected = ("", CONSOLE_ONLY_PRESET_ID)
+        assert await rebuild_module._resolve_log_scope("__user__", cache) == expected  # noqa: SLF001
+        assert await rebuild_module._resolve_log_scope("", cache) == expected  # noqa: SLF001
+        assert await rebuild_module._resolve_log_scope(None, cache) == expected  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_unknown_channel_falls_back_to_global(self, rebuild_db) -> None:
@@ -265,14 +273,19 @@ class TestReplayKeepsInstanceScope:
         assert RESULT_B[:20] in by_instance[INSTANCE_B]
 
     @pytest.mark.asyncio
-    async def test_user_initiated_results_stay_workspace_wide(self, rebuild_db) -> None:
-        """控制台直发的 CC 任务不属于任何实例，仍然落空串（对所有实例可见），行为不变。"""
+    async def test_user_initiated_results_land_in_the_console_only_bucket(self, rebuild_db) -> None:
+        """控制台直发的 CC 任务不属于任何实例，重放的结论也只能给控制台看。
+
+        实例维仍然是空串（控制台没有实例），人设维落进 `CONSOLE_ONLY_PRESET_ID`：
+        频道侧只放行「当前人设」与 0，于是这批重建出来的结论进不了任何群或私聊的召回，
+        与 `persist_cc_task_memory` 的写入侧收口一致。
+        """
         await seed_cc_exchange("cc_user:1", "__user__", RESULT_USER)
 
         assert await run_replay() == 1
 
         rows = await DBMemParagraph.filter(workspace_id=WORKSPACE_ID).all()
-        assert [row.instance_key for row in rows] == [""]
+        assert [(row.instance_key, row.preset_id) for row in rows] == [("", CONSOLE_ONLY_PRESET_ID)]
 
     @pytest.mark.asyncio
     async def test_single_instance_deployment_unchanged(self, rebuild_db) -> None:

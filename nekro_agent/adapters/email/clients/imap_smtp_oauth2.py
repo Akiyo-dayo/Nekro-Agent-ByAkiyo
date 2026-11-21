@@ -1,19 +1,25 @@
 import asyncio
 import imaplib
-import smtplib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from email.mime.multipart import MIMEMultipart
 
 from nekro_agent.adapters.email.config import EmailAccount
 from nekro_agent.core.logger import get_sub_logger
 
-from .imap_smtp_password import ImapSmtpPasswordClient, ProxiedIMAP4SSL, ProxiedSMTP, ProxiedSMTPSSL
+from .imap_smtp_password import ImapSmtpPasswordClient
 from .oauth import OAuthTokenManager
 
 logger = get_sub_logger("adapter.email.client")
 
 
 class ImapSmtpOAuth2Client(ImapSmtpPasswordClient):
+    """XOAUTH2 登录的 IMAP / SMTP
+
+    连接一律走父类的 `_open_imap` / `_new_smtp`：主机若是租户填的（从实例转回平台方、主机没被平台方改过的
+    账户，之后又被改成 OAuth2），同样只解析一次、直连校验过的地址并在登录前核对对端——认证方式换了，
+    主机的 DNS 仍可能在租户手里。
+    """
+
     def __init__(
         self,
         account: EmailAccount,
@@ -26,7 +32,9 @@ class ImapSmtpOAuth2Client(ImapSmtpPasswordClient):
 
     async def connect(self) -> None:
         access_token = await self.token_manager.get_access_token()
-        self.conn = await asyncio.to_thread(self._connect_sync_with_token, access_token)
+        imap_host, imap_port = self._imap_endpoint()
+        addresses = await self._checked_addresses(imap_host, imap_port)
+        self.conn = await asyncio.to_thread(self._connect_sync_with_token, access_token, addresses)
 
     async def send_message(self, message: MIMEMultipart) -> None:
         access_token = await self.token_manager.get_access_token()
@@ -52,16 +60,13 @@ class ImapSmtpOAuth2Client(ImapSmtpPasswordClient):
             else:
                 raise
 
-    def _connect_sync_with_token(self, access_token: str) -> imaplib.IMAP4_SSL:
-        provider_config = self.get_provider_config()
-        imap_host = provider_config.get("imap_host")
-        if not imap_host:
-            raise ValueError(f"邮箱提供商 {self.account.EMAIL_ACCOUNT} 缺少 imap_host 配置")
-        imap_port = int(provider_config.get("imap_port", 993))
-        if self.proxy_url:
-            conn = ProxiedIMAP4SSL(imap_host, imap_port, self.proxy_url, self.imap_timeout)
-        else:
-            conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=self.imap_timeout)
+    def _connect_sync_with_token(
+        self,
+        access_token: str,
+        addresses: Sequence[str] | None = None,
+    ) -> imaplib.IMAP4_SSL:
+        imap_host, imap_port = self._imap_endpoint()
+        conn = self._open_imap(imap_host, imap_port, addresses)
         auth_string = self._build_xoauth2_string(access_token)
         conn.authenticate("XOAUTH2", lambda _: auth_string.encode())
         self._post_login_imap(conn, imap_host)
@@ -76,35 +81,20 @@ class ImapSmtpOAuth2Client(ImapSmtpPasswordClient):
         access_token: str,
     ) -> None:
         auth_string = self._build_xoauth2_string(access_token)
+        addresses = await self._checked_addresses(smtp_host, port)
 
         def auth_object(_challenge: bytes | None = None) -> str:
             return auth_string
 
         def _sync_send() -> None:
-            if use_ssl:
-                smtp_ssl_cls = ProxiedSMTPSSL if self.proxy_url else smtplib.SMTP_SSL
-                if self.proxy_url:
-                    server_context = smtp_ssl_cls(smtp_host, port, self.proxy_url, 60)
-                else:
-                    server_context = smtp_ssl_cls(smtp_host, port, timeout=60)
-                with server_context as server:
-                    server.ehlo()
-                    auth_code, auth_response = server.auth("XOAUTH2", auth_object)
-                    logger.debug(f"SMTP XOAUTH2 认证结果: host={smtp_host}, port={port}, code={auth_code}, response={auth_response!r}")
-                    server.send_message(message)
-            else:
-                smtp_cls = ProxiedSMTP if self.proxy_url else smtplib.SMTP
-                if self.proxy_url:
-                    server_context = smtp_cls(smtp_host, port, self.proxy_url, 60)
-                else:
-                    server_context = smtp_cls(smtp_host, port, timeout=60)
-                with server_context as server:
-                    server.ehlo()
+            with self._new_smtp(smtp_host, port, use_ssl, 60, addresses) as server:
+                server.ehlo()
+                if not use_ssl:
                     server.starttls()
                     server.ehlo()
-                    auth_code, auth_response = server.auth("XOAUTH2", auth_object)
-                    logger.debug(f"SMTP XOAUTH2 认证结果: host={smtp_host}, port={port}, code={auth_code}, response={auth_response!r}")
-                    server.send_message(message)
+                auth_code, auth_response = server.auth("XOAUTH2", auth_object)
+                logger.debug(f"SMTP XOAUTH2 认证结果: host={smtp_host}, port={port}, code={auth_code}, response={auth_response!r}")
+                server.send_message(message)
 
         await asyncio.to_thread(_sync_send)
 

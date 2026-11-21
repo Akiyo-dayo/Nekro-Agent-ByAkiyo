@@ -1,0 +1,176 @@
+{
+  "title": "频道额度",
+  "subtitle": "平台方给每个群与私聊承诺的每日用量，按额度时区结算。",
+  "intro": {
+    "text": "这里是平台方给每个群 / 私聊的每日额度；它与「",
+    "quotaLink": "配额页",
+    "after": "」的回复配额是两层（那一层是租户对自己群的自限），两层都放行才回复。",
+    "settingsHint": "时区、token 计入范围、告警阈值在「系统配置 → 频道额度」里改。"
+  },
+  "actions": {
+    "refresh": "刷新",
+    "editPolicy": "编辑本频道策略",
+    "bonus": "今天临时加额",
+    "myLimit": "我的额度",
+    "save": "保存",
+    "cancel": "取消",
+    "close": "关闭"
+  },
+  "global": {
+    "title": "全局策略",
+    "subtitle": "这一层的开关是总闸：关着时所有频道都不受限，实例层与频道层只能在它开着时把某处关掉。",
+    "enabled": "启用频道额度",
+    "unit": "额度单位",
+    "groupLimit": "群每日额度",
+    "privateLimit": "私聊每日额度",
+    "limitHint": "0 = 不限",
+    "action": "超额动作",
+    "pauseMessage": "暂停提示",
+    "pauseMessageHint": "留空使用默认文案；这句会以 Bot 的口吻发进群里，最多 {{max}} 字。",
+    "charCount": "{{value}} / {{max}}",
+    "save": "保存全局策略",
+    "saveSuccess": "全局策略已保存"
+  },
+  "filters": {
+    "day": "日期",
+    "state": "状态",
+    "type": "类型",
+    "tenant": "租户",
+    "all": "全部",
+    "group": "群聊",
+    "private": "私聊"
+  },
+  "columns": {
+    "channel": "频道",
+    "type": "类型",
+    "instance": "实例",
+    "tenant": "租户",
+    "unit": "单位",
+    "usage": "用量 / 额度",
+    "remaining": "剩余",
+    "progress": "进度",
+    "state": "状态",
+    "action": "超额动作"
+  },
+  "unit": {
+    "replies": "回复次数",
+    "tokens": "Token"
+  },
+  "state": {
+    "disabled": "功能关闭",
+    "unlimited": "不限",
+    "normal": "正常",
+    "warning": "已告警",
+    "exceeded": "已超额",
+    "paused": "已暂停"
+  },
+  "action": {
+    "alert": "只告警",
+    "pause": "暂停"
+  },
+  "value": {
+    "unlimited": "不限",
+    "bonus": "+{{value}}",
+    "empty": "没有符合条件的频道",
+    "emptyHint": "换个日期、状态或类型再看；一个频道都没有时，先在实例管理里接入频道。"
+  },
+  "detail": {
+    "title": "频道额度详情",
+    "days7": "最近 7 天",
+    "days30": "最近 30 天",
+    "dailyTitle": "逐天用量",
+    "sceneTitle": "按场景的 token 合计",
+    "sceneHint": "这就是后台调用烧掉的部分；与「用量」页的账本同源。",
+    "policyTitle": "生效策略",
+    "columns": {
+      "day": "日期",
+      "replies": "回复次数",
+      "tokensAll": "Token（全部）",
+      "tokensReply": "Token（回复链路）",
+      "bonus": "临时加额",
+      "scene": "场景"
+    },
+    "scene": {
+      "chat": "回复",
+      "history_plan": "上下文规划",
+      "affection_eval": "好感评估",
+      "memory_consolidate": "记忆沉淀",
+      "embedding": "向量化",
+      "vision_describe": "图片描述",
+      "plugin": "插件",
+      "command": "命令",
+      "other": "其他"
+    },
+    "policy": {
+      "unit": "单位",
+      "platformLimit": "平台方额度",
+      "tenantLimit": "租户额度",
+      "effectiveLimit": "生效额度",
+      "action": "超额动作",
+      "pauseMessage": "暂停提示"
+    },
+    "noScene": "这段时间内没有调用记录",
+    "notSet": "未设"
+  },
+  "policyDialog": {
+    "titleInstance": "编辑实例层策略",
+    "titleChannel": "编辑本频道策略",
+    "inherit": "继承上一层",
+    "inheritHint": "选中「继承」表示这一列不设值，跟上一层；后端只认 null。",
+    "enabled": "启用开关",
+    "enabledOn": "开",
+    "enabledOff": "关",
+    "unit": "额度单位",
+    "groupLimit": "群每日额度",
+    "privateLimit": "私聊每日额度",
+    "limitHint": "0 = 不限",
+    "action": "超额动作",
+    "pauseMessage": "暂停提示",
+    "pauseMessageHint": "留空表示跟上一层；最多 {{max}} 字。",
+    "saveSuccess": "策略已保存",
+    "limitInvalid": "额度请填写不小于 0 的整数，或留空表示继承",
+    "pauseTooLong": "暂停提示最多 {{max}} 字"
+  },
+  "bonusDialog": {
+    "amount": "加额数量",
+    "hint": "加的是今天的额度，按当前生效单位计；只影响今天。",
+    "invalid": "请填写正整数",
+    "success": "已加 {{value}}"
+  },
+  "recount": {
+    "all": "按账本重算这一天",
+    "channel": "按账本重算今天",
+    "channelTitle": "按账本重算",
+    "hint": "回复次数不重算，只重算 token。重算「今天」时，聚合之后、写入之前落进来的请求会被覆盖；对今天的数字请以零点后的自动对账为准。",
+    "allSuccess": "已按账本重算 {{day}}：处理了 {{channels}} 个频道",
+    "channelSuccess": "已按账本重算这个频道的 token"
+  },
+  "tenantDialog": {
+    "titleInstance": "我的额度（本实例）",
+    "titleChannel": "我的额度（本频道）",
+    "groupLimit": "群每日额度",
+    "privateLimit": "私聊每日额度",
+    "limit": "每日额度",
+    "pauseMessage": "暂停提示",
+    "pauseMessageHint": "留空使用平台方的提示语；最多 {{max}} 字。",
+    "platformCeiling": "平台方上限：{{value}}",
+    "unit": "当前单位：{{unit}}",
+    "ceilingHint": "只能往下调，不能高于平台方额度；服务端会再校验一次。",
+    "clearHint": "留空表示清除自己设的值，回到平台方给的额度。",
+    "success": "额度已保存",
+    "overCeiling": "不能高于平台方上限 {{value}}",
+    "invalid": "请填写正整数"
+  },
+  "instanceSection": {
+    "title": "频道额度",
+    "subtitle": "平台方给这个实例下每个群 / 私聊承诺的每日额度；实例层只写想改的列，其余跟全局。",
+    "platformPolicy": "实例层策略",
+    "editPolicy": "编辑实例层策略",
+    "myLimit": "我的额度",
+    "myLimitHint": "在你名下实例上再调低额度与自定义暂停提示，不能超过平台方给的上限。"
+  },
+  "statusRow": {
+    "label": "今日额度：{{used}} / {{limit}}（{{unit}}）",
+    "unlimitedLabel": "今日额度：{{used}}（不限）"
+  }
+}

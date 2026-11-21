@@ -53,7 +53,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tortoise.exceptions import IntegrityError
 from tortoise.expressions import Q
@@ -74,6 +74,7 @@ from .stage import (
     ADMIN_WRITE_SOURCES,
     AFFECTION_DAILY_WINDOW_SECONDS,
     AFFECTION_WEEKLY_WINDOW_SECONDS,
+    MODEL_SOURCES,
     AffectionEventSource,
     AffectionRateLimits,
     AffectionStage,
@@ -90,6 +91,9 @@ logger = get_sub_logger("affection")
 MAX_NICKNAME_LENGTH = 64
 MAX_STATE_TEXT_LENGTH = 300
 MAX_EVENT_TEXT_LENGTH = 160
+# 模型给一个人记的称呼。它会被下一轮提示词回注，同样要封顶；它比昵称短得多，
+# 因为称呼是一句话里叫出来的东西，太长就不像称呼了。
+MAX_CALL_NAME_LENGTH = 24
 
 # 缓存条目上限。超出后整体清空而不是做精细淘汰：好感度快照重建代价极低，
 # 与其为它维护一套 LRU，不如让缓存偶尔冷启动一次。
@@ -100,6 +104,7 @@ _CACHE_MAX_ENTRIES = 4096
 REASON_BLOCKED_CLEAR = "评估请求被内容审核拦下，去掉旧印象重试后成功；旧印象有嫌疑，已清空（分数不变）"
 REASON_NARRATIVE_CLEAR = "管理员清空了印象（分数不变）"
 REASON_NARRATIVE_EDIT = "管理员编辑了印象（分数不变）"
+REASON_CALL_NAME = "改了称呼"
 
 
 class AffectionWriteSuperseded(Exception):
@@ -122,6 +127,25 @@ class AdminWriteGuard:
 
 
 @dataclass(frozen=True)
+class AffectionWriteOutcome:
+    """一次写入的「发生了什么」，只给模型写分的调用方用
+
+    里程碑的判据要用三样东西：这次写入之前的阶段（决定「从」写什么）、写入之后的阶段
+    （决定要不要写）、以及新建那条流水的 ID（里程碑段落要反指它）。这三样都只在
+    :func:`_write` 的行锁里读得到：锁外再读一次，读到的是别人写入之后的状态，
+    「从」就会写错，而且并发下两个调用方会各自以为自己是那条跃迁的见证者。
+
+    `stage_before` 取自 `stage_of(record.score)` 在改分**之前**求值，`stage_after` 取自
+    改分之后；`score_after` 是落库后的分数。三者都是行锁内的一致快照。
+    """
+
+    event_id: int
+    stage_before: AffectionStage
+    stage_after: AffectionStage
+    score_after: int
+
+
+@dataclass(frozen=True)
 class AffectionSnapshot:
     """好感度的只读快照
 
@@ -137,6 +161,14 @@ class AffectionSnapshot:
     state_text: str
     last_event_text: str
     interaction_count: int
+    # 最近的关系里程碑引用，新的在前。存成元组而不是 list：快照是跨请求共享的缓存对象，
+    # 一个可变列表被调用方就地 append 一下，就污染了整份缓存。
+    milestone_refs: Tuple[Dict[str, Any], ...] = ()
+    # 模型给这个人记的称呼；空串表示不特别称呼。也是不可信内容，读侧要清洗后再注入。
+    call_name: str = ""
+    # 最近一次**有好感记录的互动**：写分（后台评估或主模型自主调分）时更新，
+    # 只说话不写分不算。久别提示按它算，不是按最近一次说话算。
+    last_interact_at: Optional[datetime] = None
 
     @property
     def has_relationship(self) -> bool:
@@ -149,14 +181,19 @@ class AffectionSnapshot:
 
         提示词按 `exists` 过滤时，这种空壳会渲染成一个"陌生人"条目——而
         `AffectionSnapshot.empty` 存在的全部理由就是"不该在提示词里凭空多出一个陌生人条目"。
-        判据因此看**实质**而不是看行在不在：分数为 0、一次互动都没有、两段描述都空，
-        这一行就没有携带任何信息，读侧当作没有。
+        判据因此看**实质**而不是看行在不在：分数为 0、一次互动都没有、两段描述都空、
+        也没记过称呼，这一行就没有携带任何信息，读侧当作没有。
 
         管理员重置过的人不会被误判：重置清空描述但 `interaction_count` 留着，
-        那是真打过交道的证据。人工调到非 0 分的人同样保留。
+        那是真打过交道的证据。人工调到非 0 分的人同样保留。称呼也算实质：模型只给一个
+        从没调过分的人记了称呼时，那一行只有 `call_name` 有内容，不算它就等于记了不显示。
         """
         return self.exists and not (
-            self.score == 0 and self.interaction_count == 0 and not self.state_text and not self.last_event_text
+            self.score == 0
+            and self.interaction_count == 0
+            and not self.state_text
+            and not self.last_event_text
+            and not self.call_name
         )
 
     @classmethod
@@ -183,7 +220,22 @@ class AffectionSnapshot:
             state_text=record.state_text,
             last_event_text=record.last_event_text,
             interaction_count=record.interaction_count,
+            milestone_refs=normalize_milestone_refs(record.milestone_refs),
+            call_name=record.call_name,
+            last_interact_at=record.last_interact_at,
         )
+
+
+def normalize_milestone_refs(raw: object) -> Tuple[Dict[str, Any], ...]:
+    """把库里的 `milestone_refs` 收敛成只含 dict 元素的元组
+
+    脏值容错放在这里而不是每个读侧各写一遍：这一列是 JSON，历史数据、手工改库、
+    将来的格式变更都可能让它变成别的东西。读侧一律拿到「可能是空的元组」，
+    少一个 `isinstance` 就少一处会抛 `TypeError` 的提示词构造路径。
+    """
+    if not isinstance(raw, list):
+        return ()
+    return tuple(item for item in raw if isinstance(item, dict))
 
 
 _cache: Dict[AffectionKey, Tuple[float, AffectionSnapshot]] = {}
@@ -356,7 +408,7 @@ async def apply_delta(
     Returns:
         更新后的快照
     """
-    return await _write(
+    snapshot, _outcome = await _write(
         key,
         delta=delta,
         target_score=None,
@@ -372,6 +424,47 @@ async def apply_delta(
         update_event_text=update_event_text,
         guard=guard,
     )
+    return snapshot
+
+
+async def apply_model_delta(
+    key: AffectionKey,
+    *,
+    delta: int,
+    reason: str,
+    source: AffectionEventSource,
+    chat_key: str = "",
+    nickname: str = "",
+    state_text: Optional[str] = None,
+    event_text: Optional[str] = None,
+    source_platform_userid: str = "",
+    guard: Optional[AdminWriteGuard] = None,
+) -> Tuple[AffectionSnapshot, AffectionWriteOutcome]:
+    """模型写分的专用入口：除了快照，还返回这次写入「发生了什么」
+
+    里程碑的判据要用到写入之前的阶段与新建流水的 ID，而这两样只在行锁里读得到
+    （见 :class:`AffectionWriteOutcome`）。因此模型写分不能走 :func:`apply_delta`——
+    那条路径只回快照，调用方拿到快照后再去查「刚才那一笔」，并发下会查到别人的。
+
+    `source` 必须在 :data:`MODEL_SOURCES` 里：运营动作不该产出里程碑，把这条约束放在
+    入口上，比让每个调用方自己记得别传 `manual` 更可靠。参数含义与 :func:`apply_delta` 相同。
+    """
+    if source not in MODEL_SOURCES:
+        raise ValueError(f"只有模型写的分才走这里: {source}")
+    return await _write(
+        key,
+        delta=delta,
+        target_score=None,
+        reason=reason,
+        source=source,
+        chat_key=chat_key,
+        nickname=nickname,
+        state_text=state_text,
+        event_text=event_text,
+        bump_interaction=True,
+        source_platform_userid=source_platform_userid,
+        guard=guard,
+    )
 
 
 async def clear_narrative(
@@ -382,13 +475,18 @@ async def clear_narrative(
     operator: str = "",
     chat_key: str = "",
     guard: Optional[AdminWriteGuard] = None,
+    clear_call_name: bool = False,
 ) -> AffectionSnapshot:
     """只清两段描述（`state_text` / `last_event_text`），分数、阶段、互动次数都不动
 
     记一条 `delta=0` 的事件。后台「只清印象」与评估被拦后的清理共用这一个入口，
-    区别只在 `source` 与是否带 `guard`。
+    区别只在 `source`、是否带 `guard` 与是否连称呼一起清。
+
+    `clear_call_name` 只有后台「只清印象」传：管理员点了「清空」，称呼也是模型写的字，
+    留着它就会出现「描述清空了，称呼还在叫」。评估被拦后的清理**不传**——称呼不在评估的
+    提示词里，不是嫌疑内容，没有理由跟着一起丢。
     """
-    return await _write(
+    snapshot, _outcome = await _write(
         key,
         delta=0,
         target_score=None,
@@ -400,7 +498,9 @@ async def clear_narrative(
         operator=operator,
         bump_interaction=False,
         guard=guard,
+        call_name="" if clear_call_name else None,
     )
+    return snapshot
 
 
 async def edit_narrative(
@@ -409,14 +509,19 @@ async def edit_narrative(
     state_text: str,
     last_event_text: str,
     operator: str,
+    call_name: Optional[str] = None,
 ) -> AffectionSnapshot:
     """管理员改写两段描述，分数不动
 
     先去 NUL、再按两列各自的上限截断，然后照常走 `_write` 的清洗——人写的和模型写的
     落进同一列、同样回注提示词，清洗口径不能有两套。注入时仍按不可信块包裹（读侧不分来源）。
     事件只记宿主固定文案，不抄新旧文字。
+
+    `call_name` 传 None 表示不改称呼（前端还没传这一栏时就是 None）；传字符串时同样先
+    去 NUL 再截到 `MAX_CALL_NAME_LENGTH`，空串表示清掉称呼。这里截断不用
+    `sanitize_inline_text`：`_write` 里还会再清洗一遍，两处都加省略号会出现「…….」。
     """
-    return await _write(
+    snapshot, _outcome = await _write(
         key,
         delta=0,
         target_score=None,
@@ -426,7 +531,9 @@ async def edit_narrative(
         event_text=strip_nul(last_event_text)[:MAX_EVENT_TEXT_LENGTH],
         operator=operator,
         bump_interaction=False,
+        call_name=None if call_name is None else strip_nul(call_name)[:MAX_CALL_NAME_LENGTH],
     )
+    return snapshot
 
 
 async def set_score(
@@ -442,8 +549,11 @@ async def set_score(
 
     目标值在锁内换算成增量，因此与自动评估共享同一份并发保护：
     先读一遍再算差额会让"管理员点保存"与"后台评估刚好写入"互相覆盖。
+
+    `clear_state_text=True` 是「重置」专用的：两段描述之外，称呼也一并清掉——
+    称呼同样是模型写的字，重置要回到「这个人我一无所知」的状态。
     """
-    return await _write(
+    snapshot, _outcome = await _write(
         key,
         delta=0,
         target_score=clamp_score(score),
@@ -453,7 +563,46 @@ async def set_score(
         event_text="" if clear_state_text else None,
         operator=operator,
         bump_interaction=False,
+        call_name="" if clear_state_text else None,
     )
+    return snapshot
+
+
+async def set_call_name(
+    key: AffectionKey,
+    *,
+    call_name: str,
+    chat_key: str = "",
+    nickname: str = "",
+    source_platform_userid: str = "",
+) -> AffectionSnapshot:
+    """只改称呼：分数、阶段、两段描述与互动次数都不动
+
+    记一条 `delta=0`、`source=tool` 的流水，理由是宿主固定文案——称呼正文不进流水，
+    它已经原样存在 `call_name` 列上，抄进流水只是换个地方多留一份。
+
+    `update_event_text=False` 是关键：否则「改了称呼」会写进 `last_event_text`，
+    下一轮好感块的 `recently:` 就变成了这句宿主文案，把真正最近发生的事挤掉。
+
+    **`last_interact_at` 不更新**：改称呼不算一次互动，久别提示按「最近一次有好感记录的
+    互动」算，记个称呼不该让「好久不见」消失。因此这里也不累加 `interaction_count`。
+    """
+    snapshot, _outcome = await _write(
+        key,
+        delta=0,
+        target_score=None,
+        reason=REASON_CALL_NAME,
+        source=AffectionEventSource.TOOL,
+        chat_key=chat_key,
+        nickname=nickname,
+        state_text=None,
+        event_text=None,
+        bump_interaction=False,
+        source_platform_userid=source_platform_userid,
+        update_event_text=False,
+        call_name=call_name,
+    )
+    return snapshot
 
 
 async def _write(
@@ -471,8 +620,9 @@ async def _write(
     bump_interaction: bool = True,
     source_platform_userid: str = "",
     update_event_text: bool = True,
+    call_name: Optional[str] = None,
     guard: Optional[AdminWriteGuard] = None,
-) -> AffectionSnapshot:
+) -> Tuple[AffectionSnapshot, AffectionWriteOutcome]:
     """好感度的唯一写入口
 
     读改写放在同一个事务的行锁下：同一个人可能同时在多个群里说话，
@@ -489,11 +639,19 @@ async def _write(
     `guard` 的复核放在**拿到行锁之后**：后台写入走的也是这里、也要先拿同一把行锁，
     于是它要么已经提交（这里读得到它的事件，作废），要么排在本次写入后面（它会盖掉本次）。
     放在锁外复核会留下一个「复核完、写入前」的窗口，管理员恰好在那一刻点下去就会被盖回。
+
+    `call_name` 传 None 表示不动这一列；传字符串则先剥 NUL 再按 `MAX_CALL_NAME_LENGTH` 清洗，
+    空串表示清除——「不特别称呼」与「没改过」必须是两个状态，所以不能用 None 兼职。
+
+    Returns:
+        `(更新后的快照, 这次写入发生了什么)`。只有模型写分那条路径需要后半段
+        （里程碑判据要用），其余入口只取快照——它们对外签名与返回值因此一个字都没变。
     """
     clean_reason = sanitize_inline_text(reason, MAX_EVENT_TEXT_LENGTH)
     clean_nickname = sanitize_inline_text(nickname, MAX_NICKNAME_LENGTH)
     clean_state = sanitize_block_text(state_text, MAX_STATE_TEXT_LENGTH) if state_text is not None else None
     clean_event = sanitize_inline_text(event_text, MAX_EVENT_TEXT_LENGTH) if event_text is not None else clean_reason
+    clean_call_name = sanitize_inline_text(strip_nul(call_name), MAX_CALL_NAME_LENGTH) if call_name is not None else None
 
     await _ensure_record(key)
 
@@ -504,6 +662,9 @@ async def _write(
         if guard is not None and await latest_admin_write_at(key) != guard.seen:
             raise AffectionWriteSuperseded(f"评估开始之后这一行有了新的后台写入，本次结果作废: {key}")
 
+        # 改分**之前**取一次阶段：里程碑的「从」写的就是它。取在改分之后就只能靠
+        # 反推 delta，而 target_score 那条路径上的 delta 是锁内才算出来的。
+        stage_before = stage_of(record.score)
         effective_delta = target_score - record.score if target_score is not None else delta
         record.score = clamp_score(record.score + effective_delta)
         record.stage = stage_of(record.score).value
@@ -514,6 +675,8 @@ async def _write(
             record.state_generated_at = db_now()
         if update_event_text:
             record.last_event_text = clean_event
+        if clean_call_name is not None:
+            record.call_name = clean_call_name
         if chat_key:
             record.last_chat_key = chat_key[:256]
         if bump_interaction:
@@ -521,7 +684,7 @@ async def _write(
             record.last_interact_at = db_now()
         await record.save()
 
-        await DBAffectionEvent.create(
+        event = await DBAffectionEvent.create(
             **key.as_columns(),
             # 空串表示"与 platform_userid 相同"，见 `models/db_affection.py`。
             # 写成人自己的号码也不算错，但空串让"这条是副号干的"一眼可见。
@@ -535,8 +698,14 @@ async def _write(
         )
 
     snapshot = AffectionSnapshot.from_record(record)
+    outcome = AffectionWriteOutcome(
+        event_id=event.id,
+        stage_before=stage_before,
+        stage_after=stage_of(record.score),
+        score_after=record.score,
+    )
     invalidate_cache(key)
-    return snapshot
+    return snapshot, outcome
 
 
 async def list_events(key: AffectionKey, limit: int = 20) -> List[DBAffectionEvent]:
@@ -564,6 +733,39 @@ async def _person_events(key: AffectionKey) -> QuerySet[DBAffectionEvent]:
     return DBAffectionEvent.filter(**key.scope_columns(), platform_userid__in=await person_account_ids(key))
 
 
+async def list_milestone_events(key: AffectionKey, limit: int = 50) -> List[DBAffectionEvent]:
+    """这个人这一份好感下生成过里程碑的流水，新的在前
+
+    详情页的「关系里程碑」一栏用它，删除接口的归属校验也用它：一个段落要算「属于这一行」，
+    判据只能是「这一行的某条流水把它生成出来」。范围与 :func:`list_events` 完全相同
+    （同域、同人设、含合并过来的账号），否则后台能拿别人的段落编号删到别人的记忆。
+    """
+    return await (await _person_events(key)).filter(memory_paragraph_id__isnull=False).order_by("-id").limit(limit)
+
+
+async def person_milestone_paragraph_ids(key: AffectionKey) -> List[int]:
+    """这个人这一份好感下全部里程碑段落 ID，去重、按流水 ID 倒序
+
+    重置要用它把这一份好感下的里程碑全部软删。去重是必要的：同一条段落理论上只由一条
+    流水生成，但历史数据、重复调用都可能让两行指向同一段，软删两次不致命，
+    可计数会骗人。顺序只为了让「先删新的」这件事确定下来，便于用例断言。
+    """
+    rows = (
+        await (await _person_events(key))
+        .filter(memory_paragraph_id__isnull=False)
+        .order_by("-id")
+        .values_list("memory_paragraph_id", flat=True)
+    )
+    seen: List[int] = []
+    for row in rows:
+        if row is None:
+            continue
+        paragraph_id = int(row)
+        if paragraph_id not in seen:
+            seen.append(paragraph_id)
+    return seen
+
+
 async def redact_event_reason(key: AffectionKey, event_id: int, *, operator: str) -> Optional[DBAffectionEvent]:
     """软删一条流水的理由：`reason` 置空，记下删除时间与操作者，行与分数一概不动
 
@@ -573,6 +775,10 @@ async def redact_event_reason(key: AffectionKey, event_id: int, *, operator: str
     已经删过的再删一次原样返回、不改删除记录：第一次是谁、什么时候删的才是要留的痕迹。
     `last_event_text` 跟流水是两回事，这里不连带它（要改它走 :func:`clear_narrative` /
     :func:`edit_narrative`）。快照里没有流水，但照样让缓存失效，与另外两个后台操作同一口径。
+
+    这条流水生成过里程碑时，还要把那段改写成不带起因的模板：起因就抄自这条理由，
+    理由删了正文却留着，等于换个地方原样保存了要删掉的内容。改写失败只告警——
+    理由已经删掉这件事不能因为记忆那边出问题而回滚。
     """
     event = await (await _person_events(key)).filter(id=event_id).first()
     if event is None:
@@ -583,6 +789,14 @@ async def redact_event_reason(key: AffectionKey, event_id: int, *, operator: str
         event.deleted_by = operator[:128]
         await event.save(update_fields=["reason", "deleted_at", "deleted_by"])
     invalidate_cache(key)
+    if event.memory_paragraph_id is not None:
+        # 延迟导入：`milestones` 反过来要用本模块的读写入口，模块级导入会成环。
+        from . import milestones
+
+        try:
+            await milestones.strip_reason(int(event.memory_paragraph_id), domain=key.domain)
+        except Exception as e:
+            logger.warning(f"删除流水理由后改写里程碑失败（已忽略）: event_id={event_id}, error={e}")
     return event
 
 
@@ -619,7 +833,7 @@ async def throttle_llm_delta(
     limits: AffectionRateLimits,
     now: Optional[datetime] = None,
 ) -> int:
-    """自动评估专用：把变化量收进递减收益与滚动窗口预算
+    """模型写分专用（后台评估与主模型自主调整）：把变化量收进递减收益与滚动窗口预算
 
     人工调整（`source=manual`）与重置（`source=reset`）**不经过这里**：它们直接调
     `apply_delta` / `set_score`，管理员来修数据时不该被"这个人今天已经涨够了"挡住。
@@ -642,10 +856,14 @@ async def throttle_llm_delta(
 
 
 async def window_usage(key: AffectionKey, *, now: Optional[datetime] = None) -> AffectionWindowUsage:
-    """统计滚动窗口内由自动评估造成的累计涨跌
+    """统计滚动窗口内由模型写分造成的累计涨跌
 
-    只数 `source=llm` 的事件：人工调整、重置与账号合并的补偿都是运营手段，既不占用用户的额度，
-    也不会因为管理员改了一次分就把额度"退"回来。
+    只数模型写的分（后台评估与主模型自主调整，见 `stage.MODEL_SOURCES`）：人工调整、
+    重置与账号合并的补偿都是运营手段，既不占用用户的额度，也不会因为管理员改了一次分
+    就把额度"退"回来。
+
+    两种模型来源必须**共用一份**日 / 周额度：否则模型可以靠「评估加一次、自己再调一次」
+    把额度翻倍——同一段对话被算两次，正是这条额度要挡的事。
 
     额度按**人**算而不是按账号算：与 :func:`list_events` 用同一份账号并集。两者若不一致，
     后台显示的流水与额度算的流水就是两本账，而"换个号接着刷"恰好是这条额度要挡的事。
@@ -665,7 +883,7 @@ async def window_usage(key: AffectionKey, *, now: Optional[datetime] = None) -> 
         events = DBAffectionEvent.filter(
             **key.scope_columns(),
             platform_userid__in=await person_account_ids(key),
-            source=AffectionEventSource.LLM.value,
+            source__in=[source.value for source in MODEL_SOURCES],
         )
         return AffectionWindowUsage(
             daily_gain=await _sum_deltas(events, since=daily_since, positive=True),
@@ -675,6 +893,58 @@ async def window_usage(key: AffectionKey, *, now: Optional[datetime] = None) -> 
     except Exception as e:
         logger.warning(f"好感度窗口用量统计失败（本轮不做窗口限制）: key={key}, error={e}")
         return AffectionWindowUsage.unused()
+
+
+async def tool_adjusted_since(key: AffectionKey, *, chat_key: str, since: datetime) -> bool:
+    """这个人在这段时间里有没有在本频道自己调过分
+
+    评估用它判断「主模型这一轮是不是已经表过态了」：同一段对话被主模型当场调一次、
+    再被后台评估判一次，就是同一件事算了两遍。改称呼那条 `delta = 0` 的流水不算——
+    它没有动分数，评估该照常打分。
+
+    范围与 :func:`window_usage` 相同（同域、同人设、这个人全部账号的并集）：
+    并集若不一致，换个号说句话就能让评估再算一次。
+
+    查询失败时返回 False（fail-open）：这条判断只是少算一次分，而额度那一层仍然兜底，
+    不该因为一次统计查询失败就把这一轮评估整个丢掉。
+    """
+    return await _scored_since(key, chat_key=chat_key, since=since, source=AffectionEventSource.TOOL)
+
+
+async def evaluator_scored_since(key: AffectionKey, *, chat_key: str, since: datetime) -> bool:
+    """后台评估在这段时间里有没有在本频道给这个人记过分（:func:`tool_adjusted_since` 的另一半）
+
+    评估在每轮开始时登记、与主模型并行跑：评估先落了分，主模型随后才当场调分，
+    评估那一刻看不到工具流水，同一段对话就会被算两次。自主调分因此反过来查一次：
+    `since` 取这个人在本频道最近一条发言的时间，那之后评估已经记过非零分，说明评估看的
+    正是这一段，这次就不再记。两边合起来是「同一段对话只记一次，谁先写算谁的」。
+
+    只看 `delta != 0`：评估因为工具已调过而只更新印象时，记的是 0 分流水，不算。
+    口径、账号并集与失败处理同 :func:`tool_adjusted_since`。
+    """
+    return await _scored_since(key, chat_key=chat_key, since=since, source=AffectionEventSource.LLM)
+
+
+async def _scored_since(
+    key: AffectionKey,
+    *,
+    chat_key: str,
+    since: datetime,
+    source: AffectionEventSource,
+) -> bool:
+    try:
+        return await DBAffectionEvent.filter(
+            **key.scope_columns(),
+            platform_userid__in=await person_account_ids(key),
+            chat_key=chat_key,
+            create_time__gte=since,
+            source=source.value,
+        ).exclude(delta=0).exists()
+    except Exception as e:
+        logger.warning(
+            f"好感度模型记分查询失败（按没有记过处理）: key={key}, chat_key={chat_key}, source={source.value}, error={e}",
+        )
+        return False
 
 
 async def _sum_deltas(events: QuerySet[DBAffectionEvent], *, since: datetime, positive: bool) -> int:

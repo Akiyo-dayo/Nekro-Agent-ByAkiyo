@@ -104,6 +104,23 @@ def _clean_state(monkeypatch: pytest.MonkeyPatch):
     "订阅位只有一个"这类断言会随执行顺序时好时坏。
     """
     monkeypatch.setattr(voice, "listen_forever", _never_ending_consumer)
+
+    # 心声的布防与发送已经接上按频道判据；本文件测的是生命周期与降级行为，不是作用域，
+    # 这里把判据与插件发送方法替身成 StubCtx 上的记录口，保持原用例的观察面不变。
+    async def _effective(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    async def _send_image(_chat_key: str, image_path: str, ctx: Any, **_kwargs: Any) -> bool:
+        await ctx.send_image(image_path)
+        return True
+
+    async def _send_text(_chat_key: str, message: str, ctx: Any, **_kwargs: Any) -> bool:
+        await ctx.send_text(message)
+        return True
+
+    monkeypatch.setattr(voice, "plugin_effective_in_chat", _effective)
+    monkeypatch.setattr(voice.plugin, "send_image", _send_image)
+    monkeypatch.setattr(voice.plugin, "send_text", _send_text)
     _teardown()
     yield
     _teardown()

@@ -364,7 +364,7 @@ export default function OverviewTab({
   const versionInfo = [sandboxStatus?.cc_version ? `${sandboxStatus.cc_version} (Sandbox)` : null, sandboxStatus?.claude_code_version ? `${sandboxStatus.claude_code_version} (Claude Code)` : null]
     .filter((value): value is string => value !== null)
     .join(' | ')
-  const knownStatuses = ['active', 'stopped', 'failed', 'deleting'] as const
+  const knownStatuses = ['active', 'stopped', 'failed', 'deleting', 'transitioning'] as const
   const workspaceStatusLabel = knownStatuses.includes(workspace.status as (typeof knownStatuses)[number])
     ? t(`status.${workspace.status}`)
     : workspace.status

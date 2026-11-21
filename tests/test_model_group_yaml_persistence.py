@@ -51,6 +51,7 @@ from nekro_agent.core.core_utils import ConfigBase
 from nekro_agent.core.os_env import OsEnv
 from nekro_agent.models.db_model_group import DBModelGroup
 from nekro_agent.services import model_group_service
+from nekro_agent.tools import private_file
 from nekro_agent.tools.credential_cipher import (
     credential_cipher_status,
     is_encrypted_envelope,
@@ -475,7 +476,7 @@ class TestHandEditedKeyAgainstAnExistingRowIsBackedUpBeforeItIsMasked:
             calls.append((flags, mode))
             return real_open(path, flags, mode, *args, **kwargs)
 
-        monkeypatch.setattr(model_group_service.os, "open", spy)
+        monkeypatch.setattr(private_file.os, "open", spy)
         target = tmp_path / "private.yaml"
 
         model_group_service._write_private_file(target, "x: 1\n")
@@ -916,9 +917,9 @@ class TestBackupFileProtectionIsReportedHonestlyPerPlatform:
         logs: List[Tuple[str, str]],
     ) -> None:
         fake = _FakeIcacls(returncode=0)
-        monkeypatch.setattr(model_group_service, "_is_windows", lambda: True)
+        monkeypatch.setattr(private_file, "is_windows", lambda: True)
         _simulate_windows_account(monkeypatch)
-        monkeypatch.setattr(model_group_service.subprocess, "run", fake)
+        monkeypatch.setattr(private_file.subprocess, "run", fake)
 
         await self._run_backup(boot_env, monkeypatch)
 
@@ -938,9 +939,9 @@ class TestBackupFileProtectionIsReportedHonestlyPerPlatform:
         monkeypatch: pytest.MonkeyPatch,
         logs: List[Tuple[str, str]],
     ) -> None:
-        monkeypatch.setattr(model_group_service, "_is_windows", lambda: True)
+        monkeypatch.setattr(private_file, "is_windows", lambda: True)
         _simulate_windows_account(monkeypatch)
-        monkeypatch.setattr(model_group_service.subprocess, "run", _FakeIcacls(returncode=5))
+        monkeypatch.setattr(private_file.subprocess, "run", _FakeIcacls(returncode=5))
 
         await self._run_backup(boot_env, monkeypatch)
 
@@ -956,8 +957,8 @@ class TestBackupFileProtectionIsReportedHonestlyPerPlatform:
         logs: List[Tuple[str, str]],
     ) -> None:
         fake = _FakeIcacls(returncode=0)
-        monkeypatch.setattr(model_group_service, "_is_windows", lambda: False)
-        monkeypatch.setattr(model_group_service.subprocess, "run", fake)
+        monkeypatch.setattr(private_file, "is_windows", lambda: False)
+        monkeypatch.setattr(private_file.subprocess, "run", fake)
 
         await self._run_backup(boot_env, monkeypatch)
 

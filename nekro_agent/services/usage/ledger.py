@@ -264,6 +264,23 @@ async def _write_record(draft: LLMUsageDraft) -> None:
             is_fallback=context.is_fallback,
             generation_time_ms=draft.generation_time_ms,
         )
+        # 频道每日额度的计数是**另一件事**，单独一个 try：放进上面那个 try 里的话，
+        # 计数失败会被记成「流水落库失败」，运维会去查数据库连接，而真正的原因只是
+        # 一张缓存表没写进去。计数自己已经把异常咽掉了，这里再兜一层是因为它被调用的
+        # 位置在后台任务里，任何漏出来的异常都会变成一条没人看的 task 异常。
+        if context.chat_key:
+            try:
+                from nekro_agent.services.channel_quota.counter import record_tokens
+
+                await record_tokens(
+                    context.chat_key,
+                    adapter_key,
+                    instance_key,
+                    context.scene.value,
+                    draft.token_total,
+                )
+            except Exception as e:  # noqa: BLE001 - 计数失败不能影响记账
+                logger.warning(f"频道额度计数失败（已忽略）: chat_key={context.chat_key} | {e}")
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001

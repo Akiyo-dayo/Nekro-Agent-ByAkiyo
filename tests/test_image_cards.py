@@ -1220,6 +1220,18 @@ class TestTheBoardIsAlwaysTheCallersOwnChannel:
         await add_message(CHAT_KEY_A, USER_MAIN, nickname="主号")
         await add_affection(USER_MAIN, 40)
 
+        from nekro_agent.api import message as message_api
+        from nekro_agent.core.config import config as core_config
+
+        # 发送走插件推送方法：先判「好感榜插件在这个频道生效」，再调 `nekro_agent.api.message.send_image`。
+        # 本组钉的是归属而不是开关，所以把插件放进全局启用，并把发送接到替身上记账。
+        monkeypatch.setattr(core_config, "PLUGIN_ENABLED", [*core_config.PLUGIN_ENABLED, rank_plugin.plugin.key])
+
+        async def _send_image(chat_key: str, file_path: str, ctx: Any, **_kwargs: Any) -> None:
+            ctx.sent.append((chat_key, file_path))
+
+        monkeypatch.setattr(message_api, "send_image", _send_image)
+
         rendered = _capture_render(monkeypatch)
         ctx = _StubCtx(CHAT_KEY_A)
         result = await rank_plugin.send_affection_rank(ctx, CHAT_KEY_A, USER_MAIN)  # pyright: ignore[reportArgumentType]

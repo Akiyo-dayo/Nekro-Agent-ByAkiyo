@@ -12,8 +12,11 @@ from croniter import croniter
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
 from nekro_agent.services.message_service import message_service
+from nekro_agent.services.plugin.scope import plugin_effective_in_chat
 
 from .cn_workday_service import cn_workday_service
+from .constants import TIMER_PLUGIN_KEY
+from .reminder_message import build_auto_pause_result, build_reminder_result
 
 logger = get_sub_logger("timer")
 @dataclass(frozen=True, order=True)
@@ -303,14 +306,24 @@ class RecurringTimerService:
         await self.upsert_job(job)
 
     async def _fire_job(self, job: DBRecurringTimerJob, fired_at: datetime, is_misfire: bool) -> None:
+        # `timer` 插件在这个频道已不生效：跳过这一次，但**不算失败**——不涨连续失败计数、
+        # 不写 last_error，下一次照常排（调用方随后仍会 upsert 下一次触发时间）。
+        if not await plugin_effective_in_chat(TIMER_PLUGIN_KEY, job.chat_key):
+            logger.info(f"timer 插件在该频道未生效，跳过本次周期任务: chat_key={job.chat_key} job_id={job.job_id}")
+            return
+
         try:
             logger.debug(f"[cron] fire: job_id={job.job_id}, misfire={is_misfire}")
-            title = f"{job.title}\n" if job.title else ""
-            misfire_tag = "（补发）" if is_misfire else ""
-            system_message = f"⏰ 定时提醒{misfire_tag}：{title}{job.event_desc}"
-            await message_service.push_system_message(
+            # 标题与描述都是写任务的人（或模型）留下的字符串，可能被注入过；走不可信通道，
+            # 只有宿主写死的引导语与回显的任务 ID 留在可信摘要里。
+            await message_service.push_untrusted_message(
                 chat_key=job.chat_key,
-                agent_messages=system_message,
+                result=build_reminder_result(
+                    description=job.event_desc,
+                    title=job.title or "",
+                    task_id=job.job_id,
+                    is_misfire=is_misfire,
+                ),
                 trigger_agent=True,
             )
         except Exception as e:
@@ -343,14 +356,17 @@ class RecurringTimerService:
         logger.debug(f"[cron] auto_paused: job_id={job.job_id}, failures={job.consecutive_failures}")
 
         try:
-            await message_service.push_system_message(
+            if not await plugin_effective_in_chat(TIMER_PLUGIN_KEY, job.chat_key):
+                logger.info(f"timer 插件在该频道未生效，跳过自动暂停提示: chat_key={job.chat_key} job_id={job.job_id}")
+                return
+            # 不唤起对话：任务刚因为连续失败被停掉，此刻再跑一轮大概率只是重演同一次失败。
+            # `last_error` 是上游异常文本，构造器里先脱敏再进正文（可能带 Bearer / api_key）。
+            await message_service.push_untrusted_message(
                 chat_key=job.chat_key,
-                agent_messages=(
-                    "⏸️ 定时任务已自动暂停：连续触发失败次数过多。\n"
-                    f"- 任务ID: {job.job_id}\n"
-                    f"- 标题: {job.title or '（无）'}\n"
-                    f"- 最近错误: {job.last_error or '（无）'}\n"
-                    "你可以让 AI 调用 resume_recurring_timer 恢复，或 update_recurring_timer 修正参数。"
+                result=build_auto_pause_result(
+                    job_id=job.job_id,
+                    title=job.title or "",
+                    last_error=job.last_error,
                 ),
                 trigger_agent=False,
             )

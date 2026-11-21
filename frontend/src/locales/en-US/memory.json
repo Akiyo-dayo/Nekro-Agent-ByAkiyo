@@ -1,0 +1,324 @@
+{
+  "title": "Memory",
+  "subtitle": "Review, filter, and maintain long-term memory in the instance",
+  "scopeBanner": "What you can see here follows the current instance. Switching instances changes both the list and the filter options.",
+  "tabs": {
+    "items": "Memory items",
+    "quarantine": "Quarantine",
+    "summaries": "Channel summaries",
+    "promptRounds": "Prompt details"
+  },
+  "kind": {
+    "paragraph": "Paragraph",
+    "episode": "Episode",
+    "relation": "Relation",
+    "entity": "Entity"
+  },
+  "status": {
+    "all": "All statuses",
+    "active": "Active",
+    "quarantined": "Quarantined",
+    "deleted": "Deleted",
+    "pruned": "Pruned",
+    "hard_deleted": "Permanently deleted",
+    "unknown": "Unknown"
+  },
+  "partition": {
+    "all": "All partitions",
+    "domain": "Domain",
+    "workspace": "Workspace",
+    "workspaceWithId": "Workspace #{{id}}"
+  },
+  "domain": {
+    "self": "This instance",
+    "group": "Domain instances"
+  },
+  "cognitive": {
+    "episodic": "Episodic",
+    "semantic": "Semantic"
+  },
+  "knowledge": {
+    "conversation": "Conversation",
+    "preference": "Preference",
+    "fact": "Fact",
+    "experience": "Experience",
+    "decision": "Decision",
+    "emotion": "Emotion"
+  },
+  "origin": {
+    "message": "Message",
+    "consolidation": "Consolidation",
+    "task": "Task result",
+    "manual": "Manual",
+    "plugin": "Plugin",
+    "affection": "Affection milestone"
+  },
+  "sort": {
+    "create_time": "Created",
+    "update_time": "Updated",
+    "blocked_round_hits": "Blocked rounds"
+  },
+  "order": {
+    "desc": "Descending",
+    "asc": "Ascending"
+  },
+  "preset": {
+    "none": "Default preset",
+    "consoleOnly": "Console only (conclusions from console-dispatched CC tasks)"
+  },
+  "filters": {
+    "searchPlaceholder": "Search content or summary",
+    "clearSearch": "Clear search",
+    "searchTooLong": "Search is limited to {{max}} characters; the rest was trimmed.",
+    "status": "Status",
+    "channel": "Source channel",
+    "preset": "Preset",
+    "allChannels": "All channels",
+    "allPresets": "All presets",
+    "all": "All",
+    "partition": "Partition",
+    "domain": "Domain",
+    "person": "Person",
+    "personPlaceholder": "Account or name",
+    "cognitive": "Cognitive type",
+    "knowledge": "Knowledge type",
+    "origin": "Source",
+    "allOrigins": "All sources",
+    "timeFrom": "From",
+    "timeTo": "To",
+    "sort": "Sort",
+    "order": "Order",
+    "pageSize": "Page size",
+    "pageSizeOption": "{{count}} rows",
+    "more": "More filters",
+    "moreWithCount": "More filters · {{count}}",
+    "clear": "Clear filters"
+  },
+  "columns": {
+    "content": "Content",
+    "status": "Status",
+    "persons": "People",
+    "channel": "Source channel",
+    "partition": "Partition",
+    "blockedHits": "Blocked rounds",
+    "time": "Time",
+    "type": "Type",
+    "quarantineReason": "Reason",
+    "quarantinedAt": "Quarantined",
+    "actions": "Actions"
+  },
+  "detail": {
+    "title": "Paragraph details",
+    "episodeTitle": "Episode details",
+    "content": "Content",
+    "summary": "Summary",
+    "persons": "People",
+    "personsHelper": "Only non-bot accounts that spoke in the source channel are accepted; this is checked on save.",
+    "channel": "Source channel",
+    "episode": "Episode",
+    "cognitive": "Cognitive type",
+    "knowledge": "Knowledge type",
+    "baseWeight": "Base weight",
+    "reinforceCount": "Reinforcements",
+    "blockedHits": "Blocked rounds",
+    "quarantineReason": "Quarantine reason",
+    "quarantinedAt": "Quarantined at",
+    "partition": "Partition",
+    "instance": "Instance",
+    "titleField": "Title",
+    "narrativeSummary": "Narrative summary",
+    "timeRange": "Time range",
+    "openAffection": "Open affection details",
+    "milestoneRecordNotFound": "The affection record this milestone belongs to is not visible or no longer exists."
+  },
+  "actions": {
+    "delete": "Delete",
+    "hardDelete": "Delete permanently",
+    "quarantine": "Quarantine",
+    "restore": "Restore",
+    "freeze": "Freeze",
+    "unfreeze": "Unfreeze",
+    "protect": "Protect",
+    "unprotect": "Remove protection",
+    "reinforce": "Reinforce",
+    "demote": "Weaken",
+    "save": "Save changes",
+    "saveSuccess": "Saved",
+    "deleteSuccess": "Moved to Deleted",
+    "freezeSuccess": "Frozen",
+    "unfreezeSuccess": "Unfrozen",
+    "protectSuccess": "Protected",
+    "unprotectSuccess": "Protection removed",
+    "reinforceSuccess": "Reinforced",
+    "demoteSuccess": "Weakened",
+    "quarantineSuccess": "Moved to Quarantine",
+    "restoreSuccess": "Restored"
+  },
+  "bulk": {
+    "previewTitle": "Confirm bulk action",
+    "previewLine": "Apply “{{action}}” to {{matched}} memory items.",
+    "confirm": "Confirm",
+    "noMatch": "No memory items match the current filters. They may have been handled by someone else.",
+    "cascade": "This also removes {{episodes}} episodes, {{relations}} relations, {{persons}} people, and {{reinforcementLogs}} reinforcement logs.",
+    "success": "Processed {{affected}} memory items.",
+    "partial": "Processed {{affected}}; {{failed}} failed and remain in the list.",
+    "countChanged": "The count changed. The preview has been refreshed; please confirm again.",
+    "selected": "{{count}} selected",
+    "selectedAll": "All {{total}} items matching the filters are selected",
+    "selectAll": "Select all {{total}} items matching the filters",
+    "selectOnlyChecked": "Keep only checked rows",
+    "hardDeleteNotes": {
+      "chatRecords": "Chat history itself is not deleted; only memory is removed.",
+      "summary": "Channel summaries may also cover this content; edit them under Channel summaries if needed.",
+      "promptRounds": "Prompt details that referenced these items will show them as permanently deleted."
+    }
+  },
+  "deleteDialog": {
+    "title": "Delete this memory?",
+    "description": "It will no longer be injected or retrieved, but it stays under Deleted and can still be permanently deleted later.",
+    "confirm": "Delete"
+  },
+  "hardDeleteDialog": {
+    "title": "Delete permanently?",
+    "confirm": "Delete permanently",
+    "success": "Permanently deleted along with {{count}} related records.",
+    "successEpisode": "This episode has been permanently deleted.",
+    "episodeDescription": "Only this episode is deleted. Its member paragraphs stay and will be grouped again later."
+  },
+  "quarantine": {
+    "restoreSuccess": "Restored. It will be retrieved and injected again."
+  },
+  "quarantineReason": {
+    "manual": "Manually quarantined",
+    "auto_blocked": "Auto-quarantined after blocked rounds",
+    "unknown": "Other reason"
+  },
+  "trace": {
+    "button": "Trace original messages",
+    "empty": "Original messages not found (they may have been cleaned up).",
+    "crossChannel": "This memory comes from another channel."
+  },
+  "flags": {
+    "frozen": "Frozen",
+    "protected": "Protected"
+  },
+  "errors": {
+    "notFoundTitle": "Not found",
+    "notFoundHint": "This record does not exist, or it is not in an instance you can manage."
+  },
+  "summaries": {
+    "columns": {
+      "channel": "Channel",
+      "preset": "Preset",
+      "latest": "Latest version",
+      "content": "Content",
+      "versionCount": "Versions",
+      "status": "Status",
+      "updatedAt": "Updated"
+    },
+    "source": {
+      "auto": "Automatic",
+      "manual": "Manual edit",
+      "rollback": "Rollback"
+    },
+    "latestVersion": "Version {{version}}",
+    "pausedChip": "Auto-update paused",
+    "dialog": {
+      "title": "Channel summary",
+      "pauseLabel": "Pause auto-update",
+      "pauseTooltip": "Only stops automatic updates while consolidating; the summary is still injected. To stop injection too, turn off channel summaries in system settings.",
+      "pausedBy": "Paused by {{user}} at {{time}}",
+      "paused": "Auto-update paused",
+      "resumed": "Auto-update resumed",
+      "contentLabel": "Content of the latest version",
+      "charCount": "{{count}} characters",
+      "save": "Save as a new version",
+      "saveSuccess": "Saved as a new version",
+      "conflict": "The summary was just updated; the latest version has been loaded",
+      "conflictReplaced": "Your changes were not saved and have been replaced with the latest version",
+      "discardedLabel": "What you wrote (discarded, copyable)",
+      "historyTitle": "Version history",
+      "rollbackPrevious": "Roll back to the previous version",
+      "rollbackToVersion": "Roll back to this version",
+      "rollbackSuccess": "Rolled back as version {{version}}",
+      "rollbackFrom": "Rolled back from version {{version}}",
+      "editedBy": "Edited by {{user}}",
+      "version": "Version {{version}}",
+      "expand": "Show full text",
+      "collapse": "Collapse",
+      "untitled": "(empty)",
+      "emptyVersions": "No versions to show yet."
+    }
+  },
+  "promptRounds": {
+    "columns": {
+      "time": "Time",
+      "outcome": "Outcome",
+      "memory": "Memory",
+      "summary": "Summary",
+      "affection": "Affection",
+      "worldbook": "Worldbook",
+      "renderCount": "Renders"
+    },
+    "outcome": {
+      "ok": "Succeeded",
+      "blocked": "Blocked",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "memoryState": {
+      "injected": "{{count}} items · {{chars}} chars",
+      "empty": "Nothing to inject",
+      "disabled": "Switched off",
+      "suppressed": "Blocked last round, not injected this round",
+      "error": "Error"
+    },
+    "worldbookState": {
+      "injected": "{{count}} items · {{chars}} chars",
+      "none": "No match",
+      "disabled": "Switched off",
+      "suppressed": "Blocked last round; reference entries were not injected",
+      "error": "Error; nothing was injected this round"
+    },
+    "summaryState": {
+      "injected": "Version {{version}} · {{chars}} chars",
+      "none": "None",
+      "disabled": "Switched off",
+      "suppressed": "Not injected this round"
+    },
+    "affectionShown": "{{people}} people · {{chars}} chars",
+    "affectionNone": "Not shown",
+    "pickChannel": "Pick a channel first",
+    "pickChannelHint": "Prompt details are recorded per channel; pick one to look at them.",
+    "detail": {
+      "summaryLine": "{{cooldownSkipped}} items skipped by cooldown, memory block {{blockChars}} chars",
+      "summaryCurrent": "That summary version is still the latest",
+      "summaryOutdated": "That summary version has been updated since",
+      "summaryDeleted": "That summary version is gone",
+      "summaryNone": "No summary was injected this round",
+      "itemsTitle": "Memory items",
+      "type": "Type",
+      "preview": "Preview",
+      "status": "Current status",
+      "chars": "Chars",
+      "renders": "Renders",
+      "actions": "Actions",
+      "noItems": "No memory item was injected this round",
+      "affectionMilestones": "Injected milestones",
+      "quarantineSuccess": "Moved to quarantine",
+      "deleteSuccess": "Moved to Deleted"
+    }
+  },
+  "empty": {
+    "itemsTitle": "No memory items yet",
+    "itemsHint": "Try different filters, or come back after new memories are formed in a conversation.",
+    "episodesTitle": "No episodes yet",
+    "episodesHint": "Episodes are aggregated from paragraphs on the same topic. Try different filters.",
+    "quarantineTitle": "Quarantine is empty",
+    "quarantineHint": "No memory is quarantined right now.",
+    "summariesTitle": "No channel summaries yet",
+    "summariesHint": "Once channel summaries are enabled, they are generated automatically while consolidating.",
+    "promptRoundsTitle": "No records for this channel yet",
+    "promptRoundsHint": "One row is recorded after each conversation round; retention is configured in system settings."
+  }
+}

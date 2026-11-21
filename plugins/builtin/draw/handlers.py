@@ -1,10 +1,10 @@
+import asyncio
 import base64
 import json
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiofiles
 import magic
 from httpx import AsyncClient, Timeout
 
@@ -13,8 +13,9 @@ from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
 from nekro_agent.core.config import config as global_config
 from nekro_agent.services.agent.creator import ContentSegment, OpenAIChatMessage
-from nekro_agent.services.plugin.scope_guard import require_same_tenant_chat_key
+from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND, require_same_tenant_chat_key
 from nekro_agent.tools.path_convertor import convert_to_host_path
+from nekro_agent.tools.sandbox_shared_files import read_host_file_bytes
 
 from .models import ImageReference, MultiImageDrawRequest
 from .plugin import config, plugin
@@ -227,9 +228,11 @@ async def draw(
     # 转换为沙盒文件
     result_sandbox_file = await _ctx.fs.mixed_forward_file(result_file_url)
 
-    # 如果需要发送到聊天
+    # 如果需要发送到聊天，走插件推送方法：目标频道所在作用域关掉了绘图插件时不发，
+    # 按「频道不存在」处理（与跨租户越权同口径）
     if send_to_chat:
-        await _ctx.ms.send_image(send_to_chat, result_sandbox_file, ctx=_ctx)
+        if not await plugin.send_image(send_to_chat, result_sandbox_file, _ctx):
+            raise ValueError(CHANNEL_NOT_FOUND)
 
     return result_sandbox_file
 
@@ -338,16 +341,17 @@ async def draw_with_multiple_images(
         # 转换为沙盒文件
         result_sandbox_file = await _ctx.fs.mixed_forward_file(result_file_url)
         
-        # 如果需要发送到聊天
-        if send_to_chat:
-            await _ctx.ms.send_image(send_to_chat, result_sandbox_file, ctx=_ctx)
-        
     except (ValueError, TypeError, KeyError) as e:
         raise Exception(f"参考图片信息格式错误: {e}") from e
     except Exception as e:
         logger.error(f"多图绘制失败: {e}")
         raise Exception(f"多图绘制失败: {e}") from e
     else:
+        # 发送放在 try 之外：目标频道未启用插件时要抛 CHANNEL_NOT_FOUND，
+        # 不能被上面的异常分支改写成「参考图片信息格式错误」
+        if send_to_chat:
+            if not await plugin.send_image(send_to_chat, result_sandbox_file, _ctx):
+                raise ValueError(CHANNEL_NOT_FOUND)
         return result_sandbox_file
 
 
@@ -815,14 +819,14 @@ async def generate_chat_mode_image(model_group, prompt: str, size: str, refer_im
 async def prepare_reference_image(refer_image: str, chat_key: str, container_key: str) -> str:
     """准备参考图片数据"""
     if refer_image:
-        async with aiofiles.open(
+        # 参考图在沙盒可写的共享目录里时，逐级不跟随链接地读（否则会把链接指向的宿主文件发给外部模型）
+        image_data = await asyncio.to_thread(
+            read_host_file_bytes,
             convert_to_host_path(Path(refer_image), chat_key=chat_key, container_key=container_key),
-            mode="rb",
-        ) as f:
-            image_data = await f.read()
-            mime_type = magic.from_buffer(image_data, mime=True)
-            image_data = base64.b64encode(image_data).decode("utf-8")
-        return f"data:{mime_type};base64,{image_data}"
+        )
+        mime_type = magic.from_buffer(image_data, mime=True)
+        encoded = base64.b64encode(image_data).decode("utf-8")
+        return f"data:{mime_type};base64,{encoded}"
     return OPENAI_IMAGE_PLACEHOLDER
 
 
@@ -835,14 +839,13 @@ async def prepare_multiple_reference_images(
     image_data_list = []
     
     for image_ref in image_refs:
-        async with aiofiles.open(
+        image_data = await asyncio.to_thread(
+            read_host_file_bytes,
             convert_to_host_path(Path(image_ref.image_path), chat_key=chat_key, container_key=container_key),
-            mode="rb",
-        ) as f:
-            image_data = await f.read()
-            mime_type = magic.from_buffer(image_data, mime=True)
-            image_data_b64 = base64.b64encode(image_data).decode("utf-8")
-            image_data_list.append(f"data:{mime_type};base64,{image_data_b64}")
+        )
+        mime_type = magic.from_buffer(image_data, mime=True)
+        image_data_b64 = base64.b64encode(image_data).decode("utf-8")
+        image_data_list.append(f"data:{mime_type};base64,{image_data_b64}")
     
     return image_data_list
 

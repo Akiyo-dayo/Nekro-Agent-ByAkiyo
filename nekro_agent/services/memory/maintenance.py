@@ -22,7 +22,12 @@ from nekro_agent.models.db_mem_paragraph import DBMemParagraph
 from nekro_agent.models.db_mem_reinforcement_log import DBMemReinforcementLog
 from nekro_agent.models.db_mem_relation import DBMemRelation
 from nekro_agent.models.db_workspace import DBWorkspace
-from nekro_agent.services.memory.feature_flags import MemoryOperation, ensure_memory_system_enabled
+from nekro_agent.services.memory.feature_flags import (
+    MemoryOperation,
+    ensure_memory_system_enabled,
+    is_domain_scope_enabled,
+)
+from nekro_agent.services.memory.prompt_rounds import prune_prompt_rounds
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
 
 logger = get_sub_logger("memory.maintenance")
@@ -220,7 +225,12 @@ async def prune_workspace_memories(workspace_id: int) -> MemoryPruneResult:
 
 
 async def prune_all_workspaces() -> dict[int, MemoryPruneResult]:
-    """清理所有工作区的低价值记忆。"""
+    """清理所有工作区的低价值记忆。
+
+    闸开时频道记忆写在域分区 0，它不属于任何工作区，工作区遍历碰不到；所以遍历完工作区
+    之后额外清理一次分区 0，结果字典的键是 0。函数内部三条扫描都是按主键游标分页的，
+    分区再大也不会一次取全量。闸关时分区 0 不是一条有效的记忆归属，行为与今天相同。
+    """
     results: dict[int, MemoryPruneResult] = {}
     cursor = 0
     while True:
@@ -238,5 +248,19 @@ async def prune_all_workspaces() -> dict[int, MemoryPruneResult]:
                 logger.warning(f"工作区记忆清理失败: workspace={workspace_id}, error={e}")
             # 让出事件循环：这条链路是后台维护，不能把主对话饿在后面排队
             await asyncio.sleep(PRUNE_WORKSPACE_INTERVAL_SECONDS)
+
+    if is_domain_scope_enabled():
+        try:
+            results[0] = await prune_workspace_memories(0)
+        except Exception as e:
+            logger.warning(f"域分区记忆清理失败: workspace=0, error={e}")
+        await asyncio.sleep(PRUNE_WORKSPACE_INTERVAL_SECONDS)
+
+    # 提示词明细按频道保留，不挂在任何工作区上；放在工作区与分区 0 都清完之后再按年龄
+    # 扫一遍，处理不活跃频道留下的尾巴。失败只记日志，不影响本次记忆清理的结果。
+    try:
+        await prune_prompt_rounds(config.MEMORY_PROMPT_ROUNDS_MAX_AGE_DAYS)
+    except Exception as e:
+        logger.warning(f"提示词明细清理失败: error={e}")
 
     return results

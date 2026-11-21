@@ -99,6 +99,81 @@ export interface TenantMemberCreateRequest {
 /** 把实例划归某租户；空列表表示解绑全部 */
 export interface TenantInstanceBindRequest {
   instance_keys: string[]
+  /** 只作用于本次改变归属的实例；工作区里的记忆不删 */
+  clear_memory_and_affection?: boolean
+  /**
+   * 划转时一并删除这些实例上用户登记的服务器凭据
+   *
+   * 默认删除：凭据是「能进别人家门」的东西，误跟过去比误删代价大。取消勾选才让
+   * 行跟着实例走，归新的租户管理。
+   */
+  delete_ssh_credentials?: boolean
+  /**
+   * 划转时一并删除这些实例自己填的邮箱（连同它们收到的信与附件）
+   *
+   * 默认删除：那是上一任主人的收件箱（密码重置、验证码、账单），跟着实例划给新租户等于直接交出去。
+   * 取消勾选才让账户跟着实例走。不管勾不勾，平台方邮箱点名这个实例的共享都会取消、未发的节日邮件都作废。
+   */
+  delete_instance_mailboxes?: boolean
+  /**
+   * 划转时一并删除这些实例的插件设置：实例级与频道级启停、实例级插件配置（API Key 之类）
+   *
+   * 默认删除，与服务器凭据、自有邮箱同一条取舍；取消勾选才让这些设置跟着实例走。
+   */
+  delete_plugin_settings?: boolean
+  /**
+   * 划转时一并删除这些实例的配置覆盖：核心配置的实例层与这些实例频道上的频道层覆盖
+   *
+   * 默认删除，口径与插件设置相同；取消勾选才跟着实例走。
+   */
+  delete_config_overrides?: boolean
+}
+
+/** 划转预览里的一行：一个实例的归属变化与它会带走的记忆规模 */
+export interface TenantInstanceTransferChange {
+  adapter_key: string
+  instance_key: string
+  display_name: string
+  from_tenant_id: number | null
+  from_tenant_name: string
+  to_tenant_id: number | null
+  to_tenant_name: string
+  /** 保存后会被移出实例组（回到自成一域） */
+  in_group: boolean
+  memory_paragraphs: number
+  memory_quarantined: number
+  memory_summaries: number
+  memory_prompt_rounds: number
+  /** 按这个实例对归属的世界书本数 */
+  worldbook_books: number
+  /** 这些世界书里的条目数 */
+  worldbook_entries: number
+  /** 该实例对上用户登记的 SSH 服务器凭据行数 */
+  ssh_credentials: number
+  /** 本实例收集库里的表情数（收集库跟着实例走，划转不删） */
+  collected_emotions?: number
+  /** 本实例自己填的邮箱个数 */
+  email_accounts?: number
+  /** 本实例记下的用户邮件偏好条数 */
+  email_user_prefs?: number
+  /** 本实例名下有设置的插件个数（实例级启停、频道级启停、实例级配置的并集） */
+  plugin_settings?: number
+  /** 本实例名下有生效覆盖的配置文件个数（核心配置的实例层 + 它的频道） */
+  config_overrides?: number
+  memory_affection_rows: number
+  memory_affection_events: number
+  /**
+   * 该实例上带租户额度设置的策略行数（实例层 + 频道层，四个租户字段任一非空）
+   *
+   * 保存时这些设置**一律**被清空，与 `clear_memory_and_affection` 无关：那是旧租户
+   * 对他自己的群设的额度与提示语，新租户不该继承。
+   */
+  channel_quota_tenant_settings: number
+}
+
+/** 一次租户实例划转会改变哪些实例、各自带走多少记忆 */
+export interface TenantInstanceTransferPreview {
+  changes: TenantInstanceTransferChange[]
 }
 
 /**
@@ -216,6 +291,8 @@ export interface ModelGroupUpsertRequest {
   chat_proxy?: string
   enable_vision?: boolean
   enable_cot?: boolean
+  /** 预填方式；不提交表示保持不变，新建时后端按 off 落库 */
+  prefill_mode?: 'off' | 'assistant' | 'deepseek'
   temperature?: number | null
   top_p?: number | null
   top_k?: number | null
@@ -396,9 +473,39 @@ export const tenantApi = {
     await axios.delete(`${tenantPath(tenantId)}/members/${userId}`)
   },
 
-  /** 划归实例（整表替换，传空列表表示解绑全部） */
-  async bindInstances(tenantId: number, instanceKeys: string[]): Promise<void> {
+  /** 预览本次划转会改变哪些实例的归属，仅平台方可用 */
+  async previewInstanceBinding(
+    tenantId: number,
+    instanceKeys: string[]
+  ): Promise<TenantInstanceTransferPreview> {
     const body: TenantInstanceBindRequest = { instance_keys: instanceKeys }
+    const response = await axios.post<TenantInstanceTransferPreview>(
+      `${tenantPath(tenantId)}/instances/preview`,
+      body
+    )
+    return response.data
+  },
+
+  /** 划归实例（整表替换，传空列表表示解绑全部） */
+  async bindInstances(
+    tenantId: number,
+    instanceKeys: string[],
+    clearMemoryAndAffection = false,
+    deleteSshCredentials = true,
+    deleteInstanceMailboxes = true,
+    deletePluginSettings = true,
+    deleteConfigOverrides = true
+  ): Promise<void> {
+    const body: TenantInstanceBindRequest = {
+      instance_keys: instanceKeys,
+      // 后端默认就是删除；这里始终显式带上，界面上的默认勾选与请求体保持同一语义
+      delete_ssh_credentials: deleteSshCredentials,
+      delete_instance_mailboxes: deleteInstanceMailboxes,
+      delete_plugin_settings: deletePluginSettings,
+      delete_config_overrides: deleteConfigOverrides,
+    }
+    // 为假时请求体与改动前逐字相同：这个字段不能凭空出现
+    if (clearMemoryAndAffection) body.clear_memory_and_affection = true
     await axios.put(`${tenantPath(tenantId)}/instances`, body)
   },
 

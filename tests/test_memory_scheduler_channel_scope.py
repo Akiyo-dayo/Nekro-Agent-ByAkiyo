@@ -39,6 +39,7 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.services.memory import scheduler as scheduler_module
+from nekro_agent.services.memory.consolidator import ConsolidationResult
 from nekro_agent.services.memory.scheduler import (
     ConsolidationPriority,
     MemoryMaintenanceScheduler,
@@ -93,7 +94,7 @@ class TestQueueKeepsEveryChannel:
         await schedule(scheduler, WORKSPACE_ID, CHAT_B)
         await schedule(scheduler, WORKSPACE_ID, CHAT_C)
 
-        assert len(scheduler._heap) == 3  # noqa: SLF001
+        assert len(scheduler.queued_tasks()) == 3
         # 改前这里只剩 [CHAT_C]：后两次调度把版本号推到 3，前两个任务被判为过期
         assert sorted(await drain(scheduler)) == sorted([CHAT_A, CHAT_B, CHAT_C])
 
@@ -116,15 +117,16 @@ class TestSingleChannelUnchanged:
         await schedule(scheduler, WORKSPACE_ID, CHAT_A, ConsolidationPriority.HIGH)
         await schedule(scheduler, WORKSPACE_ID, CHAT_A, ConsolidationPriority.URGENT)
 
-        assert len(scheduler._heap) == 3  # noqa: SLF001
-        # 三次调度的是同一个频道，只有最后一次有效——这是「任务更新」的原意
+        # 同一个频道在队列里只留一项：后两次调度只更新它（优先级取最急的），不再重复入队
+        assert len(scheduler.queued_tasks()) == 1
+        assert scheduler.queued_tasks()[0].priority == ConsolidationPriority.URGENT
         assert await drain(scheduler) == [CHAT_A]
 
     @pytest.mark.asyncio
     async def test_running_channel_is_skipped(self, scheduler: MemoryMaintenanceScheduler) -> None:
         scheduler._running_scopes.add((WORKSPACE_ID, CHAT_A))  # noqa: SLF001
         await schedule(scheduler, WORKSPACE_ID, CHAT_A)
-        assert scheduler._heap == []  # noqa: SLF001
+        assert scheduler.queued_tasks() == []
 
     @pytest.mark.asyncio
     async def test_running_channel_does_not_block_sibling(self, scheduler: MemoryMaintenanceScheduler) -> None:
@@ -162,8 +164,8 @@ class TestPendingCounterIsPerChannel:
         # 而沉淀只做了其中一个频道
         assert scheduler._channel_stats[(WORKSPACE_ID, CHAT_A)].pending_messages == 2  # noqa: SLF001
         assert scheduler._channel_stats[(WORKSPACE_ID, CHAT_B)].pending_messages == 2  # noqa: SLF001
-        assert [item.chat_key for item in scheduler._heap].count(CHAT_A) >= 1  # noqa: SLF001
-        assert [item.chat_key for item in scheduler._heap].count(CHAT_B) >= 1  # noqa: SLF001
+        assert [item.chat_key for item in scheduler.queued_tasks()].count(CHAT_A) == 1
+        assert [item.chat_key for item in scheduler.queued_tasks()].count(CHAT_B) == 1
 
     @pytest.mark.asyncio
     async def test_consolidating_one_channel_does_not_zero_the_other(
@@ -179,8 +181,10 @@ class TestPendingCounterIsPerChannel:
         )
         handled: List[Tuple[int, str]] = []
 
-        async def handler(workspace_id: int, chat_key: str) -> None:
+        async def handler(workspace_id: int, chat_key: str) -> ConsolidationResult:
             handled.append((workspace_id, chat_key))
+            pending = scheduler._channel_stats[(workspace_id, chat_key)].pending_messages  # noqa: SLF001
+            return ConsolidationResult(messages_processed=pending)
 
         scheduler.set_consolidation_handler(handler)  # type: ignore[arg-type]
         for _ in range(3):
@@ -215,8 +219,9 @@ class TestWorkspaceStaysSerialized:
         monkeypatch.setattr(config, "MEMORY_CONSOLIDATION_BATCH_COOLDOWN_SECONDS", 0)
         handled: List[str] = []
 
-        async def handler(workspace_id: int, chat_key: str) -> None:
+        async def handler(workspace_id: int, chat_key: str) -> ConsolidationResult:
             handled.append(chat_key)
+            return ConsolidationResult()
 
         scheduler.set_consolidation_handler(handler)  # type: ignore[arg-type]
         scheduler._running_workspaces.add(WORKSPACE_ID)  # noqa: SLF001
@@ -228,7 +233,7 @@ class TestWorkspaceStaysSerialized:
 
         # 没有真的跑，而是原样重排回队列等对方让出工作区
         assert handled == []
-        assert [item.chat_key for item in scheduler._heap] == [CHAT_B]  # noqa: SLF001
+        assert [item.chat_key for item in scheduler.queued_tasks()] == [CHAT_B]
 
     @pytest.mark.asyncio
     async def test_workspace_released_after_execution(
@@ -242,8 +247,9 @@ class TestWorkspaceStaysSerialized:
         # ——第一版就是这么写的，"不登记 _running_workspaces" 的变异实测存活。
         seen: List[Tuple[set, set]] = []
 
-        async def handler(workspace_id: int, chat_key: str) -> None:
+        async def handler(workspace_id: int, chat_key: str) -> ConsolidationResult:
             seen.append((set(scheduler._running_workspaces), set(scheduler._running_scopes)))  # noqa: SLF001
+            return ConsolidationResult()
 
         scheduler.set_consolidation_handler(handler)  # type: ignore[arg-type]
         await schedule(scheduler, WORKSPACE_ID, CHAT_A)

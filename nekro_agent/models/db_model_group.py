@@ -51,7 +51,7 @@
 """
 
 from enum import Enum
-from typing import Any, Iterable, List, Optional, Union
+from typing import Iterable, List, Optional
 
 from tortoise import Tortoise, fields
 from tortoise.backends.base.client import BaseDBAsyncClient
@@ -59,12 +59,9 @@ from tortoise.models import Model
 
 from nekro_agent.core.config import ModelConfigGroup, is_model_group_api_key_placeholder
 from nekro_agent.core.logger import get_sub_logger
+from nekro_agent.models.fields import EncryptedTextField
 from nekro_agent.schemas.tenant import ModelGroupOwnership
-from nekro_agent.tools.credential_cipher import (
-    classify_stored_credential,
-    decrypt_credential,
-    encrypt_credential,
-)
+from nekro_agent.tools.credential_cipher import classify_stored_credential
 
 logger = get_sub_logger("model_group")
 
@@ -88,34 +85,6 @@ class ModelGroupVisibility(str, Enum):
 # 而默认值本身是一条**平台方从没做过的授权**，越权闸门管不到它。
 # 开放给租户必须是平台方在后台的一次显式动作。
 DEFAULT_VISIBILITY = ModelGroupVisibility.PRIVATE
-
-
-class EncryptedTextField(fields.TextField):
-    """静态加密的文本字段
-
-    读写都在这里收口：`to_db_value` 出去时加密、`to_python_value` 回来时解密，
-    模型属性因此永远是明文，上层代码不需要知道这一列是加密的。
-
-    ⚠️ **不要按这一列做查询过滤**（`filter(api_key=...)`）。每次加密都用新的随机 nonce，
-    同一个明文两次写入得到两个不同的密文，等值匹配永远不成立 —— 而它会静默地返回空集，
-    不会报错。目前全仓没有这样的调用点（凭据本来也没有按值检索的用途）。
-
-    ⚠️ 建表 DDL 仍是 `TEXT`，`api_key` 这个列名也没变：**列名不承诺明文**，而值自己带
-    `nkenc1:` 前缀说明自己是密文。刻意不新造一个叫 `xxx_encrypted` 的列，
-    `secret_payload_encrypted` 就是前车之鉴（名字写着加密、存的是明文）。
-    """
-
-    def to_db_value(self, value: Any, instance: "Union[type[Model], Model]") -> Any:
-        value = super().to_db_value(value, instance)
-        if value is None:
-            return None
-        return encrypt_credential(str(value))
-
-    def to_python_value(self, value: Any) -> Any:
-        value = super().to_python_value(value)
-        if value is None:
-            return None
-        return decrypt_credential(str(value))
 
 
 class DBModelGroup(Model):
@@ -155,6 +124,7 @@ class DBModelGroup(Model):
     model_type = fields.CharField(max_length=32, default="chat", description="模型类型 chat/embedding/draw")
     enable_vision = fields.BooleanField(default=False, description="启用视觉功能")
     enable_cot = fields.BooleanField(default=False, description="启用外置思维链")
+    prefill_mode = fields.CharField(max_length=16, default="off", description="预填方式 off / assistant / deepseek")
     token_input_rate = fields.FloatField(default=1.0, description="输入 Token 倍率")
     token_completion_rate = fields.FloatField(default=1.0, description="补全 Token 倍率")
     model_price_rate = fields.FloatField(default=1.0, description="模型价格倍率")
@@ -267,6 +237,7 @@ class DBModelGroup(Model):
             MODEL_TYPE=self.model_type if self.model_type in ("chat", "embedding", "draw") else "chat",
             ENABLE_VISION=self.enable_vision,
             ENABLE_COT=self.enable_cot,
+            PREFILL_MODE=self.prefill_mode if self.prefill_mode in ("off", "assistant", "deepseek") else "off",
             TOKEN_INPUT_RATE=self.token_input_rate,
             TOKEN_COMPLETION_RATE=self.token_completion_rate,
             MODEL_PRICE_RATE=self.model_price_rate,
@@ -288,6 +259,7 @@ class DBModelGroup(Model):
         self.model_type = group.MODEL_TYPE
         self.enable_vision = group.ENABLE_VISION
         self.enable_cot = group.ENABLE_COT
+        self.prefill_mode = group.PREFILL_MODE
         self.token_input_rate = group.TOKEN_INPUT_RATE
         self.token_completion_rate = group.TOKEN_COMPLETION_RATE
         self.model_price_rate = group.MODEL_PRICE_RATE

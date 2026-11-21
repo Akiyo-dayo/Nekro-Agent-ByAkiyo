@@ -275,7 +275,8 @@
     "expandAttachment": "Expand",
     "collapseAttachment": "Collapse",
     "attachmentEmpty": "Attachment content is empty.",
-    "openAttachment": "Open attachment",
+    "attachmentLoadFailed": "Could not load the attachment. Try again later.",
+    "openAttachment": "Download attachment",
     "selectHint": "Select an email from the list to view its details.",
     "detailLoadError": "Failed to load email details",
     "refreshHint": "Refreshes every 30 seconds",
@@ -292,7 +293,29 @@
     "loadError": "Failed to load email list"
   },
   "emailAccounts": {
-    "title": "Email Accounts",
+    "share": {
+      "title": "Shared sending",
+      "column": "Shared sending",
+      "scope": "Share with",
+      "hint": "Which tenant instances' chats may send mail through this mailbox (sending only; its inbox stays hidden). The platform's own instances are not restricted by this setting.",
+      "instances": "Listed instances",
+      "instancesHint": "Matters for tenant instances only: platform instances can use it either way.",
+      "listedCount": "{{count}} listed instance(s)",
+      "options": {
+        "all_instances": "All instances",
+        "listed": "Listed instances",
+        "none": "Not shared"
+      }
+    },
+    "transfer": {
+      "action": "Move to an instance",
+      "title": "Move to an instance",
+      "description": "Hand {{address}} over to an instance: it leaves the platform's mailbox list and becomes that instance's own mailbox, managed and used by that instance; mail already received for this address goes with it.",
+      "instance": "Target instance",
+      "confirm": "Move",
+      "oauthOnly": "This mailbox signs in with OAuth / an official API; those credentials belong to the platform and cannot be moved to an instance.",
+      "done": "Moved to the instance"
+    },    "title": "Email Accounts",
     "description": "Manage Email adapter accounts, official login authorization, default sender selection, and manual inbox diagnostics. Account data is stored in RECEIVE_ACCOUNTS.",
     "refresh": "Refresh",
     "add": "Add Account",

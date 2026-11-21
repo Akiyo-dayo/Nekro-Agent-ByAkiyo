@@ -98,7 +98,7 @@ def _install_memory_fakes(
     monkeypatch: pytest.MonkeyPatch,
     scores: dict[int, float],
 ) -> None:
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(text: str, **_kwargs: object) -> list[float]:
         return [_QUERY_MARKER.get(text, 0.0), 0.0, 0.0, 0.0]
 
     monkeypatch.setattr(config, "MEMORY_ENABLE_SYSTEM", True)
@@ -311,8 +311,14 @@ class TestRunAgentWiresRoundRecall:
             committed.append(one_time_code)
             return 1
 
+        async def no_db(*_args: Any, **_kwargs: Any) -> Any:
+            return None
+
         monkeypatch.setattr(run_agent_module, "_run_agent_in_instance_scope", fake_round)
         monkeypatch.setattr(run_agent_module, "commit_round_recall", fake_commit)
+        # 回合首尾的频道额度计数要查消息表，这组用例不建库（理由见 `test_agent_round_control._Harness.install`）
+        monkeypatch.setattr(run_agent_module, "_channel_message_marker", no_db)
+        monkeypatch.setattr(run_agent_module, "_record_round_reply", no_db)
         ctx = SimpleNamespace(db_chat_channel=SimpleNamespace(chat_key=self.CHAT_KEY, instance_key="ob10002"))
 
         if outcome is None:
@@ -375,6 +381,8 @@ class TestSuppressedRoundSkipsMemoryBlock:
             *,
             scope: Any = None,
             record_access: bool = True,
+            requester: Any = None,
+            exclude_origin_kinds: Any = (),
         ) -> list[list[Any]]:
             calls["batch"] += 1
             return [[] for _ in requests]

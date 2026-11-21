@@ -90,6 +90,9 @@ const EMPTY_CONFIG: ModelGroupConfig = {
   // 反过来则是整轮对话（连同纯文字消息）一起失败。
   ENABLE_VISION: false,
   ENABLE_COT: false,
+  // 后端 `ModelConfigGroup.PREFILL_MODE` 的默认值就是 off。预填要服务商真的支持
+  // 「把末尾 assistant 消息当作回答开头」，默认关是唯一不会让存量组突然改变请求形状的取值。
+  PREFILL_MODE: 'off',
 }
 
 /**
@@ -197,6 +200,7 @@ export default function ModelGroupFormDialog({
       MODEL_TYPE: initialConfig.MODEL_TYPE || 'chat',
       ENABLE_VISION: initialConfig.ENABLE_VISION ?? false,
       ENABLE_COT: initialConfig.ENABLE_COT ?? false,
+      PREFILL_MODE: initialConfig.PREFILL_MODE ?? 'off',
     })
     // 编辑时回显该组当下的可见性（存量 shared 的组不能被表单默认值偷偷改掉）；
     // 新建 / 复制一律回到 `DEFAULT_VISIBILITY`
@@ -386,6 +390,9 @@ export default function ModelGroupFormDialog({
       model_type: (config.MODEL_TYPE || 'chat').trim(),
       enable_vision: config.ENABLE_VISION,
       enable_cot: config.ENABLE_COT,
+      // 老组回显时可能没有这个键，按后端默认的 off 提交，不能漏成 undefined
+      // （`_merge_payload` 只合并显式提交的字段，漏了就是保持原值，表单上看不出差别）。
+      prefill_mode: config.PREFILL_MODE ?? 'off',
       temperature: config.TEMPERATURE ?? null,
       top_p: config.TOP_P ?? null,
       top_k: config.TOP_K ?? null,
@@ -726,6 +733,28 @@ export default function ModelGroupFormDialog({
                 </div>
               </Tooltip>
             </Stack>
+            {/* 预填只对聊天组有意义：嵌入 / 绘图组根本没有「回复开头」这回事 */}
+            {(config.MODEL_TYPE || 'chat') === 'chat' && (
+              <TextField
+                select
+                fullWidth
+                size={inputSize}
+                label={t('modelGroup.form.prefillMode')}
+                value={config.PREFILL_MODE ?? 'off'}
+                onChange={e =>
+                  setConfig({
+                    ...config,
+                    PREFILL_MODE: e.target.value as 'off' | 'assistant' | 'deepseek',
+                  })
+                }
+                helperText={t('modelGroup.helpers.prefillMode')}
+                sx={{ mt: 2, maxWidth: 560 }}
+              >
+                <MenuItem value="off">{t('modelGroup.form.prefillModeOff')}</MenuItem>
+                <MenuItem value="assistant">{t('modelGroup.form.prefillModeAssistant')}</MenuItem>
+                <MenuItem value="deepseek">{t('modelGroup.form.prefillModeDeepseek')}</MenuItem>
+              </TextField>
+            )}
           </Box>
 
           <ActionButton

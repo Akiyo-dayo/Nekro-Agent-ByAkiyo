@@ -275,7 +275,8 @@
     "expandAttachment": "展开",
     "collapseAttachment": "收起",
     "attachmentEmpty": "附件内容为空。",
-    "openAttachment": "打开附件",
+    "attachmentLoadFailed": "附件取不回来，请稍后再试。",
+    "openAttachment": "下载附件",
     "selectHint": "从左侧选择一封邮件查看详情。",
     "detailLoadError": "加载邮件详情失败",
     "refreshHint": "列表每 30 秒自动刷新",
@@ -292,7 +293,29 @@
     "loadError": "加载邮件列表失败"
   },
   "emailAccounts": {
-    "title": "邮箱账户",
+    "share": {
+      "title": "共享发信",
+      "column": "共享发信",
+      "scope": "共享给哪些实例",
+      "hint": "决定哪些租户实例的会话能用这个邮箱发信（只能发信，看不到收件箱）；平台方自己的实例不受这一项限制。",
+      "instances": "指定的实例",
+      "instancesHint": "只对租户实例有意义：平台方实例本来就能用，选不选都一样。",
+      "listedCount": "指定 {{count}} 个实例",
+      "options": {
+        "all_instances": "所有实例",
+        "listed": "指定实例",
+        "none": "不共享"
+      }
+    },
+    "transfer": {
+      "action": "转为实例自有",
+      "title": "转为实例自有",
+      "description": "把 {{address}} 交给一个实例：它从平台方的邮箱列表里移走，变成那个实例自己的邮箱，由那个实例管理与收发；这个地址下已经收到的信一并归那个实例。",
+      "instance": "目标实例",
+      "confirm": "转过去",
+      "oauthOnly": "这个邮箱用的是 OAuth / 官方 API 登录，凭据是平台方那一整套，不能转为实例自有。",
+      "done": "已转为实例自有"
+    },    "title": "邮箱账户",
     "description": "管理 Email 适配器的多账户收发、官方登录授权、默认发件人与手动收件诊断。账户信息保存到适配器配置 RECEIVE_ACCOUNTS。",
     "refresh": "刷新",
     "add": "添加账户",

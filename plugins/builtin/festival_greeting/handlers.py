@@ -5,8 +5,9 @@ import random
 from typing import List, Union
 
 from nekro_agent.core import logger
+from nekro_agent.core.config import config as core_config
 from nekro_agent.models.db_chat_channel import DBChatChannel
-from nekro_agent.services.message_service import message_service
+from nekro_agent.services.broadcast_targets import BroadcastSkipReason, get_broadcast_skip_reason
 from nekro_agent.services.timer.timer_service import timer_service
 
 from .festivals import (
@@ -19,6 +20,7 @@ from .festivals import (
     FestivalDateCalculator,
     FestivalType,
 )
+from .mail import enqueue_festival_mail
 from .plugin import (
     CustomLunarFestival,
     CustomNthWeekdayFestival,
@@ -32,6 +34,19 @@ FESTIVAL_CHAT_KEY = "system_festival"
 
 # 存储已设置的节日定时器信息
 _festival_timers: List[str] = []
+
+# 节日邮件入队的后台任务：起完就不管它，但要留住引用（否则任务可能被回收），
+# 并在结束时把异常记下来——不这样做的话，「邮件没发出去」在日志里一个字都不会有
+_mail_tasks: set = set()
+
+
+def _on_mail_task_done(task) -> None:
+    _mail_tasks.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.warning(f"节日邮件入队任务失败（群推送不受影响）: {type(error).__name__}: {error}")
 
 
 def _convert_custom_festivals(
@@ -115,15 +130,30 @@ async def _festival_callback(festival_name: str, event_desc: str):
     Args:
         festival_name: 节日名称
         event_desc: 事件描述
+
+    全平台广播只由**平台方的全局开关**决定：全局关着、只有某些实例开着时，定时器可能还在，
+    但这里整次跳过。定时器的建 / 清仍跟着 `on_enabled` / `on_disabled`（不另造生命周期接口），
+    由于到点什么都不推，对外与「定时器不跑」等价。
     """
+    if plugin.key not in core_config.PLUGIN_ENABLED:
+        logger.info(f"节日祝福插件未在全局启用，跳过本次全平台广播: {festival_name}")
+        return
+
+    # 邮件入队是另一条独立的路：起一个后台任务就往下走，不阻塞群推送，也不让一次模型调用
+    # 或一次查库把这一天的群消息一起拖没。总闸与名单的判据都在入队那一侧（核心服务里）
+    mail_task = asyncio.create_task(enqueue_festival_mail(festival_name, event_desc))
+    _mail_tasks.add(mail_task)
+    mail_task.add_done_callback(_on_mail_task_done)
+
     # 每次触发时重新获取配置
     current_config: FestivalGreetingConfig = plugin.get_config(FestivalGreetingConfig)
 
+    blacklist_mode = current_config.AUTO_GREETING_ENABLED
     target_chat_keys: List[str] = []
 
-    if current_config.AUTO_GREETING_ENABLED:
+    if blacklist_mode:
         # 黑名单模式：向所有活跃频道发送，排除黑名单
-        all_active_channels = await DBChatChannel.filter(is_active=True).all()
+        all_active_channels = await DBChatChannel.filter(is_active=True).order_by("id").all()
         blacklist = set(current_config.BLACKLIST_CHATS)
         target_chat_keys = [
             channel.chat_key
@@ -132,7 +162,8 @@ async def _festival_callback(festival_name: str, event_desc: str):
         ]
         logger.info(f"[黑名单模式] 节日祝福启动，共 {len(target_chat_keys)} 个目标频道")
     else:
-        # 白名单模式：仅向白名单中的频道发送
+        # 白名单模式：仅向白名单中的频道发送。运营明确点名的频道只按实例离线跳过，
+        # 不按「多久没人说话」筛：点名的意图优先于活跃度推断
         whitelist = set(current_config.WHITELIST_CHATS)
         target_chat_keys = [key for key in whitelist if key != "group_0"]
         logger.info(f"[白名单模式] 节日祝福启动，共 {len(target_chat_keys)} 个目标频道")
@@ -141,22 +172,71 @@ async def _festival_callback(festival_name: str, event_desc: str):
         logger.info(f"没有需要发送祝福的目标频道，任务 {festival_name} 结束")
         return
 
+    # 广播可能持续几个小时，开头那份频道列表里的状态会过期，所以逐个推送前都重新取行、重新判
+    inactive_days = current_config.SKIP_INACTIVE_DAYS if blacklist_mode else 0
     sent_count = 0
+    skipped_offline = 0
+    skipped_not_in_group = 0
+    skipped_silent = 0
+    skipped_quota_paused = 0
+    skipped_disabled_or_missing = 0
+    skipped_plugin_disabled = 0
     for chat_key in target_chat_keys:
+        channel = await DBChatChannel.filter(chat_key=chat_key).order_by("id").first()
+        if channel is None:
+            logger.warning(f"频道 {chat_key} 已不存在，跳过节日祝福")
+            skipped_disabled_or_missing += 1
+            continue
+        if blacklist_mode and not channel.is_active:
+            skipped_disabled_or_missing += 1
+            continue
+
         try:
-            await message_service.push_system_message(
+            skip_reason = await get_broadcast_skip_reason(channel, inactive_days=inactive_days)
+        except Exception as e:
+            # 判断本身出错时按不跳过处理：宁可多发一条，也不要因为一次查询抖动漏掉整批频道
+            logger.warning(f"判断频道 {chat_key} 是否适合推送时出错，按不跳过处理: {e}")
+            skip_reason = None
+
+        if skip_reason is not None:
+            logger.debug(f"节日祝福跳过频道 {chat_key}: {skip_reason.value}")
+            if skip_reason is BroadcastSkipReason.INSTANCE_OFFLINE:
+                skipped_offline += 1
+            elif skip_reason is BroadcastSkipReason.BOT_NOT_IN_GROUP:
+                skipped_not_in_group += 1
+            elif skip_reason is BroadcastSkipReason.NO_RECENT_INBOUND:
+                skipped_silent += 1
+            elif skip_reason is BroadcastSkipReason.CHANNEL_QUOTA_PAUSED:
+                skipped_quota_paused += 1
+            # 被跳过的频道不 sleep：睡眠是为了给真正会触发 Agent 的频道错峰
+            continue
+
+        try:
+            # 走插件推送方法：它在发送前判「节日祝福插件在这个频道 / 实例是否生效」，
+            # 租户关掉自己实例上的插件就不会收到全平台广播。
+            pushed = await plugin.push_system_message(
                 chat_key=chat_key,
                 agent_messages=event_desc,
                 trigger_agent=True,
             )
+            if not pushed:
+                skipped_plugin_disabled += 1
+                continue
             sent_count += 1
-            # 每个聊天频道间隔随机时间，防止并发过高
+            # 每个聊天频道间隔随机时间，防止并发过高；只有推送成功后才等待
             if current_config.RANDOM_DELAY_MAX > 0:
                 await asyncio.sleep(random.randint(1, current_config.RANDOM_DELAY_MAX))
         except Exception as e:
             logger.error(f"向频道 {chat_key} 发送 {festival_name} 祝福失败: {e}")
 
-    logger.info(f"节日祝福 {festival_name} 发送完成，共推送至 {sent_count} 个聊天频道")
+    # 白名单模式不按活跃度筛（inactive_days 为 0），那一项就不打，免得读日志的人以为筛过
+    silent_part = f"近 {inactive_days} 天没人说话 {skipped_silent} 个、" if inactive_days > 0 else ""
+    logger.info(
+        f"节日祝福 {festival_name} 发送完成：推送 {sent_count} 个频道；"
+        f"跳过 实例不在线 {skipped_offline} 个、Bot 已不在群 {skipped_not_in_group} 个、{silent_part}"
+        f"今日额度已用完 {skipped_quota_paused} 个、已停用或不存在 {skipped_disabled_or_missing} 个、"
+        f"插件在该频道未生效 {skipped_plugin_disabled} 个",
+    )
 
 
 async def _set_festival_timer(

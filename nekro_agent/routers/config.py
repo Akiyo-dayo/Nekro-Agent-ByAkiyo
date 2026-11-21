@@ -1,12 +1,15 @@
 import asyncio
 import json
 import re
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Type, get_args
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict
 
 from nekro_agent.core.config import CoreConfig, ModelConfigGroup, config
+from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_model_group import DBModelGroup
 from nekro_agent.models.db_user import DBUser
@@ -23,6 +26,7 @@ from nekro_agent.schemas.errors import (
 from nekro_agent.schemas.tenant import CREDENTIAL_MASK, CurrentIdentity
 from nekro_agent.services.config_resolver import EffectiveConfigTrace, config_resolver
 from nekro_agent.services.config_service import (
+    ADAPTER_OVERRIDE_KEY_PREFIX,
     CHANNEL_OVERRIDE_KEY_PREFIX,
     INSTANCE_OVERRIDE_KEY_PREFIX,
     INSTANCE_OVERRIDE_KEY_SEP,
@@ -48,7 +52,12 @@ from nekro_agent.services.model_group_test import (
     prepare_model_group_test,
     run_model_group_test,
 )
+from nekro_agent.services.output_filter.engine import disabled_regexes
+from nekro_agent.services.output_filter.rules import compile_rules
+from nekro_agent.services.output_filter.service import STARTER_WORDS_PATH
+from nekro_agent.services.output_filter.stats import hit_store
 from nekro_agent.services.quota_service import assert_tenant_quota_within_ceiling
+from nekro_agent.services.tavern import audit
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import (
@@ -198,6 +207,8 @@ class ModelGroupTestResponse(BaseModel):
 
     items: List[ModelGroupTestItem]
 
+
+logger = get_sub_logger("config_router")
 
 router = APIRouter(prefix="/config", tags=["Config"])
 
@@ -404,12 +415,29 @@ def _current_config_value(config_key: str, item_key: str) -> Any:
 
 
 # 平台方专属的系统配置前缀：这些项决定"谁能操作总后台"，不是业务参数。
-# 目前只有运维 Bot 一组——它的白名单一旦可写，租户管理员把自己的账号填进去
-# 就拿到了平台方的运维通道，而通道背后是宿主级的实例与容器操作。
-PLATFORM_ONLY_SYSTEM_CONFIG_PREFIXES = ("OPS_BOT_",)
+# 运维 Bot 与运维工具两组——它们的白名单一旦可写，租户管理员把自己的账号填进去
+# 就拿到了平台方的运维通道，而通道背后是宿主级的实例与容器操作（运维工具还能让模型
+# 直接发起调用）。只读同样要挡：名单本身就是冒充所需的情报。
+# SSH 网关一组同理：所有者名单决定谁的话能让 Bot 动平台方服务器，用户白名单决定谁能在聊天里
+# 登记服务器，其余是网关的端口、上限与审计参数——都是平台方的事，租户既不该改也不该看。
+PLATFORM_ONLY_SYSTEM_CONFIG_PREFIXES = ("OPS_BOT_", "OPS_AGENT_", "SSH_GATEWAY_")
 
-# 按整键登记的同类项。超级用户名单决定谁能在聊天里执行 `sh`：租户读得到它，冒充所需的情报就是现成的
-PLATFORM_ONLY_SYSTEM_CONFIG_KEYS = frozenset({"SUPER_USERS"})
+# 按整键登记的同类项。超级用户名单决定谁能在聊天里执行 `sh`：租户读得到它，冒充所需的情报就是现成的。
+# 上传图片保留天数是平台方的运维参数：一改就按期删掉全部租户的聊天图片，只能由平台方定。
+# 实例自有邮箱的总闸与每实例上限是同一件事的两端：开关决定这项能力有没有，上限是连接数
+# （整个部署共用一个发信出口）。两者都由平台方定——租户能改就等于能自己把总闸打开。
+# 节日邮件的间隔与总闸是同一个出口的节奏与开关：租户能改就等于能给自己放开限速、或替
+# 全平台关掉别人的祝福邮件。
+PLATFORM_ONLY_SYSTEM_CONFIG_KEYS = frozenset(
+    {
+        "SUPER_USERS",
+        "UPLOADS_IMAGE_RETENTION_DAYS",
+        "EMAIL_INSTANCE_ACCOUNTS_ENABLED",
+        "EMAIL_MAX_ACCOUNTS_PER_INSTANCE",
+        "EMAIL_OUTBOX_INTERVAL_SECONDS",
+        "EMAIL_FESTIVAL_MAIL_ENABLED",
+    },
+)
 
 # 平台方一侧也只有 `Role.Super` 能改的项：写进超级用户名单就能在聊天里 `sh`，
 # 与 `/commands/webui-execute` 同档（那一条也是 `Role.Super`）
@@ -504,6 +532,217 @@ async def _assert_tenant_outbound_url_allowed(
     await assert_outbound_urls_allowed(identity, value)
 
 
+def _submitted_bool(raw_value: str, current_value: bool) -> bool:
+    """按 `ConfigService.set_config_value` 的同一套字面量解析提交的布尔值
+
+    解析不了时保留当前值：权限判据不应因为一个格式错误的提交而放行一次「打开」。
+    """
+    normalized = raw_value.strip().lower()
+    if normalized in ("true", "1", "yes", "t", "y"):
+        return True
+    if normalized in ("false", "0", "no", "f", "n"):
+        return False
+    return current_value
+
+
+def _submitted_int(raw: str, current: int) -> int:
+    """按 `ConfigService.set_config_value` 的同一套口径解析提交的整数
+
+    解析不了时保留当前值：与 `_submitted_bool` 同一个理由——权限判据不应因为一个格式错误
+    的提交而放行一次「调高」，也不该因为读不懂而把当前值判成一次降低。
+    """
+    try:
+        return int(raw.strip())
+    except (AttributeError, ValueError):
+        return current
+
+
+def _tenant_only_lower_field_names() -> List[str]:
+    """标了 `tenant_may_only_lower` 的配置项（导入期已校验它们都是 bool 或 int）"""
+    return [
+        name
+        for name, field in CoreConfig.model_fields.items()
+        if isinstance(field.json_schema_extra, dict) and field.json_schema_extra.get("tenant_may_only_lower")
+    ]
+
+
+def _field_is_int(field_name: str) -> bool:
+    """这一项是整数型的上限项（bool 也继承自 int，因此必须用 `is int` 精确判）"""
+    field = CoreConfig.model_fields.get(field_name)
+    return field is not None and field.annotation is int
+
+
+def _int_value(value: Any, default: int) -> int:
+    """把配置项取值读成整数；`None` 或转不成整数时取默认值
+
+    与 `_submitted_bool` 同一个取舍：读不出来就按默认值走，而不是让一次格式错误的取值
+    变成异常或一个凭空放大的上限。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_raise_denied(before: int, after: int, inherited: int) -> bool:
+    """整数型上限项：这次写入是否把这一层的生效值抬高了
+
+    规则：写完以后这一层的生效值不能超过「写之前的生效值」与「上层值」两者中较大的那个，
+    即 `after > max(before, inherited)` 时拒绝。理由：
+
+    - 上限由平台方定（上层值），租户只能往下调；
+    - 调低以后可以回到上层值，但不能超过它；
+    - 平台方给某个实例单独调高过的值，租户可以往下调，但调高不行。
+
+    只要不超过这两个数里的较大者，无论提交的是「与当前值相同的整页保存」还是「在不高于
+    上层的范围内新写一条覆盖」，都是允许的——整数项没有 bool 那条「钉在高值」的问题：
+    它的生效值就是数字本身，上层之后怎么改都不会让这一层凭空变高。
+    """
+    return after > max(before, inherited)
+
+
+def _layer_effective_bool(toggle: bool, value: bool, field_name: str, inherited: Dict[str, Any]) -> bool:
+    """一层覆盖在给定上层值下的生效值：覆盖开着取本层值，关着取上层值"""
+    return value if toggle else bool(inherited.get(field_name, value))
+
+
+def _layer_effective_int(toggle: bool, value: int, field_name: str, inherited: Dict[str, Any]) -> int:
+    """整数项的同一件事：覆盖开着取本层值，关着取上层值（缺项时取字段默认值）"""
+    if toggle:
+        return value
+    default = _int_value(CoreConfig.model_fields[field_name].default, 0)
+    return _int_value(inherited.get(field_name, default), default)
+
+
+async def _assert_tenant_may_not_raise_only_field(user: DBUser, config_key: str, configs: Dict[str, str]) -> None:
+    """标了 `tenant_may_only_lower` 的项，租户只能把写入后的生效值往低处调
+
+    判据是「写入前 vs 写入后**该作用域**的生效值」，而不是提交里那个原始值：
+    覆盖开关关着时提交值不参与解析，上层（实例层的上一层是适配器 / 全局，频道层的上一层是
+    实例 / 适配器 / 全局）的值才是实际生效的那一个。所以这几种写法都要挡：
+
+    - bool 项：打开覆盖并提交 True；
+    - bool 项：关掉覆盖、而上层此刻是 True；
+    - bool 项：上层此刻是 True 时新写一条「打开且为 True」的覆盖。写的那一刻生效值没变，但它把
+      这一层钉在了 True：平台方之后把上层关掉，这一层仍然开着，等于租户自己开了。
+      租户想要「开」就沿用上层（不写覆盖）；原样带回的同一对取值（整页保存）不受影响。
+    - int 项：写完以后的生效值高过「写之前的生效值」与「上层值」两者中较大的那个
+      （见 `_int_raise_denied`）。上面那条「钉在高值」的规则对 int 不适用：整数项的生效值
+      就是数字本身，租户写一条不超过上层的覆盖不会在平台方之后改动时凭空变高。
+
+    上层值一律向 `config_resolver.inherited_values()` 要，不在这里重写四层解析。
+    """
+    if not _is_tenant_view(user):
+        return
+    if not config_key.startswith(_OVERRIDE_LAYER_KEY_PREFIXES):
+        return
+
+    inherited = await config_resolver.inherited_values(config_key)
+    inherited_values: Dict[str, Any] = inherited or {}
+
+    for field_name in _tenant_only_lower_field_names():
+        toggle = f"enable_{field_name}"
+        if field_name not in configs and toggle not in configs:
+            continue
+
+        current_toggle = bool(_current_config_value(config_key, toggle))
+        new_toggle = _submitted_bool(configs[toggle], current_toggle) if toggle in configs else current_toggle
+
+        if _field_is_int(field_name):
+            default = _int_value(CoreConfig.model_fields[field_name].default, 0)
+            current_value = _int_value(_current_config_value(config_key, field_name), default)
+            new_value = _submitted_int(configs[field_name], current_value) if field_name in configs else current_value
+            inherited_value = _int_value(inherited_values.get(field_name, default), default)
+            before = current_value if current_toggle else inherited_value
+            after = new_value if new_toggle else inherited_value
+            if _int_raise_denied(before, after, inherited_value):
+                raise PermissionDeniedError(detail=f"配置项 {field_name} 的上限由平台方设定，租户管理员只能调低")
+            continue
+
+        current_value = bool(_current_config_value(config_key, field_name))
+        new_value = _submitted_bool(configs[field_name], current_value) if field_name in configs else current_value
+        before = _layer_effective_bool(current_toggle, current_value, field_name, inherited_values)
+        after = new_value if new_toggle else bool(inherited_values.get(field_name, current_value))
+        if after and not before:
+            raise PermissionDeniedError(detail=f"配置项 {field_name} 只能由平台方打开，租户管理员只能关闭")
+        if new_toggle and new_value and not (current_toggle and current_value):
+            raise PermissionDeniedError(
+                detail=f"配置项 {field_name} 只能由平台方打开；租户管理员只能写关闭的覆盖，或者沿用上层",
+            )
+
+
+async def _assert_tenant_layer_swap_may_not_raise(user: DBUser, config_key: str, *, persisting: bool) -> None:
+    """`/save` 与 `/reload` 在内存与磁盘之间整层搬运，同样不能让「租户只能调低」的项变高
+
+    两条路径都不带提交值：`/save` 把内存里这一层写盘（重启以后生效的就是它），`/reload`
+    把磁盘上的这一层读回内存（立刻生效）。租户能走到这两条路径（自己名下的实例 / 频道键），
+    所以按「搬运前 vs 搬运后」比较这一层的生效值：
+
+    - `/save`（`persisting=True`）：之前 = 磁盘那份，之后 = 内存那份；
+    - `/reload`（`persisting=False`）：之前 = 内存那份，之后 = 磁盘那份。
+
+    正常流程里内存是经 `/set`、`/batch`、`PUT /instance/...` 判过以后才写进去的，与磁盘相比
+    不会更高，这一判不会拦到。它挡的是两份不一致的时候：例如平台方用 `/set` 改了内存却没落盘，
+    租户用 `/reload` 把磁盘上那份「开」读回来，或者用 `/save` 把平台方没打算落盘的「开」写下去。
+
+    整数项（如每轮字数上限）同一套逻辑，只是比较的是数值：搬运后的生效值不得超过搬运前的。
+    """
+    if not _is_tenant_view(user):
+        return
+    if not config_key.startswith(_OVERRIDE_LAYER_KEY_PREFIXES):
+        return
+    field_names = _tenant_only_lower_field_names()
+    if not field_names:
+        return
+    memory_layer = UnifiedConfigService._get_config_instance(config_key)  # noqa: SLF001
+    if memory_layer is None:
+        return
+    path = memory_layer.get_config_file_path()
+    disk_layer = (
+        type(memory_layer).load_from_path(path) if path is not None and path.exists() else type(memory_layer)()
+    )
+
+    inherited = await config_resolver.inherited_values(config_key)
+    inherited_values: Dict[str, Any] = inherited or {}
+    for field_name in field_names:
+        toggle = f"enable_{field_name}"
+        if _field_is_int(field_name):
+            default = _int_value(CoreConfig.model_fields[field_name].default, 0)
+            inherited_value = _int_value(inherited_values.get(field_name, default), default)
+            in_memory = _layer_effective_int(
+                bool(getattr(memory_layer, toggle, False)),
+                _int_value(getattr(memory_layer, field_name, default), default),
+                field_name,
+                inherited_values,
+            )
+            on_disk = _layer_effective_int(
+                bool(getattr(disk_layer, toggle, False)),
+                _int_value(getattr(disk_layer, field_name, default), default),
+                field_name,
+                inherited_values,
+            )
+            before, after = (on_disk, in_memory) if persisting else (in_memory, on_disk)
+            if _int_raise_denied(before, after, inherited_value):
+                raise PermissionDeniedError(detail=f"配置项 {field_name} 的上限由平台方设定，租户管理员只能调低")
+            continue
+
+        in_memory = _layer_effective_bool(
+            bool(getattr(memory_layer, toggle, False)),
+            bool(getattr(memory_layer, field_name, False)),
+            field_name,
+            inherited_values,
+        )
+        on_disk = _layer_effective_bool(
+            bool(getattr(disk_layer, toggle, False)),
+            bool(getattr(disk_layer, field_name, False)),
+            field_name,
+            inherited_values,
+        )
+        before, after = (on_disk, in_memory) if persisting else (in_memory, on_disk)
+        if after and not before:
+            raise PermissionDeniedError(detail=f"配置项 {field_name} 只能由平台方打开，租户管理员只能关闭")
+
+
 async def _assert_tenant_may_write(user: DBUser, config_key: str, configs: Dict[str, str]) -> None:
     """租户身份不得写入承载凭据、决定平台方权限边界、或引用了别人资源的配置项
 
@@ -571,6 +810,10 @@ async def _assert_tenant_may_write(user: DBUser, config_key: str, configs: Dict[
         # 让一个注定被拒的写入先去解析调用方给的域名，本身就是一次被白嫖的出站探测。
         await _assert_tenant_outbound_url_allowed(identity, config_key, item_key, current_item, raw_value)
 
+    # 「租户只能关、不能开」的开关单独一判：它看的是写入前后该作用域的**生效值**，
+    # 与逐提交项循环里的凭据 / 边界判据正交。
+    await _assert_tenant_may_not_raise_only_field(user, config_key, configs)
+
 
 def _sanitize_config_updates(config_key: str, configs: Dict[str, str]) -> Dict[str, str]:
     """写入前处理掩码占位
@@ -619,9 +862,12 @@ async def _assert_config_key_accessible(user: DBUser, config_key: str, *, for_wr
     `UnifiedConfigService` 之前 —— `_get_config_instance()` 对覆盖类配置键会
     `dump_config()` 落盘，光是"读"别人的实例配置就会在磁盘上凭空造出一份覆盖文件。
 
-    平台方与未启用多租户的部署直接放行，行为与改造前逐字一致。
+    平台方与未启用多租户的部署不受归属限制，但**实例 / 频道作用域的目标必须存在**：覆盖按实例标识 /
+    会话标识存在文件里，对一个已经删掉的标识读写都会落下一份文件（读也会，见上），以后用同一个
+    标识新建的实例（可能归别的租户）会直接读到它。共享作用域对平台方照旧直接放行。
     """
     if not _is_tenant_view(user):
+        await _assert_override_target_exists(config_key)
         return
     if config_key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
         # 分隔符必须与 `instance_override_config_key()` 生成时用的一致（`INSTANCE_OVERRIDE_KEY_SEP`，
@@ -644,6 +890,27 @@ async def _assert_config_key_accessible(user: DBUser, config_key: str, *, for_wr
         raise PermissionDeniedError(detail=f"配置 '{config_key}' 作用于全部租户，租户身份只能修改自己实例或频道的配置")
 
 
+async def _assert_override_target_exists(config_key: str) -> None:
+    """平台方读写实例层 / 频道层覆盖时，目标实例（按适配器 + 实例）或频道必须存在，否则 404"""
+    from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+
+    if config_key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
+        adapter_key, _, instance_key = config_key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(
+            INSTANCE_OVERRIDE_KEY_SEP,
+        )
+        if (
+            not adapter_key
+            or not instance_key
+            or not await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=instance_key).exists()
+        ):
+            raise NotFoundError(resource=f"配置 '{config_key}'")
+        return
+    if config_key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
+        chat_key = config_key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :]
+        if not chat_key or not await DBChatChannel.filter(chat_key=chat_key).exists():
+            raise NotFoundError(resource=f"频道 '{chat_key}'")
+
+
 async def _assert_chat_key_accessible(user: DBUser, chat_key: str) -> None:
     """校验当前身份能否访问某个频道所属的实例
 
@@ -655,6 +922,131 @@ async def _assert_chat_key_accessible(user: DBUser, chat_key: str) -> None:
     if channel is None:
         raise NotFoundError(resource=f"频道 '{chat_key}'")
     await assert_instance_accessible(user, channel.instance_key, adapter_key=channel.adapter_key)
+
+
+@lru_cache(maxsize=1)
+def audited_fields() -> List[str]:
+    """`CoreConfig` 上标了 `audit_changes` 的字段名
+
+    只算一次：字段定义在进程生命周期里不变，而五个写入口每次都要用这份清单。
+    """
+    names: List[str] = []
+    for name, field in CoreConfig.model_fields.items():
+        extra = field.json_schema_extra
+        if isinstance(extra, dict) and extra.get("audit_changes"):
+            names.append(name)
+    return names
+
+
+@dataclass(frozen=True)
+class _AuditTarget:
+    """一次写入落在哪一层、归属是谁"""
+
+    layer: str
+    adapter_key: str = ""
+    instance_key: str = ""
+    chat_key: str = ""
+
+
+def _audit_target(config_key: str) -> Optional[_AuditTarget]:
+    """从 `config_key` 判层；插件配置与适配器自己的配置返回 `None`
+
+    判层沿用 `_assert_tenant_layer_swap_may_not_raise` / `_assert_config_key_accessible`
+    里那套前缀与分隔符，不另写一份解析：`config_key` 的形态一旦有两份实现，两份就会
+    各自漂移，而这里判错一次就会把审计记到别人头上。
+    """
+    if config_key == "system":
+        return _AuditTarget(layer="system")
+    if config_key.startswith(ADAPTER_OVERRIDE_KEY_PREFIX):
+        return _AuditTarget(layer="adapter", adapter_key=config_key[len(ADAPTER_OVERRIDE_KEY_PREFIX) :])
+    if config_key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
+        adapter_key, _, instance_key = config_key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(
+            INSTANCE_OVERRIDE_KEY_SEP,
+        )
+        if not adapter_key or not instance_key:
+            return None
+        return _AuditTarget(layer="instance", adapter_key=adapter_key, instance_key=instance_key)
+    if config_key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
+        return _AuditTarget(layer="channel", chat_key=config_key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :])
+    return None
+
+
+async def _audit_target_for(config_key: str) -> Optional[_AuditTarget]:
+    """在判层结果上补频道能查到的实例对
+
+    审计行除了 `chat_key` 还记 `adapter_key` / `instance_key`，租户查「我实例的变更」
+    时才有索引可用。频道行查不到（或库不可用）时只记频道层，不因此拒绝写入。
+    """
+    target = _audit_target(config_key)
+    if target is None or target.layer != "channel":
+        return target
+    try:
+        channel = await DBChatChannel.filter(chat_key=target.chat_key).first()
+    except Exception as e:
+        logger.warning(f"查询频道归属失败，审计只记频道层: {target.chat_key}, 错误: {e}")
+        return target
+    if channel is None:
+        return target
+    return replace(target, adapter_key=channel.adapter_key, instance_key=channel.instance_key)
+
+
+def _audit_values(config_key: str, *, from_disk: bool = False) -> Dict[str, Any]:
+    """取这一层上被审计字段的原始值；没有覆盖的字段记成 `None`（摘要 `inherit`）
+
+    `from_disk=True` 给 `/save` 用：它不提交取值，变化发生在「磁盘那份 → 内存那份」之间，
+    所以写入前的对比基准必须是文件而不是内存对象。`/reload` 反过来，写入前取内存即可
+    （写成功后注册表里的实例就是磁盘那份）。
+
+    只对 `CoreConfig` 的配置键调用；插件配置与适配器自己的配置没有这些字段。
+    """
+    names = audited_fields()
+    if not names:
+        return {}
+    layer = UnifiedConfigService._get_config_instance(config_key)
+    if layer is None:
+        return {}
+    if from_disk:
+        path = layer.get_config_file_path()
+        try:
+            layer = type(layer).load_from_path(path) if path is not None and path.exists() else type(layer)()
+        except Exception as e:
+            # 文件损坏 / 权限不足不该让一次保存失败；没有对比基准就不写审计。
+            logger.warning(f"读取配置落盘值失败，跳过本次审计比较: {config_key}, 错误: {e}")
+            return {}
+
+    values: Dict[str, Any] = {}
+    for name in names:
+        if config_key == "system":
+            values[name] = getattr(layer, name, None)
+        elif getattr(layer, f"enable_{name}", False):
+            values[name] = getattr(layer, name, None)
+        else:
+            values[name] = None
+    return values
+
+
+async def _record_audited_changes(
+    user: DBUser,
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    target: _AuditTarget,
+) -> None:
+    """逐字段比较写入前后的层值，有变化才写审计
+
+    `record_change` 自己会跳过摘要相同的项；这里不重复判一遍，否则「布尔 false 与
+    字符串 'false' 摘要相同」这类边界又会多出一份判据。
+    """
+    for name in audited_fields():
+        await audit.record_change(
+            user=user,
+            layer=target.layer,
+            field=name,
+            old=before.get(name),
+            new=after.get(name),
+            adapter_key=target.adapter_key,
+            instance_key=target.instance_key,
+            chat_key=target.chat_key,
+        )
 
 
 def _raise_config_error(
@@ -735,6 +1127,66 @@ async def get_ui_onboarding_guide_status(
 ) -> UiOnboardingGuideStatus:
     """由后端判断当前是否需要展示界面上手引导"""
     return UiOnboardingGuideStatus(should_show=config.ENABLE_UI_ONBOARDING_GUIDE)
+
+
+def _output_filter_rule_texts(adapter_key: str, instance_key: str) -> tuple[str, str]:
+    """某实例生效的过滤词与正则（实例 > 适配器 > 全局）
+
+    合并一律交给 `config_resolver`，不在这里另写一套层级规则：两处各写一份的话，
+    发送时生效的规则和后台列出来的「被拒规则」迟早对不上。解析失败退回全局配置。
+    """
+    try:
+        effective = config_resolver.get_instance_effective_config(adapter_key, instance_key)
+    except Exception as exc:  # noqa: BLE001 - 只影响「被拒规则」这一栏的展示
+        logger.warning(f"读取实例输出过滤配置失败，按全局配置列出被拒规则: {adapter_key}/{instance_key}, 错误: {exc}")
+        effective = config
+    return effective.OUTPUT_FILTER_WORDS, effective.OUTPUT_FILTER_REGEX
+
+
+@router.get("/output-filter/hits", summary="获取输出过滤命中统计")
+@require_role(Role.Admin)
+async def get_output_filter_hits(
+    adapter_key: Optional[str] = Query(default=None),
+    instance_key: Optional[str] = Query(default=None),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> Dict[str, Any]:
+    """命中统计与当前配置里被拒的规则
+
+    统计只含规则与次数，不含被杀的消息原文。租户身份必须指定实例作用域，且只能看自己的
+    实例；平台方不指定实例时返回全部实例。被拒规则的来源与运行时停用的正则合并返回。
+    """
+    if _is_tenant_view(_current_user) and not instance_key:
+        raise ValidationError(reason="租户身份必须指定实例作用域")
+
+    resolved_adapter_key = adapter_key or ""
+    if instance_key:
+        instance = await assert_instance_accessible(_current_user, instance_key, adapter_key=resolved_adapter_key)
+        resolved_adapter_key = resolved_adapter_key or instance.adapter_key
+        instances = hit_store.snapshot(resolved_adapter_key, instance_key)
+        words_text, regex_text = _output_filter_rule_texts(resolved_adapter_key, instance_key)
+    else:
+        instances = hit_store.snapshot(resolved_adapter_key or None)
+        words_text, regex_text = config.OUTPUT_FILTER_WORDS, config.OUTPUT_FILTER_REGEX
+
+    rejected_rules: List[Dict[str, str]] = [
+        {"rule": rule, "reason": reason}
+        for rule, reason in compile_rules(words_text, regex_text).rejected
+    ]
+    rejected_rules.extend({"rule": rule, "reason": reason} for rule, reason in disabled_regexes().items())
+    return {"instances": instances, "rejected_rules": rejected_rules}
+
+
+@router.get("/output-filter/starter-words", summary="获取起步词表")
+@require_role(Role.Admin)
+async def get_output_filter_starter_words(
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> Dict[str, str]:
+    """返回起步词表的全文；文件缺失时返回空串，不影响其它功能"""
+    try:
+        return {"text": STARTER_WORDS_PATH.read_text(encoding="utf-8")}
+    except OSError as e:
+        logger.warning(f"读取输出过滤起步词表失败: {e}")
+        return {"text": ""}
 
 
 @router.get("/info/{config_key}", summary="获取配置基本信息", response_model=ConfigInfo)
@@ -822,15 +1274,19 @@ async def set_config_value(
     """设置指定配置的配置项值
 
     值等于 `CREDENTIAL_MASK` 表示"保持不变"，直接跳过写入，避免把真实凭据覆盖成掩码串。
+    平台方也过可访问性判据：实例层 / 频道层的目标必须存在（见 `_assert_config_key_accessible`）。
     """
+    await _assert_config_key_accessible(_current_user, config_key)
     if _is_tenant_view(_current_user):
-        await _assert_config_key_accessible(_current_user, config_key)
         await _assert_tenant_may_write(_current_user, config_key, {item_key: value})
     _assert_super_role_items_unchanged(_current_user, config_key, {item_key: value})
 
     sanitized = _sanitize_config_updates(config_key, {item_key: value})
     if item_key not in sanitized:
         return ActionResponse(ok=True)
+
+    target = await _audit_target_for(config_key)
+    before = _audit_values(config_key) if target is not None else {}
 
     success, error_msg = UnifiedConfigService.set_config_value(config_key, item_key, sanitized[item_key])
     if not success:
@@ -840,6 +1296,8 @@ async def set_config_value(
             error_msg=error_msg,
             operation="设置配置",
         )
+    if target is not None:
+        await _record_audited_changes(_current_user, before, _audit_values(config_key), target)
     return ActionResponse(ok=True)
 
 
@@ -853,11 +1311,15 @@ async def batch_update_config(
     """批量更新指定配置
 
     取值等于 `CREDENTIAL_MASK` 的字段（含嵌套结构里的位置）视为"保持不变"。
+    平台方也过可访问性判据：实例层 / 频道层的目标必须存在（见 `_assert_config_key_accessible`）。
     """
+    await _assert_config_key_accessible(_current_user, config_key)
     if _is_tenant_view(_current_user):
-        await _assert_config_key_accessible(_current_user, config_key)
         await _assert_tenant_may_write(_current_user, config_key, body.configs)
     _assert_super_role_items_unchanged(_current_user, config_key, body.configs)
+
+    target = await _audit_target_for(config_key)
+    before = _audit_values(config_key) if target is not None else {}
 
     success, error_msg = UnifiedConfigService.batch_update_config(config_key, _sanitize_config_updates(config_key, body.configs))
     if not success:
@@ -877,6 +1339,9 @@ async def batch_update_config(
             operation="保存配置",
         )
 
+    if target is not None:
+        await _record_audited_changes(_current_user, before, _audit_values(config_key), target)
+
     # 系统配置保存后同步全局语言
     if config_key == "system":
         from nekro_agent.schemas.i18n import SupportedLang, set_system_lang
@@ -894,11 +1359,20 @@ async def save_config_api(
 ) -> ActionResponse:
     """保存指定配置到文件
 
-    落盘与 `/batch/{config_key}` 同属写侧，判据也用同一条：跨租户共享作用域对租户 403，
+    落盘与 `/batch/{config_key}` 同属写侧，可访问性判据用同一条：跨租户共享作用域对租户 403，
     别人的实例/频道 404。前端在实例作用域下走 `PUT /config/instance/...`（写入即落盘），
     不会经过这里。
+
+    这里不提交任何取值，只把内存里这一层原样写盘，所以 `_assert_tenant_may_write` 的逐项判据
+    无从比较；「租户只能关、不能开」的开关另按「磁盘那份 vs 内存那份」比一次
+    （`_assert_tenant_layer_swap_may_not_raise`）。
     """
     await _assert_config_key_accessible(_current_user, config_key)
+    await _assert_tenant_layer_swap_may_not_raise(_current_user, config_key, persisting=True)
+
+    # `/save` 不提交取值：变化发生在「磁盘那份 → 内存那份」之间，对比基准取文件。
+    target = await _audit_target_for(config_key)
+    before = _audit_values(config_key, from_disk=True) if target is not None else {}
 
     success, error_msg = UnifiedConfigService.save_config(config_key)
     if not success:
@@ -908,6 +1382,8 @@ async def save_config_api(
             error_msg=error_msg,
             operation="保存配置",
         )
+    if target is not None:
+        await _record_audited_changes(_current_user, before, _audit_values(config_key), target)
     return ActionResponse(ok=True)
 
 
@@ -925,10 +1401,17 @@ async def reload_config_api(
     `system` 另外只许 `Role.Super`：回滚会一并改动 `SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS`
     里的项（超级管理员刚从名单里移走、还没落盘的人会被读回来），而重置是整份配置一起读，
     没法像写入那样只拦「值真的变了」的那一项。
+
+    读回来的值立刻生效，「租户只能关、不能开」的开关按「内存那份 vs 磁盘那份」比一次。
     """
     await _assert_config_key_accessible(_current_user, config_key)
     if config_key == "system" and _current_user.perm_level < Role.Super:
         raise PermissionDeniedError(detail="重置系统配置会改动超级用户名单，只有超级管理员可以执行")
+    await _assert_tenant_layer_swap_may_not_raise(_current_user, config_key, persisting=False)
+
+    # `/reload` 的写入前基准是内存那份；写成功后注册表里的实例就是磁盘那份。
+    target = await _audit_target_for(config_key)
+    before = _audit_values(config_key) if target is not None else {}
 
     success, error_msg = UnifiedConfigService.reload_config(config_key)
     if not success:
@@ -938,6 +1421,8 @@ async def reload_config_api(
             error_msg=error_msg,
             operation="重置配置",
         )
+    if target is not None:
+        await _record_audited_changes(_current_user, before, _audit_values(config_key), target)
     return ActionResponse(ok=True)
 
 
@@ -968,12 +1453,15 @@ async def get_instance_config(
 ) -> List[ConfigItem]:
     """获取指定适配器实例的覆盖配置列表
 
-    租户身份只能读自己名下的实例（他人实例一律 404），且凭据一律为掩码。
+    租户身份只能读自己名下的实例（他人实例一律 404），且凭据一律为掩码。平台方读也要求这个
+    （适配器, 实例）存在：读会落一份空的覆盖文件，以后同名新建的实例会读到它。
     """
     if _is_tenant_view(_current_user):
         await assert_instance_accessible(_current_user, instance_key, adapter_key=adapter_key)
 
     config_key = _instance_override_config_key(adapter_key, instance_key)
+    if not _is_tenant_view(_current_user):
+        await _assert_override_target_exists(config_key)
     try:
         config_list = UnifiedConfigService.get_config_list(config_key)
     except ValueError:
@@ -995,12 +1483,18 @@ async def update_instance_config(
     """批量写入并保存指定适配器实例的覆盖配置
 
     租户身份只能写自己名下的实例（他人实例一律 404），且不得改动承载凭据的字段。
+    平台方写也要求这个（适配器, 实例）存在，否则 404。
     """
     config_key = _instance_override_config_key(adapter_key, instance_key)
 
     if _is_tenant_view(_current_user):
         await assert_instance_accessible(_current_user, instance_key, adapter_key=adapter_key)
         await _assert_tenant_may_write(_current_user, config_key, body.configs)
+    else:
+        await _assert_override_target_exists(config_key)
+
+    target = await _audit_target_for(config_key)
+    before = _audit_values(config_key) if target is not None else {}
 
     success, error_msg = UnifiedConfigService.batch_update_config(config_key, _sanitize_config_updates(config_key, body.configs))
     if not success:
@@ -1020,6 +1514,8 @@ async def update_instance_config(
             operation="保存实例配置",
         )
 
+    if target is not None:
+        await _record_audited_changes(_current_user, before, _audit_values(config_key), target)
     return ActionResponse(ok=True)
 
 

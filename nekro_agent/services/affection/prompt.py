@@ -28,14 +28,18 @@
 
 ## 频道被拦期间只注入阶段
 
-主对话刚被内容审核拦下或被供应商拒答的频道，抑制期内好感块只留昵称与亲密阶段，
-不注入 `feeling:` / `recently:`，见 :mod:`.suppression`。
+主对话刚被内容审核拦下或被供应商拒答的频道，抑制期内好感块只留昵称、亲密阶段与久别天数，
+不注入 `call_as:` / `feeling:` / `recently:`，见 :mod:`.suppression`。称呼与描述一样是模型写的字，
+久别天数是宿主按 `last_interact_at` 算出来的事实，所以照给。
 """
 
 from __future__ import annotations
 
 import time
-from typing import List, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+from tortoise.timezone import now as db_now
 
 from nekro_agent.core.config import CoreConfig
 from nekro_agent.core.logger import get_sub_logger
@@ -43,11 +47,21 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import SELF_SENT_SENDER_ID, TOOL_RESULT_SENDER_ID
 from nekro_agent.services.identity_scope import ChannelLike, resolve_identity_scope, resolve_identity_scopes
+from nekro_agent.services.memory import prompt_rounds
+from nekro_agent.services.memory.feature_flags import is_memory_system_enabled
 from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untrusted_block
 
 from .key import AffectionKey
+from .milestones import MILESTONE_PROMPT_MAX_CHARS, latest_milestone_texts
 from .stage import stage_label, stage_tone
-from .store import MAX_EVENT_TEXT_LENGTH, MAX_NICKNAME_LENGTH, MAX_STATE_TEXT_LENGTH, load_snapshots
+from .store import (
+    MAX_CALL_NAME_LENGTH,
+    MAX_EVENT_TEXT_LENGTH,
+    MAX_NICKNAME_LENGTH,
+    MAX_STATE_TEXT_LENGTH,
+    AffectionSnapshot,
+    load_snapshots,
+)
 from .suppression import is_narrative_suppressed
 
 logger = get_sub_logger("affection")
@@ -68,6 +82,25 @@ _HEADER = (
 )
 
 
+def _record_affection_state(
+    one_time_code: str,
+    *,
+    shown: bool,
+    text: str,
+    people: int,
+    milestone_ids: Sequence[int] = (),
+) -> str:
+    """记下好感块是否出现与字数后原样返回，采集不改变任何提示词文字。"""
+    prompt_rounds.note_affection(
+        one_time_code,
+        shown=shown,
+        chars=len(text) if shown else 0,
+        people=people if shown else 0,
+        milestone_ids=milestone_ids if shown else (),
+    )
+    return text
+
+
 async def render_affection_prompt(
     *,
     db_chat_channel: DBChatChannel,
@@ -86,12 +119,12 @@ async def render_affection_prompt(
     """
     try:
         if not config.AFFECTION_ENABLE_SYSTEM or not config.AFFECTION_ENABLE_PROMPT_INJECTION:
-            return ""
+            return _record_affection_state(one_time_code, shown=False, text="", people=0)
 
         max_users = max(1, config.AFFECTION_PROMPT_MAX_USERS)
         participants = await _recent_participants(db_chat_channel, config, max_users)
         if not participants:
-            return ""
+            return _record_affection_state(one_time_code, shown=False, text="", people=0)
 
         # 一次解析整批：域与人设与用户无关（一次查询），别名合并成一次 `IN`。
         # 人设不从外面传进来——`get_effective_preset_id` 那条回退链是**唯一**判据，
@@ -108,6 +141,10 @@ async def render_affection_prompt(
 
         blocks: List[str] = []
         rendered_keys: set[AffectionKey] = set()
+        # 与 `store` 写 `last_interact_at` 用的是同一个时钟，久别天数才不会整体偏一个时区
+        now = db_now()
+        milestone_texts = await _milestone_texts(keys, snapshots, narrative_allowed, config)
+        rendered_milestones: List[int] = []
         for (platform_userid, nickname), key in zip(participants, keys):
             snapshot = snapshots[key]
             # 判据是 `has_relationship` 而不是 `exists`：账号合并撤销之后会留下一行
@@ -122,11 +159,23 @@ async def render_affection_prompt(
                 continue
             rendered_keys.add(key)
             body_lines = [f"nickname: {sanitize_inline_text(snapshot.nickname or nickname, MAX_NICKNAME_LENGTH)}"]
+            # 称呼也是模型写的字：抑制期内一样不给，理由与 `feeling:` / `recently:` 相同
+            if narrative_allowed and snapshot.call_name:
+                body_lines.append(f"call_as: {sanitize_inline_text(snapshot.call_name, MAX_CALL_NAME_LENGTH)}")
             body_lines.append(f"closeness: {stage_label(snapshot.stage)} — {stage_tone(snapshot.stage)}")
+            # 久别提示是**宿主算出来的事实**（相隔多少天），不是模型写的字，抑制期内照样给
+            absent = absence_days(snapshot.last_interact_at, now, config.AFFECTION_ABSENCE_HINT_DAYS)
+            if absent is not None:
+                body_lines.append(f"last_seen: {absent} days ago")
             if narrative_allowed and snapshot.state_text:
                 body_lines.append(f"feeling: {sanitize_inline_text(snapshot.state_text, MAX_STATE_TEXT_LENGTH)}")
             if narrative_allowed and snapshot.last_event_text:
                 body_lines.append(f"recently: {sanitize_inline_text(snapshot.last_event_text, MAX_EVENT_TEXT_LENGTH)}")
+            milestone = milestone_texts.get(key)
+            if milestone is not None:
+                paragraph_id, content = milestone
+                body_lines.append(f"milestone: {sanitize_inline_text(content, MILESTONE_PROMPT_MAX_CHARS)}")
+                rendered_milestones.append(paragraph_id)
             blocks.append(
                 wrap_untrusted_block(
                     one_time_code,
@@ -138,7 +187,7 @@ async def render_affection_prompt(
             )
 
         if not blocks:
-            return ""
+            return _record_affection_state(one_time_code, shown=False, text="", people=0)
 
         scene_hint = (
             "This is a group chat: keep the intimacy proportionate to the setting, "
@@ -146,11 +195,67 @@ async def render_affection_prompt(
             if db_chat_channel.chat_type.value != "private"
             else ""
         )
-        return _HEADER + scene_hint + "\n" + "\n".join(blocks) + "\n"
+        text = _HEADER + scene_hint + "\n" + "\n".join(blocks) + "\n"
+        return _record_affection_state(
+            one_time_code,
+            shown=True,
+            text=text,
+            people=len(blocks),
+            milestone_ids=rendered_milestones,
+        )
     except Exception as e:
         # 好感度是风味而不是功能：拿不到就当这一轮没有，主对话必须照常进行
         logger.debug(f"好感度提示词注入失败（已忽略）: chat_key={getattr(db_chat_channel, 'chat_key', '?')}, error={e}")
-        return ""
+        return _record_affection_state(one_time_code, shown=False, text="", people=0)
+
+
+def absence_days(last_interact_at: Optional[datetime], now: datetime, hint_days: int) -> Optional[int]:
+    """相隔了几天没见；没到提示门槛或没有数据时返回 None
+
+    纯函数，时钟由调用方给：`now` 必须与 `store` 写 `last_interact_at` 的时钟一致
+    （`tortoise.timezone.now()`），否则算出来的天数会整体偏一个时区偏移量。
+
+    取的是**整天数**（向下取整）：6.9 天不算 7 天，否则「隔了 7 天」会在第 7 天刚开始时
+    就出现，而那时其实只过了 6 天多。`last_interact_at` 不带时区时按 UTC 解释——
+    库里存的一直是带时区的值，历史数据或手工改库可能出现朴素值，那时不该抛异常把整个
+    好感块打空。
+
+    Args:
+        last_interact_at: 最近一次有好感记录的互动时间；None 表示没有数据
+        now: 当前时刻
+        hint_days: 提示门槛天数；非正表示关掉这个提示
+
+    Returns:
+        相隔的整天数，或 None
+    """
+    if hint_days <= 0 or last_interact_at is None:
+        return None
+    last = last_interact_at if last_interact_at.tzinfo is not None else last_interact_at.replace(tzinfo=timezone.utc)
+    days = int((now - last).total_seconds() // 86400)
+    return days if days >= hint_days else None
+
+
+async def _milestone_texts(
+    keys: Sequence[AffectionKey],
+    snapshots: Mapping[AffectionKey, AffectionSnapshot],
+    narrative_allowed: bool,
+    config: CoreConfig,
+) -> Dict[AffectionKey, Tuple[int, str]]:
+    """本轮要渲染的里程碑正文；任何前提不满足或取不到都返回空字典
+
+    抑制期内与 `feeling:` / `recently:` 一样不给：主对话刚被拦，说明这份提示词里
+    有内容出了问题，这时再往里加一段没被审过的记忆只会让它继续被拦。
+    单独包一层 try：里程碑取不到不该连累好感块的其余部分，更不该让提示词变空。
+    """
+    if not narrative_allowed or not config.AFFECTION_MILESTONE_ENABLED:
+        return {}
+    if not is_memory_system_enabled():
+        return {}
+    try:
+        return await latest_milestone_texts(keys, snapshots)
+    except Exception as e:
+        logger.debug(f"读取关系里程碑失败（按没有处理）: error={e}")
+        return {}
 
 
 async def _recent_participants(
@@ -229,6 +334,7 @@ async def affection_score_of(db_chat_channel: ChannelLike, platform_userid: str,
 __all__ = [
     "AFFECTION_BLOCK_KIND",
     "BOT_SENDER_IDS",
+    "absence_days",
     "affection_score_of",
     "context_floor_timestamp",
     "render_affection_prompt",

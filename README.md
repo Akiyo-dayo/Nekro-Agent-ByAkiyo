@@ -5,7 +5,7 @@
 > **这是一个非官方的二次开发版本。** 它基于 [KroMiose/nekro-agent](https://github.com/KroMiose/nekro-agent)（NekroAgent）修改而来，
 > 与 NekroAgent 项目维护方没有任何隶属或背书关系。**基于 NekroAgent 项目构建**——上游项目地址：<https://github.com/KroMiose/nekro-agent>。
 >
-> - 当前版本：**0.4.5**（本版本自己的版本号；所基于的上游版本是 `2.4.0`，按 2.4.0 编写的插件可以直接安装使用。几处上游功能按本版本的多租户规则改了做法或暂未开放，例如网页聊天 MCP 不给工作区发密钥，见 [`CHANGELOG.md`](./CHANGELOG.md)）
+> - 当前版本：**0.4.6**（本版本自己的版本号；所基于的上游版本是 `2.4.0`，按 2.4.0 编写的插件可以直接安装使用。几处上游功能按本版本的多租户规则改了做法或暂未开放，例如网页聊天 MCP 不给工作区发密钥，见 [`CHANGELOG.md`](./CHANGELOG.md)）
 > - 许可证：沿用上游的 [Nekro Agent 开源协议 V1.1](./LICENSE)（基于 Apache License 2.0 修改），详见下方「许可证」与 [`NOTICE`](./NOTICE)
 > - 变更记录：[`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -61,7 +61,7 @@ sudo -E bash -c "$(curl -fsSL https://raw.githubusercontent.com/Akiyo-dayo/Nekro
 
 标签：
 
-- **版本号**（如 `0.4.5`）与 `latest`：打 `v*.*.*` 标签时构建，适用于生产；
+- **版本号**（如 `0.4.6`）与 `latest`：打 `v*.*.*` 标签时构建，适用于生产；
 - `preview` / `preview-<提交短 SHA>`：`main` 分支更新时构建，包含最新改动，适用于测试。
 
 ```bash

@@ -30,12 +30,14 @@ from nekro_agent.adapters.interface.schemas.platform import (
 )
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import OsEnv
+from nekro_agent.models.db_email import DBEmail
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.message_service import message_service
 from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text
 
-from .base import EMAIL_PROVIDER_CONFIGS
+from .base import CUSTOM_PROVIDER_KEY, EMAIL_PROVIDER_CONFIGS
 from .clients import EmailClient, GmailApiClient, ImapSmtpOAuth2Client, ImapSmtpPasswordClient, MicrosoftGraphMailClient
+from .clients.imap_smtp_password import is_imap_sequence_number
 from .config import EmailAccount, EmailConfig
 from .routers import router, set_email_adapter
 
@@ -43,6 +45,13 @@ logger = get_sub_logger("adapter.email")
 
 # 新邮件通知的正文上限：发件人、主题、附件名都由任何一个能给这个邮箱写信的人控制，整段正文限长，避免单封邮件撑爆上下文
 MAX_EMAIL_NOTICE_BODY_CHARS = 4000
+
+# 实例可用性（停用 / 归档 / 租户停用）的进程内缓存秒数。轮询每轮、每个账户判一次库没有意义，
+# 而 60 秒足够短：停用一个实例之后最迟一分钟内不再拉它的信。
+INSTANCE_ACTIVE_CACHE_SECONDS = 60.0
+
+# 实例自有账户的自定义主机校验不过时写进账户 `settings` 的文案
+RECEIVE_HOST_UNAVAILABLE = "服务器地址不可用"
 
 
 def decode_mime_words(s):
@@ -192,8 +201,16 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
         # 账户连接锁（确保每个账户的线程安全访问）
         self.imap_locks: Dict[str, asyncio.Lock] = {}
 
-        # 邮箱账户到聊天ID的映射
+        # 邮箱账户到聊天ID的映射（只放平台方账户：那张表是「地址 → email-<地址> 频道」）
         self.account_chat_mapping: Dict[str, str] = {}
+
+        # 「这个地址是谁的」：地址 → 归属。平台方账户**不在**表里（取不到就是平台方）。
+        # 收信时只看这一张表决定走哪条路：建频道那条只属于平台方账户，实例自有账户只写缓存。
+        # 由服务层在初始化 / `sync_runtime_account` / `remove_runtime_account` 时维护。
+        self.instance_account_owner: Dict[str, Any] = {}
+
+        # 实例可用性缓存：`(adapter_key, instance_key) -> (判定时刻, 是否可用)`
+        self._instance_active_cache: Dict[Tuple[str, str], Tuple[float, bool]] = {}
 
         # 轮询任务
         self._polling_task: Optional[asyncio.Task] = None
@@ -297,59 +314,106 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             raw_bytes=raw_email,
         )
 
-    def _connect_imap(self, account: EmailAccount) -> imaplib.IMAP4_SSL:
-        """连接到IMAP服务器
-
-        Args:
-            account: 邮箱账户配置
-
-        Returns:
-            imaplib.IMAP4_SSL: IMAP连接对象
-        """
-        if account.EMAIL_ACCOUNT == "自定义":
-            imap_host = account.CUSTOM_IMAP_HOST
-            if not imap_host:
-                raise ValueError("自定义邮箱提供商必须填写 IMAP 主机地址")
-            imap_port = account.CUSTOM_IMAP_PORT
-        else:
-            provider_config = EMAIL_PROVIDER_CONFIGS.get(account.EMAIL_ACCOUNT, {})
-            if not provider_config:
-                raise ValueError(f"未知的邮箱提供商: {account.EMAIL_ACCOUNT}")
-            imap_host = provider_config.get("imap_host")
-            if not imap_host:
-                raise ValueError(f"邮箱提供商 {account.EMAIL_ACCOUNT} 缺少 imap_host 配置")
-            imap_port = int(provider_config.get("imap_port", 993))
-
-        # 使用配置的超时时间
-        conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=self.config.IMAP_TIMEOUT)
-        conn.login(account.USERNAME, account.PASSWORD)
-        # 执行登录后的特殊处理（如163邮箱的ID命令）
-        self._post_login_imap(conn, account.USERNAME, imap_host)
-        logger.info(f"IMAP连接建立成功: {account.USERNAME}@{imap_host}")
-        return conn
-
     async def _notify_new_email(
         self,
         account_username: str,
         chat_id: str,
         email_id: bytes,
         parsed: ParsedEmail,
-    ) -> None:
-        """发送新邮件通知
+        *,
+        owner: Any = None,
+    ) -> bool:
+        """发送新邮件通知（平台方账户）
 
         发件人名、发件地址、主题、日期与附件名都由任何能给这个邮箱写信的人控制，
         拼进 SYSTEM 就等于让陌生人以“系统说的话”注入指令，所以只进不可信正文；
         可信摘要只放宿主写的引导语与压成单行的账户、UID、聊天标识。
+
+        通知频道在适配器层配置里，是**平台方邮箱**的通知出口。它被配成租户的频道时，
+        平台方邮件的发件人、主题、附件名就推进了租户的群：所以推送前按频道解析归属，
+        不是平台方的频道一律跳过并记 WARNING。`email_utils` 在那个频道没生效时也不推
+        （那是「这个频道的 Bot 不该处理邮件」的开关，与归属是两件事）。
+
+        `owner` 非空表示这是实例自有账户的信：走另一条判据（频道必须属于它的归属实例），
+        见 `_notify_instance_email`。
 
         Args:
             account_username: 邮箱账户用户名
             chat_id: 聊天ID
             email_id: 邮件ID
             parsed: 解析后的邮件数据
-        """
-        if not (self.config.EMAIL_NOTIFICATIONS_ENABLED and self.config.EMAIL_NOTIFICATIONS_CHAT_KEY):
-            return
+            owner: 实例自有账户的归属；平台方账户传 None
 
+        Returns:
+            是否真的推送了（开关没开、频道不归它、或插件在那没生效时为 False）
+        """
+        if owner is not None:
+            return await self._notify_instance_email(account_username, email_id, parsed, owner=owner)
+
+        if not (self.config.EMAIL_NOTIFICATIONS_ENABLED and self.config.EMAIL_NOTIFICATIONS_CHAT_KEY):
+            return False
+
+        from nekro_agent.services.resource_scope import resolve_chat_owner
+
+        owner_of_chat = await resolve_chat_owner(self.config.EMAIL_NOTIFICATIONS_CHAT_KEY)
+        if not owner_of_chat.platform:
+            logger.warning(
+                f"新邮件通知频道不属于平台方，跳过推送: 账户={account_username}, "
+                f"频道={self.config.EMAIL_NOTIFICATIONS_CHAT_KEY}",
+            )
+            return False
+
+        if not await self._email_utils_effective(self.config.EMAIL_NOTIFICATIONS_CHAT_KEY):
+            logger.debug(f"邮箱工具插件在通知频道未生效，跳过推送: 频道={self.config.EMAIL_NOTIFICATIONS_CHAT_KEY}")
+            return False
+
+        await message_service.push_untrusted_message(
+            chat_key=self.config.EMAIL_NOTIFICATIONS_CHAT_KEY,
+            result=self._build_email_notice(
+                account_username,
+                chat_id,
+                email_id,
+                parsed,
+                synced_to_chat=True,
+            ),
+            trigger_agent=True,
+        )
+        return True
+
+    async def _email_utils_effective(self, chat_key: str) -> bool:
+        """`email_utils` 在这个频道生效吗（判不出来一律按不生效）"""
+        from nekro_agent.services.email_outbox import EMAIL_UTILS_PLUGIN_KEY
+        from nekro_agent.services.plugin.scope import plugin_effective_in_chat
+
+        try:
+            return bool(await plugin_effective_in_chat(EMAIL_UTILS_PLUGIN_KEY, chat_key))
+        except Exception as e:  # noqa: BLE001 - 判据查不动时按不生效处理（宁可少推一条）
+            logger.warning(f"判断邮箱工具插件是否在频道生效失败，按不生效处理: {chat_key} | {type(e).__name__}")
+            return False
+
+    def _build_email_notice(
+        self,
+        account_username: str,
+        chat_id: str,
+        email_id: bytes,
+        parsed: ParsedEmail,
+        *,
+        synced_to_chat: bool,
+    ) -> UntrustedToolResult:
+        """两条收信路径共用的通知体
+
+        外部字段（发件人、主题、日期、附件名）只进不可信正文，摘要里只有宿主写的句子。
+        `synced_to_chat` 区分两种语气：平台方账户的信会被 `collect_message` 收进
+        `email-<地址>` 频道，所以说「已同步到聊天」；实例自有账户不建频道、也不经聊天，
+        它的正文只落在缓存表里，只能说「用 get_email_content 取」。
+
+        Args:
+            account_username: 收件账户（压成单行回显）
+            chat_id: 平台方账户的 email 频道标识；实例自有账户传空串
+            email_id: 邮件 UID
+            parsed: 解析后的邮件
+            synced_to_chat: 这封信有没有被同步进一个聊天频道
+        """
         attachment_info = (
             f"\n附件: 有 {len(parsed.attachments)} 个附件\n附件名称: {', '.join(parsed.attachments)}"
             if parsed.attachments
@@ -364,21 +428,105 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             MAX_EMAIL_NOTICE_BODY_CHARS,
         )
 
-        result = UntrustedToolResult(
-            kind="EmailNotice",
-            body=body,
-            summary=(
+        if synced_to_chat:
+            summary = (
                 f"[邮箱新邮件通知] 收件账户 {echo_inline(account_username)} 收到一封新邮件"
                 f"（UID {echo_inline(self._email_id_text(email_id))}），发件人、主题、日期与附件见下方不可信块。"
                 f"邮件内容已同步到聊天 {echo_inline(chat_id)}，你可以使用 get_email_content 方法获取完整内容。"
-            ),
+            )
+        else:
+            summary = (
+                f"[邮箱新邮件通知] 收件账户 {echo_inline(account_username)} 收到一封新邮件"
+                f"（UID {echo_inline(self._email_id_text(email_id))}），发件人、主题、日期与附件见下方不可信块。"
+                f"你可以使用 get_email_content 方法获取完整内容。"
+            )
+        return UntrustedToolResult(
+            kind="EmailNotice",
+            body=body,
+            summary=summary,
             attrs={"attachments": len(parsed.attachments)},
         )
+
+    async def _notify_instance_email(
+        self,
+        account_username: str,
+        email_id: bytes,
+        parsed: ParsedEmail,
+        *,
+        owner: Any,
+    ) -> bool:
+        """实例自有账户的新邮件通知：只推到归属实例自己的频道
+
+        三道判据，缺一不推：
+
+        1. 账户配了 `notify_chat_key`；
+        2. 那个频道能解析出归属，且 `(adapter_key, instance_key)` 就是账户的归属实例对——
+           配成别的实例的频道、或平台方的频道，都会把这一封的正文推进别人的群；
+        3. `email_utils` 在那个频道生效（频道关了邮件插件就不该被邮件打扰）。
+
+        不满足时记 WARNING，并在账户行的 `settings.notify_unavailable` 上打个标记：后台账户
+        列表据此显示「通知频道不可用」——只写在日志里的话，配错的管理员永远看不到。
+        满足时把标记清掉。
+        """
+        chat_key = str(owner.notify_chat_key or "").strip()
+        if not chat_key:
+            return False
+
+        from nekro_agent.services.resource_scope import resolve_chat_owner
+
+        reason = ""
+        resolved = await resolve_chat_owner(chat_key)
+        if not resolved.resolved:
+            reason = "频道不存在"
+        elif resolved.adapter_key != owner.adapter_key or resolved.instance_key != owner.instance_key:
+            reason = "频道不属于这个实例"
+        elif not await self._email_utils_effective(chat_key):
+            reason = "邮箱工具插件在那个频道未生效"
+
+        if reason:
+            logger.warning(
+                f"实例自有邮箱的通知频道不可用，跳过推送: 账户={account_username}, "
+                f"实例={owner.adapter_key}/{owner.instance_key}, 原因={reason}",
+            )
+            await self._set_notify_unavailable(owner.account_id, True)
+            return False
+
         await message_service.push_untrusted_message(
-            chat_key=self.config.EMAIL_NOTIFICATIONS_CHAT_KEY,
-            result=result,
+            chat_key=chat_key,
+            result=self._build_email_notice(
+                account_username,
+                "",
+                email_id,
+                parsed,
+                synced_to_chat=False,
+            ),
             trigger_agent=True,
         )
+        await self._set_notify_unavailable(owner.account_id, False)
+        return True
+
+    async def _set_notify_unavailable(self, account_id: int, unavailable: bool) -> None:
+        """在账户行 `settings` 上记 / 清「通知频道不可用」
+
+        只在值真的变了时回写：每收到一封信都写一次库没有意义，而且这条标记只是给人看的。
+        """
+        from nekro_agent.models.db_email_account import DBEmailAccount
+
+        try:
+            row = await DBEmailAccount.get_or_none(id=int(account_id))
+            if row is None:
+                return
+            settings = dict(row.settings or {})
+            if bool(settings.get("notify_unavailable", False)) == unavailable:
+                return
+            if unavailable:
+                settings["notify_unavailable"] = True
+            else:
+                settings.pop("notify_unavailable", None)
+            row.settings = settings
+            await row.save(update_fields=["settings", "update_time"])
+        except Exception as e:  # noqa: BLE001 - 标记写不进去不该影响收信
+            logger.debug(f"写入通知频道可用性失败: id={account_id} | {type(e).__name__}")
 
     @property
     def key(self) -> str:
@@ -411,9 +559,10 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
         """初始化适配器"""
         logger.info("邮箱适配器初始化...")
 
-        # 检查是否有启用的邮箱账户
+        # 检查是否有启用的邮箱账户（平台方那批；实例自有账户在 `_init_email_clients` 里另接）
         enabled_accounts = [acc for acc in self.config.RECEIVE_ACCOUNTS if acc.ENABLED and acc.RECEIVE_ENABLED]
-        if not enabled_accounts:
+        instance_accounts = await self._load_instance_accounts()
+        if not enabled_accounts and not instance_accounts:
             logger.info("没有启用的邮箱账户，跳过邮箱适配器初始化")
             return
 
@@ -425,12 +574,36 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             logger.error(f"创建附件保存目录失败: {e}")
 
         # 初始化邮件客户端连接等操作
-        await self._init_email_clients()
+        await self._init_email_clients(instance_accounts)
         # 初始化邮箱账户到聊天ID的映射
         self._init_account_chat_mapping()
         # 启动轮询任务
         self._start_polling()
         logger.info("邮箱适配器初始化完成")
+
+    async def _load_instance_accounts(self) -> List[Tuple[EmailAccount, Any]]:
+        """取实例自有账户的「运行时账户 + 归属」；查不动时只记 WARNING 并返回空
+
+        启动早期数据库还没就绪是正常情形（适配器比库先起来）：那不该让平台方账户的初始化
+        跟着失败，所以这里把异常收在本函数里，调用方拿到空列表照常往下走。
+        """
+        from nekro_agent.services.email_accounts import instance_runtime_accounts
+
+        try:
+            return await instance_runtime_accounts(self)
+        except Exception as e:  # noqa: BLE001 - 启动早期库没就绪：只跳过实例自有账户
+            logger.warning(f"读取实例自有邮箱账户失败，本轮不接它们的收信: {type(e).__name__}: {e}")
+            return []
+
+    async def all_accounts(self) -> List[EmailAccount]:
+        """运行时能用的全部账户：平台方配置里的 ∪ 各实例自有的
+
+        发信时按地址找回运行时账户用它。收信连接池另按 `instance_runtime_accounts()` 建
+        （`_init_email_clients` 的平台方那半段保持原样），两处地址已保证全局唯一。
+        """
+        from nekro_agent.services.email_accounts import all_runtime_accounts
+
+        return await all_runtime_accounts(self)
 
     async def cleanup(self) -> None:
         """清理适配器"""
@@ -445,6 +618,8 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                 logger.warning(f"关闭邮件客户端连接时出错: {e}")
         self.email_clients.clear()
         self.imap_connections.clear()
+        self.instance_account_owner.clear()
+        self._instance_active_cache.clear()
         logger.info("邮箱适配器清理完成")
 
     def _start_polling(self) -> None:
@@ -486,11 +661,18 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                 # 检查每个账户的新邮件
                 accounts_to_check = list(self.email_clients.items())
                 for account_username, client in accounts_to_check:
-                    if self._polling_active:
-                        try:
-                            await self._check_new_emails(account_username, client)
-                        except Exception as e:
-                            logger.error(f"检查账户 {account_username} 的新邮件时发生错误: {e}")
+                    if not self._polling_active:
+                        continue
+                    # 实例自有账户：实例停用 / 租户停用 / 总闸关掉时不拉这一轮。判据结果缓存 60 秒，
+                    # 免得每轮每个账户查一次库
+                    if account_username in self.instance_account_owner and not await self._instance_mailbox_pollable(
+                        account_username,
+                    ):
+                        continue
+                    try:
+                        await self._check_new_emails(account_username, client)
+                    except Exception as e:
+                        logger.error(f"检查账户 {account_username} 的新邮件时发生错误: {e}")
 
                 # 等待下次轮询
                 await asyncio.sleep(self.config.POLL_INTERVAL)
@@ -502,6 +684,39 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                 logger.error(f"邮箱适配器轮询过程中发生错误: {e}")
                 # 发生错误时仍然继续轮询
                 await asyncio.sleep(self.config.POLL_INTERVAL)
+
+    async def _instance_mailbox_pollable(self, account_username: str, *, use_cache: bool = True) -> bool:
+        """这个实例自有账户这一轮该不该收信
+
+        三道闸：总闸开着、账户的归属实例当前可用（实例停用 / 归档 / 租户停用都算不可用）、
+        账户还在池里。实例可用性查库的结果缓存 `INSTANCE_ACTIVE_CACHE_SECONDS` 秒——轮询是
+        每轮每账户一次，直接查库会把一轮拖成几十次单行查询；而一分钟的滞后对「停用一个实例」
+        这件事是可以接受的。
+
+        `use_cache=False` 是手动收信那条路：用户点了「收一次」，要的是当下的判断。
+        """
+        from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+        from nekro_agent.services import email_accounts as mail
+
+        if not mail.instance_accounts_enabled():
+            return False
+        owner = self.instance_account_owner.get(account_username)
+        if owner is None:
+            # 表里没有它 = 平台方账户：平台方那一侧没有额外闸门
+            return True
+        key = (owner.adapter_key, owner.instance_key)
+        moment = time.monotonic()
+        if use_cache:
+            cached = self._instance_active_cache.get(key)
+            if cached is not None and moment - cached[0] < INSTANCE_ACTIVE_CACHE_SECONDS:
+                return cached[1]
+        try:
+            active = await DBAdapterInstance.is_instance_active(owner.adapter_key, owner.instance_key)
+        except Exception as e:  # noqa: BLE001 - 判据查不动时按不可用处理（fail-closed）
+            logger.warning(f"判断实例是否可用失败，这一轮不收它的自有邮箱: {owner.adapter_key}/{owner.instance_key} | {e}")
+            active = False
+        self._instance_active_cache[key] = (moment, active)
+        return active
 
     @asynccontextmanager
     async def _account_lock(self, account_username: str):
@@ -895,6 +1110,10 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                         list_step["criteria"] = "UNSEEN" if effective_unseen_only else "ALL"
                     result.debug_steps.append(list_step)
                     email_ids = await client.list_message_ids(effective_unseen_only)
+                    if account_username in self.instance_account_owner:
+                        # 实例自有账户的服务器可以是租户自己的：编号后面要拼目录，只认纯数字
+                        # （平台方的 Gmail / Graph 账户编号是十六进制串，不在这里过滤）
+                        email_ids = [email_id for email_id in email_ids if is_imap_sequence_number(email_id)]
                     result.found_count = len(email_ids)
                     result.debug_steps.append(
                         {
@@ -944,15 +1163,14 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                 result.errors.append({"stage": "pull", "message": str(e)})
             if reconnect_on_error and reconnect_needed:
                 result.reconnect_attempted = True
-                for account in self.config.RECEIVE_ACCOUNTS:
-                    if account_username == account.USERNAME and account.ENABLED and account.RECEIVE_ENABLED:
-                        logger.info(f"尝试重新连接账户 {account_username}")
-                        result.reconnect_success = await self._reconnect_email_client(account)
-                        if result.reconnect_success:
-                            logger.info(f"账户 {account_username} 重新连接成功")
-                        else:
-                            logger.error(f"账户 {account_username} 重新连接失败")
-                        break
+                account = await self._account_for_reconnect(account_username)
+                if account is not None:
+                    logger.info(f"尝试重新连接账户 {account_username}")
+                    result.reconnect_success = await self._reconnect_email_client(account)
+                    if result.reconnect_success:
+                        logger.info(f"账户 {account_username} 重新连接成功")
+                    else:
+                        logger.error(f"账户 {account_username} 重新连接失败")
         finally:
             result.finished_at = int(time.time())
             result.duration_ms = int((time.monotonic() - started_monotonic) * 1000)
@@ -985,7 +1203,18 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
         *,
         raise_on_error: bool = False,
     ) -> bool:
-        """处理单封邮件"""
+        """处理单封邮件
+
+        先按 `instance_account_owner` 分流：
+
+        - **平台方账户**（表里没有它）：与改造前相同——`collect_message` 收进
+          `email-<地址>` 频道、写缓存、推通知；
+        - **实例自有账户**：**不调 `collect_message`、不建频道**（那个频道没有实例段，建出来
+          就归平台方），只写带归属快照的缓存、把附件下载到 `_i<id>` 目录、按需推一条通知。
+
+        两条路径共用解析、正文规范化与缓存字段的拼法（`_email_cache_defaults` 与
+        `_email_content_text`），否则「同一封信在两处入库成两份不同内容」只是时间问题。
+        """
         try:
             raw_email = await client.fetch_raw_message(email_id)
             if raw_email is None:
@@ -997,6 +1226,10 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             # 只解析一次邮件，避免重复解析
             email_message = email.message_from_bytes(raw_email)
             parsed = self._parse_email(raw_email)
+
+            owner = self.instance_account_owner.get(account_username)
+            # 附件落到哪个账户目录：平台方账户是地址，实例自有账户取表里的 attachment_dir
+            attachment_dir = owner.attachment_dir if owner is not None else account_username
 
             # 处理附件下载（基于解析结果）
             if parsed.attachments and email_message.is_multipart():
@@ -1011,6 +1244,7 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                                 account_username,
                                 parsed.subject,
                                 self._email_id_text(email_id),
+                                directory=attachment_dir,
                             ),
                         )
 
@@ -1019,25 +1253,40 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             if parsed.html_content:
                 html_text_content = self._html_to_text(parsed.html_content)
 
+            if owner is not None:
+                # 实例自有账户：只写缓存 + 按需通知，不碰聊天频道
+                await DBEmail.update_or_create(
+                    defaults=self._email_cache_defaults(
+                        parsed,
+                        email_message,
+                        html_text_content,
+                        owner_adapter_key=owner.adapter_key,
+                        owner_instance_key=owner.instance_key,
+                    ),
+                    account_username=account_username,
+                    email_uid=self._email_id_text(email_id),
+                )
+                logger.info(f"已把实例自有邮箱 {account_username} 的邮件写入缓存: {parsed.subject}")
+                try:
+                    notified = await self._notify_new_email(
+                        account_username,
+                        "",
+                        email_id,
+                        parsed,
+                        owner=owner,
+                    )
+                    if notified:
+                        logger.info(
+                            f"已在实例 {owner.adapter_key}/{owner.instance_key} 的通知频道"
+                            f" {owner.notify_chat_key} 触发 AI 处理邮箱新邮件，账户={account_username}",
+                        )
+                except Exception as notify_exc:
+                    logger.error(f"触发实例自有邮箱的新邮件通知失败: {notify_exc}")
+                return True
+
+            # ===== 平台方账户：以下与改造前逐字相同 =====
             # 构建消息内容
-            content = (
-                f"主题: {parsed.subject}\n"
-                f"发件人: {parsed.sender_name} <{parsed.sender_addr}>\n"
-                f"日期: {parsed.date_str}\n\n"
-            )
-
-            if parsed.text_content:
-                content += parsed.text_content
-            elif parsed.html_content:
-                content += html_text_content or self._html_to_text(parsed.html_content)
-            else:
-                content += "[无邮件正文内容]"
-
-            # 添加附件信息
-            if parsed.attachments:
-                content += f"\n\n附件 ({len(parsed.attachments)} 个):\n"
-                for attachment in parsed.attachments:
-                    content += f"- {attachment}\n"
+            content = self._email_content_text(parsed, html_text_content)
 
             # 生成时间戳
             try:
@@ -1081,59 +1330,26 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
 
             # 写入本地缓存
             try:
-                import json
-
-                from nekro_agent.models.db_email import DBEmail
-
-                # 提取 In-Reply-To 和 References 头
-                in_reply_to = email_message.get("In-Reply-To", "") or ""
-                references_header = email_message.get("References", "") or ""
-                message_id_header = email_message.get("Message-ID", "") or ""
-
-                # 收件人列表
-                to_header = email_message.get("To", "") or ""
-                recipients_json = json.dumps([addr.strip() for addr in to_header.split(",") if addr.strip()])
-
-                # 正文截断到前 5000 字符
-                body_text = parsed.text_content or html_text_content or ""
-                body_text = body_text[:5000]
-
-                # 附件名称列表
-                attachment_names_json = json.dumps(parsed.attachments) if parsed.attachments else "[]"
-
-                # 解析邮件日期
-                email_date = None
-                try:
-                    from email.utils import parsedate_to_datetime
-
-                    if parsed.date_str:
-                        email_date = parsedate_to_datetime(parsed.date_str)
-                except Exception:
-                    pass
-
                 await DBEmail.update_or_create(
-                    defaults={
-                        "message_id": message_id_header[:512],
-                        "subject": parsed.subject[:1024],
-                        "sender": f"{parsed.sender_name} <{parsed.sender_addr}>"[:512],
-                        "recipients": recipients_json,
-                        "date": email_date,
-                        "body_text": body_text,
-                        "has_attachments": len(parsed.attachments) > 0,
-                        "attachment_names": attachment_names_json,
-                        "in_reply_to": in_reply_to[:512],
-                        "references": references_header,
-                    },
+                    defaults=self._email_cache_defaults(
+                        parsed,
+                        email_message,
+                        html_text_content,
+                        # 平台方账户的归属快照是两列空串：撞上一条实例残留行时，
+                        # 整行被改写并改回平台方，旧内容不会以平台方的名义留下
+                        owner_adapter_key="",
+                        owner_instance_key="",
+                    ),
                     account_username=account_username,
                     email_uid=self._email_id_text(email_id),
                 )
             except Exception as cache_exc:
                 logger.warning(f"写入邮件缓存失败: {cache_exc}")
 
-            # 发送新邮件通知
+            # 发送新邮件通知（没推成功就不打那条 INFO：跳过时已经有 WARNING 说明原因）
             try:
-                await self._notify_new_email(account_username, chat_id, email_id, parsed)
-                if self.config.EMAIL_NOTIFICATIONS_ENABLED and self.config.EMAIL_NOTIFICATIONS_CHAT_KEY:
+                notified = await self._notify_new_email(account_username, chat_id, email_id, parsed)
+                if notified:
                     logger.info(
                         f"已根据配置在频道 {self.config.EMAIL_NOTIFICATIONS_CHAT_KEY} 触发 AI 处理邮箱新邮件，账户={account_username}, 主题={parsed.subject}",
                     )
@@ -1146,6 +1362,85 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             if raise_on_error:
                 raise
             return False
+
+    def _email_content_text(self, parsed: ParsedEmail, html_text_content: str) -> str:
+        """平台方收信路径喂给 `collect_message` 的那段正文（与改造前逐字相同）"""
+        content = (
+            f"主题: {parsed.subject}\n"
+            f"发件人: {parsed.sender_name} <{parsed.sender_addr}>\n"
+            f"日期: {parsed.date_str}\n\n"
+        )
+        if parsed.text_content:
+            content += parsed.text_content
+        elif parsed.html_content:
+            content += html_text_content or self._html_to_text(parsed.html_content)
+        else:
+            content += "[无邮件正文内容]"
+
+        if parsed.attachments:
+            content += f"\n\n附件 ({len(parsed.attachments)} 个):\n"
+            for attachment in parsed.attachments:
+                content += f"- {attachment}\n"
+        return content
+
+    def _email_cache_defaults(
+        self,
+        parsed: ParsedEmail,
+        email_message: Message,
+        html_text_content: str,
+        *,
+        owner_adapter_key: str,
+        owner_instance_key: str,
+    ) -> Dict[str, Any]:
+        """两条收信路径共用的缓存字段
+
+        `defaults` 必须含**全部内容列与两列快照**：唯一键是 `(account_username, email_uid)`，
+        同一个地址换了主人之后旧行可能还在表里，新信的 UID 又恰好撞上时，
+        `update_or_create` 会把那一行**整行**改写成新主人的（含快照），旧主题、旧正文、
+        旧附件名都不会以新主人的名义留下。少写一列就等于给旧内容留一个能被读到的缝。
+        """
+        import json
+
+        # 提取 In-Reply-To 和 References 头
+        in_reply_to = email_message.get("In-Reply-To", "") or ""
+        references_header = email_message.get("References", "") or ""
+        message_id_header = email_message.get("Message-ID", "") or ""
+
+        # 收件人列表
+        to_header = email_message.get("To", "") or ""
+        recipients_json = json.dumps([addr.strip() for addr in to_header.split(",") if addr.strip()])
+
+        # 正文截断到前 5000 字符
+        body_text = parsed.text_content or html_text_content or ""
+        body_text = body_text[:5000]
+
+        # 附件名称列表
+        attachment_names_json = json.dumps(parsed.attachments) if parsed.attachments else "[]"
+
+        # 解析邮件日期
+        email_date = None
+        try:
+            from email.utils import parsedate_to_datetime
+
+            if parsed.date_str:
+                email_date = parsedate_to_datetime(parsed.date_str)
+        except Exception:
+            pass
+
+        return {
+            "message_id": message_id_header[:512],
+            "subject": parsed.subject[:1024],
+            "sender": f"{parsed.sender_name} <{parsed.sender_addr}>"[:512],
+            "recipients": recipients_json,
+            "date": email_date,
+            "body_text": body_text,
+            "has_attachments": len(parsed.attachments) > 0,
+            "attachment_names": attachment_names_json,
+            "in_reply_to": in_reply_to[:512],
+            "references": references_header,
+            "owner_adapter_key": owner_adapter_key,
+            "owner_instance_key": owner_instance_key,
+        }
 
     def _init_account_chat_mapping(self) -> None:
         """初始化邮箱账户到聊天ID的映射"""
@@ -1166,8 +1461,20 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             return MicrosoftGraphMailClient(account, proxy_url)
         return ImapSmtpPasswordClient(account, self.config.IMAP_TIMEOUT, proxy_url)
 
-    async def _init_email_clients(self) -> None:
-        """初始化邮件客户端连接"""
+    async def _init_email_clients(self, instance_accounts: Optional[List[Tuple[EmailAccount, Any]]] = None) -> None:
+        """初始化邮件客户端连接
+
+        `email_clients` 是**收信**连接池：轮询循环逐个遍历它去拉信，所以这里只放开着收信、
+        已经连上的账户。只发信的账户不进池子——发信时按地址取不到客户端就临时建一个
+        （`send_email` 一直是这么做的）；把未连接的客户端塞进来，轮询会去对它 `select` 信箱、
+        失败后重连 IMAP，等于替一个没开收信的账户收信。
+
+        平台方账户那一段与改造前逐字相同（只连 `RECEIVE_ACCOUNTS` 里开着收信的）。之后接
+        实例自有账户：它们与平台方共用一个池（键都是地址，地址全局唯一已由服务层保证），
+        同时记进 `instance_account_owner`——收信处理时按这张表决定走哪条路。
+        `account_chat_mapping` 不放实例自有账户：那张表是「地址 → `email-<地址>` 频道」的映射，
+        而实例自有账户没有那个频道（建出来没有实例段、会被判成平台方）。
+        """
         for account in self.config.RECEIVE_ACCOUNTS:
             if not account.ENABLED or not account.RECEIVE_ENABLED:
                 continue
@@ -1185,12 +1492,106 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
             except Exception as e:
                 logger.error(f"邮件客户端连接建立失败 ({account.USERNAME}): {e}")
 
+        if instance_accounts is None:
+            instance_accounts = await self._load_instance_accounts()
+        for account, owner in instance_accounts:
+            if not account.ENABLED or not account.RECEIVE_ENABLED:
+                continue
+            # 地址已在池里（同一个地址不会出现两次，这里只是防御）：平台方那份优先
+            if account.USERNAME in self.email_clients:
+                continue
+            if not await self._instance_mailbox_allowed(account):
+                continue
+            try:
+                client = self._create_email_client(account)
+                await client.connect()
+            except Exception as e:
+                logger.warning(f"实例自有邮箱连接建立失败，本轮不收它: {account.USERNAME} | {type(e).__name__}: {e}")
+                continue
+            self.email_clients[account.USERNAME] = client
+            conn = getattr(client, "conn", None)
+            if conn is not None:
+                self.imap_connections[account.USERNAME] = conn
+            self.imap_locks[account.USERNAME] = asyncio.Lock()
+            self.instance_account_owner[account.USERNAME] = owner
+            logger.info(f"实例自有邮箱客户端连接建立成功: {account.USERNAME}")
+
+    async def _instance_mailbox_allowed(self, account: EmailAccount, *, record_error: bool = True) -> bool:
+        """实例自有账户连之前/收之前的归属检查
+
+        两件事：
+
+        1. **总闸**：平台方关掉实例自有邮箱之后，池里的旧连接也不该继续收；
+        2. **自定义主机再校验**（防 DNS 重绑）：保存时解析到公网、连的时候解析到内网就是靠这一步
+           挡住的。C2 的 `send_via_account` 已经在发信前查 SMTP，这里是 IMAP 那一半。
+           不过就不连、记 WARNING，并在账户行的 `settings.last_receive_error` 里留一句
+           「服务器地址不可用」——后台账户页据此显示「收信不可用」。
+
+        `record_error=False` 时不回写数据库（轮询每轮都回写一次没有意义，且会拖慢一轮）。
+        """
+        from nekro_agent.services import email_accounts as mail
+
+        if not mail.instance_accounts_enabled():
+            logger.debug(f"实例自有邮箱的总闸关着，跳过: {account.USERNAME}")
+            return False
+        if account.EMAIL_ACCOUNT != CUSTOM_PROVIDER_KEY:
+            return True
+        try:
+            await mail.assert_custom_mail_host_allowed(account.CUSTOM_IMAP_HOST, int(account.CUSTOM_IMAP_PORT))
+        except Exception as e:  # noqa: BLE001 - 校验不过就是「不连」，不是异常路径
+            logger.warning(f"实例自有邮箱的 IMAP 主机在连接前校验不过，跳过: {account.USERNAME} | {type(e).__name__}")
+            if record_error:
+                await self._record_receive_error(account.USERNAME, RECEIVE_HOST_UNAVAILABLE)
+            return False
+        return True
+
+    async def _record_receive_error(self, account_username: str, message: str) -> None:
+        """把最近一次收信失败写进账户行的 `settings`（账户页据此提示）"""
+        from nekro_agent.models.db_email_account import DBEmailAccount
+
+        try:
+            row = await DBEmailAccount.get_or_none(username=account_username)
+            if row is None:
+                return
+            settings = dict(row.settings or {})
+            settings["last_receive_error"] = message
+            row.settings = settings
+            await row.save(update_fields=["settings", "update_time"])
+        except Exception as e:  # noqa: BLE001 - 回写失败不该让收信路径炸掉
+            logger.debug(f"写入收信错误信息失败: {account_username} | {type(e).__name__}")
+
+    async def _account_for_reconnect(self, account_username: str) -> Optional[EmailAccount]:
+        """轮询出错后要重连的那个账户；不该重连（停用、关了收信、已经不在了）时返回 None
+
+        平台方账户照旧从 `RECEIVE_ACCOUNTS` 里找。实例自有账户不在那里——原先只遍历它，于是实例自有
+        账户一次出错之后就永远不再收信。它们从表里现取（`instance_runtime_accounts`：只含启用的行、
+        归属实例当前可用、总闸开着），取的是最新的主机与授权码。
+        """
+        for account in self.config.RECEIVE_ACCOUNTS:
+            if account_username == account.USERNAME:
+                return account if account.ENABLED and account.RECEIVE_ENABLED else None
+        if account_username not in self.instance_account_owner:
+            return None
+        for account, _owner in await self._load_instance_accounts():
+            if account.USERNAME == account_username:
+                return account if account.ENABLED and account.RECEIVE_ENABLED else None
+        return None
+
     async def _reconnect_email_client(self, account: EmailAccount) -> bool:
-        """重新连接邮件客户端"""
+        """重新连接邮件客户端
+
+        实例自有账户与平台方账户共用这一条：前者在连之前多两道检查（总闸、自定义主机再校验），
+        后者与改造前相同。`instance_account_owner` 里已有的归属**不清**——重连不该丢掉
+        「这个地址是谁的」，否则重连之后这封信会走平台方那条建频道的路。
+        """
+        is_instance_account = account.USERNAME in self.instance_account_owner
         try:
             await self._remove_email_client(account.USERNAME)
             if not account.ENABLED or not account.RECEIVE_ENABLED:
                 return True
+            if is_instance_account and not await self._instance_mailbox_allowed(account):
+                # 校验不过：不连、不重试。`last_receive_error` 已在检查里记下
+                return False
 
             client = self._create_email_client(account)
             await client.connect()
@@ -1200,7 +1601,9 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
                 self.imap_connections[account.USERNAME] = conn
             if account.USERNAME not in self.imap_locks:
                 self.imap_locks[account.USERNAME] = asyncio.Lock()
-            self.account_chat_mapping[account.USERNAME] = account.USERNAME
+            # 实例自有账户没有 `email-<地址>` 频道，不进这张映射
+            if not is_instance_account:
+                self.account_chat_mapping[account.USERNAME] = account.USERNAME
         except Exception as e:
             logger.error(f"邮件客户端重新连接失败 ({account.USERNAME}): {e}")
             return False
@@ -1465,23 +1868,45 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
         account_username: str,
         email_subject: str,
         email_uid: str | None = None,
+        *,
+        directory: str | None = None,
     ) -> None:
-        """下载邮件附件"""
+        """下载邮件附件到 `email_attachment/<目录名>/<UID>/`
+
+        Args:
+            part: 邮件中的附件部分
+            filename: 附件名（会被清理成合法文件名）
+            account_username: 平台方账户的地址；`directory` 没给时用它当目录名
+            email_subject: 没有 UID 时退化成主题目录
+            email_uid: 邮件 UID（目录名的第二段）
+            directory: 这个账户的附件根目录名。平台方账户是地址，实例自有账户取表里的
+                `attachment_dir`（`_i<id>` 形态，或由平台方转来的原地址）。分开放是因为
+                实例自有账户的附件不该落进「按地址命名」的目录：那个目录属于平台方账户，
+                地址换了主人时会被整目录清掉。
+        """
+        from nekro_agent.services.email_accounts import attachment_file_path, email_attachment_root
+
         try:
-            # 使用固定的附件保存目录，便于沙盒访问
-            base_path = Path(OsEnv.DATA_DIR) / "uploads" / "email_attachment"
-            # 保存到 DATA_DIR/uploads/email_attachment/{邮箱账户名}/{邮件UID}/ 目录下
-            email_dir = (
-                base_path / account_username / email_uid
-                if email_uid
-                else base_path / account_username / self._sanitize_filename(email_subject)[:50]
+            # 保存到 DATA_DIR/uploads/email_attachment/{账户目录}/{邮件UID}/ 目录下。
+            # UID 是收信服务器给的：实例自有账户可以填自定义 IMAP 服务器，一个不老实的服务器回
+            # `* SEARCH /app/nekro_agent` 或 `../..`，就能把附件写到附件目录外面（pathlib 拼接时右边
+            # 是绝对路径会把左边整个丢掉，下次 import 就是代码执行）。所以：写入与读取用**同一个**
+            # 路径函数（逐层判「账户目录 → 邮件目录 → 文件」的父子关系、每一段只收单段名字），
+            # 落盘前再确认一次结果在附件总目录之内
+            mail_dir_name = email_uid if email_uid else self._sanitize_filename(email_subject)[:50]
+            file_path = attachment_file_path(
+                directory if directory is not None else account_username,
+                mail_dir_name,
+                self._sanitize_filename(filename),
             )
+            root = email_attachment_root().resolve()
+            if file_path is None or not file_path.is_relative_to(root):
+                logger.warning(f"附件路径不合法或越出了附件目录，跳过下载: {filename}")
+                return
+            email_dir = file_path.parent
 
             # 异步创建目录
             await asyncio.to_thread(email_dir.mkdir, parents=True, exist_ok=True)
-
-            # 构造完整的文件路径
-            file_path = email_dir / self._sanitize_filename(filename)
 
             # 异步获取附件数据（解码可能耗时）
             attachment_data = await asyncio.to_thread(part.get_payload, decode=True)
@@ -1496,6 +1921,16 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
 
         except Exception as e:
             logger.error(f"下载附件 {filename} 时出错: {e}")
+
+    def _attachment_dir_name(self, directory: str) -> str:
+        """账户目录名只收单段名字：`../<别的账户>` 不能把附件写进别人的目录
+
+        与下载、删除、改名共用服务层那一条判据（`safe_attachment_dir_name`），
+        不在这里另写一份。
+        """
+        from nekro_agent.services.email_accounts import safe_attachment_dir_name
+
+        return safe_attachment_dir_name(directory)
 
     def _sanitize_filename(self, filename: str) -> str:
         """清理文件名，移除非法字符"""

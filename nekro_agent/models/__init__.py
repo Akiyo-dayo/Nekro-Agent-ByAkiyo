@@ -3,9 +3,18 @@ from .db_adapter_instance_event import DBAdapterInstanceEvent  # noqa: F401
 from .db_adapter_instance_session import DBAdapterInstanceSession  # noqa: F401
 from .db_affection import DBAffection, DBAffectionEvent  # noqa: F401
 from .db_announcement import DBAnnouncement, DBAnnouncementDelivery  # noqa: F401
+from .db_channel_quota import DBChannelQuotaDaily, DBChannelQuotaPolicy  # noqa: F401
 from .db_chat_channel import DBChatChannel  # noqa: F401
 from .db_chat_message import DBChatMessage  # noqa: F401
+from .db_config_audit import DBConfigChangeAudit  # noqa: F401
 from .db_email import DBEmail  # noqa: F401
+from .db_email_account import DBEmailAccount  # noqa: F401
+from .db_email_outbox import DBEmailOutbox  # noqa: F401
+from .db_email_send_log import DBEmailSendLog  # noqa: F401
+from .db_email_user_pref import DBEmailUserPref  # noqa: F401
+from .db_emotion_item import DBEmotionItem  # noqa: F401
+from .db_emotion_set import DBEmotionSet  # noqa: F401
+from .db_emotion_set_assignment import DBEmotionSetAssignment  # noqa: F401
 from .db_exec_code import DBExecCode  # noqa: F401
 from .db_identity import DBIdentityAlias, DBIdentityAliasRequest, DBIdentityPerson  # noqa: F401
 from .db_instance_group import DBInstanceDomainBinding, DBInstanceGroup  # noqa: F401
@@ -17,19 +26,29 @@ from .db_kb_chunk import DBKBChunk  # noqa: F401
 from .db_kb_document import DBKBDocument  # noqa: F401
 from .db_kb_document_reference import DBKBDocumentReference  # noqa: F401
 from .db_llm_usage import DBLLMUsageRecord  # noqa: F401
+from .db_mem_channel_summary import DBMemChannelSummary  # noqa: F401
+from .db_mem_channel_summary_state import DBMemChannelSummaryState  # noqa: F401
 from .db_mem_entity import DBMemEntity  # noqa: F401
 from .db_mem_episode import DBMemEpisode  # noqa: F401
 from .db_mem_media_resource import DBMemMediaResource  # noqa: F401
 from .db_mem_paragraph import DBMemParagraph  # noqa: F401
+from .db_mem_paragraph_person import DBMemParagraphPerson  # noqa: F401
+from .db_mem_prompt_round import DBMemPromptRound  # noqa: F401
 from .db_mem_reinforcement_log import DBMemReinforcementLog  # noqa: F401
 from .db_mem_relation import DBMemRelation  # noqa: F401
 from .db_model_group import DBModelGroup  # noqa: F401
+from .db_ops_agent_audit import DBOpsAgentAudit  # noqa: F401
 from .db_plugin_data import DBPluginData  # noqa: F401
 from .db_preset import DBPreset  # noqa: F401
+from .db_preset_card import DBPresetCard  # noqa: F401
 from .db_recurring_timer_job import DBRecurringTimerJob  # noqa: F401
 from .db_tenant import DBTenant  # noqa: F401
 from .db_user import DBUser  # noqa: F401
+from .db_wb_book import DBWbBook  # noqa: F401
+from .db_wb_entry import DBWbEntry  # noqa: F401
 from .db_workspace import DBWorkspace  # noqa: F401
 from .db_workspace_comm_log import DBWorkspaceCommLog  # noqa: F401
 from .db_workspace_resource import DBWorkspaceResource  # noqa: F401
 from .db_workspace_resource_binding import DBWorkspaceResourceBinding  # noqa: F401
+from .db_ws_ssh_audit import DBWsSshAudit  # noqa: F401
+from .db_ws_ssh_credential import DBWsSshCredential  # noqa: F401

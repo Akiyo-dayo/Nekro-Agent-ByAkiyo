@@ -2,7 +2,8 @@
 
 公告是整个后台**唯一一条"能往别人群里发消息"**的批量写入面，改前那 8 个端点
 一个作用域都没有：租户管理员提交 `scope_type=all` 就会打进平台方与其它租户的全部活跃群。
-`routers/email.py` 那 4 条则是另一种形态 —— 它们根本没有可收敛的租户维度。
+`routers/email.py` 那 4 条是另一种形态 —— 它们曾经根本没有可收敛的租户维度，
+现在按 `DBEmail` 上的归属快照收敛到某个实例对。
 
 这里钉住四件事：
 
@@ -339,28 +340,47 @@ class TestDeprecatedBatchSend:
         }
 
 
-class TestPlatformMailboxIsOwnerOnly:
-    """平台方收件箱没有可收敛的租户维度，只能是平台方专属
+class TestPlatformMailboxIsOwnedByThePlatformScope:
+    """平台方收件箱只出现在平台方作用域里
 
-    收件账号存在 email 适配器的适配器层配置里（跨租户共享的作用域），
-    且 email 是单实例适配器 —— `DBEmail` 里没有任何一列能把某封邮件判给某个租户。
+    改造前这一族只能是平台方专属，因为 `DBEmail` 没有任何一列能把某封邮件判给某个租户。
+    现在它带归属快照（`owner_*` 为空 = 平台方），于是判据从「身份是平台方」细化成
+    「这封邮件属于哪个实例对」：租户必须给出自己的实例，拿到的也只是那个实例自己的邮箱；
+    平台方邮箱（`owner_*` 为空）在任何租户请求下都读不到。
     """
 
-    async def test_tenant_identity_is_refused(self, db) -> None:
-        with pytest.raises(PermissionDeniedError):
-            await require_platform_owner()(current_user=acme_admin())
+    async def test_tenant_without_scope_is_refused(self, db) -> None:
+        """租户不带实例参数 → 400，而不是"默认给平台方那份" """
+        with pytest.raises(ValidationError):
+            await get_emails(offset=0, limit=25, account=None, adapter_key="", instance_key="", _current_user=acme_admin())
+
+    async def test_tenant_cannot_read_the_platform_mailbox(self, db) -> None:
+        """租户拿自己的实例去读，读到的只能是那个实例的邮箱，平台方那封不在里面"""
+        listed = await get_emails(
+            offset=0, limit=25, account=None, adapter_key=ADAPTER, instance_key=OWN_INSTANCE, _current_user=acme_admin(),
+        )
+
+        assert listed.items == []
+
+    async def test_tenant_cannot_reach_the_platform_mail_by_id(self, db) -> None:
+        """按 ID 直接取平台方那封：与不存在同一个 404"""
+        with pytest.raises(NotFoundError):
+            await get_email_detail(
+                1, adapter_key=ADAPTER, instance_key=OWN_INSTANCE, _current_user=acme_admin(),
+            )
 
     @pytest.mark.parametrize("identity", UNRESTRICTED_IDENTITIES)
     async def test_unrestricted_identities_still_read_the_mailbox(
         self, db, identity: Callable[[], DBUser],
     ) -> None:
-        """未启用多租户的部署里 `require_platform_owner()` 恒放行，行为逐字不变"""
+        """平台方不带实例参数时看到的仍是平台方邮箱，行为逐字不变"""
         user = identity()
-        assert await require_platform_owner()(current_user=user) is user
 
         # 直接调用端点函数时 FastAPI 的 `Query(...)` 默认值不会被解析，分页参数要显式给
-        listed = await get_emails(offset=0, limit=25, account=None, _current_user=user, _owner=user)
-        detail = await get_email_detail(1, _current_user=user, _owner=user)
+        listed = await get_emails(
+            offset=0, limit=25, account=None, adapter_key="", instance_key="", _current_user=user,
+        )
+        detail = await get_email_detail(1, adapter_key="", instance_key="", _current_user=user)
 
         assert [item.subject for item in listed.items] == ["[重置密码] 验证码 998877"]
         assert detail.body_text == "验证码 998877"

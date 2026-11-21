@@ -19,6 +19,10 @@ from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.schemas.i18n import i18n_text
 from nekro_agent.services.agent.templates.base import PromptTemplate, register_template
 from nekro_agent.services.command.base import CommandPermission
+from nekro_agent.services.output_filter.service import (
+    filter_platform_request,
+    outbound_filtered,
+)
 
 from .schemas.platform import (
     PlatformChannel,
@@ -613,9 +617,11 @@ class BaseAdapter(ABC, Generic[TConfig]):
 
         platform_segments = await build_command_output_platform_segments(response, chat_key)
         if platform_segments:
-            plt_response = await self.forward_message(
+            request = await filter_platform_request(
                 PlatformSendRequest(chat_key=chat_key, segments=platform_segments),
             )
+            with outbound_filtered():
+                plt_response = await self.forward_message(request)
             if not plt_response.success:
                 raise ValueError(f"适配器发送消息失败，错误: {plt_response.error_message}")
             return

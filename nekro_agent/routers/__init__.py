@@ -41,10 +41,13 @@ from .dashboard import router as dashboard_router
 from .deployment import router as deployment_router
 from .email import router as email_router
 from .events import router as events_router
+from .instance_email import router as instance_email_router
 from .kb_library import router as kb_library_router
 from .logs import router as logs_router
 from .mcp import router as mcp_router
+from .memory_admin import router as memory_admin_router
 from .plugin_editor import router as plugin_editor_router
+from .plugin_route_ticket import router as plugin_route_ticket_router
 from .plugins import router as plugins_router
 from .presets import router as presets_router
 from .resources import router as resources_router
@@ -53,12 +56,15 @@ from .rpc import router as exec_router
 from .sandbox import router as sandbox_router
 from .skills import router as skills_router
 from .space_cleanup import router as space_cleanup_router
+from .ssh_gateway import router as ssh_gateway_router
+from .tavern import router as tavern_router
 from .timers import router as timers_router
 from .user import router as user_router
 from .user_manager import router as user_manager_router
 from .webhook import router as webhook_router
 from .workspace_kb import router as workspace_kb_router
 from .workspaces import router as workspaces_router
+from .worldbook import router as worldbook_router
 
 # 注意：插件路由现在通过插件路由管理器动态挂载，支持热重载
 # 不再使用静态路由挂载方式
@@ -157,6 +163,7 @@ def mount_api_routes(app: FastAPI):
     api.include_router(logs_router)
     api.include_router(config_router)
     api.include_router(plugins_router)
+    api.include_router(plugin_route_ticket_router)
     api.include_router(plugin_editor_router)
     api.include_router(sandbox_router)
     api.include_router(dashboard_router)
@@ -178,6 +185,7 @@ def mount_api_routes(app: FastAPI):
     api.include_router(space_cleanup_router)
     api.include_router(timers_router)
     api.include_router(workspaces_router)
+    api.include_router(ssh_gateway_router)
     api.include_router(workspace_kb_router)
     api.include_router(kb_library_router)
     api.include_router(skills_router)
@@ -186,7 +194,11 @@ def mount_api_routes(app: FastAPI):
     api.include_router(events_router)
     api.include_router(commands_router)
     api.include_router(mcp_router)
+    api.include_router(memory_admin_router)
+    api.include_router(worldbook_router)
+    api.include_router(tavern_router)
     api.include_router(email_router)
+    api.include_router(instance_email_router)
     api.include_router(console_router)
     api.include_router(affection_router)
 

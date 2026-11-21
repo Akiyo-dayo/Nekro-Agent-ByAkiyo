@@ -465,6 +465,72 @@ class TestCrossTenantWritesAreBlocked:
         )
         assert detail.sandbox_image == "platform/custom"
 
+    @pytest.mark.parametrize("identity", UNRESTRICTED_IDENTITIES)
+    async def test_saving_the_current_image_does_not_pin_the_workspace(self, db, identity) -> None:  # noqa: ARG002
+        """配置页保存会回传当前生效值；平台方照写就会把工作区钉死在当时的默认镜像上，
+        以后平台方调整默认镜像它也不跟着变。提交空串则让单独设置过的工作区重新跟随默认"""
+        from nekro_agent.core.config import config as app_config
+
+        workspace_id = await workspace_id_of("acme-single")
+        await update_workspace(
+            workspace_id=workspace_id,
+            body=WorkspaceUpdate(
+                description="kept",
+                sandbox_image=app_config.CC_SANDBOX_IMAGE,
+                sandbox_version=app_config.CC_SANDBOX_IMAGE_TAG,
+            ),
+            _current_user=identity(),
+        )
+        workspace = await DBWorkspace.get(id=workspace_id)
+        assert (workspace.description, workspace.sandbox_image, workspace.sandbox_version) == ("kept", "", "latest")
+
+        await update_workspace(
+            workspace_id=workspace_id,
+            body=WorkspaceUpdate(sandbox_image="platform/custom", sandbox_version="v1"),
+            _current_user=identity(),
+        )
+        await update_workspace(
+            workspace_id=workspace_id,
+            body=WorkspaceUpdate(sandbox_image="", sandbox_version=""),
+            _current_user=identity(),
+        )
+        workspace = await DBWorkspace.get(id=workspace_id)
+        assert (workspace.sandbox_image, workspace.sandbox_version) == ("", "")
+
+
+class TestEffectiveSandboxImage:
+    """建容器、检查 / 拉取镜像、读接口展示都走 `effective_sandbox_image`"""
+
+    async def test_the_column_default_latest_follows_the_global_tag(self, db) -> None:  # noqa: ARG002
+        """`sandbox_version` 列默认值是 latest，意思是「跟着全局默认」：默认镜像从不发 latest，
+        照字面用会让所有没单独设过版本的工作区去拉一个不存在的标签"""
+        from nekro_agent.core.config import config as app_config
+        from nekro_agent.services.workspace.container import effective_sandbox_image
+
+        workspace = await DBWorkspace.get(id=await workspace_id_of("acme-single"))
+        assert (workspace.sandbox_image, workspace.sandbox_version) == ("", "latest")
+        assert effective_sandbox_image(workspace) == (app_config.CC_SANDBOX_IMAGE, app_config.CC_SANDBOX_IMAGE_TAG)
+
+        workspace.sandbox_version = ""
+        assert effective_sandbox_image(workspace) == (app_config.CC_SANDBOX_IMAGE, app_config.CC_SANDBOX_IMAGE_TAG)
+        # 平台方单独钉过的具体标签照用
+        workspace.sandbox_version = "0.1.13"
+        assert effective_sandbox_image(workspace) == (app_config.CC_SANDBOX_IMAGE, "0.1.13")
+        # 单独设了镜像名的工作区，标签照它自己写的，latest 也照字面
+        workspace.sandbox_image = "platform/custom"
+        workspace.sandbox_version = "latest"
+        assert effective_sandbox_image(workspace) == ("platform/custom", "latest")
+        workspace.sandbox_version = ""
+        assert effective_sandbox_image(workspace) == ("platform/custom", app_config.CC_SANDBOX_IMAGE_TAG)
+
+    def test_the_default_image_is_pinned_and_never_latest(self) -> None:
+        """默认镜像的标签必须是固定不变的具体版本：自建镜像不发 latest"""
+        from nekro_agent.core.config import CoreConfig
+
+        fields = CoreConfig.model_fields
+        assert fields["CC_SANDBOX_IMAGE"].default == "ghcr.io/akiyo-dayo/nekro-cc-sandbox"
+        assert fields["CC_SANDBOX_IMAGE_TAG"].default not in ("", "latest")
+
 
 class TestPlatformCredentialsStayHidden:
     """租户看不到平台方的模型凭据，这是定制版运营模式的前提"""

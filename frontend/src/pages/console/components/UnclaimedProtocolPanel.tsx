@@ -20,9 +20,11 @@ import {
   Alert,
   AlertTitle,
   Box,
+  Checkbox,
   Chip,
   CircularProgress,
   Divider,
+  FormControlLabel,
   Stack,
   TextField,
   Typography,
@@ -46,6 +48,7 @@ import {
   type UnclaimedInstanceItem,
 } from '../../../services/api/console'
 import { CHAT_CHANNEL_LIST_KEY } from '../../chat-channel/queryKeys'
+import CrossTenantSettingsChoice from './CrossTenantSettingsChoice'
 
 /** 认领的两条出路 */
 type ClaimMode = 'new' | 'adopt'
@@ -87,6 +90,11 @@ export default function UnclaimedProtocolPanel({
   const [newInstanceKey, setNewInstanceKey] = useState('')
   const [adoptTargetKey, setAdoptTargetKey] = useState('')
   const [confirmKey, setConfirmKey] = useState('')
+  // 并入两端归属不同时默认删除源实例上用户登记的服务器凭据（与跨租户换实例对同一口径），取消勾选才跟过去
+  const [deleteSshCredentials, setDeleteSshCredentials] = useState(true)
+  // 源实例的插件设置与配置覆盖同一口径：两端归属不同时默认删除
+  const [deletePluginSettings, setDeletePluginSettings] = useState(true)
+  const [deleteConfigOverrides, setDeleteConfigOverrides] = useState(true)
 
   // 待认领清单只对平台方开放（后端 Role.Super）。
   //
@@ -127,8 +135,23 @@ export default function UnclaimedProtocolPanel({
     setNewInstanceKey('')
     setAdoptTargetKey(canUsePreferred ? preferred : '')
     setConfirmKey('')
+    setDeleteSshCredentials(true)
+    setDeletePluginSettings(true)
+    setDeleteConfigOverrides(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target])
+
+  // 并入走的就是归属迁移：用换实例对的预览取「两端归属是否不同」与源实例上用户登记的服务器凭据条数
+  const adoptPreviewQuery = useQuery({
+    queryKey: ['console-instance-migration-preview', adoptTargetKey, target?.instance_key ?? ''],
+    queryFn: () => consoleApi.previewInstanceMigration(adoptTargetKey, target?.instance_key ?? ''),
+    enabled: mode === 'adopt' && Boolean(target) && Boolean(adoptTargetKey),
+    retry: false,
+    staleTime: 0,
+  })
+  const adoptSshCredentialCount = adoptPreviewQuery.data?.ssh_credentials ?? 0
+  const showSshCredentialChoice =
+    mode === 'adopt' && Boolean(adoptPreviewQuery.data?.cross_tenant) && adoptSshCredentialCount > 0
 
   const claimMutation = useMutation({
     mutationFn: (): Promise<InstanceClaimResult> => {
@@ -137,6 +160,9 @@ export default function UnclaimedProtocolPanel({
         return consoleApi.adoptInstance(adoptTargetKey, {
           source_instance_key: target.instance_key,
           confirm_source_instance_key: confirmKey.trim(),
+          delete_ssh_credentials: deleteSshCredentials,
+          delete_plugin_settings: deletePluginSettings,
+          delete_config_overrides: deleteConfigOverrides,
         })
       }
       return consoleApi.claimInstance(target.instance_key, {
@@ -158,6 +184,7 @@ export default function UnclaimedProtocolPanel({
       void queryClient.invalidateQueries({ queryKey: ['console-overview'] })
       void queryClient.invalidateQueries({ queryKey: ['instance-scope', 'instances'] })
       void queryClient.invalidateQueries({ queryKey: [CHAT_CHANNEL_LIST_KEY] })
+      void queryClient.invalidateQueries({ queryKey: ['console-instance-migration-preview'] })
       if (result.ok) onClaimed?.(result)
     },
     onError: (error: Error) => notification.error(error.message),
@@ -173,7 +200,10 @@ export default function UnclaimedProtocolPanel({
     Boolean(target) &&
     (mode === 'new'
       ? !newKeyError
-      : Boolean(adoptTargetKey) && confirmKey.trim() === target?.instance_key)
+      : // 预览没回来之前不让提交：否则凭据删不删由默认值决定，管理员却没看到条数
+        Boolean(adoptTargetKey) &&
+        Boolean(adoptPreviewQuery.data) &&
+        confirmKey.trim() === target?.instance_key)
 
   if (unclaimedQuery.isError || items.length === 0) return null
 
@@ -337,8 +367,49 @@ export default function UnclaimedProtocolPanel({
                       onChange={value => {
                         setAdoptTargetKey(value)
                         setConfirmKey('')
+                        setDeleteSshCredentials(true)
+                        setDeletePluginSettings(true)
+                        setDeleteConfigOverrides(true)
                       }}
                     />
+                    {showSshCredentialChoice && (
+                      <Box>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={deleteSshCredentials}
+                              disabled={claimMutation.isPending}
+                              onChange={event => setDeleteSshCredentials(event.target.checked)}
+                            />
+                          }
+                          label={
+                            <Typography variant="body2">
+                              {t('migrationDialog.deleteSshCredentialsLabel', {
+                                count: adoptSshCredentialCount,
+                              })}
+                            </Typography>
+                          }
+                        />
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ display: 'block', ml: 4 }}
+                        >
+                          {t('migrationDialog.deleteSshCredentialsHint')}
+                        </Typography>
+                      </Box>
+                    )}
+                    {Boolean(adoptPreviewQuery.data?.cross_tenant) && (
+                      <CrossTenantSettingsChoice
+                        pluginSettings={adoptPreviewQuery.data?.plugin_settings ?? 0}
+                        configOverrides={adoptPreviewQuery.data?.config_overrides ?? 0}
+                        deletePluginSettings={deletePluginSettings}
+                        deleteConfigOverrides={deleteConfigOverrides}
+                        onDeletePluginSettingsChange={setDeletePluginSettings}
+                        onDeleteConfigOverridesChange={setDeleteConfigOverrides}
+                        disabled={claimMutation.isPending}
+                      />
+                    )}
                     <Divider />
                     <TextField
                       size="small"

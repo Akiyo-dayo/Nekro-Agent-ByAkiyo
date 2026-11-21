@@ -6,6 +6,7 @@ from typing import Any
 
 from tortoise import timezone
 from tortoise.exceptions import IntegrityError
+from tortoise.expressions import Q
 from tortoise.transactions import in_transaction
 
 from nekro_agent.core.logger import get_sub_logger
@@ -125,7 +126,8 @@ class AdapterInstanceService:
             DBAdapterInstance: 创建或更新后的实例对象
 
         Raises:
-            ConflictError: 新建时该 `instance_key` 已被**另一个适配器**的实例占用
+            ConflictError: 新建时该 `instance_key`（不分大小写）已被另一个适配器的实例、或同一适配器下
+                只差大小写的实例占用
         """
         metadata_json: str = json.dumps(metadata, ensure_ascii=False) if metadata else ""
 
@@ -169,8 +171,20 @@ class AdapterInstanceService:
         # 数据库的唯一约束只到 (adapter_key, instance_key)，但人设、插件开关、好感与记忆、协议端
         # 容器名都只按 `instance_key` 存取，同名的两个实例会在这些地方共用一份数据；两行再分属
         # 两个租户，就是跨租户的读写。总后台建实例时查的是全表重名，这里与它保持同一条判据。
-        if await DBAdapterInstance.filter(instance_key=instance_key).exclude(adapter_key=adapter_key).exists():
+        # 不分大小写：标识会拼进插件设置与配置覆盖的目录名，Windows / macOS 上 `Inst` 与 `inst` 是同一个目录
+        # （同一适配器下只差大小写的也算）。精确同一个（适配器, 标识）的行不算：上面查过不存在，此刻有就是并发
+        # 刚建的，照旧交给唯一约束。用 `~Q(a, b)`：`.exclude(a=, b=)` 在 Tortoise 里是 `NOT a AND NOT b`
+        if (
+            await DBAdapterInstance.filter(instance_key__iexact=instance_key)
+            .filter(~Q(adapter_key=adapter_key, instance_key=instance_key))
+            .exists()
+        ):
             raise ConflictError(resource=f"实例 '{instance_key}'")
+
+        # 实例标识可以被重新认领：建之前清掉这个标识上残留的插件设置与配置覆盖（出错抛出，不建）
+        from nekro_agent.services.instance_settings import sweep_before_create
+
+        await sweep_before_create(adapter_key, instance_key)
 
         instance: DBAdapterInstance = await DBAdapterInstance.create(
             adapter_key=adapter_key,

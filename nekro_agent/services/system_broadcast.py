@@ -39,16 +39,19 @@ _MAX_QUEUE_SIZE = 200
 _MAX_SUBSCRIBERS = 50
 
 
-WorkspaceStatusValue = Literal["active", "stopped", "failed", "deleting"]
+WorkspaceStatusValue = Literal["active", "stopped", "failed", "deleting", "transitioning"]
 WORKSPACE_STATUS_ACTIVE: WorkspaceStatusValue = "active"
 WORKSPACE_STATUS_STOPPED: WorkspaceStatusValue = "stopped"
 WORKSPACE_STATUS_FAILED: WorkspaceStatusValue = "failed"
 WORKSPACE_STATUS_DELETING: WorkspaceStatusValue = "deleting"
+# 启动 / 重启 / 重建 / 停止进行中（`services/workspace/container.py` 的过渡状态）
+WORKSPACE_STATUS_TRANSITIONING: WorkspaceStatusValue = "transitioning"
 WORKSPACE_STATUS_VALUES: tuple[WorkspaceStatusValue, ...] = (
     WORKSPACE_STATUS_ACTIVE,
     WORKSPACE_STATUS_STOPPED,
     WORKSPACE_STATUS_FAILED,
     WORKSPACE_STATUS_DELETING,
+    WORKSPACE_STATUS_TRANSITIONING,
 )
 
 WorkspaceCcRuntimePhase = Literal["queued", "running", "responding", "completed", "failed", "cancelled"]

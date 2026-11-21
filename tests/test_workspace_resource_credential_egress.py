@@ -404,7 +404,9 @@ class TestTheMaskSentinelMeansKeepUnchanged:
             resource.id, _submit_back(detail, declassify_the_private_key)
         )
 
-        env_vars = await workspace_resource_service.resolve_workspace_resources_to_env(bound_workspace.id)
+        env_vars = await workspace_resource_service.resolve_workspace_resources_to_env(
+            bound_workspace.id, allow_platform_secrets=True
+        )
         assert env_vars["NEKRO_RESOURCE_PROD_SSH_PRIVATE_KEY"] == REAL_PRIVATE_KEY
         assert CREDENTIAL_MASK not in env_vars.values()
 
@@ -466,7 +468,9 @@ class TestTheOnlyLegitimateExitStillWorks:
     """
 
     async def test_env_injection_still_gets_the_plaintext(self, resource, bound_workspace) -> None:  # noqa: ARG002
-        env_vars = await workspace_resource_service.resolve_workspace_resources_to_env(bound_workspace.id)
+        env_vars = await workspace_resource_service.resolve_workspace_resources_to_env(
+            bound_workspace.id, allow_platform_secrets=True
+        )
 
         assert env_vars["NEKRO_RESOURCE_PROD_SSH_PRIVATE_KEY"] == REAL_PRIVATE_KEY
         assert env_vars["NEKRO_RESOURCE_PROD_SSH_ROOT_PASSWORD"] == REAL_ROOT_PASSWORD

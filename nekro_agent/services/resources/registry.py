@@ -24,6 +24,17 @@ def _field(
     )
 
 
+# 三个「直接给一台服务器」的资源模板。SSH 网关开着时它们的载荷不再注入容器：
+# 网关在 NA 进程里拿着凭据替容器连服务器，把私钥、root 口令留在容器环境里等于白做。
+SSH_RESOURCE_TEMPLATE_KEYS: frozenset[str] = frozenset(
+    {
+        "server_ssh_key",
+        "server_ssh_password",
+        "server_root_password",
+    },
+)
+
+
 _TEMPLATES: list[ResourceTemplate] = [
     ResourceTemplate(
         key="server_ssh_key",

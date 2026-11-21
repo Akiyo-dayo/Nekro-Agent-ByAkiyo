@@ -30,6 +30,36 @@ def _expected_rel_path(document_id: int, text: str) -> str:
     return f"{document_id}-{hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]}.md"
 
 
+def _fake_kb_files(normalized_dir: Path) -> SimpleNamespace:
+    """`kb_files` 的假实现：规范化文本落在 `normalized_dir/<rel>`，源文件固定是 `normalized_dir/source.md`"""
+
+    def _path(area: str, rel: str) -> Path:
+        return normalized_dir / ("source.md" if area == "source" else rel)
+
+    def _unlink(_workspace_id: int, area: str, rel: str) -> bool:
+        target = _path(area, rel)
+        if not target.exists():
+            return False
+        target.unlink()
+        return True
+
+    def _copy_to(_workspace_id: int, area: str, rel: str, destination: Path) -> bool:
+        source = _path(area, rel)
+        if not source.is_file():
+            return False
+        destination.write_bytes(source.read_bytes())
+        return True
+
+    return SimpleNamespace(
+        SOURCE="source",
+        NORMALIZED="normalized",
+        exists=lambda _workspace_id, area, rel: _path(area, rel).is_file(),
+        write_text=lambda _workspace_id, area, rel, text: _path(area, rel).write_text(text, "utf-8"),
+        unlink=_unlink,
+        copy_to=_copy_to,
+    )
+
+
 @dataclass
 class _FakeDocument:
     id: int = 1
@@ -112,15 +142,8 @@ def _install_harness(
     monkeypatch.setattr(index_service, "embed_kb_batch", _fake_embed)
     monkeypatch.setattr(index_service, "_swap_document_index", _recording_swap)
     monkeypatch.setattr(index_service, "extract_source_file", lambda *_args: SimpleNamespace(text=extracted_text))
-    monkeypatch.setattr(
-        index_service,
-        "WorkspaceService",
-        SimpleNamespace(
-            ensure_kb_dirs=lambda _workspace_id: None,
-            resolve_kb_source_path=lambda _workspace_id, _path: normalized_dir / "source.md",
-            resolve_kb_normalized_path=lambda _workspace_id, rel_path: normalized_dir / rel_path,
-        ),
-    )
+    monkeypatch.setattr(index_service, "WorkspaceService", SimpleNamespace(ensure_kb_dirs=lambda _workspace_id: None))
+    monkeypatch.setattr(index_service, "kb_files", _fake_kb_files(normalized_dir))
 
     return _IndexHarness(
         document=document,
@@ -584,11 +607,7 @@ def _install_swap_harness(
 
     monkeypatch.setattr(index_service, "kb_qdrant_manager", qdrant)
     monkeypatch.setattr(index_service, "DBKBChunk", model)
-    monkeypatch.setattr(
-        index_service,
-        "WorkspaceService",
-        SimpleNamespace(resolve_kb_normalized_path=lambda _workspace_id, rel_path: Path(tempfile.gettempdir()) / rel_path),
-    )
+    monkeypatch.setattr(index_service, "kb_files", _fake_kb_files(Path(tempfile.gettempdir())))
     monkeypatch.setattr(
         index_service,
         "in_transaction",

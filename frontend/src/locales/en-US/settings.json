@@ -54,6 +54,10 @@
       "modelType": "Model Type",
       "vision": "Vision",
       "cot": "External CoT",
+      "prefillMode": "Prefill mode",
+      "prefillModeOff": "Off (default)",
+      "prefillModeAssistant": "Trailing assistant message (Anthropic native, OpenRouter, etc.)",
+      "prefillModeDeepseek": "DeepSeek prefix completion (set the API base URL to DeepSeek's beta endpoint)",
       "temperature": "Temperature",
       "topP": "Top P",
       "presencePenalty": "Presence Penalty",
@@ -70,6 +74,7 @@
       "modelName": "If list fetch fails, enter model name manually",
       "vision": "Enable model vision capability. Turn on only for models that really accept image input; enabling it on a text-only model makes every round fail upstream.",
       "cot": "Enable NA-provided Chain of Thought. Disable if model supports native CoT.",
+      "prefillMode": "Turn this on only when the service really treats a trailing assistant message as the start of the reply. If the provider rejects it, the prefill is removed and the request retried once, and this group stops sending prefill for a while.",
       "advanced": "Advanced Options",
       "expandAdvanced": "Expand Advanced Options ▶",
       "collapseAdvanced": "Collapse Advanced Options ▼",
@@ -719,5 +724,27 @@
       "fetchSuccess": "Fetched {{count}} models",
       "fetchFailed": "Failed to fetch model list"
     }
+  },
+  "outputFilter": {
+    "title": "Hits & Starter Words",
+    "refresh": "Refresh",
+    "instance": "Instance",
+    "kind": "Type",
+    "rule": "Rule",
+    "count": "Hits",
+    "lastHitAt": "Last Hit",
+    "empty": "No hits yet",
+    "loading": "Loading…",
+    "rejectedTitle": "These rules are not active",
+    "starterButton": "View Starter Words",
+    "starterTitle": "Starter Words",
+    "starterHint": "The list is disabled by default and is for reference only.",
+    "starterNote": "Disabled by default. Copy it into \"Filter Words\" and save to take effect.",
+    "copy": "Copy",
+    "copied": "Copied",
+    "pluginHint": "Messages sent by plugins that bypass the framework and connect to the protocol endpoint directly cannot be filtered.",
+    "kindWord": "Word",
+    "kindRegex": "Regex",
+    "kindError": "Engine Error"
   }
 }
