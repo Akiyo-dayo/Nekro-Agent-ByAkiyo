@@ -1,4 +1,4 @@
-"""网页聊天 MCP 条目对租户不可见、也加不进工作区（设计 §3.2）
+"""网页聊天 MCP 条目对租户不可见、也加不进工作区
 
 租户看得见却永远用不了，比看不见更糟：他会去点、去测、去报「连不上」。所以读取侧直接摘掉，
 加入侧按「全局库中不存在」拒绝——不额外泄露「有这么一条，但你不能用」。
@@ -169,20 +169,28 @@ async def test_platform_owner_can_add_web_chat_entry(monkeypatch: pytest.MonkeyP
     assert enabled == [WEB_CHAT_MCP_SERVER_NAME]
 
 
-def test_registry_does_not_list_the_web_chat_template() -> None:
-    """这一版不往工作区 `.mcp.json` 写网页聊天条目，模板加进库里也用不上，所以不列"""
+def test_registry_lists_the_web_chat_template_without_headers() -> None:
+    """模板可以列：加进库里的条目本身不带令牌，令牌按工作区现场派生"""
     from nekro_agent.services.mcp.registry import get_registry
 
-    assert all(item.id != WEB_CHAT_MCP_SERVER_ID for item in get_registry())
-    assert all(item.url != WEB_CHAT_MCP_URL for item in get_registry())
+    template = next(item for item in get_registry() if item.id == WEB_CHAT_MCP_SERVER_ID)
+
+    assert template.url == WEB_CHAT_MCP_URL
+    assert template.headers == {}
 
 
-def test_new_library_is_not_seeded_with_the_web_chat_entry(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_new_library_is_seeded_with_one_web_chat_entry(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """新库种一条内置网页聊天条目；库条目恒不带令牌"""
     from nekro_agent.core import auto_inject_mcp
 
     monkeypatch.setattr(auto_inject_mcp, "_AUTO_INJECT_PATH", tmp_path / "configs" / "auto-inject-mcp.json")
 
-    assert auto_inject_mcp.get_auto_inject_mcp_servers() == []
+    servers = auto_inject_mcp.get_auto_inject_mcp_servers()
+
+    assert len(servers) == 1
+    assert servers[0]["id"] == WEB_CHAT_MCP_SERVER_ID
+    assert servers[0]["name"] == WEB_CHAT_MCP_SERVER_NAME
+    assert servers[0]["headers"] == {}
 
 
 def test_registry_returns_copies() -> None:

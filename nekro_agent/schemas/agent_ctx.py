@@ -259,7 +259,20 @@ class AgentCtx(BaseModel):
         workspace_id = db_channel.workspace_id
         if not workspace_id:
             return None
-        return await DBWorkspace.get_or_none(id=workspace_id)
+        workspace = await DBWorkspace.get_or_none(id=workspace_id)
+        if workspace is not None:
+            # 频道经插件工具（CC 委托、收发工作区文件、知识库、记忆）取用工作区的共同入口：
+            # 取用方是租户频道，就把工作区记进网页聊天 MCP 的「曾经不归平台方」标记。
+            # 工作区里的文件从这里开始对这个频道可达，而这条路径上没有别的归属推导
+            from nekro_agent.services.mcp.web_chat_workspace_taint import note_channel_workspace_access
+
+            await note_channel_workspace_access(
+                workspace,
+                adapter_key=str(db_channel.adapter_key or ""),
+                instance_key=str(db_channel.instance_key or ""),
+                reason=f"频道 {db_channel.chat_key} 取用绑定工作区",
+            )
+        return workspace
 
     async def get_onebot_v11_bot(self) -> OneBotV11Bot:
         """

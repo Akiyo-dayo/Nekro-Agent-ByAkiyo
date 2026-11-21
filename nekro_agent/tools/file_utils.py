@@ -71,6 +71,8 @@ class FileUtils:
     def get_upload_file_path(cls, from_chat_key: str, file_name: str = "", use_suffix: str = "", seed: str = "") -> str:
         """获取或生成一个可用的上传文件路径
 
+        文件名会先经 `safe_upload_file_name` 清洗；落盘目标越出上传目录时抛 `UnsafeUploadPathError`。
+
         Args:
             from_chat_key: 聊天频道ID
             file_name: 文件名

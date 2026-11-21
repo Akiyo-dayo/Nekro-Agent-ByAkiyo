@@ -2,9 +2,9 @@
 
 两份约束同时在这儿：
 1. 字段名跟 Claude Code 的 schema（`type`，不是 `transport`；不带 NA 内部的 `id`）；
-2. 网页聊天条目**这一版一律不写**，不论工作区此刻归谁、条目是内置的还是平台方手工配的。
-   工作区归属随频道绑定 / 解绑来回变：平台方新建工作区时写进去的令牌，租户频道绑上来后留在租户
-   读得到的地方，租户再解绑，工作区重新算成平台方，那张令牌就能以平台方身份调用（插件兼容会话复核）。
+2. 网页聊天条目只写给**合格**的工作区（此刻归平台方，且从未出现过非平台方归属）：
+   令牌按工作区现场派生，库里或手工条目里带的头一律被整体覆盖；不合格时整条不写。
+   资格判定本身在 `services/mcp/web_chat_workspace_taint.py`，本文件只管写盘形态。
 """
 
 import json
@@ -58,13 +58,13 @@ def test_http_entry_uses_claude_code_schema() -> None:
     "library",
     [
         _web_chat_library(),
-        # 平台方手工把外接令牌写进条目：同样不写，令牌不能落进以后可能交给租户的工作区
+        # 平台方手工把外接令牌写进条目：没有合格工作区时同样不写，令牌不能落进以后可能交给租户的工作区
         _web_chat_library(headers={"Authorization": "Bearer external-secret"}),
         # 改了名、只靠 URL 认出来的
         {"my-chat": {"name": "my-chat", "type": "http", "url": "http://example.com/api/mcp/web-chat/mcp", "validation": {"status": "validated"}}},
     ],
 )
-def test_web_chat_entry_is_never_written(library: Dict[str, Dict[str, Any]]) -> None:
+def test_web_chat_entry_is_skipped_without_an_eligible_workspace(library: Dict[str, Dict[str, Any]]) -> None:
     names = list(library)
     disk = _build_disk_mcp_config({"mcp_servers_enabled": names}, library=library)
 
@@ -72,8 +72,27 @@ def test_web_chat_entry_is_never_written(library: Dict[str, Dict[str, Any]]) -> 
     assert "nwc1." not in json.dumps(disk)
 
 
-def test_renamed_reference_to_the_builtin_entry_is_still_skipped() -> None:
-    """工作区记的是旧名、库里内置条目改过名：解析得到的仍是网页聊天条目，照样不写"""
+@pytest.mark.parametrize(
+    "library",
+    [
+        _web_chat_library(),
+        _web_chat_library(headers={"Authorization": "Bearer external-secret"}),
+        {"my-chat": {"name": "my-chat", "type": "http", "url": "http://example.com/api/mcp/web-chat/mcp", "validation": {"status": "validated"}}},
+    ],
+)
+def test_eligible_workspace_gets_a_fresh_token_and_overrides_manual_headers(
+    library: Dict[str, Dict[str, Any]],
+) -> None:
+    names = list(library)
+    disk = _build_disk_mcp_config({"mcp_servers_enabled": names}, library=library, web_chat_workspace_id=42)
+
+    entry = disk["mcpServers"][names[0]]
+    assert entry["headers"] == auth.build_workspace_web_chat_mcp_headers(42)
+    assert "external-secret" not in json.dumps(disk)
+
+
+def test_renamed_reference_to_the_builtin_entry_is_still_recognized() -> None:
+    """工作区记的是旧名、库里内置条目改过名：解析得到的仍是网页聊天条目，按资格决定写不写"""
     library = {
         "Local Web Chat MCP": {
             "id": auth.WEB_CHAT_MCP_SERVER_ID,
@@ -86,9 +105,13 @@ def test_renamed_reference_to_the_builtin_entry_is_still_skipped() -> None:
     }
 
     assert _resolve_library_entry(auth.WEB_CHAT_MCP_SERVER_NAME, library) is library["Local Web Chat MCP"]
-    disk = _build_disk_mcp_config({"mcp_servers_enabled": [auth.WEB_CHAT_MCP_SERVER_NAME]}, library=library)
+    metadata = {"mcp_servers_enabled": [auth.WEB_CHAT_MCP_SERVER_NAME]}
 
-    assert disk["mcpServers"] == {}
+    assert _build_disk_mcp_config(metadata, library=library)["mcpServers"] == {}
+    entry = _build_disk_mcp_config(metadata, library=library, web_chat_workspace_id=42)["mcpServers"][
+        auth.WEB_CHAT_MCP_SERVER_NAME
+    ]
+    assert entry["headers"] == auth.build_workspace_web_chat_mcp_headers(42)
 
 
 def test_other_servers_are_written_next_to_a_skipped_web_chat_entry() -> None:
@@ -102,20 +125,19 @@ def test_other_servers_are_written_next_to_a_skipped_web_chat_entry() -> None:
     assert list(disk["mcpServers"]) == ["some-fetch"]
 
 
-@pytest.mark.parametrize("owner_group", ["", "t5", "shared"])
-async def test_written_file_has_no_web_chat_entry_whoever_owns_the_workspace(
-    owner_group: str,
+@pytest.mark.parametrize("eligible", [True, False])
+async def test_written_file_follows_the_eligibility_verdict(
+    eligible: bool,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """插件兼容会话复核的 5 步里，第 1 步平台方工作区写盘就会把令牌写进去；现在不论归属都不写"""
-    from nekro_agent.services.workspace import network_guard
+    """写盘只看资格判定：合格才写这一条并带令牌，不合格整条不写"""
+    from nekro_agent.services.mcp import web_chat_workspace_taint
 
-    async def owner(_workspace: Any) -> str:
-        return owner_group
+    async def fake_eligible(_workspace: Any) -> bool:
+        return eligible
 
-    monkeypatch.setattr(network_guard, "resolve_workspace_network_group", owner)
-    monkeypatch.setattr(network_guard, "resolve_workspace_owner_group_strict", owner)
+    monkeypatch.setattr(web_chat_workspace_taint, "is_workspace_web_chat_token_eligible", fake_eligible)
     monkeypatch.setattr(manager, "_global_library_by_name", lambda: {**_fetch_library(), **_web_chat_library(auto_inject=True)})
     monkeypatch.setattr(manager.WorkspaceService, "get_workspace_dir", staticmethod(lambda _workspace_id: tmp_path))
 
@@ -125,10 +147,14 @@ async def test_written_file_has_no_web_chat_entry_whoever_owns_the_workspace(
 
     await manager.WorkspaceService._write_mcp_disk_locked(_Workspace())  # type: ignore[arg-type]
 
-    written = (tmp_path / "default" / ".mcp.json").read_text(encoding="utf-8")
-    assert "nwc1." not in written
-    assert auth.WEB_CHAT_MCP_SERVER_NAME not in written
-    assert "some-fetch" in json.loads(written)["mcpServers"]
+    written = json.loads((tmp_path / "default" / ".mcp.json").read_text(encoding="utf-8"))
+    assert "some-fetch" in written["mcpServers"]
+    if eligible:
+        entry = written["mcpServers"][auth.WEB_CHAT_MCP_SERVER_NAME]
+        assert entry["headers"] == auth.build_workspace_web_chat_mcp_headers(7)
+    else:
+        assert auth.WEB_CHAT_MCP_SERVER_NAME not in written["mcpServers"]
+        assert "nwc1." not in json.dumps(written)
 
 
 def test_unvalidated_entry_is_not_written() -> None:

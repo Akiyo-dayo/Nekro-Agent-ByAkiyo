@@ -2,8 +2,8 @@
 
 与上游的关键差别：内置条目**不存令牌**。上游用一枚全局令牌写进库条目，再抄进每个引用它的
 工作区 `.mcp.json`；本分支的工作区可以归租户，全局令牌落进租户工作区就是提权。所以这里
-`headers` 恒为空。按工作区派生的令牌这一版也不发（理由见 `web_chat_mcp/na_app.py`）：
-网页聊天 MCP 只接受平台方的后台登录态与外接固定令牌。
+`headers` 恒为空，工作区令牌按工作区现场派生（`nwc1.<工作区 id>.<HMAC>`），只写给合格的工作区：
+合格 = 此刻归平台方，且从来没有出现过非平台方归属（`services/mcp/web_chat_workspace_taint.py`）。
 """
 
 from __future__ import annotations
@@ -90,8 +90,8 @@ def is_valid_external_web_chat_mcp_token(token: str) -> bool:
 
 
 # ── 工作区令牌 ────────────────────────────────────────────────────────────────
-# 0.4.3 不发也不认（`.mcp.json` 不写、MCP 入口对 `nwc1.` 一律 401），见 `web_chat_mcp/na_app.py` 模块说明；
-# 派生与解析留着给以后的根治方案用（出现过非平台方归属的工作区打不会自动消失的标记）。
+# 按工作区派生，只写给合格的工作区（此刻归平台方且从未出现过非平台方归属，见
+# `web_chat_workspace_taint.py`）；被标记的工作区不发也不认，标记不会自动消失。
 # 进程级密钥，每次重启换一份：旧令牌自动失效，与上游「重启后失效」的语义一致。
 _INTERNAL_SECRET: str = secrets.token_urlsafe(32)
 WORKSPACE_TOKEN_PREFIX = "nwc1"
@@ -154,7 +154,7 @@ def refresh_web_chat_mcp_runtime_auth() -> List[str]:
     """清掉库里内置条目残留的令牌，返回需要重写 `.mcp.json` 的条目名
 
     与上游的差别：这里不做「注入令牌」，只做「归一 + 清空」，库条目本身永远不带令牌；
-    这一版也不往工作区 `.mcp.json` 写网页聊天条目。
+    工作区 `.mcp.json` 里的令牌由写盘时按工作区现场派生（`services/workspace/manager.py`）。
     """
     from nekro_agent.core.auto_inject_mcp import get_auto_inject_mcp_servers, set_auto_inject_mcp_servers
 
@@ -176,11 +176,21 @@ def refresh_web_chat_mcp_runtime_auth() -> List[str]:
 
 
 async def init_web_chat_mcp_runtime_auth() -> None:
-    """启动时轮换密钥，并重写引用了内置条目的工作区 `.mcp.json`
+    """启动时先回填工作区标记，再轮换密钥，并重写引用了内置条目的工作区 `.mcp.json`
 
-    这一版 `.mcp.json` 不写网页聊天条目，重写的作用是把旧文件里可能残留的这一条抹掉。
-    失败只记警告：网页聊天 MCP 起不来不该拖住整个进程启动。
+    回填扫描单独 try：失败只记 error，不拖住密钥轮换。记录不可用期间工作区令牌一律不生效，
+    下一次判定会经 `ensure_taint_record` 重扫重建。
+    整个流程失败只记警告：网页聊天 MCP 起不来不该拖住整个进程启动。
     """
+    try:
+        from nekro_agent.services.mcp.web_chat_workspace_taint import scan_workspace_taint
+
+        await scan_workspace_taint()
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            f"启动时回填网页聊天 MCP 的工作区标记失败，记录可用之前所有工作区令牌都不生效，"
+            f"下一次判定会重扫: {e}",
+        )
     try:
         from nekro_agent.services.workspace.manager import WorkspaceService
 
@@ -272,8 +282,8 @@ def is_web_chat_mcp_entry(raw: Dict[str, Any]) -> bool:
 def build_web_chat_mcp_server_entry(*, auto_inject: bool = False) -> Dict[str, Any]:
     """全局 MCP 库里的内置条目
 
-    **不带任何令牌**：`headers` 恒为空。库条目会被工作区列表接口带出去，而这一版也不往工作区
-    `.mcp.json` 写网页聊天条目；这里只用来把库里已有的历史变体归一成一条。
+    **不带任何令牌**：`headers` 恒为空。库条目会被工作区列表接口与 `/mcp/registry` 带出去，
+    令牌只按工作区现场派生、只写进合格工作区的 `.mcp.json`。
     """
     return {
         "id": WEB_CHAT_MCP_SERVER_ID,

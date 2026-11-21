@@ -66,33 +66,31 @@ def tenant_group_key(tenant_id: int) -> str:
     return workspace_group_key([tenant_id])
 
 
-async def resolve_workspace_owner_groups(workspace_ids: Sequence[int]) -> Dict[int, str]:
-    """批量推导一批工作区各自的归属分组键
+async def resolve_workspace_owner_groups_strict(workspace_ids: Sequence[int]) -> Dict[int, str]:
+    """批量推导一批工作区各自的归属分组键，查询失败直接抛出
 
     与 `resolve_workspace_network_group` 是同一套判定，只是把「一次两查」摊平成
     「一批两查」：列表接口一页可以有 100 个工作区，逐个推导就是 200 次查询。
     `tests/test_workspace_tenant_scope.py` 钉住了两者在全部边界上给出相同结论。
 
-    读不到归属时（查询失败）按平台方分组处理，与单个版本一致 —— 对租户而言这是拒绝，
-    不会把工作区错误地判给某个租户。
+    需要按归属做**授权**判定、且「读不到」必须拒绝的地方用这一版；普通读接口用
+    `resolve_workspace_owner_groups`，那里读不到按平台方处理不会把工作区错判给某个租户。
 
     Args:
         workspace_ids: 工作区 ID
 
     Returns:
         `{workspace_id: 分组键}`，入参里的每个 ID 都有一项
+
+    Raises:
+        Exception: 频道绑定或实例归属读取失败
     """
     ids = sorted({int(workspace_id) for workspace_id in workspace_ids})
     groups: Dict[int, str] = dict.fromkeys(ids, PLATFORM_GROUP)
     if not ids:
         return groups
 
-    try:
-        rows = await DBChatChannel.filter(workspace_id__in=ids).values("workspace_id", "adapter_key", "instance_key")
-    except Exception as e:
-        logger.warning(f"批量读取工作区的频道绑定失败，全部按平台方分组处理: {e}")
-        return groups
-
+    rows = await DBChatChannel.filter(workspace_id__in=ids).values("workspace_id", "adapter_key", "instance_key")
     refs_by_workspace: Dict[int, List[InstanceRef]] = {}
     for row in rows:
         refs_by_workspace.setdefault(int(row["workspace_id"]), []).append(
@@ -104,15 +102,11 @@ async def resolve_workspace_owner_groups(workspace_ids: Sequence[int]) -> Dict[i
     named = sorted({instance_key for refs in refs_by_workspace.values() for _, instance_key in refs if instance_key})
     tenant_by_ref: Dict[InstanceRef, Optional[int]] = {}
     if named:
-        try:
-            instance_rows = await DBAdapterInstance.filter(instance_key__in=named).values(
-                "adapter_key",
-                "instance_key",
-                "tenant_id",
-            )
-        except Exception as e:
-            logger.warning(f"批量读取工作区所属实例的租户归属失败，全部按平台方分组处理: {e}")
-            return groups
+        instance_rows = await DBAdapterInstance.filter(instance_key__in=named).values(
+            "adapter_key",
+            "instance_key",
+            "tenant_id",
+        )
         # 按 (适配器, 实例) 成对对上：另一个适配器下可以有归别的租户的同名实例
         tenant_by_ref = {
             (str(row["adapter_key"]), str(row["instance_key"])): row["tenant_id"] for row in instance_rows
@@ -121,6 +115,32 @@ async def resolve_workspace_owner_groups(workspace_ids: Sequence[int]) -> Dict[i
     # 空 instance_key 是多账号化之前尚未被认领的历史频道，查不到实例行的同理，两者都按平台方计入
     for workspace_id, refs in refs_by_workspace.items():
         groups[workspace_id] = workspace_group_key([tenant_by_ref.get(ref) if ref[1] else None for ref in refs])
+    return groups
+
+
+async def resolve_workspace_owner_groups(workspace_ids: Sequence[int]) -> Dict[int, str]:
+    """批量推导一批工作区各自的归属分组键
+
+    调用严格版；读不到归属时（查询失败）按平台方分组处理，与单个版本一致 —— 对租户而言
+    这是拒绝，不会把工作区错误地判给某个租户。成功时顺手把非平台方归属记进网页聊天 MCP
+    的「曾经不归平台方」标记（`services/mcp/web_chat_workspace_taint.py`）。
+
+    Args:
+        workspace_ids: 工作区 ID
+
+    Returns:
+        `{workspace_id: 分组键}`，入参里的每个 ID 都有一项
+    """
+    ids = sorted({int(workspace_id) for workspace_id in workspace_ids})
+    try:
+        groups = await resolve_workspace_owner_groups_strict(ids)
+    except Exception as e:
+        logger.warning(f"批量读取工作区的频道绑定或实例归属失败，全部按平台方分组处理: {e}")
+        return dict.fromkeys(ids, PLATFORM_GROUP)
+
+    from nekro_agent.services.mcp.web_chat_workspace_taint import note_workspace_owner_groups
+
+    note_workspace_owner_groups(groups, reason="归属推导")
     return groups
 
 

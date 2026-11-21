@@ -533,18 +533,24 @@ async def resolve_workspace_owner_group_strict(workspace: "DBWorkspace") -> str:
 
     bound = await DBChatChannel.filter(workspace_id=workspace.id).values_list("adapter_key", "instance_key")
     if not bound:
-        return PLATFORM_GROUP
+        group = PLATFORM_GROUP
+    else:
+        refs = [(str(adapter_key or ""), str(instance_key or "")) for adapter_key, instance_key in bound]
+        named = sorted({instance_key for _, instance_key in refs if instance_key})
+        tenant_by_ref: Dict[Tuple[str, str], Optional[int]] = {}
+        if named:
+            rows = await DBAdapterInstance.filter(instance_key__in=named).values("adapter_key", "instance_key", "tenant_id")
+            # 按 (适配器, 实例) 成对对上：另一个适配器下可以有归别的租户的同名实例
+            tenant_by_ref = {(str(row["adapter_key"]), str(row["instance_key"])): row["tenant_id"] for row in rows}
 
-    refs = [(str(adapter_key or ""), str(instance_key or "")) for adapter_key, instance_key in bound]
-    named = sorted({instance_key for _, instance_key in refs if instance_key})
-    tenant_by_ref: Dict[Tuple[str, str], Optional[int]] = {}
-    if named:
-        rows = await DBAdapterInstance.filter(instance_key__in=named).values("adapter_key", "instance_key", "tenant_id")
-        # 按 (适配器, 实例) 成对对上：另一个适配器下可以有归别的租户的同名实例
-        tenant_by_ref = {(str(row["adapter_key"]), str(row["instance_key"])): row["tenant_id"] for row in rows}
+        # 空 instance_key 是多账号化之前尚未被认领的历史频道，查不到实例行的同理，两者都按平台方计入
+        group = workspace_group_key([tenant_by_ref.get(ref) if ref[1] else None for ref in refs])
 
-    # 空 instance_key 是多账号化之前尚未被认领的历史频道，查不到实例行的同理，两者都按平台方计入
-    return workspace_group_key([tenant_by_ref.get(ref) if ref[1] else None for ref in refs])
+    # 归属是推出来的，每次算出来都顺手记进「曾经不归平台方」的标记：写入口可能漏，这里兜底
+    from nekro_agent.services.mcp.web_chat_workspace_taint import note_workspace_owner_group
+
+    note_workspace_owner_group(workspace.id, group, reason="归属推导")
+    return group
 
 
 async def _ensure_network(docker: aiodocker.Docker, group: str) -> WorkspaceNetwork:

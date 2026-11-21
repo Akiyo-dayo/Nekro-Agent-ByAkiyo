@@ -91,20 +91,26 @@ def _resolve_library_entry(name: str, library: Dict[str, Dict[str, Any]]) -> Opt
 def _build_disk_mcp_config(
     workspace_metadata: Dict[str, Any],
     library: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    web_chat_workspace_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """从全局 MCP 库 + workspace.metadata.mcp_servers_enabled 构建 .mcp.json 写盘内容。
 
     向后兼容：当 mcp_servers_enabled 不存在时，回退读取老的 metadata.mcp_config.mcpServers
     （把其 key 视作 enabled name 列表，从全局库查配置）。
 
-    网页聊天条目**一律不写**，不论工作区此刻归谁：工作区归属会随频道绑定 / 解绑来回变，
-    写进 `.mcp.json` 的平台方令牌会留在租户读得到的地方，见 `web_chat_mcp/na_app.py` 模块说明。
-    按名字、`id` 或 URL 认出来的条目都跳过，平台方手工配的也一样。
+    网页聊天条目的令牌**在这里现场派生**：库里不存令牌，写盘时按 `web_chat_workspace_id`
+    签一张。为 None（工作区此刻不合格）时直接跳过这一条——不仅调用时会被拒，也没有理由把
+    一张平台方令牌摆进以后可能交给租户的文件里。`headers` 整体覆盖：库里或手工条目里带的
+    任何头都不保留。
     """
     if library is None:
         library = _global_library_by_name()
 
-    from nekro_agent.services.mcp.web_chat_auth import is_web_chat_mcp_entry
+    from nekro_agent.services.mcp.web_chat_auth import (
+        build_workspace_web_chat_mcp_headers,
+        is_web_chat_mcp_entry,
+    )
 
     enabled_names: List[str] = list(workspace_metadata.get("mcp_servers_enabled", []) or [])
     if not enabled_names:
@@ -117,14 +123,50 @@ def _build_disk_mcp_config(
         raw = _resolve_library_entry(name, library)
         if raw is None:
             continue
-        if is_web_chat_mcp_entry(raw):
-            logger.debug(f"跳过网页聊天 MCP 条目 {name}：这一版不写进工作区 .mcp.json")
-            continue
         entry = _raw_to_disk_entry(raw)
         if entry is None:
             continue
+        if is_web_chat_mcp_entry(raw):
+            if web_chat_workspace_id is None:
+                logger.debug(f"跳过网页聊天 MCP 条目 {name}：工作区不含该条目或此刻不合格")
+                continue
+            entry["headers"] = build_workspace_web_chat_mcp_headers(web_chat_workspace_id)
         dst_servers[name] = entry
     return {"mcpServers": dst_servers}
+
+
+async def _render_disk_mcp_json(workspace: DBWorkspace) -> str:
+    """渲染这个工作区的 `.mcp.json` 内容
+
+    网页聊天条目的令牌只发给合格的工作区：启用清单里确实有这一条时才去判资格，没有就不必
+    付出一次归属推导与记录重建的代价。
+    """
+    from nekro_agent.services.mcp.web_chat_auth import is_web_chat_mcp_entry
+
+    library = _global_library_by_name()
+    metadata = workspace.metadata or {}
+    enabled_names: List[str] = list(metadata.get("mcp_servers_enabled", []) or [])
+    if not enabled_names:
+        legacy_servers: Dict[str, Any] = (metadata.get("mcp_config") or {}).get("mcpServers", {}) or {}
+        enabled_names = list(legacy_servers.keys())
+
+    has_web_chat_entry = any(
+        (raw := _resolve_library_entry(name, library)) is not None and is_web_chat_mcp_entry(raw)
+        for name in enabled_names
+    )
+
+    web_chat_workspace_id: Optional[int] = None
+    if has_web_chat_entry:
+        from nekro_agent.services.mcp.web_chat_workspace_taint import is_workspace_web_chat_token_eligible
+
+        if await is_workspace_web_chat_token_eligible(workspace):
+            web_chat_workspace_id = workspace.id
+
+    return json.dumps(
+        _build_disk_mcp_config(metadata, library, web_chat_workspace_id=web_chat_workspace_id),
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 class WorkspaceService:
@@ -750,10 +792,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         # 注意：与 CLAUDE.md 同理，必须放在 /workspace/default/ 下，CC 只在项目根目录查找
         mcp_path = ws_dir / "default" / ".mcp.json"
         mcp_path.parent.mkdir(parents=True, exist_ok=True)
-        mcp_path.write_text(
-            json.dumps(_build_disk_mcp_config(workspace.metadata or {}), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        mcp_path.write_text(await _render_disk_mcp_json(workspace), encoding="utf-8")
         logger.debug(f"写入 .mcp.json: {mcp_path}")
 
         # 写入 CLAUDE.md 到 CC 工作目录（/workspace/default/CLAUDE.md）
@@ -1105,10 +1144,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
         mcp_path = ws_dir / "default" / ".mcp.json"
         mcp_path.parent.mkdir(parents=True, exist_ok=True)
-        mcp_path.write_text(
-            json.dumps(_build_disk_mcp_config(workspace.metadata or {}), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        mcp_path.write_text(await _render_disk_mcp_json(workspace), encoding="utf-8")
 
     @staticmethod
     async def sync_mcp_to_disk(workspace: DBWorkspace) -> None:
@@ -1174,14 +1210,30 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
     @staticmethod
     async def bind_channel(workspace: DBWorkspace, chat_key: str) -> None:
-        """将频道绑定到工作区"""
+        """将频道绑定到工作区
+
+        频道若归租户实例，工作区在这一刻就变成了非平台方归属：先给它打上「曾经不归平台方」
+        的标记再改库。标记写不进去就拒绝这次绑定——否则归属已经变了、令牌却还在，事后补不回。
+        """
+        from nekro_agent.services.mcp.web_chat_workspace_taint import (
+            instance_owner_tenant,
+            taint_workspace_if_non_platform,
+            taint_workspaces,
+        )
+
         channel = await DBChatChannel.filter(chat_key=chat_key).first()
         if channel is None:
             from nekro_agent.schemas.errors import NotFoundError
 
             raise NotFoundError(resource=f"频道 {chat_key}")
+        tenant_id = await instance_owner_tenant(channel.adapter_key, channel.instance_key or "")
+        if tenant_id is not None:
+            taint_workspaces([workspace.id], reason=f"绑定租户频道 {chat_key}", refuse_on_failure=True)
         channel.workspace_id = workspace.id
         await channel.save(update_fields=["workspace_id", "update_time"])
+        # 改库后按整个工作区再推导一次：查实例归属与改库之间，这个实例可能刚被划给租户
+        # （划转那一侧的置位只看得到改库前已经绑上的频道），两边都会错过这一次
+        await taint_workspace_if_non_platform(workspace, reason=f"绑定频道 {chat_key} 后复核")
 
     @staticmethod
     async def unbind_channel(workspace: DBWorkspace, chat_key: str) -> None:

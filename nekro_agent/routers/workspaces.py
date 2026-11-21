@@ -55,6 +55,7 @@ from nekro_agent.schemas.workspace import (
     WorkspaceSummary,
     WorkspaceUpdate,
 )
+from nekro_agent.services.agent.upstream_redaction import redact_cc_failure_text
 from nekro_agent.services.mcp.schemas import McpServerConfig
 from nekro_agent.services.memory.feature_flags import (
     MemoryOperation,
@@ -3595,25 +3596,28 @@ async def user_send_to_cc(
                     )
                     chunks.append(chunk)
         except CCSandboxError as e:
+            # 上游报错常回显凭据，而通讯日志与运行状态租户后台都看得到：与插件委托路径用同一个脱敏出口
+            error_text = redact_cc_failure_text(e)
             err_log = await DBWorkspaceCommLog.create(
                 workspace_id=workspace_id,
                 direction="SYSTEM",
                 source_chat_key="__user__",
-                content=f"[错误] CC 返回错误: {e}",
+                content=f"[错误] CC 返回错误: {error_text}",
             )
             await comm_broadcast.publish(workspace_id, _comm_log_to_entry(err_log))
-            await _runtime_status(phase="failed", error_summary=str(e)[:180])
+            await _runtime_status(phase="failed", error_summary=error_text[:180])
             await _status(False)
             return
         except Exception as e:
+            error_text = redact_cc_failure_text(e)
             err_log = await DBWorkspaceCommLog.create(
                 workspace_id=workspace_id,
                 direction="SYSTEM",
                 source_chat_key="__user__",
-                content=f"[错误] 任务异常: {e}",
+                content=f"[错误] 任务异常: {error_text}",
             )
             await comm_broadcast.publish(workspace_id, _comm_log_to_entry(err_log))
-            await _runtime_status(phase="failed", error_summary=str(e)[:180])
+            await _runtime_status(phase="failed", error_summary=error_text[:180])
             await _status(False)
             return
 
@@ -3696,15 +3700,24 @@ async def force_cancel_comm_task(
     cancelled = await client.force_cancel_current_task(workspace_id="default")
 
     # 如果任务来自某个 NA 频道（非用户直发），同步取消 NA 侧的后台任务
-    # 使任务以 cancel 状态结束，避免 fail 路径触发 NA 侧 AI 误以为是异常并盲目重试
-    if source_chat_key and source_chat_key != "__user__":
+    # 使任务以 cancel 状态结束，避免 fail 路径触发 NA 侧 AI 误以为是异常并盲目重试。
+    # 来源频道是 CC 容器报回的，而 NA 侧任务键是全局的 `cc_delegate:{chat_key}`：只在该频道确实绑定在
+    # 本工作区时才取消，否则容器报一个别的租户的频道，就能借这个按钮打断那边的委托、并在那边推送中止通知、触发 Agent
+    if isinstance(source_chat_key, str) and source_chat_key and source_chat_key != "__user__":
         try:
+            from nekro_agent.models.db_chat_channel import DBChatChannel
             from nekro_agent.services.plugin.task import task as task_api
 
-            na_cancelled = await task_api.cancel("cc_delegate", source_chat_key)
-            if na_cancelled:
-                logger.info(
-                    f"[force_cancel_comm_task] 已同步取消 NA 侧 cc_delegate 任务: chat_key={source_chat_key}"
+            if await DBChatChannel.filter(chat_key=source_chat_key, workspace_id=ws.id).exists():
+                na_cancelled = await task_api.cancel("cc_delegate", source_chat_key)
+                if na_cancelled:
+                    logger.info(
+                        f"[force_cancel_comm_task] 已同步取消 NA 侧 cc_delegate 任务: chat_key={source_chat_key}"
+                    )
+            else:
+                logger.warning(
+                    f"[force_cancel_comm_task] CC 报回的来源频道没有绑定到本工作区，不取消 NA 侧任务: "
+                    f"workspace={ws.id} chat_key={source_chat_key!r}"
                 )
         except Exception as e:
             logger.warning(f"[force_cancel_comm_task] 取消 NA 侧任务失败: {e}")

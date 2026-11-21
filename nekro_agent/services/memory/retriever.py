@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -35,13 +34,13 @@ from nekro_agent.services.memory.recall_contract import (
     MEMORY_CONTEXT_CATEGORY_LABELS,
     MEMORY_CONTEXT_CORE_SECTION,
     MEMORY_CONTEXT_EVIDENCE_SECTION,
-    MEMORY_CONTEXT_FOCUS_TITLE,
     MemoryAnswerStyle,
     MemoryIntentType,
     MemoryKnowledgeHint,
     MemoryTypeHint,
 )
 from nekro_agent.services.memory.text_terms import extract_query_terms, lexical_coverage
+from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 logger = get_sub_logger("memory.retriever")
 
@@ -718,17 +717,22 @@ async def retrieve_memories_batch(
     requests: Sequence[BatchRecallRequest],
     *,
     scope: MemoryScope,
+    record_access: bool = True,
 ) -> list[list[RetrievedMemory]]:
     """并发执行多条检索，返回与 `requests` **同序**的结果列表。
 
     一次注入里的多条 query 彼此独立（各自一次 embedding + 一次 Qdrant 查询 + 若干读库），
     串行执行等于把这些等待时间原样叠加到主对话链路上，所以检索本身走 `asyncio.gather`。
 
-    **但访问记录必须留在检索之后按输入顺序串行补记。** `_record_access` 里的 `reinforce()`
-    是读改写（`base_weight = min(base_weight + boost, 2.0)` + 写 `last_reinforced_at`），
-    并由 `REINFORCE_COOLDOWN_SECONDS` 的窗口判定挡住重复强化 —— 而这个判定读的正是
-    上一次写入的 `last_reinforced_at`。把它一起并发就等于让同一条记忆在**同一次注入内**
-    被多条 query 各强化一次、并多写几行强化日志，正是那个冷却窗口当初要消灭的写放大。
+    `record_access=True`（默认）时，检索之后按输入顺序**串行**补记访问：`_record_access`
+    里的 `reinforce()` 是读改写（`base_weight = min(base_weight + boost, 2.0)` + 写
+    `last_reinforced_at`），并由 `REINFORCE_COOLDOWN_SECONDS` 的窗口判定挡住重复强化 ——
+    而这个判定读的正是上一次写入的 `last_reinforced_at`。并发补记就等于让同一条记忆在
+    **同一次调用内**被多条 query 各强化一次、并多写几行强化日志。
+
+    注入链路传 `record_access=False`：检索时不强化，注入了哪些记进本轮记录，由
+    `round_recall.commit_round_recall` 在主对话成功返回后补记一次。这样一轮主对话迭代
+    几次也只算一次，被拦下的轮次则完全不强化。
 
     单条 query 失败不连坐：该条回空列表，其余照常返回（记忆注入是风味不是功能，
     读路径 fail-open 是硬要求）。
@@ -762,7 +766,7 @@ async def retrieve_memories_batch(
             memories_per_request.append([])
             continue
         memories_per_request.append(result.memories)
-        if result.memories:
+        if record_access and result.memories:
             await retriever.record_access(result.memories, request.query)
 
     return memories_per_request
@@ -785,24 +789,6 @@ async def compile_memories_for_context(
 
     lines: list[str] = [MEMORY_CONTEXT_BLOCK_TITLE]
     current_length = len(lines[0])
-
-    focus_points = [point for point in recall_query.focus_points if point.strip()]
-    if focus_points:
-        title = MEMORY_CONTEXT_FOCUS_TITLE
-        if current_length + len(title) + 1 <= max_length:
-            lines.append(title)
-            current_length += len(title) + 1
-        for point in focus_points[:4]:
-            focus_line = f"- {point[:120]}"
-            if current_length + len(focus_line) + 1 > max_length:
-                break
-            lines.append(focus_line)
-            current_length += len(focus_line) + 1
-    elif recall_query.focus_text:
-        focus_line = f"当前关注：{recall_query.focus_text[:120]}"
-        if current_length + len(focus_line) + 1 <= max_length:
-            lines.append(focus_line)
-            current_length += len(focus_line) + 1
 
     primary_items: list[RetrievedMemory] = []
     supporting_items: list[RetrievedMemory] = []
@@ -982,19 +968,21 @@ def _format_compiled_memory_line(mem: RetrievedMemory) -> str:
     """将单条记忆编排为更适合 prompt 的上下文行。"""
     category = _resolve_context_category(mem)
     label = MEMORY_CONTEXT_CATEGORY_LABELS.get(category, "记忆")
+    # 记忆正文全部来自群聊，任何群成员都能往里写：先折成单行再限长，
+    # 否则一个换行就能在提示词里伪造出一条新的渲染行。
     if mem.source_type == "relation":
-        return f"- [{label}] {mem.summary}"
+        return f"- [{label}] {sanitize_inline_text(mem.summary or '', 120)}"
     if mem.source_type == "episode":
         time_str = mem.event_time.strftime("%m-%d %H:%M") if mem.event_time else "未知时间"
-        title = re.sub(r"\s+", " ", (mem.summary or "").strip()) or "事件"
-        narrative = re.sub(r"\s+", " ", (mem.content or "").strip())[:160]
+        title = sanitize_inline_text(mem.summary or "", 120) or "事件"
+        narrative = sanitize_inline_text(mem.content or "", 160)
         return f"- [{label} {time_str}] {title}：{narrative}"
 
     time_str = mem.event_time.strftime("%m-%d %H:%M") if mem.event_time else "未知时间"
-    content = re.sub(r"\s+", " ", (mem.content or "").strip())
-    summary = re.sub(r"\s+", " ", (mem.summary or "").strip())
+    content = sanitize_inline_text(mem.content or "", 140)
+    summary = sanitize_inline_text(mem.summary or "", 120)
     body = content or summary
     if summary and summary not in body and len(summary) > 6:
         body = f"{summary}：{body}"
-    body = body[:140]
+    body = sanitize_inline_text(body, 140)
     return f"- [{label} {time_str}] {body}"

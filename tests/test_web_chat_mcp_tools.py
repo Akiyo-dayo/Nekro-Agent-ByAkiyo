@@ -4,6 +4,7 @@
 以及「应用确实挂在 `/api/mcp/web-chat`」——工具签名写错或挂载路径漏了，入口鉴权再严也没用。
 """
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -94,11 +95,101 @@ async def test_file_upload_rejects_paths_outside_allowlist(tmp_path: Any) -> Non
     assert result["error"]["type"] == "FileNotAllowed"
 
 
-async def test_send_file_to_missing_path_reports_file_error() -> None:
-    result = await WebChatMcpService().send_file("web-session_test", file_path="/definitely/not/here.bin")
+async def test_send_file_to_missing_path_reports_file_error(tmp_path: Any) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+
+    result = await WebChatMcpService(WebChatMcpSettings(file_allowlist=[allowed])).send_file(
+        "web-session_test",
+        file_path=str(allowed / "missing.bin"),
+    )
 
     assert result["ok"] is False
     assert result["error"]["type"] == "FileNotFound"
+
+
+async def test_file_upload_outside_allowlist_does_not_reveal_existence(tmp_path: Any) -> None:
+    """白名单外的路径，存在与不存在必须拿到同一个结果，否则等于一个宿主机文件探针"""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    existing = tmp_path / "existing.txt"
+    existing.write_text("hello", encoding="utf-8")
+    missing = tmp_path / "missing.txt"
+    service = WebChatMcpService(WebChatMcpSettings(file_allowlist=[allowed]))
+
+    existing_result = await service.send_file("web-session_test", file_path=str(existing))
+    missing_result = await service.send_file("web-session_test", file_path=str(missing))
+
+    assert existing_result == missing_result
+    assert existing_result["error"]["type"] == "FileNotAllowed"
+
+
+async def test_file_allowlist_is_checked_before_existence(tmp_path: Any) -> None:
+    result = await WebChatMcpService(WebChatMcpSettings(file_allowlist=[])).send_file(
+        "web-session_test",
+        file_path=str(tmp_path / "missing.txt"),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["type"] == "FileAllowlistRequired"
+
+
+async def test_nul_byte_path_is_rejected_as_not_allowed(tmp_path: Any) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    service = WebChatMcpService(WebChatMcpSettings(file_allowlist=[allowed]))
+
+    result = await service.send_file("web-session_test", file_path=str(allowed / "a\x00b.txt"))
+
+    assert result["ok"] is False
+    assert result["error"]["type"] == "FileNotAllowed"
+
+
+async def test_symlink_inside_allowlist_pointing_outside_is_rejected(tmp_path: Any) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("hello", encoding="utf-8")
+    link = allowed / "link.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("本机不允许创建符号链接")
+
+    result = await WebChatMcpService(WebChatMcpSettings(file_allowlist=[allowed])).send_file(
+        "web-session_test",
+        file_path=str(link),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["type"] == "FileNotAllowed"
+
+
+async def test_subdirectory_inside_allowlist_is_not_a_file(tmp_path: Any) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    (allowed / "subdir").mkdir()
+
+    result = await WebChatMcpService(WebChatMcpSettings(file_allowlist=[allowed])).send_file(
+        "web-session_test",
+        file_path=str(allowed / "subdir"),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["type"] == "FileNotFound"
+
+
+def test_validate_file_path_returns_resolved_path_for_allowed_file(tmp_path: Any) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    target = allowed / "ok.txt"
+    target.write_text("hello", encoding="utf-8")
+    service = WebChatMcpService(WebChatMcpSettings(file_allowlist=[allowed]))
+
+    result = service._validate_file_path(str(target))
+
+    assert isinstance(result, Path)
+    assert result == target.resolve()
 
 
 @pytest.mark.parametrize(

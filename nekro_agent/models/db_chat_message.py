@@ -35,6 +35,9 @@ from nekro_agent.tools.untrusted_content import (
 # 合并转发内容完全由发送方构造，渲染进提示词时的长度上限
 MAX_FORWARD_PROMPT_LENGTH = 2048
 
+# JSON 卡片摘要进提示词前的长度上限
+MAX_JSON_CARD_PROMPT_LENGTH = 2048
+
 # 不可信正文被单条消息长度上限截断时留下的记号
 UNTRUSTED_BODY_TRUNCATION_PLACEHOLDER = "\n(content too long, omitted)\n"
 
@@ -240,12 +243,13 @@ def _render_segment_pieces(
                 else f"<{one_time_code} | At:[@id:{seg.target_platform_userid};nickname:{seg.target_nickname}@]>"
             )
         elif isinstance(seg, ChatMessageSegmentJsonCard):
-            # JSON卡片消息：直接使用格式化后的文本，已经包含所有关键信息
-            prompt_str += (
-                f"{seg.text}"
-                if travel_mode
-                else f"<{one_time_code} | {seg.text}>"
-            )
+            # 卡片的标题、描述、分享者昵称与链接全部由发送方构造，拼接后与真实群聊消息格式同构。
+            # 不能出现在带令牌的标签里（那等于让发送方冒充宿主说话），两种渲染模式都包进不可信边界；
+            # 漫游模式拿不到本轮令牌，边界里的令牌是空的，但 `trust:untrusted` 标注仍在
+            card_body = _limit_body(sanitize_block_text(seg.text, MAX_JSON_CARD_PROMPT_LENGTH))
+            pieces.append((prompt_str, False))
+            prompt_str = ""
+            pieces.append((wrap_untrusted_block(one_time_code, "JsonCard", card_body), True))
         elif isinstance(seg, ChatMessageSegmentForward):
             # 合并转发的昵称与正文均由发送方任意构造，与真实群聊消息格式同构。
             # 必须包裹在带会话令牌的边界内并标注为不可信，否则可伪造他人发言。

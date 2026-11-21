@@ -3,10 +3,11 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, FrozenSet, List, Literal, Optional
 
 from pydantic import BaseModel
 
+from nekro_agent.core.logger import logger
 from nekro_agent.core.os_env import OsEnv
 
 CC_PRESETS_PATH = Path(OsEnv.DATA_DIR) / "configs" / "cc-model-presets.json"
@@ -109,6 +110,40 @@ class CCModelPresetsStore:
             if p.get("is_default"):
                 return CCModelPresetItem(**p)
         return None
+
+    def secret_values(self) -> FrozenSet[str]:
+        """预设里需要按字面量遮蔽的凭据
+
+        CC 模型预设存在 `configs/cc-model-presets.json` 这个独立文件里，不在 `ConfigManager`
+        的配置树上，所以 `collect_platform_secrets()` 收不到它——上游报错回显预设凭据时，
+        脱敏集合里必须显式带上这些值。
+
+        **原值与 `strip()` 后的取值都要收**（理由同 `routers/cc_relay.py` 的
+        `_relay_secret_values`）：真实上线的是 strip 之后的那份，而预设里可能存着带尾随
+        换行的 Key，只收原文就遮不住上游回显的那一份。
+
+        只读 `_load_raw()`：`ensure_default` / `list_all` 会写文件，脱敏不能有落盘副作用。
+        文件不存在时返回空集合；读文件或解析出错时记 WARNING 并返回空集合，不抛。
+        """
+        secret_key_markers = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+        values: set[str] = set()
+        try:
+            raw = self._load_raw()
+            for preset in raw.get("presets", []):
+                token = str(preset.get("auth_token") or "")
+                values.update(candidate for candidate in (token, token.strip()) if candidate)
+                extra_env = preset.get("extra_env") or {}
+                if not isinstance(extra_env, dict):
+                    continue
+                for key, value in extra_env.items():
+                    if not any(marker in str(key).upper() for marker in secret_key_markers):
+                        continue
+                    text = str(value or "")
+                    values.update(candidate for candidate in (text, text.strip()) if candidate)
+        except Exception as e:
+            logger.warning(f"[cc_model_presets] 读取预设凭据失败，脱敏集合按空处理: {e}")
+            return frozenset()
+        return frozenset(values)
 
     def list_all(self) -> List[CCModelPresetItem]:
         self.ensure_default()

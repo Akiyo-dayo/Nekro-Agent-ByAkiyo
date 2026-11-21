@@ -9,16 +9,17 @@ from nekro_agent.core.os_env import OsEnv
 
 _AUTO_INJECT_PATH = Path(OsEnv.DATA_DIR) / "configs" / "auto-inject-mcp.json"
 
-# 默认为空列表 — 不预设任何 MCP 服务。上游在这里种一条内置网页聊天条目；本分支这一版不往工作区
-# `.mcp.json` 写网页聊天条目（见 `web_chat_mcp/na_app.py` 模块说明），种下来也用不上，所以不种
+# 默认为空列表 — 不预设任何 MCP 服务（内置网页聊天条目单独种下，见 `_ensure_file`）
 _DEFAULT_MCP_SERVERS: List[Dict[str, Any]] = []
 
 
 def _ensure_file() -> None:
     _AUTO_INJECT_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not _AUTO_INJECT_PATH.exists():
+        from nekro_agent.services.mcp.web_chat_auth import build_web_chat_mcp_server_entry
+
         _AUTO_INJECT_PATH.write_text(
-            json.dumps({"servers": _DEFAULT_MCP_SERVERS}, indent=2),
+            json.dumps({"servers": [*_DEFAULT_MCP_SERVERS, build_web_chat_mcp_server_entry()]}, indent=2),
             encoding="utf-8",
         )
 
@@ -65,10 +66,10 @@ def update_auto_inject_validation(name: str, validation_state: Dict[str, Any]) -
 def _normalize_builtin_web_chat_mcp(servers: List[Dict[str, Any]], *, persist: bool = True) -> List[Dict[str, Any]]:
     """把内置网页聊天条目的历史变体归一，并清掉其中可能残留的令牌
 
-    本分支不种这一条（见 `_DEFAULT_MCP_SERVERS` 上方），但平台方手工加的、或从上游迁来的库里
-    可能已经有：这里把它们归一成一条，并抹掉其中带的令牌。
+    只在配置文件**首次创建**时种默认项；用户后来把条目删掉，这里不会强行补回（「删了就是删了」）。
+    但也正因为如此，存量库里那条带令牌的老条目必须在这里被动归一：升级后第一次读清单就抹掉。
 
-    与上游的差别：上游在这里注入运行期令牌，本分支的 `headers` 恒为空，而且这一版不往工作区写这一条。
+    与上游的差别：上游在这里注入运行期令牌，本分支的 `headers` 恒为空——令牌按工作区现场派生。
     """
     from nekro_agent.services.mcp.web_chat_auth import (
         is_web_chat_mcp_entry,

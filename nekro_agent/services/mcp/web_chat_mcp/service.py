@@ -431,23 +431,25 @@ class WebChatMcpService:
             "reply": wait_result,
         }
 
+    # 顺序是有意的：白名单为空、路径解析失败、白名单外都先于存在性判定，且后两者返回同一个结果。
+    # 否则白名单外的路径，存在与不存在会拿到不同错误，调用方就能逐个路径探宿主机上有没有文件。
     def _validate_file_path(self, file_path: str) -> Any:
-        path = Path(file_path).expanduser().resolve()
-        if not path.is_file():
-            return error_result(status="file_error", message="上传文件不存在或不是普通文件", error_type="FileNotFound")
         if not self.settings.file_allowlist:
             return error_result(
                 status="file_not_allowed",
                 message="文件上传需要配置 NEKRO_WEB_CHAT_MCP_FILE_ALLOWLIST，避免 MCP 读取任意本地文件",
                 error_type="FileAllowlistRequired",
             )
-        for allowed in self.settings.file_allowlist:
-            try:
-                path.relative_to(allowed)
-                return path
-            except ValueError:
-                continue
-        return error_result(status="file_not_allowed", message="上传文件不在允许目录内", error_type="FileNotAllowed")
+        try:
+            path = Path(file_path).expanduser().resolve()
+        except (OSError, ValueError, RuntimeError):
+            # NUL 字节、过长、死循环的符号链接这类解析不了的路径，和白名单外同一个结果
+            return error_result(status="file_not_allowed", message="上传文件不在允许目录内", error_type="FileNotAllowed")
+        if not any(path.is_relative_to(allowed) for allowed in self.settings.file_allowlist):
+            return error_result(status="file_not_allowed", message="上传文件不在允许目录内", error_type="FileNotAllowed")
+        if not path.is_file():
+            return error_result(status="file_error", message="上传文件不存在或不是普通文件", error_type="FileNotFound")
+        return path
 
 
 def error_result(*, status: str, message: str, error_type: str) -> Dict[str, Any]:

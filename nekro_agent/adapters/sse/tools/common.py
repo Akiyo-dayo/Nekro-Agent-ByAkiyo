@@ -120,12 +120,14 @@ async def bytes_to_file(
     import hashlib
 
     from nekro_agent.core.os_env import USER_UPLOAD_DIR
+    from nekro_agent.tools.path_convertor import UnsafeUploadPathError, safe_upload_file_name
 
     # 如果未提供mime_type，尝试检测
     if not mime_type:
         mime_type = magic.from_buffer(file_bytes, mime=True)
 
-    # 处理文件名
+    # 处理文件名：外部给的名字先收成单个文件名，收空了再按内容哈希命名
+    file_name = safe_upload_file_name(file_name or "")
     if not file_name:
         extension = get_extension_from_mime(mime_type)
         file_name = f"{hashlib.md5(file_bytes).hexdigest()}{extension}"
@@ -136,6 +138,10 @@ async def bytes_to_file(
 
     save_dir.mkdir(parents=True, exist_ok=True)
     file_path = save_dir / file_name
+    # 保存目录是调用方自己指定的边界，但目录本身是符号链接之类的情况文件名清洗管不到，
+    # 落盘前按 resolve 后的路径再确认一次
+    if not file_path.resolve().is_relative_to(save_dir.resolve()):
+        raise UnsafeUploadPathError("落盘目标不在保存目录里")
 
     # 写入文件
     async with aiofiles.open(file_path, "wb") as f:

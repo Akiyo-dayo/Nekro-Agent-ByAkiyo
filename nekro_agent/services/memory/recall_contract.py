@@ -64,6 +64,8 @@ class MemoryRecallPlan(BaseModel):
 
 
 MEMORY_CONTEXT_BLOCK_TITLE = "[相关记忆]"
+# 自动注入时的不可信块标签名，与 `wrap_untrusted_block` 的 `kind` 一致
+MEMORY_CONTEXT_BLOCK_KIND = "MemoryContext"
 MEMORY_CONTEXT_FOCUS_TITLE = "当前关注："
 MEMORY_CONTEXT_CORE_SECTION = "核心记忆："
 MEMORY_CONTEXT_EVIDENCE_SECTION = "支撑线索："

@@ -236,13 +236,12 @@ class TestNoUnconsumedTailRequest:
         `render_history_data` 不是纯装配。它一路展开是 `_inject_memory_context`
         → `_build_enhanced_memory_recall_plan` → **又一次 `gen_openai_chat_response`**
         （`LLMUsageScene.HISTORY_PLAN`，走计费与用量记账）→ `retrieve_memories_batch`
-        （每条 query 一次 embedding + 一次 Qdrant 查询）→ `record_access` → `reinforce()`，
-        最后那步是对 `base_weight` / `last_reinforced_at` 的**读改写落库**。
+        （每条 query 一次 embedding + 一次 Qdrant 查询）→ `stage_round_recall`（只记录，
+        不写库）。
 
         也就是说：把 `break` 往后挪到这次调用之后，`llm_calls` **一次都不会变**
-        （被跳过的仍然是那次迭代请求），但每个烧满的回合会重新多花一次规划请求、
-        一批向量检索，以及一批「为一个从未被消费的回复」而写的记忆强化。
-        复核时的变异 N1b/N1c 正是这么活下来的——只数请求数杀不掉它们。
+        （被跳过的仍然是那次迭代请求），但每个烧满的回合会重新多花一次规划请求与
+        一批向量检索。被跳过的那次渲染本来就不会强化，只数请求数杀不掉这类变异。
         """
         harness = _burn_every_iteration(max_retry)
         harness.install(monkeypatch)

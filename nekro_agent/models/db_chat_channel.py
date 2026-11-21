@@ -221,6 +221,23 @@ class DBChatChannel(Model):
             )
             migrated = await migrate_chat_key_references(old_chat_key, chat_key, instance_key=instance_key)
 
+            # 历史频道可能已经绑着工作区：认领给租户实例后，那个工作区的归属就从平台方变成了租户。
+            # 认领是自动路径，置位失败不拦认领，只记警告（记录不可用期间所有工作区令牌都不生效）
+            if unclaimed_channel.workspace_id is not None:
+                try:
+                    from nekro_agent.services.mcp.web_chat_workspace_taint import (
+                        instance_owner_tenant,
+                        taint_workspaces,
+                    )
+
+                    if await instance_owner_tenant(adapter_key, instance_key) is not None:
+                        taint_workspaces(
+                            [unclaimed_channel.workspace_id],
+                            reason=f"历史频道认领到租户实例 {instance_key}",
+                        )
+                except Exception as e:  # noqa: BLE001 - 置位失败不影响认领
+                    logger.warning(f"认领历史频道 {old_chat_key} 时置位工作区标记失败: {e}")
+
             unclaimed_channel.chat_key = chat_key
             unclaimed_channel.instance_key = instance_key
             await unclaimed_channel.save(update_fields=["chat_key", "instance_key", "update_time"])

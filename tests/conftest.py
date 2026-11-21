@@ -17,6 +17,7 @@ jieba 缺席时（它是 `pyproject.toml` 里的正式依赖，正常不会）�
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -48,3 +49,26 @@ def _fresh_rpc_decode_budget() -> None:
     from nekro_agent.services.rpc_service import decode_budget
 
     decode_budget.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_web_chat_workspace_taint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    """网页聊天 MCP 的「曾经不归平台方」标记按用例隔离
+
+    置位现在挂在归属推导上，任何用例推导出租户归属都会写这个文件；不隔离就会写进真实的
+    `data/system`。模块级的内存集合跨用例残留，还会让下一条用例里同 id 的工作区被误判成被标记。
+    所以落盘改道到临时目录，内存集合与待重建标志、重建锁一并重置；收尾取消没跑完的清理任务。
+    """
+    from nekro_agent.services.mcp import web_chat_workspace_taint as taint
+
+    monkeypatch.setattr(taint, "taint_file", lambda: tmp_path / "web_chat_mcp_tainted_workspaces.json")
+    monkeypatch.setattr(taint, "_memory_tainted", set())
+    monkeypatch.setattr(taint, "_rebuild_pending", False)
+    monkeypatch.setattr(taint, "_rebuild_lock", None)
+
+    yield
+
+    for task in list(taint._scrub_tasks):
+        if not task.done():
+            task.cancel()
+    taint._scrub_tasks.clear()

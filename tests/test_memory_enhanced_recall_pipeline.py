@@ -627,6 +627,7 @@ class TestInjectionUsesBatchEntryPoint:
             requests: Any,
             *,
             scope: Any = None,
+            record_access: bool = True,
         ) -> list[list[Any]]:
             captured.append(list(requests))
             return [[] for _ in requests]
@@ -648,6 +649,7 @@ class TestInjectionUsesBatchEntryPoint:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel(""),
+            one_time_code="test-code",
             max_memories=8,
         )
 
@@ -668,7 +670,13 @@ class TestInjectionUsesBatchEntryPoint:
         """
         calls: list[str] = []
 
-        async def fake_batch(workspace_id: int, requests: Any, *, scope: Any = None) -> list[list[Any]]:
+        async def fake_batch(
+            workspace_id: int,
+            requests: Any,
+            *,
+            scope: Any = None,
+            record_access: bool = True,
+        ) -> list[list[Any]]:
             calls.append("batch")
             return [[] for _ in requests]
 
@@ -688,6 +696,7 @@ class TestInjectionUsesBatchEntryPoint:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel(""),
+            one_time_code="test-code",
             max_memories=8,
         )
 
@@ -829,6 +838,7 @@ class TestInjectionCallSiteContract:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel("inst_a"),
+            one_time_code="test-code",
         )
 
         # 正例先立住：注入块必须真的有东西，否则下一条"不含乙实例"会因为全空而恒成立
@@ -851,6 +861,7 @@ class TestInjectionCallSiteContract:
             requests: Any,
             *,
             scope: Any = None,
+            record_access: bool = True,
         ) -> list[list[Any]]:
             captured["scope"] = scope
             captured["requests"] = list(requests)
@@ -872,6 +883,7 @@ class TestInjectionCallSiteContract:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel("inst_a"),
+            one_time_code="test-code",
         )
 
         # 两条断言缺一不可：右边那条证明调用点确实走了域解析器（零配置下它逐字等于旧函数），
@@ -899,7 +911,13 @@ class TestInjectionCallSiteContract:
         """
         captured: dict[str, Any] = {}
 
-        async def fake_batch(workspace_id: int, requests: Any, *, scope: Any = None) -> list[list[Any]]:
+        async def fake_batch(
+            workspace_id: int,
+            requests: Any,
+            *,
+            scope: Any = None,
+            record_access: bool = True,
+        ) -> list[list[Any]]:
             captured["scope"] = scope
             return [[] for _ in requests]
 
@@ -914,6 +932,7 @@ class TestInjectionCallSiteContract:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel("inst_a", preset_id=42),
+            one_time_code="test-code",
         )
 
         # 断言落在**真的传下去的那个值**上：`None` 表示"这一维不过滤"，也就是泄露
@@ -935,6 +954,7 @@ class TestInjectionCallSiteContract:
             requests: Any,
             *,
             scope: Any = None,
+            record_access: bool = True,
         ) -> list[list[Any]]:
             captured["scope"] = scope
             return [[] for _ in requests]
@@ -950,6 +970,7 @@ class TestInjectionCallSiteContract:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel(""),
+            one_time_code="test-code",
         )
 
         assert captured["scope"].allowed_instance_keys is None
@@ -973,6 +994,7 @@ class TestInjectionCallSiteContract:
             requests: Any,
             *,
             scope: Any = None,
+            record_access: bool = True,
         ) -> list[list[Any]]:
             return [[boosted], [damped]]
 
@@ -992,6 +1014,7 @@ class TestInjectionCallSiteContract:
             workspace_id=WORKSPACE_ID,
             recent_messages=[],
             channel=_StubChannel(""),
+            one_time_code="test-code",
         )
 
         assert boosted.effective_weight == pytest.approx(2.0)

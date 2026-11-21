@@ -32,6 +32,7 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.core.os_env import OsEnv
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.message_service import message_service
+from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text
 
 from .base import EMAIL_PROVIDER_CONFIGS
 from .clients import EmailClient, GmailApiClient, ImapSmtpOAuth2Client, ImapSmtpPasswordClient, MicrosoftGraphMailClient
@@ -39,6 +40,11 @@ from .config import EmailAccount, EmailConfig
 from .routers import router, set_email_adapter
 
 logger = get_sub_logger("adapter.email")
+
+# 新邮件通知的正文上限：发件人、主题、附件名都由任何一个能给这个邮箱写信的人控制，整段正文限长，避免单封邮件撑爆上下文
+MAX_EMAIL_NOTICE_BODY_CHARS = 4000
+
+
 def decode_mime_words(s):
     """解码MIME编码的字符串"""
     if not s:
@@ -331,6 +337,10 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
     ) -> None:
         """发送新邮件通知
 
+        发件人名、发件地址、主题、日期与附件名都由任何能给这个邮箱写信的人控制，
+        拼进 SYSTEM 就等于让陌生人以“系统说的话”注入指令，所以只进不可信正文；
+        可信摘要只放宿主写的引导语与压成单行的账户、UID、聊天标识。
+
         Args:
             account_username: 邮箱账户用户名
             chat_id: 聊天ID
@@ -340,26 +350,33 @@ class EmailAdapter(BaseAdapter[EmailConfig]):
         if not (self.config.EMAIL_NOTIFICATIONS_ENABLED and self.config.EMAIL_NOTIFICATIONS_CHAT_KEY):
             return
 
-        notify_chat_key = self.config.EMAIL_NOTIFICATIONS_CHAT_KEY
         attachment_info = (
             f"\n附件: 有 {len(parsed.attachments)} 个附件\n附件名称: {', '.join(parsed.attachments)}"
             if parsed.attachments
             else "\n附件: 无附件"
         )
 
-        notify_text = (
-            f"[邮箱新邮件通知]\n"
-            f"收件账户: {account_username}\n"
-            f"邮件UID: {self._email_id_text(email_id)}\n"
+        body = sanitize_block_text(
             f"发件人: {parsed.sender_name} <{parsed.sender_addr}>\n"
             f"主题: {parsed.subject}\n"
             f"日期: {parsed.date_str}"
-            f"{attachment_info}\n\n"
-            f"邮件内容已同步到聊天 {chat_id}，你可以使用 get_email_content 方法获取完整内容。"
+            f"{attachment_info}",
+            MAX_EMAIL_NOTICE_BODY_CHARS,
         )
-        await message_service.push_system_message(
-            chat_key=notify_chat_key,
-            agent_messages=notify_text,
+
+        result = UntrustedToolResult(
+            kind="EmailNotice",
+            body=body,
+            summary=(
+                f"[邮箱新邮件通知] 收件账户 {echo_inline(account_username)} 收到一封新邮件"
+                f"（UID {echo_inline(self._email_id_text(email_id))}），发件人、主题、日期与附件见下方不可信块。"
+                f"邮件内容已同步到聊天 {echo_inline(chat_id)}，你可以使用 get_email_content 方法获取完整内容。"
+            ),
+            attrs={"attachments": len(parsed.attachments)},
+        )
+        await message_service.push_untrusted_message(
+            chat_key=self.config.EMAIL_NOTIFICATIONS_CHAT_KEY,
+            result=result,
             trigger_agent=True,
         )
 

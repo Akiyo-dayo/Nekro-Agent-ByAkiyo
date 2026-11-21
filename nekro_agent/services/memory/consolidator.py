@@ -10,11 +10,12 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import json5
+import openai
 from tortoise.timezone import now as db_now
 
 from nekro_agent.core.config import config
@@ -131,6 +132,12 @@ class ConsolidationResult:
     messages_processed: int = 0
     last_processed_message_db_id: int = 0
     errors: list[str] | None = None
+    # 这一批为什么被跳过 / 失败，供调用方区分「已推进」与「原地重试」
+    skipped_reason: str | None = None
+    failed_reason: str | None = None
+    retry_after: str | None = None
+    # 这一轮只初始化了首次沉淀的游标，没有取消息、没有调模型
+    cursor_initialized: bool = False
 
 
 class MemoryResponseParseError(RuntimeError):
@@ -139,6 +146,65 @@ class MemoryResponseParseError(RuntimeError):
     def __init__(self, classification: str, message: str):
         super().__init__(message)
         self.classification = classification
+
+
+class ConsolidationBatchSkipped(RuntimeError):
+    """这一批不可能成功，跳过并推进进度。
+
+    内容被拦、供应商拒答、解析重试用尽都属于这一类：同样的输入重发多少次结果都一样，
+    原样留在游标上只会让后面所有消息永远排在这一批后面。
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class ConsolidationBatchFailed(RuntimeError):
+    """临时故障，不推进进度，下次再试。
+
+    鉴权、限流、超时、5xx 都是「现在不行、以后可能行」，推进游标等于把这一段时间的
+    对话永久丢掉。
+    """
+
+    def __init__(self, reason: str, original: Exception | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.original_error = original
+
+
+def _classify_llm_failure(exc: Exception) -> str:
+    """把沉淀模型调用的失败归到「能不能原地重试」的那几类里。
+
+    只用于决定进度推不推进与日志分类，不改变异常本身的传播方式。
+    """
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return "auth"
+    if isinstance(exc, openai.RateLimitError):
+        return "rate_limit"
+    # `APITimeoutError` 是 `APIConnectionError` 的子类，两类都按超时处理
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return "timeout"
+    if isinstance(exc, openai.InternalServerError):
+        return "server_error"
+    if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
+        return "server_error"
+    return "unknown"
+
+
+def _parse_retry_after(value: Any) -> datetime | None:
+    """解析进度里存的 ISO 退避截止时间；格式不对就当作没有退避。
+
+    写进去的是 `datetime.now().isoformat()`（本地朴素时间），这里统一去掉时区再比较，
+    避免历史数据带偏移量时在比较处抛 `TypeError`。
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None)
 
 
 class EpisodicConsolidator:
@@ -186,8 +252,16 @@ class EpisodicConsolidator:
         except json.JSONDecodeError:
             return {}
 
-    async def _mark_consolidated(self, chat_key: str, last_message_db_id: int) -> None:
-        """记录最近一次已沉淀到的消息边界。"""
+    async def _update_memory_state(
+        self,
+        chat_key: str,
+        mutate: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """读取频道 data 里的 memory_state，交给 `mutate` 原地修改后写回。
+
+        进度、跳过计数、失败计数与退避时间都落在同一个字典里，读改写只留这一处，
+        避免两个调用点各写一份「解析 data → 取 memory_state → 保存」。
+        """
         channel = await self._load_channel(chat_key)
         if channel is None:
             return
@@ -202,12 +276,31 @@ class EpisodicConsolidator:
         memory_state = data.get("memory_state", {})
         if not isinstance(memory_state, dict):
             memory_state = {}
-        memory_state["last_consolidated_message_db_id"] = last_message_db_id
-        memory_state["last_consolidated_at"] = datetime.now().isoformat()
+        mutate(memory_state)
         data["memory_state"] = memory_state
 
         channel.data = json.dumps(data, ensure_ascii=False)
         await channel.save(update_fields=["data", "update_time"])
+
+    @staticmethod
+    def _advance_cursor(memory_state: dict[str, Any], last_message_db_id: int) -> None:
+        """把游标推到这一批的最后一条，顺带清掉临时故障的计数与退避。
+
+        游标能推进，说明模型这一轮应答了（哪怕是拒答或解析不出），「连续失败」就该从头算；
+        跳过计数是历史记录，不在这里清。
+        """
+        memory_state["last_consolidated_message_db_id"] = last_message_db_id
+        memory_state["last_consolidated_at"] = datetime.now().isoformat()
+        if "consecutive_failures" in memory_state:
+            memory_state["consecutive_failures"] = 0
+        memory_state.pop("consolidation_retry_after", None)
+
+    async def _mark_consolidated(self, chat_key: str, last_message_db_id: int) -> None:
+        """记录最近一次已沉淀到的消息边界。"""
+        await self._update_memory_state(
+            chat_key,
+            lambda memory_state: self._advance_cursor(memory_state, last_message_db_id),
+        )
 
     async def load_persona_context(self, chat_key: str) -> PersonaContext | None:
         """加载人设上下文
@@ -281,6 +374,49 @@ class EpisodicConsolidator:
         result = ConsolidationResult()
 
         try:
+            channel: DBChatChannel | None = None
+            memory_state: dict[str, Any] = {}
+            # 退避期内直接返回：不取消息、不调模型，等下次调度再试
+            if persist_progress:
+                channel = await self._load_channel(chat_key)
+                if channel is not None:
+                    memory_state = self._read_memory_state(channel)
+                    retry_after = _parse_retry_after(memory_state.get("consolidation_retry_after"))
+                    if retry_after is not None and retry_after > datetime.now():
+                        logger.debug(
+                            f"记忆沉淀处于退避期，跳过本轮: chat_key={chat_key}, retry_after={retry_after.isoformat()}",
+                        )
+                        result.failed_reason = "backoff"
+                        result.retry_after = retry_after.isoformat()
+                        return result
+
+            # 首次沉淀初始化游标：没有游标键就从「当前最新消息」开始，不回溯开启之前的历史。
+            # 临时故障只写了失败计数、同样没有游标键，所以判键而不是判整个 memory_state 是否为空。
+            # 重建自己管游标（persist_progress=False），显式传了起点的调用也由调用方管，都不初始化。
+            if (
+                persist_progress
+                and start_after_db_id is None
+                and channel is not None
+                and "last_consolidated_message_db_id" not in memory_state
+            ):
+                latest = await self._latest_message_db_id(chat_key)
+                if isinstance(max_message_db_id, int) and max_message_db_id > 0:
+                    latest = min(latest, max_message_db_id)
+                started_at = datetime.now().isoformat()
+
+                def init_cursor(state: dict[str, Any]) -> None:
+                    state["last_consolidated_message_db_id"] = latest
+                    state["consolidation_start_message_db_id"] = latest
+                    state["consolidation_started_at"] = started_at
+
+                await self._update_memory_state(chat_key, init_cursor)
+                logger.info(
+                    f"记忆沉淀首次初始化游标: chat_key={chat_key}, start_message_db_id={latest}; "
+                    "不回溯开启之前的历史，要回溯走重建",
+                )
+                result.cursor_initialized = True
+                return result
+
             # 加载人设上下文
             await self.load_persona_context(chat_key)
 
@@ -300,7 +436,73 @@ class EpisodicConsolidator:
             last_message_db_id = messages[-1].id
 
             # 提炼记忆
-            memory_items = await self._extract_memories(messages)
+            try:
+                memory_items = await self._extract_memories(messages)
+            except ConsolidationBatchSkipped as e:
+                reason = e.reason
+                # 这一批不可能成功：推进进度，否则后面的消息永远排在它后面
+                if persist_progress:
+                    now = datetime.now()
+
+                    def record_skip(memory_state: dict[str, Any]) -> None:
+                        # 推进游标与记跳过计数合成一次写盘
+                        self._advance_cursor(memory_state, last_message_db_id)
+                        memory_state["skipped_batches"] = int(memory_state.get("skipped_batches", 0)) + 1
+                        memory_state["skipped_messages"] = int(memory_state.get("skipped_messages", 0)) + len(messages)
+                        memory_state["last_skip_at"] = now.isoformat()
+                        memory_state["last_skip_reason"] = reason
+
+                    await self._update_memory_state(chat_key, record_skip)
+                logger.warning(
+                    f"记忆沉淀跳过这一批: chat_key={chat_key}, reason={reason}, "
+                    f"message_range={messages[0].id}-{messages[-1].id}",
+                )
+                result.skipped_reason = reason
+                return result
+            except ConsolidationBatchFailed as e:
+                reason = e.reason
+                # 临时故障：进度原地不动，整批下次重来
+                if persist_progress:
+                    now = datetime.now()
+                    failures = 0
+                    retry_after_iso: str | None = None
+
+                    def record_failure(memory_state: dict[str, Any]) -> None:
+                        nonlocal failures, retry_after_iso
+                        failures = int(memory_state.get("consecutive_failures", 0)) + 1
+                        memory_state["consecutive_failures"] = failures
+                        memory_state["last_failure_at"] = now.isoformat()
+                        memory_state["last_failure_reason"] = reason
+                        if failures >= 3:
+                            # 30 分钟起步，每多一次失败翻倍，封顶 6 小时
+                            delay_seconds = min(30 * 60 * 2 ** (failures - 3), 6 * 60 * 60)
+                            retry_after_iso = (now + timedelta(seconds=delay_seconds)).isoformat()
+                            memory_state["consolidation_retry_after"] = retry_after_iso
+
+                    await self._update_memory_state(chat_key, record_failure)
+                    result.retry_after = retry_after_iso
+                    if failures == 3:
+                        logger.error(
+                            f"记忆沉淀连续 {failures} 次失败，已退避到 {retry_after_iso}: "
+                            f"chat_key={chat_key}, reason={reason}",
+                        )
+                    else:
+                        logger.warning(
+                            f"记忆沉淀失败（连续 {failures} 次），进度不推进: "
+                            f"chat_key={chat_key}, reason={reason}",
+                        )
+                else:
+                    logger.warning(
+                        f"记忆沉淀失败，进度不推进: chat_key={chat_key}, reason={reason}",
+                    )
+                if result.errors is None:
+                    result.errors = []
+                original = e.original_error
+                result.errors.append(str(original) if original is not None else str(e))
+                result.failed_reason = reason
+                return result
+
+            # 提炼成功（含正常返回空列表）：推进游标时顺带清掉失败计数与退避，历史跳过计数保留
             if not memory_items:
                 if persist_progress:
                     await self._mark_consolidated(chat_key, last_message_db_id)
@@ -348,6 +550,14 @@ class EpisodicConsolidator:
             logger.exception(f"沉淀过程失败: {e}")
             result.errors = [str(e)]
             return result
+
+    async def _latest_message_db_id(self, chat_key: str) -> int:
+        """取频道当前最大的消息 id，没有消息返回 0。
+
+        单独成方法是为了让测试能打桩「频道此刻的最大消息 id」。
+        """
+        latest = await DBChatMessage.filter(chat_key=chat_key).order_by("-id").first()
+        return latest.id if latest is not None else 0
 
     async def _fetch_messages(
         self,
@@ -440,6 +650,9 @@ class EpisodicConsolidator:
 
 如果没有值得记住的内容，返回空数组：{{"memories": []}}"""
 
+        from nekro_agent.services.agent.openai import LLMContentBlockedError
+        from nekro_agent.services.agent.provider_refusal import detect_provider_refusal
+
         parse_retries = max(0, int(config.MEMORY_CONSOLIDATION_PARSE_MAX_RETRIES))
         for attempt in range(parse_retries + 1):
             try:
@@ -452,13 +665,23 @@ class EpisodicConsolidator:
                         use_fallback_model,
                     )
                 response = await self._call_llm(prompt, use_fallback_model=use_fallback_model)
+                # 供应商把拒绝页当成普通正文返回时，解析重试没有任何意义
+                refusal = detect_provider_refusal(response)
+                if refusal is not None:
+                    logger.warning(f"记忆沉淀响应是供应商拒答页，跳过这一批: provider={refusal.provider}")
+                    raise ConsolidationBatchSkipped("provider_refusal")
                 return await self._parse_memory_response(response)
+            except ConsolidationBatchSkipped:
+                raise
+            except LLMContentBlockedError as e:
+                logger.warning(f"记忆沉淀请求被内容策略拦截，跳过这一批: {e}")
+                raise ConsolidationBatchSkipped("content_blocked") from e
             except MemoryResponseParseError as e:
                 if attempt >= parse_retries:
                     logger.warning(
                         f"记忆响应解析在重试后仍失败: classification={e.classification}, attempts={attempt + 1}"
                     )
-                    return []
+                    raise ConsolidationBatchSkipped("parse_failed") from e
                 delay = min(2.0, 0.5 * (attempt + 1))
                 logger.warning(
                     f"记忆响应解析失败，准备重新请求 LLM: classification={e.classification}, "
@@ -467,8 +690,9 @@ class EpisodicConsolidator:
                 )
                 await asyncio.sleep(delay)
             except Exception as e:
-                logger.exception(f"LLM 提取记忆失败: {e}")
-                return []
+                reason = _classify_llm_failure(e)
+                logger.exception(f"LLM 提取记忆失败: reason={reason}, error={e}")
+                raise ConsolidationBatchFailed(reason, original=e) from e
         return []
 
     def _build_conversation_text(self, messages: list[DBChatMessage]) -> str:

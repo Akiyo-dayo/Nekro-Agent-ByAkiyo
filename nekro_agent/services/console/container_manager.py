@@ -66,6 +66,7 @@ DNS 单段最长 63。派生前缀最长 22 + 模板 13 + 实例标识最长 32 
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import random
@@ -1355,6 +1356,23 @@ _ENTRY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _MIN_PORT = 1
 _MAX_PORT = 65535
 
+_UNSAFE_URL_CHARS = re.compile(r"[\x00-\x20\x7f\\]")
+"""空白、控制字符、DEL 与反斜杠：WHATWG 会删掉制表符 / 换行、把 `\\` 当成 `/`，其他解析器不会"""
+
+_OUTBOUND_URL_PATTERN = re.compile(
+    r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*)://"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*\.?)"
+    r"(?::(?P<port>[0-9]{1,5}))?"
+    r"(?=[/?#]|$)",
+)
+"""协议 `://` 主机 [:端口] 之后只能紧跟 `/`、`?`、`#` 或结尾。主机只能是 ASCII 域名（标签只含字母数字下划线短横线，
+至多一个末尾点）或方括号包起来的 IPv6；用户名密码（`@`）、多余斜杠、百分号、非 ASCII、空端口都匹配不上"""
+
+_NUMERIC_TAIL_PATTERN = re.compile(r"(?:^|\.)(?:0[xX][0-9A-Fa-f]*|[0-9]+)\.?$")
+"""WHATWG 把「最后一段是数字」的主机一律按 IPv4 解析（十进制整数、十六进制、八进制、简写都认）"""
+
+_CANONICAL_IPV4_PATTERN = re.compile(r"^(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}$")
+
 _NAPCAT_FIELDS_BY_TYPE: Dict[NetworkEntryType, Tuple[str, ...]] = {
     NetworkEntryType.WS_CLIENT: (
         "enable",
@@ -1691,9 +1709,52 @@ def _validate_entry_shape(entry: NetworkEntry, index: int) -> None:
         return
 
     schemes = _CLIENT_URL_SCHEMES[entry.type]
-    parsed = urlparse(entry.url)
+    try:
+        parsed = urlparse(entry.url)
+    except ValueError as e:
+        raise ValidationError(
+            reason=f"{label}的地址 '{entry.url}' 非法，必须是完整的 {' / '.join(f'{s}://' for s in schemes)} 地址"
+        ) from e
     if parsed.scheme.lower() not in schemes or not parsed.hostname:
         raise ValidationError(reason=f"{label}的地址 '{entry.url}' 非法，必须是完整的 {' / '.join(f'{s}://' for s in schemes)} 地址")
+
+
+def _split_outbound_client_url(url: str) -> Tuple[str, str, Optional[int]]:
+    """按严格形状拆出 (协议, 主机, 端口)，协议与主机已转小写
+
+    NapCat 连接时按 WHATWG URL 规则解析地址，而校验用的是 Python / httpx 的解析，两边对反斜杠、
+    用户名密码、百分号编码主机、数字简写主机（十进制整数、`127.1`、`0x7f.0.0.1`）、
+    非 ASCII 主机、夹带制表符的地址会得出不同的主机，校验通过的地址 NapCat 可能连去别处。
+    所以只放行所有解析器都得出同一个主机的形状，其余一律拒绝。
+
+    Raises:
+        ValueError: 形状有歧义或不受支持，文案可直接展示给用户
+    """
+    if _UNSAFE_URL_CHARS.search(url):
+        raise ValueError("地址里不能有空白、控制字符或反斜杠")
+    match = _OUTBOUND_URL_PATTERN.match(url)
+    if match is None:
+        raise ValueError(
+            "主机部分只能是纯 ASCII 域名（中文域名请写成 xn-- 形式）、标准 x.x.x.x 或方括号包起来的 IPv6，"
+            "不能带用户名密码（@）、多余斜杠、百分号或空端口",
+        )
+    scheme = match["scheme"].lower()
+    host = match["host"].lower()
+    port_text = match["port"]
+    port = int(port_text) if port_text is not None else None
+    if port is not None and not _MIN_PORT <= port <= _MAX_PORT:
+        raise ValueError(f"端口 {port_text} 超出范围（{_MIN_PORT}-{_MAX_PORT}）")
+    if host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError as e:
+            raise ValueError("方括号里不是合法的 IPv6 地址") from e
+    elif _NUMERIC_TAIL_PATTERN.search(host):
+        if _CANONICAL_IPV4_PATTERN.match(host) is None or any(int(part) > 255 for part in host.split(".")):
+            raise ValueError(
+                "数字形式的主机必须写成标准的 x.x.x.x（每段 0-255、不带前导 0），不接受十六进制、八进制、简写与末尾点"
+            )
+    return scheme, host, port
 
 
 async def _assert_outbound_url_safe(entry: NetworkEntry, index: int) -> None:
@@ -1707,16 +1768,29 @@ async def _assert_outbound_url_safe(entry: NetworkEntry, index: int) -> None:
     托管条目不走这里——它的地址指向 NA 自身（容器网络内的服务名，必然是私网地址），
     调用方传什么都会在 `_normalize_entries` 里被后端生成值覆盖，所以既没有校验的必要，
     也不存在「打个托管标记就绕过校验」的缝隙：绕过的代价是地址被丢弃。
+
+    NapCat 按 WHATWG 规则解析地址，而校验用的是 Python / httpx 的解析，同一个字符串可以
+    得出不同的主机。因此先按严格形状拆出主机与端口，再用它们重拼一个干净的探测地址交给
+    公网校验：路径、查询、片段不参与判定，校验的主机就恒等于形状检查拆出来的那个。
     """
     if entry.managed_by_nekro or entry.type not in _CLIENT_URL_SCHEMES:
         return
 
-    parsed = urlparse(entry.url)
-    probe_scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme.lower(), parsed.scheme.lower())
+    prefix = f"第 {index + 1} 条连接的地址不被允许: "
     try:
-        await assert_download_url_safe(parsed._replace(scheme=probe_scheme).geturl())
+        scheme, host, port = _split_outbound_client_url(entry.url)
+    except ValueError as e:
+        raise ValidationError(reason=f"{prefix}{e}") from e
+    if scheme not in _CLIENT_URL_SCHEMES[entry.type]:
+        raise ValidationError(reason=f"{prefix}协议 {scheme}:// 不适用于该类型的连接")
+
+    # 只把拆出来的主机和端口交给校验：路径、查询、片段不参与判定，也就没有「校验看到的主机」与「实际连接的主机」不一致的缝隙
+    probe_scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
+    probe_url = f"{probe_scheme}://{host}{f':{port}' if port is not None else ''}/"
+    try:
+        await assert_download_url_safe(probe_url)
     except UnsafeDownloadUrlError as e:
-        raise ValidationError(reason=f"第 {index + 1} 条连接的地址不被允许: {e}") from e
+        raise ValidationError(reason=f"{prefix}{e}") from e
 
 
 async def _validate_entries(entries: List[NetworkEntry]) -> None:

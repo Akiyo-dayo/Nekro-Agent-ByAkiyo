@@ -22,6 +22,7 @@ from nekro_agent.services.agent.provider_refusal import (
     normalize_for_match,
 )
 from nekro_agent.services.agent.session_token import attach_untrusted_result, register_session_token
+from nekro_agent.services.memory.round_recall import commit_round_recall, discard_round_recall
 from nekro_agent.services.model_group_service import enforce_channel_model_group_scope
 from nekro_agent.services.plugin.call_priority import build_plugin_call_priority_rules
 from nekro_agent.services.plugin.prompt_activation import build_plugin_activation_rules
@@ -506,12 +507,15 @@ async def _run_agent_with_affection_suppression(
     db_chat_channel: DBChatChannel,
     one_time_code: str,
 ) -> None:
-    """跑一轮，并按结果开关这个频道的好感描述抑制
+    """跑一轮，并按结果开关这个频道的好感描述抑制与记忆强化
 
     一轮以内容审核拦截 / 供应商拒答收尾：给频道记标记，抑制期内好感块只注入昵称与阶段，
-    不注入两段描述——如果是描述里混进了会被拦的内容，下一轮就不会再被同一段描述锁住。
-    一轮正常收尾：清掉标记。其余失败（超时、无进展、没写代码……）与描述无关，不动标记。
-    标记只在进程内，重启即失，见 `services/affection/suppression.py`。
+    不注入两段描述——如果是描述里混进了会被拦的内容，下一轮就不会再被同一段描述锁住；
+    同理，本轮注入的记忆不强化，下一轮也不注入记忆块。一轮正常收尾：清掉标记，并把本轮
+    注入过的记忆一次性补记强化。其余失败（超时、无进展、没写代码……）与描述无关，不动标记，
+    但同样不强化——只有正常收尾才算「这些记忆被用上了」。
+    标记与召回记录都只在进程内，重启即失，见 `services/affection/suppression.py` 与
+    `services/memory/round_recall.py`。
     """
     try:
         await _run_agent_in_instance_scope(
@@ -524,9 +528,17 @@ async def _run_agent_with_affection_suppression(
     except (AllLLMRequestsFailedError, AgentProviderRefusalError) as error:
         if _round_was_blocked(error):
             suppress_narrative(chat_key)
-            logger.info(f"[run_agent] {chat_key} | 本轮被内容审核拦下或被供应商拒答，好感描述暂不注入这个频道")
+            logger.info(
+                f"[run_agent] {chat_key} | 本轮被内容审核拦下或被供应商拒答，好感描述暂不注入这个频道；"
+                "本轮注入的记忆不强化，下一轮也不注入记忆块",
+            )
         raise
-    lift_narrative_suppression(chat_key)
+    else:
+        lift_narrative_suppression(chat_key)
+        await commit_round_recall(one_time_code)
+    finally:
+        # 成功路径上已被 `commit` 弹出，这里是空操作；任何失败路径都在这里丢掉本轮记录。
+        discard_round_recall(one_time_code)
 
 
 async def _run_agent_in_instance_scope(
@@ -869,18 +881,18 @@ async def _run_agent_in_instance_scope(
         # `render_history_data`）**只为喂那次请求而存在**，一并跳过。
         #
         # ⚠️ **`render_history_data` 远不止「一趟 DB 查询 + 模板渲染」**，它自己就带外部副作用，
-        # 所以「跳过它」这件事必须单独交代清楚（复核修正：原注释断言这一段「没有任何对外副作用」，
-        # 那是错的）。它一路展开是 `_inject_memory_context` → `_build_enhanced_memory_recall_plan`
-        # → **又一次 `gen_openai_chat_response`**（`LLMUsageScene.HISTORY_PLAN`，走计费与用量记账）
-        # → `retrieve_memories_batch`（每条 query 一次 embedding + 一次 Qdrant 查询）
-        # → `record_access` → `reinforce()`，那是对 `base_weight` / `last_reinforced_at` 的
-        # **读改写落库**外加强化日志行。也就是说开了增强检索的部署，一个烧满的回合改造前浪费的是
-        # **两次** LLM 请求（迭代请求 + 规划请求），不是一次。
+        # 所以「跳过它」这件事必须单独交代清楚。它一路展开是 `_inject_memory_context`
+        # → `_build_enhanced_memory_recall_plan` → **又一次 `gen_openai_chat_response`**
+        # （`LLMUsageScene.HISTORY_PLAN`，走计费与用量记账）→ `retrieve_memories_batch`
+        # （每条 query 一次 embedding + 一次 Qdrant 查询）→ `stage_round_recall`（只记录，
+        # 不写库）。也就是说开了增强检索的部署，一个烧满的回合改造前浪费的是**两次** LLM
+        # 请求（迭代请求 + 规划请求），不是一次。
         #
-        # 跳过它们**不是回归而是修正**：那次强化记的是「这条记忆被用于生成某个回复」，
-        # 而那个回复从来没有被消费过——把它记进权重等于凭空延长一条记忆的寿命。
+        # 跳过它们**不是回归而是修正**：那次渲染的结果从来没有进沙盒、没有被消费过，现在它
+        # 也不再强化——没被消费的渲染本来就不该按「这条记忆被用上了」记账。跳过它省下的正是
+        # 规划请求与检索这两段开销。
         # 反过来说，这也意味着 `break` 的**位置**是有含义的：往后挪一行就把这两次请求与那批
-        # 强化写库全请回来，而请求计数一次都不会变。用例因此**单独数 `render_history_data`
+        # 检索全请回来，而请求计数一次都不会变。用例因此**单独数 `render_history_data`
         # 的调用次数**（`TestNoUnconsumedTailRequest::test_the_skipped_assembly_is_actually_skipped`），
         # 只数 `llm_calls` 的话这个变异会活着。
         #

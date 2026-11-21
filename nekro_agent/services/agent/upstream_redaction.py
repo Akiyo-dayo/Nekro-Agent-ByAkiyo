@@ -62,6 +62,7 @@ from __future__ import annotations
 import traceback
 from typing import FrozenSet, Iterable, Optional
 
+from nekro_agent.core.cc_model_presets import cc_presets_store
 from nekro_agent.services.sandbox.credential_guard import collect_platform_secrets
 from nekro_agent.tools.redaction import redact_credentials
 
@@ -99,6 +100,26 @@ def redact_upstream_text(text: str, secret_values: Optional[Iterable[str]] = Non
     return redact_credentials(text, literal_secrets=values)
 
 
+def redact_cc_failure_text(text: object) -> str:
+    """CC 工作区失败信息的脱敏出口
+
+    CC 报回的错误文本、SSE 错误事件与异常文本会进模型上下文、工作区通讯日志与运行状态推送，
+    后两处租户后台看得到。CC 模型预设存在独立的 `configs/cc-model-presets.json` 里，不在配置树上，
+    `collect_platform_secrets()` 收不到，这里显式并进按值的集合；按形态的规则照旧。
+
+    **只用于失败信息**：按形态的规则会把正常输出里的 `token = "…"` 也打掉。插件的委托路径与
+    后台直发路径用的是这同一个函数。
+
+    Args:
+        text: 失败信息；`None` 当空串，其他类型先转成字符串（CC 报回的字段类型不可信）
+
+    Returns:
+        脱敏后的文本
+    """
+    raw = "" if text is None else str(text)
+    return redact_upstream_text(raw, collect_llm_secret_values(*cc_presets_store.secret_values()))
+
+
 def format_redacted_traceback(exc: BaseException, secret_values: Optional[Iterable[str]] = None) -> str:
     """把异常渲染成**不含局部变量**的 traceback 文本并脱敏
 
@@ -120,5 +141,6 @@ def format_redacted_traceback(exc: BaseException, secret_values: Optional[Iterab
 __all__ = [
     "collect_llm_secret_values",
     "format_redacted_traceback",
+    "redact_cc_failure_text",
     "redact_upstream_text",
 ]

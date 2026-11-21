@@ -377,9 +377,24 @@ async def bind_tenant_instances(
     record_instances_exposure(
         [*stale_rows, *instances], reason=f"租户 {tenant.id} 的实例归属变更", refuse_on_failure=True,
     )
+    # 划入 / 收回租户都会让实例名下频道绑着的工作区变成非平台方归属：同样先记后改，记不下来就拒绝。
+    # 收回之后工作区重新算成平台方，前租户手里那张网页聊天令牌就又能用了，而全量重建补不回它
+    from nekro_agent.services.mcp.web_chat_workspace_taint import taint_workspaces_bound_to_instance_keys
+
+    await taint_workspaces_bound_to_instance_keys(
+        [*released, *wanted],
+        reason=f"租户 {tenant.id} 的实例归属变更",
+        refuse_on_failure=True,
+    )
     await stale.update(tenant_id=None)
     if wanted:
         await DBAdapterInstance.filter(instance_key__in=wanted).update(tenant_id=tenant.id)
+        # 改库后再补一遍：上面置位与改库之间新绑到这些实例频道上的工作区，绑定那一侧查到的还是平台方。
+        # 库已经改了，这一遍记不下来不再拒绝，记录会置为待重建（判定一律不合格）
+        try:
+            await taint_workspaces_bound_to_instance_keys(wanted, reason=f"租户 {tenant.id} 的实例归属变更后复核")
+        except Exception as e:  # noqa: BLE001 - 库已改，补记失败只记警告
+            logger.warning(f"租户 {tenant.id} 的实例归属变更后补记网页聊天 MCP 工作区标记失败: {e}")
 
     # 归属真的变了的那些实例必须退出它此前所在的记忆/好感域，否则就是跨租户串域：
     # 域的归属校验只在"加入实例组的那一刻"成立（`assert_instance_joinable`），

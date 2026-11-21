@@ -21,7 +21,12 @@ from PIL import Image
 from nekro_agent.core import logger
 from nekro_agent.core.config import CoreConfig
 from nekro_agent.core.os_env import USER_UPLOAD_DIR, OsEnv
-from nekro_agent.tools.path_convertor import is_url_path, sanitize_chat_key_for_path
+from nekro_agent.tools.path_convertor import (
+    UnsafeUploadPathError,
+    is_url_path,
+    safe_upload_file_name,
+    sanitize_chat_key_for_path,
+)
 
 _APP_VERSION: str = ""
 
@@ -277,7 +282,7 @@ async def assert_tenant_endpoint_url_safe(url: str) -> None:
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
 # `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求触发发布的 git tag 与它一致（标签写法见 publish.yml）。
-FORK_VERSION = "0.4.4"
+FORK_VERSION = "0.4.5"
 FORK_AUTHOR = "Akiyo_dayo"
 
 # 本分支代码所基于的上游 NekroAgent 发布版，只用于署名「基于 NekroAgent 某版本」。
@@ -425,30 +430,6 @@ async def _fetch_following_redirects(client: httpx.AsyncClient, url: str) -> byt
     # 并不是所有调用方都会打印下载异常，这里自己留一条；只记主机名
     logger.warning(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次，已放弃: {httpx.URL(url).host}")
     raise UnsafeDownloadUrlError(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次")
-
-
-class UnsafeUploadPathError(ValueError):
-    """落盘目标不在上传目录里"""
-
-
-# Windows 上有特殊含义的字符：`:` 是盘符与 NTFS 备用数据流，其余是保留字符
-_UPLOAD_NAME_FORBIDDEN_CHARS = frozenset('<>:"|?*')
-
-
-def safe_upload_file_name(file_name: str) -> str:
-    """把调用方给的文件名收成上传目录里的「一个文件名」
-
-    文件名常常来自外部：协议端上报的附件名、聊天平台里发件人自己起的文件名。原样拼进
-    `USER_UPLOAD_DIR/<会话>/` 的话，`../../x` 或一个绝对路径就能把文件写到上传目录之外
-    （`Path("a") / "/etc/x"` 直接得到 `/etc/x`）。这里只留最后一段（`/` 与 `\\` 都算分隔符），
-    去掉控制字符与 Windows 保留字符；收完是空串、`.` 或 `..` 时返回空串，调用方照旧退回按内容哈希命名。
-    """
-    name = str(file_name or "").replace("\\", "/").rsplit("/", 1)[-1]
-    name = "".join(char for char in name if char >= " " and char != "\x7f" and char not in _UPLOAD_NAME_FORBIDDEN_CHARS).strip()
-    if name in ("", ".", ".."):
-        return ""
-    # 按 UTF-8 字节截：文件系统的上限是 255 字节，按字符截时中文名可以超过它，写盘报错
-    return name.encode("utf-8")[:200].decode("utf-8", "ignore")
 
 
 def _upload_save_path(file_name: str, from_chat_key: str) -> Path:

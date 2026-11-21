@@ -456,6 +456,22 @@ async def migrate_instance_ownership(
     每个频道一个事务，实例级的记忆/人设扫尾另起一个事务。一个频道失败不回滚已完成的频道，
     因为「搬了一半」在本操作里是可恢复状态（重跑即可补齐），而把已完成的搬运回退成半旧半新才是更坏的状态。
     """
+    # 源或目标实例只要有一方归租户，源实例名下的频道搬走就会让它们绑着的工作区归属来回变：
+    # 先把这些工作区记进「曾经不归平台方」的标记，记不下来就拒绝这次迁移（与令牌曝光记录同一个失败方向）
+    from nekro_agent.services.mcp.web_chat_workspace_taint import (
+        instance_owner_tenant,
+        taint_workspaces_bound_to_instance_keys,
+    )
+
+    source_tenant = await instance_owner_tenant(adapter_key, source_instance_key)
+    target_tenant = await instance_owner_tenant(adapter_key, target_instance_key)
+    if source_tenant is not None or target_tenant is not None:
+        await taint_workspaces_bound_to_instance_keys(
+            [source_instance_key],
+            reason=f"频道迁移实例 {source_instance_key} -> {target_instance_key}",
+            refuse_on_failure=True,
+        )
+
     plan = await plan_instance_migration(adapter_key, source_instance_key, target_instance_key)
 
     moved: List[str] = []
@@ -483,6 +499,17 @@ async def migrate_instance_ownership(
 
     for source_name, count in (await _migrate_instance_scoped_rows(source_instance_key, target_instance_key)).items():
         counts[source_name] = counts.get(source_name, 0) + count
+
+    if target_tenant is not None:
+        # 搬完再补一遍目标实例：开头置位与搬运之间新绑到源实例频道上的工作区，随频道一起到了租户名下。
+        # 库已经改了，这一遍记不下来不再拒绝，记录会置为待重建（判定一律不合格）
+        try:
+            await taint_workspaces_bound_to_instance_keys(
+                [target_instance_key],
+                reason=f"频道迁移实例 {source_instance_key} -> {target_instance_key} 后复核",
+            )
+        except Exception as e:  # noqa: BLE001 - 库已改，补记失败只记警告
+            logger.warning(f"频道迁移后补记网页聊天 MCP 工作区标记失败: {e}")
 
     residual = await _count_instance_residual(adapter_key, source_instance_key)
     logger.warning(

@@ -61,6 +61,52 @@ def assert_path_within(base_dir: Path, target_path: Path) -> Path:
     return target_path
 
 
+class UnsafeUploadPathError(ValueError):
+    """落盘目标不在上传目录里"""
+
+
+# Windows 上有特殊含义的字符：`:` 是盘符与 NTFS 备用数据流，其余是保留字符
+_UPLOAD_NAME_FORBIDDEN_CHARS = frozenset('<>:"|?*')
+
+# Windows 的保留设备名：不管有没有后缀（`NUL.txt`）都会被当成设备，写入「成功」但没有文件。
+# `COM¹` 这类上标数字在较新的 Windows 上同样保留；`CONIN$` / `CONOUT$` 是控制台设备
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{device}{digit}" for device in ("COM", "LPT") for digit in "123456789¹²³"},
+)
+
+
+def _is_reserved_device_name(name: str) -> bool:
+    """文件名（第一个点之前的部分，去掉尾部空格）是不是 Windows 保留设备名，不分大小写"""
+    return name.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_RESERVED_DEVICE_NAMES
+
+
+def safe_upload_file_name(file_name: str) -> str:
+    """把调用方给的文件名收成上传目录里的「一个文件名」
+
+    文件名常常来自外部：协议端上报的附件名、聊天平台里发件人自己起的文件名。原样拼进
+    `USER_UPLOAD_DIR/<会话>/` 的话，`../../x` 或一个绝对路径就能把文件写到上传目录之外
+    （`Path("a") / "/etc/x"` 直接得到 `/etc/x`）。这里只留最后一段（`/` 与 `\\` 都算分隔符），
+    去掉控制字符与 Windows 保留字符；收完是空串时返回空串，调用方照旧退回按内容哈希命名。
+
+    同时收掉末尾的点和空格，并把 Windows 的保留设备名按空串处理：这两条与平台无关，在所有平台
+    上一视同仁，好让同一个文件名在 Linux 容器与 Windows 宿主上落成同一个名字。
+    """
+    name = str(file_name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(char for char in name if char >= " " and char != "\x7f" and char not in _UPLOAD_NAME_FORBIDDEN_CHARS)
+    # 按 UTF-8 字节截：文件系统的上限是 255 字节，按字符截时中文名可以超过它，写盘报错
+    name = name.strip().encode("utf-8")[:200].decode("utf-8", "ignore")
+    # Windows 会静默去掉文件名末尾的点和空格，名字与磁盘上的对不上；截断也可能留下尾部空格，所以放在截断之后，反复收到稳定
+    while True:
+        trimmed = name.strip().rstrip(". ")
+        if trimmed == name:
+            break
+        name = trimmed
+    if not name or _is_reserved_device_name(name):
+        return ""
+    return name
+
+
 # Linux 上已打开 fd 的符号链接目录
 PROC_FD_DIR = "/proc/self/fd"
 
@@ -362,15 +408,23 @@ def convert_filename_to_access_path(filename: str | Path, chat_key: str) -> Path
 def get_upload_file_path(from_chat_key: str, file_name: str = "", use_suffix: str = "", seed: str = "") -> str:
     """生成一个可用的上传文件路径
 
+    文件名会先经 `safe_upload_file_name` 清洗；落盘目标越出上传目录时抛 `UnsafeUploadPathError`。
+
     Args:
         from_chat_key (str): 聊天频道ID
         file_name (str): 文件名
         use_suffix (str): 文件后缀
     """
+    file_name = safe_upload_file_name(file_name)
     if not file_name:
         if not seed:
             seed = str(uuid.uuid4())
         file_name = f"{hashlib.md5(seed.encode()).hexdigest()}{use_suffix}"
-    save_path = Path(USER_UPLOAD_DIR) / sanitize_chat_key_for_path(from_chat_key) / Path(file_name)
+    base = Path(USER_UPLOAD_DIR)
+    save_path = base / sanitize_chat_key_for_path(from_chat_key) / file_name
+    # 文件名清洗管不到会话目录本身：会话目录是符号链接之类的情况要在这里兜底，异常类型与
+    # common_util 的四个落盘函数保持一致
+    if not save_path.resolve().is_relative_to(base.resolve()):
+        raise UnsafeUploadPathError("落盘目标不在上传目录里")
     save_path.parent.mkdir(parents=True, exist_ok=True)
     return str(save_path)

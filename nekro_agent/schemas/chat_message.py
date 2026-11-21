@@ -88,10 +88,11 @@ class ChatMessageSegmentFile(ChatMessageSegment):
 
         local_path, _file_name = await download_file(url, file_name=file_name, use_suffix=use_suffix, from_chat_key=from_chat_key)
 
+        # 落盘函数会清洗文件名，消息段要存实际落盘名，否则渲染给模型的沙盒路径会指向不存在的文件
         return cls(
             type=cls.get_segment_type(),
-            text=f"[{cls.get_segment_type().value.capitalize()}: {file_name or _file_name}]",
-            file_name=file_name or _file_name,
+            text=f"[{cls.get_segment_type().value.capitalize()}: {_file_name}]",
+            file_name=_file_name,
             local_path=local_path,
             remote_url=url,
         )
@@ -108,8 +109,8 @@ class ChatMessageSegmentFile(ChatMessageSegment):
 
         return cls(
             type=cls.get_segment_type(),
-            text=f"[{cls.get_segment_type().value.capitalize()}: {file_name or _file_name}]",
-            file_name=file_name or _file_name,
+            text=f"[{cls.get_segment_type().value.capitalize()}: {_file_name}]",
+            file_name=_file_name,
             local_path=local_path,
         )
 
@@ -196,8 +197,8 @@ class ChatMessageSegmentFile(ChatMessageSegment):
 
         return cls(
             type=cls.get_segment_type(),
-            text=f"[{cls.get_segment_type().value.capitalize()}: {file_name or _file_name}]",
-            file_name=file_name or _file_name,
+            text=f"[{cls.get_segment_type().value.capitalize()}: {_file_name}]",
+            file_name=_file_name,
             local_path=local_path,
         )
 
@@ -213,8 +214,8 @@ class ChatMessageSegmentFile(ChatMessageSegment):
 
         return cls(
             type=cls.get_segment_type(),
-            text=f"[{cls.get_segment_type().value.capitalize()}: {file_name or _file_name}]",
-            file_name=file_name or _file_name,
+            text=f"[{cls.get_segment_type().value.capitalize()}: {_file_name}]",
+            file_name=_file_name,
             local_path=local_path,
         )
 

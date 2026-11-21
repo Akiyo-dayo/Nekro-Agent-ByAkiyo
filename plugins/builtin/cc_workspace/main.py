@@ -47,6 +47,7 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.models.db_workspace_comm_log import DBWorkspaceCommLog
+from nekro_agent.services.agent.upstream_redaction import redact_cc_failure_text
 from nekro_agent.services.message_service import message_service
 from nekro_agent.services.plugin.task import AsyncTaskHandle, TaskCtl
 from nekro_agent.services.plugin.task import task as task_api
@@ -362,16 +363,24 @@ _cc_result_watcher_task: "asyncio.Task[None] | None" = None
 _WATCHER_INTERVAL: int = 30  # 秒；CC 结果最大投递延迟 ≈ 此值
 
 
+def _redact_cc_text(text: object) -> str:
+    """脱敏 CC 的失败信息（只用于失败信息，见 `redact_cc_failure_text`）
+
+    CC 报回的错误文本、SSE 错误事件与异常文本会进模型上下文、工作区通讯日志与运行状态推送，
+    后两处租户看得到。后台直发路径（`routers/workspaces.py`）用的是同一个函数。
+    """
+    return redact_cc_failure_text(text)
 
 
 async def _broadcast_error_comm_log(workspace_id: int, source_chat_key: str, content: str) -> None:
     """将错误信息写入 SYSTEM 方向 CommLog 并广播，使前端 CommTab 可以实时看到错误详情。"""
     try:
+        # 本插件的错误通讯日志都走这个出口，集中脱敏：租户后台看得到
         err_log = await DBWorkspaceCommLog.create(
             workspace_id=workspace_id,
             direction="SYSTEM",
             source_chat_key=source_chat_key,
-            content=content,
+            content=_redact_cc_text(content),
             is_streaming=False,
             task_id=f"cc_delegate:{source_chat_key}",
         )
@@ -502,26 +511,51 @@ async def _broadcast_cc_status(
         logger.warning("[cc_workspace] 全局 SSE 推送 CC_ACTIVE 失败: %s", _e)
 
 
-async def _deliver_pending_result(workspace: "DBWorkspace", item: dict, *, source: str) -> None:
+async def _deliver_pending_result(workspace: "DBWorkspace", item: object, *, source: str) -> None:
     """投递单条 CC 待处理结果：写通讯日志 + 广播 + 推送结果（不可信正文）并触发 Agent。
 
     内置去重机制：同一 (workspace_id, source_chat_key, result_id) 在 TTL 内不会重复投递，
     防止 SSE 实时路径和 Watcher 轮询路径的边缘时序导致重复触发 Agent。
 
+    目标频道必须是当前绑定在本工作区的频道：CC 报回的 ``source_chat_key`` 只当查询条件、
+    不当授权，否则能影响 CC 读到什么的人就能把结果投进别的租户的频道。
+
     Args:
         workspace: 工作区 ORM 对象
-        item:      CC /pending-results 返回的单条 dict
+        item:      CC /pending-results 返回的单条（应为 dict，类型不对就跳过）
         source:    投递来源标识（"startup" 或 "watcher"），仅用于日志/消息区分
     """
-    source_chat_key: str = item.get("source_chat_key", "")
-    result: str = item.get("result", "")
-    result_id: str = item.get("id", "")
-    is_error: bool = item.get("is_error", False)
-    error_code: str = item.get("error_code", "")
+    # 条目由 CC 容器报回，字段类型也不可信：类型不对就整条跳过，不能让一条坏数据在后面抛出来、
+    # 拖垮调用它的轮询循环（循环里每条另有兜底）
+    if not isinstance(item, dict):
+        logger.warning(f"[cc_workspace] 跳过格式不对的待投递结果({source})：{type(item).__name__}")
+        return
+    source_chat_key = item.get("source_chat_key")
+    result = item.get("result")
+    if not isinstance(source_chat_key, str) or not isinstance(result, str):
+        logger.warning(f"[cc_workspace] 跳过字段类型不对的待投递结果({source})：id={item.get('id')!r}")
+        return
+    result_id = str(item.get("id") or "")
+    is_error = bool(item.get("is_error", False))
+    error_code = "" if item.get("error_code") is None else str(item.get("error_code"))
+
+    if is_error:
+        # 失败信息会进模型上下文、工作区通讯日志与运行状态推送：先按凭据脱敏，非错误结果不动
+        result = _redact_cc_text(result)
+        error_code = _redact_cc_text(error_code)
 
     if not source_chat_key or not result.strip():
         logger.debug(f"[cc_workspace] 跳过无效的待投递结果: id={result_id!r}")
         return
+
+    # CC 容器里跑的是会执行命令的 CC，谁能影响它读到的文件或网页，谁就可能改写待投递结果里的
+    # source_chat_key。只投给当前确实绑定在本工作区的那一行频道，CC 报回的标识只当查询条件；
+    # 推送时直接用查到的这一行，不再按 chat_key 重新解析。查询出错（例如标识里带 PG 不收的 NUL）按未绑定处理
+    try:
+        bound_channel = await DBChatChannel.filter(chat_key=source_chat_key, workspace_id=workspace.id).first()
+    except Exception as e:
+        logger.warning(f"[cc_workspace] 查询投递目标频道失败({source})，按未绑定处理：id={result_id!r} error={e}")
+        bound_channel = None
 
     # ── 去重检查 ─────────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc).timestamp()
@@ -559,6 +593,19 @@ async def _deliver_pending_result(workspace: "DBWorkspace", item: dict, *, sourc
     # CC 后台任务完成，广播状态结束
     await _broadcast_cc_status(workspace.id, False, name=workspace.name)
 
+    # 目标频道没有绑定在本工作区（含 "__user__" 后台手动发送）：结果只记进本工作区自己的通讯日志，
+    # 工作区所有者仍能看到，但不推给任何频道
+    if bound_channel is None:
+        logger.warning(
+            f"[cc_workspace] 结果未投递({source})：CC 报回的来源频道没有绑定到本工作区 "
+            f"workspace={workspace.id} chat_key={source_chat_key!r} id={result_id!r}"
+        )
+        await _broadcast_system_comm_log(
+            workspace.id,
+            "[结果未投递] CC 报回的来源频道没有绑定到本工作区，这条结果只记在通讯日志里，没有推给任何频道。",
+        )
+        return
+
     # 推送并触发 NA Agent。CC 读的是工作区文件与网页，它报回的结果、错误信息谁都可能影响，
     # 只进不可信正文；宿主自己写的引导语进可信摘要
     try:
@@ -586,6 +633,7 @@ async def _deliver_pending_result(workspace: "DBWorkspace", item: dict, *, sourc
                 summary=f"{headline}（来自工作区: {echo_inline(workspace.name)}）。{guidance}",
             ),
             trigger_agent=True,
+            db_chat_channel=bound_channel,
         )
         logger.info(
             f"[cc_workspace] 投递成功({source})：chat_key={source_chat_key!r}，"
@@ -595,6 +643,18 @@ async def _deliver_pending_result(workspace: "DBWorkspace", item: dict, *, sourc
         logger.error(
             f"[cc_workspace] 投递({source})：推送消息失败 (chat_key={source_chat_key!r}): {e}"
         )
+
+
+async def _deliver_pending_result_safely(workspace: "DBWorkspace", item: object, *, source: str) -> None:
+    """单条投递出错只记日志、接着处理下一条
+
+    待投递结果由 CC 容器报回，一条坏数据（或一次数据库抖动）在投递里抛出来，会让后台轮询循环整个退出、
+    不再重启，启动恢复也会连带不创建轮询任务：所有工作区的后台结果从此都投不出去。
+    """
+    try:
+        await _deliver_pending_result(workspace, item, source=source)
+    except Exception as e:
+        logger.error(f"[cc_workspace] 投递({source})：处理一条待投递结果出错，已跳过 (workspace={workspace.id}): {e}")
 
 
 async def _cc_result_watcher_loop() -> None:
@@ -631,7 +691,7 @@ async def _cc_result_watcher_loop() -> None:
                 f"工作区: {workspace.name}（ID: {workspace.id}）"
             )
             for item in pending:
-                await _deliver_pending_result(workspace, item, source="watcher")
+                await _deliver_pending_result_safely(workspace, item, source="watcher")
 
 
 async def recover_pending_cc_results() -> None:
@@ -668,7 +728,7 @@ async def recover_pending_cc_results() -> None:
                 f"[cc_workspace] 发现 {len(pending)} 条待投递结果，工作区: {workspace.name}（ID: {workspace.id}）"
             )
             for item in pending:
-                await _deliver_pending_result(workspace, item, source="startup")
+                await _deliver_pending_result_safely(workspace, item, source="startup")
 
     # 启动后台 Watcher（幂等：已运行则跳过）
     if _cc_result_watcher_task is None or _cc_result_watcher_task.done():
@@ -705,6 +765,12 @@ async def _cc_delegate_task(
     if workspace is None:
         yield TaskCtl.fail(f"工作区 {workspace_id} 不存在")
         return
+
+    # 频道经 CC 读工作区文件的入口：容器的网络分组只在建容器时定，之后绑频道不会重新推导归属，
+    # 所以这里单独补一次置位。读不到归属按非平台方处理，函数不会抛
+    from nekro_agent.services.mcp.web_chat_workspace_taint import taint_workspace_if_non_platform
+
+    await taint_workspace_if_non_platform(workspace, reason="CC 委托")
 
     if workspace.status != "active":
         yield TaskCtl.fail(f"工作区 '{workspace.name}' 当前状态为 {workspace.status}，无法执行任务")
@@ -992,36 +1058,40 @@ async def _cc_delegate_task(
         yield TaskCtl.success(f"[CC Workspace 执行结果]\n{full_result}", data=full_result)
 
     except CCSandboxError as e:
+        # 上游报错常回显凭据：进通讯日志、运行状态 SSE 与 TaskCtl 之前统一脱敏；
+        # 平台方自己的 logger.error 保持原文
+        error_text = _redact_cc_text(str(e))
         logger.error(
             f"[cc_workspace] cc_delegate 流式执行失败: {e} "
             f"workspace={workspace_id} chat_key={handle.task_id!r} "
             f"received_chunks={chunk_count} received_chars={sum(len(c) for c in chunks)}"
         )
-        await _broadcast_error_comm_log(workspace_id, handle.task_id, f"[CC 错误] CC Sandbox 执行失败: {e}")
+        await _broadcast_error_comm_log(workspace_id, handle.task_id, f"[CC 错误] CC Sandbox 执行失败: {error_text}")
         await _publish_runtime_status(
             active=True,
             phase="failed",
             current_tool=current_tool_name,
-            error_summary=_summarize_runtime_block_text(str(e), max_length=96),
+            error_summary=_summarize_runtime_block_text(error_text, max_length=96),
         )
         await _broadcast_cc_status(workspace_id, False, started_at=started_at)
         await _publish_runtime_status(active=False)
-        yield TaskCtl.fail(f"CC Sandbox 执行失败: {e}")
+        yield TaskCtl.fail(f"CC Sandbox 执行失败: {error_text}")
     except Exception as e:
+        error_text = _redact_cc_text(str(e))
         logger.exception(
             f"[cc_workspace] cc_delegate 异常: {e} "
             f"workspace={workspace_id} chat_key={handle.task_id!r}"
         )
-        await _broadcast_error_comm_log(workspace_id, handle.task_id, f"[CC 错误] CC Workspace 发生意外错误: {e}")
+        await _broadcast_error_comm_log(workspace_id, handle.task_id, f"[CC 错误] CC Workspace 发生意外错误: {error_text}")
         await _publish_runtime_status(
             active=True,
             phase="failed",
             current_tool=current_tool_name,
-            error_summary=_summarize_runtime_block_text(str(e), max_length=96),
+            error_summary=_summarize_runtime_block_text(error_text, max_length=96),
         )
         await _broadcast_cc_status(workspace_id, False, started_at=started_at)
         await _publish_runtime_status(active=False)
-        yield TaskCtl.fail(f"CC Workspace 发生意外错误: {e}")
+        yield TaskCtl.fail(f"CC Workspace 发生意外错误: {error_text}")
 
 
 # ---------------------------------------------------------------------------
@@ -1645,7 +1715,7 @@ async def delegate_to_cc(_ctx: schemas.AgentCtx, task_prompt: str) -> str:
                 "[CC Workspace] CC 任务执行失败，失败信息见下方不可信块。"
                 "如果这是由管理员手动中止或网络中断引起的，请告知用户任务已被终止，并等待指示，不要盲目重试。"
             )
-            sections = [f"CC 任务执行失败: {ctl.message}", task_ctx_section]
+            sections = [f"CC 任务执行失败: {_redact_cc_text(ctl.message)}", task_ctx_section]
         elif ctl.signal.value == "cancel":
             guidance = (
                 "[CC Workspace] CC 任务已被管理员手动中止。"

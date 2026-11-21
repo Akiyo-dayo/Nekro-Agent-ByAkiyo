@@ -1,9 +1,7 @@
 """内置 MCP 服务注册表 — 提供推荐预置 + 空白模板"""
 
 from .schemas import McpEnvKeyDef, McpRegistryItem, McpServerType
-
-# 上游这里有一条内置网页聊天模板（`NekroWebChatTest`）。本分支这一版不往工作区 `.mcp.json` 写网页聊天条目
-# （见 `web_chat_mcp/na_app.py` 模块说明），模板加进库里也用不上，所以不列
+from .web_chat_auth import WEB_CHAT_MCP_SERVER_ID, WEB_CHAT_MCP_SERVER_NAME, WEB_CHAT_MCP_URL
 
 BUILTIN_REGISTRY: list[McpRegistryItem] = [
     # ── 推荐预置 MCP server ──
@@ -67,6 +65,18 @@ BUILTIN_REGISTRY: list[McpRegistryItem] = [
             ),
         ],
         tags=["preset", "stdio", "chat"],
+    ),
+    McpRegistryItem(
+        id=WEB_CHAT_MCP_SERVER_ID,
+        name=WEB_CHAT_MCP_SERVER_NAME,
+        description="通过 Nekro Agent Web Chat 创建测试会话、发送消息、等待回复并读取历史",
+        icon="chat",
+        type=McpServerType.http,
+        url=WEB_CHAT_MCP_URL,
+        # 模板不带任何令牌：`/mcp/registry` 对租户可读，令牌按工作区现场派生（见 web_chat_auth）
+        headers={},
+        env_keys=[],
+        tags=["preset", "http", "chat", "test", "nekro"],
     ),
     McpRegistryItem(
         id="postgres",

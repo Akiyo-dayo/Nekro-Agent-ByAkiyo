@@ -1,24 +1,21 @@
 import time
 from typing import Any, Dict, Optional, Type
 
-
 from nonebot import on_notice
 from nonebot.adapters.minecraft import Bot, NoticeEvent
 from nonebot.matcher import Matcher
 
-from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.chat_message import ChatMessage, ChatType
 from nekro_agent.services.message_service import message_service
 from nekro_agent.services.notice_service import (
-
     BaseNoticeHandler,
     NoticeConfig,
     NoticeResult,
 )
-
+from nekro_agent.tools.untrusted_content import UntrustedToolResult, sanitize_block_text
 
 logger = get_sub_logger("adapter.minecraft")
 MINECRAFT_NOTICE_SUB_TYPES = frozenset({
@@ -27,6 +24,30 @@ MINECRAFT_NOTICE_SUB_TYPES = frozenset({
     "player_death",
     "player_achievement",
 })
+
+# 摘要里的固定中文标签，只按白名单里的事件类型取值
+MINECRAFT_NOTICE_LABELS = {
+    "player_join": "玩家加入",
+    "player_quit": "玩家退出",
+    "player_death": "玩家死亡",
+    "player_achievement": "玩家成就",
+}
+# 事件原文进不可信正文前的长度上限
+MAX_MINECRAFT_NOTICE_BODY_CHARS = 2000
+
+
+def _minecraft_notice_result(info: Dict[str, str]) -> UntrustedToolResult:
+    """把通知事件包成不可信结果
+
+    玩家昵称由连服务器的玩家自填（离线服可任意取名），死亡 / 成就文本由服务端下发，
+    这些都不能以 SYSTEM 身份进上下文；事件原文只进不可信正文，摘要里只有宿主固定文案。
+    """
+    label = MINECRAFT_NOTICE_LABELS.get(info.get("sub_type", ""), "服务器事件")
+    return UntrustedToolResult(
+        kind="MinecraftNotice",
+        body=sanitize_block_text(info["event_description"], MAX_MINECRAFT_NOTICE_BODY_CHARS),
+        summary=f"[Minecraft 服务器通知] 服务器上报了一条{label}事件，玩家昵称与事件原文见下方不可信块。",
+    )
 
 
 class MinecraftNoticeHandler(BaseNoticeHandler):
@@ -44,6 +65,7 @@ class MinecraftNoticeHandler(BaseNoticeHandler):
             return None
         return {
             "user_id": str(event_dict["player"].nickname),
+            "sub_type": str(event_dict["sub_type"]),
         }
 
     async def format_message(self, _db_chat_channel: DBChatChannel, info: Dict[str, str]) -> str:
@@ -116,11 +138,13 @@ async def _(_: Matcher, event: NoticeEvent, bot: Bot):
     content_text = await handler.format_message(db_chat_channel, info)
 
     if handler.config.use_system_sender:
-        # 使用系统消息
-        await message_service.push_system_message(
+        # 昵称由连服务器的玩家自填、死亡 / 成就文本由服务端下发，不能以 SYSTEM 身份进上下文；
+        # 走不可信推送：宿主固定文案进可信摘要，事件原文进不可信块，照常触发
+        await message_service.push_untrusted_message(
             chat_key=chat_key,
-            agent_messages=content_text,
+            result=_minecraft_notice_result(info),
             trigger_agent=handler.config.force_tome,
+            db_chat_channel=db_chat_channel,
         )
     else:
         # 使用普通消息

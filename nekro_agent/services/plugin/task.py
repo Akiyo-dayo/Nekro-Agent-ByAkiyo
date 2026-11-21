@@ -31,6 +31,7 @@ from typing import (
 from pydantic import BaseModel, Field
 
 from nekro_agent.core.logger import get_sub_logger
+from nekro_agent.tools.untrusted_content import UntrustedToolResult
 
 logger = get_sub_logger("plugin_system")
 if TYPE_CHECKING:
@@ -205,16 +206,27 @@ class AsyncTaskHandle:
                 count += 1
         return count
 
-    async def notify_agent(self, message: str, trigger: bool = True) -> None:
+    async def notify_agent(self, message: "str | UntrustedToolResult", trigger: bool = True) -> None:
         """通知主 Agent
 
-        向主 Agent 推送系统消息。
+        插件自己写的、不含外部内容的固定文案可以直接传字符串，落成 SYSTEM 消息；
+        凡是含外部来源文字（网页、邮件、别人发的消息、第三方接口返回、模型输出）一律包成
+        `UntrustedToolResult`：引导语放 `summary`、外部正文放 `body`。这样外部内容不以
+        SYSTEM 身份进上下文，渲染时用当轮令牌包裹，`content_text` 只留可信摘要。
 
         Args:
-            message: 消息内容
+            message: 固定文案，或包好的不可信结果
             trigger: 是否触发 Agent 响应
         """
         from nekro_agent.services.message_service import message_service
+
+        if isinstance(message, UntrustedToolResult):
+            await message_service.push_untrusted_message(
+                chat_key=self.chat_key,
+                result=message,
+                trigger_agent=trigger,
+            )
+            return
 
         await message_service.push_system_message(
             chat_key=self.chat_key,
