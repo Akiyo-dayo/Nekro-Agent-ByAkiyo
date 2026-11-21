@@ -15,6 +15,8 @@
     "platformTitle": "Provided by the platform",
     "platformHint": "Mailboxes the platform shares with this instance. They can only send; their inbox is not visible. When this instance has its own default sender, that one is used first",
     "platformEmpty": "The platform shares no sending mailbox with this instance",
+    "platformEmptyPlatform": "No platform sending mailbox yet. Add one and share it with instances; each instance's Agent can then send through it (its inbox stays unreadable).",
+    "managePlatform": "Manage platform sending mailboxes",
     "instanceDefault": "Default for this instance",
     "overridden": "Overridden by an own mailbox",
     "ownTitle": "This instance's mailboxes",

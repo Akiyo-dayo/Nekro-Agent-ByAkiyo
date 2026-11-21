@@ -740,7 +740,7 @@ class TestWorkspaceSyncIsTheLastGate:
         await ws.save(update_fields=["metadata"])
         await WorkspaceService.sync_skills(ws)
 
-        target = WorkspaceService.get_workspace_dir(ws.id) / ".claude_home" / "skills" / case.skill_id.split("/")[-1]
+        target = WorkspaceService.claude_home(ws.id).path / "skills" / case.skill_id.split("/")[-1]
         assert target.is_dir() is case.visible_to_acme
         if case.visible_to_acme:
             assert case.body in (target / "SKILL.md").read_text(encoding="utf-8")
@@ -756,7 +756,7 @@ class TestWorkspaceSyncIsTheLastGate:
         await ws.save(update_fields=["metadata"])
         await WorkspaceService.sync_skills(ws)
 
-        target = WorkspaceService.get_workspace_dir(ws.id) / ".claude_home" / "skills" / case.skill_id.split("/")[-1]
+        target = WorkspaceService.claude_home(ws.id).path / "skills" / case.skill_id.split("/")[-1]
         assert target.is_dir()
         assert case.body in (target / "SKILL.md").read_text(encoding="utf-8")
 
@@ -771,7 +771,7 @@ class TestWorkspaceSyncIsTheLastGate:
         ws.metadata = {"skills": ["ops-runbook"]}
         await ws.save(update_fields=["metadata"])
         await WorkspaceService.sync_skills(ws)
-        target = WorkspaceService.get_workspace_dir(ws.id) / ".claude_home" / "skills" / "ops-runbook"
+        target = WorkspaceService.claude_home(ws.id).path / "skills" / "ops-runbook"
         assert target.is_dir()
 
         await DBChatChannel.create(
@@ -800,10 +800,10 @@ class TestWorkspaceSyncIsTheLastGate:
         )
         assert result.synced_count == 1
         assert (
-            WorkspaceService.get_workspace_dir(workspaces["acme-ws"].id) / ".claude_home" / "skills" / "shared-guide"
+            WorkspaceService.claude_home(workspaces["acme-ws"].id).path / "skills" / "shared-guide"
         ).is_dir()
         assert not (
-            WorkspaceService.get_workspace_dir(workspaces["rival-ws"].id) / ".claude_home" / "skills" / "shared-guide"
+            WorkspaceService.claude_home(workspaces["rival-ws"].id).path / "skills" / "shared-guide"
         ).exists()
 
     @pytest.mark.asyncio

@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from tortoise.expressions import Q, Subquery
+from tortoise.functions import Count, Max
 from tortoise.queryset import QuerySet
 from tortoise.transactions import in_transaction
 
@@ -40,12 +41,19 @@ from nekro_agent.models.db_mem_paragraph_person import DBMemParagraphPerson
 from nekro_agent.models.db_mem_prompt_round import DBMemPromptRound
 from nekro_agent.models.db_mem_reinforcement_log import DBMemReinforcementLog, TargetType
 from nekro_agent.models.db_mem_relation import DBMemRelation
+from nekro_agent.models.db_state_channel import DBStateChannel
+from nekro_agent.models.db_state_person import DBStatePerson
+from nekro_agent.models.db_state_snapshot import DBStateSnapshot
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.models.db_wb_book import DBWbBook
 from nekro_agent.models.db_wb_entry import DBWbEntry
 from nekro_agent.schemas.errors import ConflictError, ValidationError
 from nekro_agent.services.memory.instance_scope import CONSOLE_ONLY_PRESET_ID, AdminFilter, AdminMemoryScope
+from nekro_agent.services.memory.retention import PRUNE_ACTIONS
 from nekro_agent.services.memory.scope_condition import MemTable
+
+if TYPE_CHECKING:  # pragma: no cover - 只在类型检查时需要；运行时延迟导入，避免与身份域模块成环
+    from nekro_agent.services.identity_scope import ScopeDomain
 
 logger = get_sub_logger("memory.admin")
 
@@ -71,14 +79,15 @@ MemoryType = Literal["paragraph", "episode", "relation", "entity"]
 def paragraph_status(row: DBMemParagraph) -> Literal["active", "quarantined", "deleted", "pruned"]:
     """段落的四态判据。
 
-    隔离与软删都复用 `is_inactive`，靠 `quarantined_at` 分开；维护任务清理掉的行带有
-    `last_manual_action = "prune"`，它和手动软删在页面上是两回事。
+    隔离与软删都复用 `is_inactive`，靠 `quarantined_at` 分开；清理掉的行带有
+    `last_manual_action` 为 `prune`（维护循环）或 `manual_prune`（管理员手动触发），
+    它和手动软删在页面上是两回事。
     """
     if not row.is_inactive:
         return "active"
     if row.quarantined_at is not None:
         return "quarantined"
-    if row.last_manual_action == "prune":
+    if row.last_manual_action in PRUNE_ACTIONS:
         return "pruned"
     return "deleted"
 
@@ -99,9 +108,8 @@ def status_q(status: str) -> Q:
     """列表用的状态条件；`all` 不加条件。
 
     `deleted` 在这里**包含** `pruned`：本函数同时服务段落与 episode，不能引用只有段落
-    有的 `last_manual_action`。段落列表要区分两者时，在调用点再叠一条
-    `last_manual_action__not="prune"`（Tortoise 的 `__not` 自带 `OR IS NULL`，
-    不会像裸 `NOT` 那样把 NULL 行一起排除）。
+    有的 `last_manual_action`。段落列表要区分两者时，在调用点再叠 :func:`_not_pruned_q`
+    （显式放行 NULL，不会像裸 `NOT IN` 那样把 NULL 行一起排除）。
     """
     if status == "all":
         return Q()
@@ -112,8 +120,13 @@ def status_q(status: str) -> Q:
     if status == "deleted":
         return Q(is_inactive=True, quarantined_at__isnull=True)
     if status == "pruned":
-        return Q(is_inactive=True, quarantined_at__isnull=True, last_manual_action="prune")
+        return Q(is_inactive=True, quarantined_at__isnull=True, last_manual_action__in=sorted(PRUNE_ACTIONS))
     raise ValidationError(reason=f"未知的状态筛选: {status}")
+
+
+def _not_pruned_q() -> Q:
+    """不是被清理掉的（两种清理动作名都不是；`last_manual_action` 为空的算「不是」）"""
+    return Q(last_manual_action__isnull=True) | Q(last_manual_action__not_in=sorted(PRUNE_ACTIONS))
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +145,8 @@ class ParagraphListFilters:
     status: str = "all"
     frozen: Optional[bool] = None
     protected: Optional[bool] = None
+    # 敏感标记：`None` 不筛，`True` 只看敏感，`False` 只看非敏感
+    sensitive: Optional[bool] = None
     cognitive_type: Optional[str] = None
     knowledge_type: Optional[str] = None
     time_from: Optional[datetime] = None
@@ -139,11 +154,22 @@ class ParagraphListFilters:
     q: Optional[str] = None
     # 来源类型，已经是 `OriginKind` 的取值；`None` 表示不筛
     origin_kind: Optional[str] = None
+    # 所属事件：`None` 不筛，`NO_EPISODE`（0）是「没归入任何事件」，正数是事件 ID
+    episode: Optional[int] = None
+
+
+# 「没归入任何事件」在 `ParagraphListFilters.episode` 里的取值。事件 ID 是自增主键、从 1 开始，
+# 0 不会撞上真实的事件。
+NO_EPISODE = 0
 
 
 @dataclass(frozen=True)
 class QuarantineEntry:
-    """隔离区的一行（段落与 episode 合并后的形状）。"""
+    """隔离区的一行（段落与 episode 合并后的形状）。
+
+    段落有认知类型与知识类型，episode 没有这两维（它只有时间窗与标题），因此 episode 行
+    一律 `None`；前端据此决定要不要显示那两个标签。
+    """
 
     memory_type: str
     id: int
@@ -152,6 +178,8 @@ class QuarantineEntry:
     quarantined_at: datetime
     quarantine_reason: str
     blocked_round_hits: int
+    cognitive_type: Optional[str] = None
+    knowledge_type: Optional[str] = None
 
 
 _SORTS = frozenset({"create_time", "update_time", "blocked_round_hits"})
@@ -224,12 +252,14 @@ def _paragraph_filter_q(filters: ParagraphListFilters) -> Optional[Q]:
     if filters.status != "all":
         status_condition = status_q(filters.status)
         if filters.status == "deleted":
-            status_condition = status_condition & Q(last_manual_action__not="prune")
+            status_condition = status_condition & _not_pruned_q()
         conditions.append(status_condition)
     if filters.frozen is not None:
         conditions.append(Q(is_frozen=filters.frozen))
     if filters.protected is not None:
         conditions.append(Q(is_protected=filters.protected))
+    if filters.sensitive is not None:
+        conditions.append(Q(is_sensitive=filters.sensitive))
     cognitive_type = _parse_cognitive_type(filters.cognitive_type)
     if cognitive_type is not None:
         conditions.append(Q(cognitive_type=cognitive_type))
@@ -246,6 +276,12 @@ def _paragraph_filter_q(filters: ParagraphListFilters) -> Optional[Q]:
     if filters.q is not None and filters.q.strip():
         keyword = filters.q.strip()[:_MAX_KEYWORD_LENGTH]
         conditions.append(Q(content__icontains=keyword) | Q(summary__icontains=keyword))
+    if filters.episode is not None:
+        if filters.episode < 0:
+            raise ValidationError(reason=f"未知的事件筛选: {filters.episode}")
+        conditions.append(
+            Q(episode_id__isnull=True) if filters.episode == NO_EPISODE else Q(episode_id=filters.episode),
+        )
     if not conditions:
         return None
     combined = conditions[0]
@@ -274,12 +310,14 @@ async def list_paragraphs(
     status: str = "all",
     frozen: Optional[bool] = None,
     protected: Optional[bool] = None,
+    sensitive: Optional[bool] = None,
     cognitive_type: Optional[str] = None,
     knowledge_type: Optional[str] = None,
     time_from: Optional[datetime] = None,
     time_to: Optional[datetime] = None,
     q: Optional[str] = None,
     origin_kind: Optional[str] = None,
+    episode: Optional[int] = None,
     sort: str = "create_time",
     order: str = "desc",
     page: int = 1,
@@ -292,12 +330,14 @@ async def list_paragraphs(
         status=status,
         frozen=frozen,
         protected=protected,
+        sensitive=sensitive,
         cognitive_type=cognitive_type,
         knowledge_type=knowledge_type,
         time_from=time_from,
         time_to=time_to,
         q=q,
         origin_kind=origin_kind,
+        episode=episode,
     )
     queryset = _filtered_paragraphs(scope, f, filters)
     total = await queryset.count()
@@ -392,6 +432,8 @@ async def list_quarantine(
             quarantined_at=row.quarantined_at,
             quarantine_reason=row.quarantine_reason,
             blocked_round_hits=row.blocked_round_hits,
+            cognitive_type=row.cognitive_type.value if row.cognitive_type is not None else None,
+            knowledge_type=row.knowledge_type.value if row.knowledge_type is not None else None,
         )
         for row in paragraphs
         if row.quarantined_at is not None
@@ -437,26 +479,26 @@ async def load_item(
     return await model.get_or_none(id=item_id)
 
 
-async def build_paragraph_detail(row: DBMemParagraph) -> dict[str, Any]:
-    """段落详情：模型字典 + 状态、涉及的人、来源频道、所属 episode、强化次数。"""
-    from nekro_agent.services.memory.persons import BOT_SENDER_ID, load_person_accounts
+async def build_paragraph_detail(
+    row: DBMemParagraph,
+    *,
+    episode_visible: Callable[[DBMemEpisode], Awaitable[bool]],
+) -> dict[str, Any]:
+    """段落详情：模型字典 + 状态、涉及的人、来源频道、所属 episode、强化次数。
 
-    accounts = (await load_person_accounts([row.id]))[row.id]
-    persons: list[dict[str, str]] = []
-    for account in accounts:
-        message: Optional[DBChatMessage] = None
-        if row.origin_chat_key:
-            # 这里查的是「显示名」而不是记忆范围，但仍写成 Q：本模块的范围条件只能由
-            # `AdminMemoryScope` 产出，避免下一次有人顺手把频道维度也拼进来。
-            message = (
-                await DBChatMessage.filter(
-                    Q(chat_key=row.origin_chat_key) & Q(platform_userid=account),
-                )
-                .exclude(sender_id=BOT_SENDER_ID)
-                .order_by("-id")
-                .first()
-            )
-        persons.append({"account": account, "display_name": (message.sender_nickname or "") if message else ""})
+    涉及的人的显示名与列表同一处（`person_labels`）：昵称取来源频道里最近的发言，
+    称呼取段落自己实例的好感记录。
+
+    所属事件与「按事件分组」同一个口径：段落可见不等于它指着的事件可见（脏数据里段落与事件
+    可以分属两个租户）。`episode_visible` 由路由按当前身份给（看事件行自己的实例对）；看不见
+    或已经没了时只给编号，`title` 为空串、`visible` 为假。服务层拿不到用户身份，所以这一步
+    做成必填参数，调用方不会忘。
+    """
+    from nekro_agent.services.memory.person_labels import label_paragraph_persons
+    from nekro_agent.services.memory.persons import load_person_accounts
+
+    accounts = await load_person_accounts([row.id])
+    persons = [label.as_dict() for label in (await label_paragraph_persons([row], accounts))[row.id]]
 
     channel_name = ""
     if row.origin_chat_key:
@@ -467,8 +509,10 @@ async def build_paragraph_detail(row: DBMemParagraph) -> dict[str, Any]:
     episode: Optional[dict[str, Any]] = None
     if row.episode_id is not None:
         episode_row = await DBMemEpisode.get_or_none(id=row.episode_id)
-        if episode_row is not None:
-            episode = {"id": episode_row.id, "title": episode_row.title}
+        if episode_row is not None and await episode_visible(episode_row):
+            episode = {"id": episode_row.id, "title": episode_row.title, "visible": True}
+        else:
+            episode = {"id": row.episode_id, "title": "", "visible": False}
 
     reinforcement_count = await DBMemReinforcementLog.filter(
         target_type=TargetType.PARAGRAPH,
@@ -477,6 +521,7 @@ async def build_paragraph_detail(row: DBMemParagraph) -> dict[str, Any]:
 
     return row.to_dict() | {
         "status": paragraph_status(row),
+        "is_sensitive": row.is_sensitive,
         "persons": persons,
         "origin_channel_name": channel_name,
         "episode": episode,
@@ -1248,6 +1293,9 @@ async def purge_instance_domain_memory(adapter_key: str, instance_key: str) -> d
         "worldbook_entries": 0,
         "affection_rows": 0,
         "affection_events": 0,
+        "state_channels": 0,
+        "state_people": 0,
+        "state_snapshots": 0,
         "vectors_failed": 0,
     }
 
@@ -1294,6 +1342,21 @@ async def purge_instance_domain_memory(adapter_key: str, instance_key: str) -> d
             adapter_key=adapter_key,
             instance_key=instance_key,
             domain_group_id=SELF_DOMAIN_GROUP_ID,
+        ).delete()
+        # 角色状态与摘要、好感同一口径：频道状态与快照按实例对，个人档案只删自成一域的那一份
+        # （属于实例组的挂在组上）。划给新租户以后，旧租户的状态与快照不该还读得到。
+        counts["state_snapshots"] = await DBStateSnapshot.filter(
+            adapter_key=adapter_key,
+            instance_key=instance_key,
+        ).delete()
+        counts["state_people"] = await DBStatePerson.filter(
+            adapter_key=adapter_key,
+            instance_key=instance_key,
+            domain_group_id=SELF_DOMAIN_GROUP_ID,
+        ).delete()
+        counts["state_channels"] = await DBStateChannel.filter(
+            adapter_key=adapter_key,
+            instance_key=instance_key,
         ).delete()
 
         # 段落删掉之后重新取一次：被连带删掉的 episode / 关系 / 实体不应再出现在这里。
@@ -1592,3 +1655,203 @@ async def resolve_person_filter(
         return frozenset({normalized})
     domain = await resolve_memory_domain(adapter_key, instance_key)
     return await expand_accounts(domain, [normalized])
+
+
+# ---------------------------------------------------------------------------
+# 分组视图：按人、按事件
+# ---------------------------------------------------------------------------
+
+# 分组前最多聚合多少个组。超过时按条数（人）/ 最近时间（事件）取前面这些：分组视图是给人
+# 翻看的，几千个组已经翻不完了，而聚合结果要整份拿回来做别名合并与排序。
+_GROUP_SCAN_LIMIT = 5000
+
+
+@dataclass(frozen=True)
+class MemoryPersonEntry:
+    """「记忆里出现过的人」的一行
+
+    `account` 是这个人的标识：选了实例时别名已经并进主账号（与按人筛选的展开同一个域），
+    平台方全量视图没有域可解析，就是账号本身。把它原样传回 `/paragraphs?person=` 筛出来的，
+    正是这一组的段落（按人筛选会再按别名展开一次）。
+    """
+
+    account: str
+    accounts: tuple[str, ...]
+    paragraph_count: int
+    last_paragraph_id: int
+    display_name: str
+    call_name: str
+    # `display_name` 从哪来：`chat`（来源频道里的发言）/ `affection`（好感记录）/ 空串（没查到）
+    name_source: str = ""
+
+
+async def list_memory_persons(
+    scope: AdminMemoryScope,
+    f: AdminFilter,
+    filters: ParagraphListFilters,
+    *,
+    domain: Optional[ScopeDomain],
+    q: str = "",
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[int, list[MemoryPersonEntry]]:
+    """满足筛选的段落里出现过哪些人、各几段，按段数倒序；返回 `(总数, 当前页)`
+
+    `domain` 是所选实例的记忆域（`resolve_memory_domain`），用来把同一个人的几个账号并成一行；
+    为 `None` 时（平台方全量视图）按账号各算一行。
+
+    `q` 只按账号匹配：名字要逐个去查消息与好感，查全量再筛太重。界面拿到第一页之后在本地
+    按名字再筛一遍。
+
+    一段记忆同时挂着同一个人的两个账号时（合并前各记了一次），这一行的段数会把它数两次——
+    这种行极少，为它在 SQL 里按人去重得先把别名表连进来，不值得。
+    """
+    from nekro_agent.services.identity_scope import resolve_person_uids
+    from nekro_agent.services.memory.person_labels import label_paragraph_persons
+
+    size = _validate_page(page, page_size)
+    paragraph_ids = _filtered_paragraphs(scope, f, filters).values("id")
+    rows = (
+        await DBMemParagraphPerson.filter(paragraph_id__in=Subquery(paragraph_ids))
+        .annotate(paragraph_count=Count("id"), last_paragraph_id=Max("paragraph_id"))
+        .group_by("account")
+        .order_by("-paragraph_count", "-last_paragraph_id")
+        .limit(_GROUP_SCAN_LIMIT)
+        .values("account", "paragraph_count", "last_paragraph_id")
+    )
+    counts = {str(row["account"]): int(row["paragraph_count"]) for row in rows}
+    last_ids = {str(row["account"]): int(row["last_paragraph_id"] or 0) for row in rows}
+
+    person_of = {account: account for account in counts}
+    if domain is not None and counts:
+        # 最多 `_GROUP_SCAN_LIMIT` 个账号；`resolve_person_uids` 内部按每条 `IN` 1000 个分块
+        person_of = await resolve_person_uids(domain, sorted(counts))
+
+    grouped: dict[str, list[str]] = {}
+    for account, person in person_of.items():
+        grouped.setdefault(person, []).append(account)
+
+    keyword = q.strip().lower()[:_MAX_KEYWORD_LENGTH]
+    entries: list[tuple[str, tuple[str, ...], int, int, str]] = []
+    for person, accounts in grouped.items():
+        if keyword and not any(keyword in account.lower() for account in [person, *accounts]):
+            continue
+        # 显示名取这个人最近那段记忆里出现的那个账号：昵称按那段的来源频道查
+        representative = max(accounts, key=lambda account: last_ids[account])
+        entries.append(
+            (
+                person,
+                tuple(sorted(accounts)),
+                sum(counts[account] for account in accounts),
+                last_ids[representative],
+                representative,
+            ),
+        )
+    entries.sort(key=lambda entry: (-entry[2], -entry[3], entry[0]))
+    total = len(entries)
+    window = entries[(page - 1) * size : page * size]
+
+    representatives = await DBMemParagraph.filter(id__in=[entry[3] for entry in window])
+    by_id = {row.id: row for row in representatives}
+    # 两个人的「最近一段」可能是同一段（两人对话里很常见）：同一段下的账号要并在一起，
+    # 按段落 ID 直接建字典会让后一个人把前一个人盖掉
+    accounts_of_paragraph: dict[int, list[str]] = {}
+    for entry in window:
+        accounts_of_paragraph.setdefault(entry[3], []).append(entry[4])
+    labels = await label_paragraph_persons(representatives, accounts_of_paragraph)
+    result: list[MemoryPersonEntry] = []
+    for person, accounts, count, last_id, representative in window:
+        label = next(
+            (item for item in labels.get(last_id, []) if item.account == representative),
+            None,
+        )
+        result.append(
+            MemoryPersonEntry(
+                account=person,
+                accounts=accounts,
+                paragraph_count=count,
+                last_paragraph_id=last_id if last_id in by_id else 0,
+                display_name=label.display_name if label is not None else "",
+                call_name=label.call_name if label is not None else "",
+                name_source=label.name_source if label is not None else "",
+            ),
+        )
+    return total, result
+
+
+@dataclass(frozen=True)
+class MemoryTopicEntry:
+    """按事件分组的一行；`episode_id` 为 `None` 的那一行是「没归入任何事件」的段落
+
+    `visible` 为假：段落还指着这个事件，但事件行已经没了、或不在这个身份的范围里。
+    这种行只给编号，不给标题与叙事——范围外的事件标题不能借分组视图漏出来。
+    """
+
+    episode_id: Optional[int]
+    title: str
+    narrative_summary: str
+    paragraph_count: int
+    last_time: Optional[datetime]
+    visible: bool
+
+
+async def list_memory_topics(
+    scope: AdminMemoryScope,
+    f: AdminFilter,
+    filters: ParagraphListFilters,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[int, list[MemoryTopicEntry]]:
+    """满足筛选的段落按所属事件分组，返回 `(组数, 当前页)`
+
+    有事件的组按组内最新一段的时间倒序；「没归入任何事件」那一组放在最后。
+    事件的标题从按同一个范围取的事件表里查（`scope.apply`），查不到的组只给编号。
+    """
+    size = _validate_page(page, page_size)
+    base = _filtered_paragraphs(scope, f, filters)
+    rows = (
+        await base.filter(episode_id__isnull=False)
+        .annotate(paragraph_count=Count("id"), last_time=Max("create_time"))
+        .group_by("episode_id")
+        .order_by("-last_time", "-episode_id")
+        .limit(_GROUP_SCAN_LIMIT)
+        .values("episode_id", "paragraph_count", "last_time")
+    )
+    groups: list[tuple[Optional[int], int, Optional[datetime]]] = [
+        (int(row["episode_id"]), int(row["paragraph_count"]), row["last_time"]) for row in rows
+    ]
+    loose_count = await _filtered_paragraphs(scope, f, filters).filter(episode_id__isnull=True).count()
+    if loose_count:
+        latest = (
+            await _filtered_paragraphs(scope, f, filters)
+            .filter(episode_id__isnull=True)
+            .order_by("-create_time")
+            .first()
+        )
+        groups.append((None, loose_count, latest.create_time if latest is not None else None))
+
+    total = len(groups)
+    window = groups[(page - 1) * size : page * size]
+    episode_ids = [episode_id for episode_id, _, _ in window if episode_id is not None]
+    episodes: dict[int, DBMemEpisode] = {}
+    if episode_ids:
+        visible_rows = await scope.apply(DBMemEpisode.all(), MemTable.EPISODE, AdminFilter()).filter(
+            id__in=episode_ids,
+        )
+        episodes = {row.id: row for row in visible_rows}
+
+    result: list[MemoryTopicEntry] = []
+    for episode_id, count, last_time in window:
+        episode = episodes.get(episode_id) if episode_id is not None else None
+        result.append(
+            MemoryTopicEntry(
+                episode_id=episode_id,
+                title=episode.title if episode is not None else "",
+                narrative_summary=(episode.narrative_summary or "")[:200] if episode is not None else "",
+                paragraph_count=count,
+                last_time=last_time,
+                visible=episode_id is None or episode is not None,
+            ),
+        )
+    return total, result

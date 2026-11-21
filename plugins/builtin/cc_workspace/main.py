@@ -912,12 +912,21 @@ async def _cc_delegate_task(
     先结束租约再交出去：任务调度在拿到终态后直接退出循环，不会再把生成器跑到 `finally`，
     等它被回收时才结束会把所有结束原因都记成「取消」。
     """
-    from nekro_agent.services.ssh_gateway.lease import LEASE_STATE_QUEUED, end_lease, get_lease
+    from nekro_agent.services.ssh_gateway.lease import (
+        LEASE_STATE_QUEUED,
+        end_lease,
+        get_lease,
+        note_final_result,
+        note_task_text,
+    )
 
     lease = get_lease(ssh_lease_id) if ssh_lease_id else None
     if lease is not None and (lease.state != LEASE_STATE_QUEUED or int(lease.workspace_id) != int(workspace_id)):
         # 交过来的不是一份待生效的租约（已经被顶替、过期或不属于这个工作区）：不认
         lease = None
+    if lease is not None:
+        # 只有带值守覆盖的租约才真的记下（事后摘要用），其余租约这一步什么都不做
+        note_task_text(lease.lease_id, task_prompt)
     end_reason = "done"
     try:
         async for ctl in _run_cc_delegate_task(handle, workspace_id, task_prompt, lease):
@@ -927,6 +936,7 @@ async def _cc_delegate_task(
             elif signal == "fail":
                 end_reason = "timeout" if "超时" in ctl.message else "failed"
             if lease is not None and signal in {"success", "fail", "cancel"}:
+                note_final_result(lease.lease_id, ctl.data if isinstance(ctl.data, str) else ctl.message)
                 end_lease(lease.lease_id, end_reason)
             yield ctl
     except asyncio.CancelledError:
@@ -1014,6 +1024,13 @@ async def _run_cc_delegate_task(
                 _envelope.ssh_servers = tuple(_aliases)
         except Exception as e:  # noqa: BLE001 - 少一段说明不该让任务失败
             logger.warning(f"[cc_workspace] 读取 SSH 授权服务器别名失败（本次不写授权说明）: {e}")
+        if _envelope.ssh_servers:
+            try:
+                from nekro_agent.services.ssh_gateway.runbook import render_for_prompt
+
+                _envelope.ssh_runbooks = await render_for_prompt(lease.credential_ids)
+            except Exception as e:  # noqa: BLE001 - 少一段手册不该让任务失败
+                logger.warning(f"[cc_workspace] 读取 SSH 运维手册失败（本次不带手册）: {type(e).__name__}")
     enriched_prompt = _envelope.to_prompt()
 
     async def _publish_runtime_status(
@@ -1688,6 +1705,8 @@ async def create_and_bind_workspace(_ctx: schemas.AgentCtx, workspace_name: str 
             description=f"由 NA 自动为频道 {chat_key} 创建",
             runtime_policy="agent",
         )
+        # 编号可能被复用：上一个同号工作区留下的 CC home 先清掉，清不掉就撤销创建（记录已删）
+        await WorkspaceService.claim_fresh_home(ws)
         # 自动注入默认技能。
         # 这里必须按**发起频道所属租户**取清单：工作区是为这个频道建的，
         # 用平台方那份等于把平台方私有技能直接预装进租户的沙盒目录。
@@ -2393,7 +2412,7 @@ async def cc_context_cmd(context: CommandExecutionContext) -> CommandResponse:
     agent_ctx = await _get_agent_ctx_from_command(context)
     context_result = await get_cc_context(agent_ctx)
     # 命令的输出是给用户看的聊天文本，不进模型上下文，不需要不可信边界：摘要 + 正文直接拼出来
-    message = f"{context_result.summary}\n\n{context_result.body}"
+    message = f"{context_result.summary}\n\n{context_result.stored_body}"
     return CmdCtl.success(
         message,
         data={

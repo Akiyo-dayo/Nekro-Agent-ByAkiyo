@@ -12,11 +12,11 @@
 （多一个回合；token 计数还有后台写入的几秒滞后）。这是有意的——在回合中途打断会留下
 发了一半的回复，比略超更糟。后台显示里用量可以超过 100%。
 
-## 两层配额的关系
+## 一个闸门里判两层
 
-这里判的是**平台方的承诺**；租户对自己群的自限是另一层（`AI_CHAT_DAILY_REPLY_LIMIT`，
-按 Bot 消息条数、UTC 零点）。两层都放行才回复，两层各管各的，理由见设计稿
-`channel-quota-design.md` 的「新额度与旧回复配额的关系」。
+`gate` 先判平台方给这个频道的承诺，再判租户自己的回复上限（`AI_CHAT_DAILY_REPLY_LIMIT`，
+按回合数、与额度同一个时区零点换天）。两层都放行才回复；任何一层判定出错都按放行处理。
+`is_paused` 也走这个闸门，因此定时提醒、插件推送这类不经过入站消息路径的回合同样受自限约束。
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from .policy import (
     resolve_policy,
     token_scope_is_reply_only,
 )
+from .self_limit import SelfLimitStatus, evaluate_self_limit
 
 logger = get_sub_logger("channel_quota")
 
@@ -79,6 +80,23 @@ class QuotaStatus:
     action: str
     policy: EffectivePolicy
     daily: Optional[DBChannelQuotaDaily]
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """统一闸门的判定结果
+
+    Attributes:
+        blocked: 这一回合是否应该被拦下
+        reason: `""` / `platform` / `self_daily` / `self_hourly`
+        status: 平台方额度状态；平台判定出错时为 None
+        self_status: 自限状态；平台已暂停或自限判定出错时为 None
+    """
+
+    blocked: bool
+    reason: str
+    status: Optional[QuotaStatus]
+    self_status: Optional[SelfLimitStatus]
 
 
 def _used_of(policy: EffectivePolicy, daily: Optional[DBChannelQuotaDaily]) -> int:
@@ -175,18 +193,18 @@ async def evaluate(channel: DBChatChannel, *, day: Optional[str] = None) -> Quot
 
 
 async def is_paused(chat_key: str) -> bool:
-    """这个频道此刻是否处在「暂停」状态
+    """这个频道此刻是否应该停止回复
 
-    频道行不存在、功能没开、额度不限、动作是只告警，都返回 False——调用方拿它当
-    「要不要拦这一回合」的闸门，任何不确定的情况都必须放行，否则一次查库抖动就会
-    让所有频道停止回复。
+    走统一闸门：平台方额度暂停或租户自限用尽都算暂停。频道行不存在、功能没开、
+    额度不限、动作是只告警，都返回 False——调用方拿它当「要不要拦这一回合」的闸门，
+    任何不确定的情况都必须放行，否则一次查库抖动就会让所有频道停止回复。
     """
     try:
         channel = await DBChatChannel.filter(chat_key=chat_key).order_by("id").first()
         if channel is None:
             return False
-        status = await evaluate(channel)
-        return status.state == STATE_PAUSED
+        result = await gate(channel)
+        return result.blocked
     except Exception as exc:  # noqa: BLE001 - 判定失败一律放行
         logger.warning(f"频道额度暂停判定失败，按未暂停处理: chat_key={chat_key} | {exc}")
         return False
@@ -240,6 +258,35 @@ async def check_and_alert(channel: DBChatChannel) -> QuotaStatus:
     return status
 
 
+async def gate(channel: DBChatChannel) -> GateResult:
+    """统一闸门：平台方额度先判，再判租户自限
+
+    两段各自兜底：任何异常都按放行处理并记 warning。判定在每条入站消息的路径上，
+    不能自己变成「群友说一句话、Bot 报一个错」的故障点。平台方已经暂停时不再算自限，
+    `reason` 以平台方为准。
+    """
+    status: Optional[QuotaStatus] = None
+    try:
+        status = await check_and_alert(channel)
+        if status.state == STATE_PAUSED:
+            return GateResult(blocked=True, reason="platform", status=status, self_status=None)
+    except Exception as exc:  # noqa: BLE001 - 判定失败一律放行
+        logger.warning(f"频道额度平台判定失败，按放行处理: chat_key={channel.chat_key} | {exc}")
+        status = None
+
+    self_status: Optional[SelfLimitStatus] = None
+    try:
+        self_status = await evaluate_self_limit(channel)
+        if self_status.exceeded:
+            reason = "self_daily" if self_status.exceeded == "daily" else "self_hourly"
+            return GateResult(blocked=True, reason=reason, status=status, self_status=self_status)
+    except Exception as exc:  # noqa: BLE001 - 判定失败一律放行
+        logger.warning(f"频道自限判定失败，按放行处理: chat_key={channel.chat_key} | {exc}")
+        self_status = None
+
+    return GateResult(blocked=False, reason="", status=status, self_status=self_status)
+
+
 __all__ = [
     "STATE_DISABLED",
     "STATE_EXCEEDED",
@@ -247,10 +294,12 @@ __all__ = [
     "STATE_PAUSED",
     "STATE_UNLIMITED",
     "STATE_WARNING",
+    "GateResult",
     "QuotaStatus",
     "background_paused",
     "build_status",
     "check_and_alert",
     "evaluate",
+    "gate",
     "is_paused",
 ]

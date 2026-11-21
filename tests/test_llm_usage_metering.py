@@ -1582,7 +1582,12 @@ class TestEmbeddingsAreBilledToo:
             async def post(self, *_args, **_kwargs):
                 return _FakeResponse()
 
+            async def aclose(self) -> None:
+                return None
+
         monkeypatch.setattr(openai_module, "_get_http_client", lambda **_kwargs: _FakeClient())
+        # 测试连接用一次性客户端（不进按地址缓存的连接池），同样换掉
+        monkeypatch.setattr(openai_module, "_create_http_client", lambda **_kwargs: _FakeClient())
 
     async def test_a_successful_embedding_lands_a_row(self, db, monkeypatch) -> None:
         self._install(
@@ -1987,8 +1992,9 @@ class TestEveryModelTestCallSiteDeclaresAttribution:
 class TestTheUsageEntryIsHiddenForTheRightReason:
     """`/console/usage` 被藏起来的**依据**必须自己有人守
 
-    这一格标了 `visibility: 'tenantAdminOnly'` 并进了 `TENANT_ADMIN_ONLY_PATHS`，
-    理由只有一条：它的每一条读端点都最低 `Role.Admin`，只读成员进来是一页 403。
+    额度与用量共用的那一格菜单标了 `visibility: 'tenantAdminOnly'`，三条标签路径
+    也都进了 `TENANT_ADMIN_ONLY_PATHS`。理由只有一条：它的每一条读端点都最低
+    `Role.Admin`，只读成员进来是一页 403。
     可这条理由本身在本轮**没有任何用例守着**——
 
     `tests/test_readonly_member_console_surface.py` 里那张
@@ -2040,15 +2046,20 @@ class TestTheUsageEntryIsHiddenForTheRightReason:
             self._min_role("GET", "/usage/no-such-endpoint")
 
     def test_the_entry_is_in_both_navigation_lists(self) -> None:
-        """菜单标记与 URL 兜底清单是**两份**，只登记一份没有任何运行时信号"""
+        """菜单标记与 URL 兜底清单是**两份**，只登记一份没有任何运行时信号
+
+        额度与用量的三个标签现在共用一格菜单（落在 `/console/channel-quota`）；
+        `/console/usage` 不再单独出现，但仍必须留在 URL 兜底清单里，
+        否则只读成员把这条标签路径直接粘进地址栏照样进得来。
+        """
         import pathlib
 
         source = pathlib.Path("frontend/src/config/navigation.tsx").read_text(encoding="utf-8")
         assert "'/console/usage',\n" in source, "URL 兜底清单 TENANT_ADMIN_ONLY_PATHS 里没有它"
-        # 菜单那一格必须紧跟着标了 tenantAdminOnly
-        entry = source.split("path: '/console/usage',", 1)
-        assert len(entry) == 2, "菜单里没有 /console/usage 这一格"
-        assert "visibility: 'tenantAdminOnly'" in entry[1][:400], "菜单格子没标 tenantAdminOnly"
+        # 三个标签共用的那一格菜单必须标了 tenantAdminOnly
+        entry = source.split("path: '/console/channel-quota',", 1)
+        assert len(entry) == 2, "菜单里没有 /console/channel-quota 这一格"
+        assert "visibility: 'tenantAdminOnly'" in entry[1][:400], "额度与用量的菜单格子没标 tenantAdminOnly"
 
 
 class TestTheTenantBreakdownIsReadable:

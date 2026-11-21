@@ -215,6 +215,7 @@ async def _paragraph(
     chat_type: str,
     content: str,
     persons: tuple[str, ...] = (),
+    sensitive: bool = False,
 ) -> DBMemParagraph:
     row = await DBMemParagraph.create(
         workspace_id=workspace_id,
@@ -230,6 +231,7 @@ async def _paragraph(
         summary=content[:16],
         origin_kind=OriginKind.CONSOLIDATION,
         event_time=_T0,
+        is_sensitive=sensitive,
     )
     for account in persons:
         await DBMemParagraphPerson.create(paragraph_id=row.id, account=account)
@@ -396,6 +398,7 @@ async def _seed_world(client: AsyncQdrantClient) -> World:
             origin_chat_key=CHAT_A1,
             chat_type="group",
             content="租户一的另一段",
+            sensitive=True,
         ),
         "a2_main": await _paragraph(
             instance_key="a2",
@@ -415,6 +418,7 @@ async def _seed_world(client: AsyncQdrantClient) -> World:
             chat_type="group",
             content="租户二的段落",
             persons=("ub1",),
+            sensitive=True,
         ),
         "p1_main": await _paragraph(
             instance_key="p1",
@@ -633,6 +637,59 @@ class TestListFilters:
                 instance_key="a1",
                 domain="everything",
             )
+
+
+class TestSensitiveFilter:
+    async def test_true_false_and_absent(self, world: World) -> None:
+        sensitive = await memory_admin.list_paragraphs(
+            _current_user=world.platform,
+            status="all",
+            sensitive=True,
+            page_size=100,
+        )
+        assert _ids(sensitive) == {world.paragraphs["a1_other"].id, world.paragraphs["b1_main"].id}
+        assert all(item.is_sensitive for item in sensitive.items)
+
+        plain = await memory_admin.list_paragraphs(
+            _current_user=world.platform,
+            status="all",
+            sensitive=False,
+            page_size=100,
+        )
+        assert world.paragraphs["a1_other"].id not in _ids(plain)
+        assert world.paragraphs["b1_main"].id not in _ids(plain)
+        assert all(item.is_sensitive is False for item in plain.items)
+
+        absent = await memory_admin.list_paragraphs(
+            _current_user=world.platform,
+            status="all",
+            page_size=100,
+        )
+        assert absent.total == 7, "不传时不筛，两种行都在"
+
+    async def test_detail_carries_the_flag(self, world: World) -> None:
+        sensitive = await memory_admin.get_memory_item(
+            _current_user=world.platform,
+            memory_type="paragraph",
+            item_id=world.paragraphs["a1_other"].id,
+        )
+        plain = await memory_admin.get_memory_item(
+            _current_user=world.platform,
+            memory_type="paragraph",
+            item_id=world.paragraphs["a1_main"].id,
+        )
+        assert sensitive.model_dump()["is_sensitive"] is True
+        assert plain.model_dump()["is_sensitive"] is False
+
+    async def test_tenant_scope_is_not_widened_by_the_filter(self, world: World) -> None:
+        response = await memory_admin.list_paragraphs(
+            _current_user=world.tenant,
+            instance_key="a1",
+            status="all",
+            sensitive=True,
+            page_size=100,
+        )
+        assert _ids(response) == {world.paragraphs["a1_other"].id}, "租户仍然只看得到自己实例的敏感段"
 
 
 class TestTenantScope:
@@ -908,6 +965,32 @@ class TestOwnItemLifecycle:
         refreshed_other = await DBMemParagraph.get(id=other.id)
         assert refreshed_other.episode_id is None
         assert refreshed_other.is_inactive is False
+
+    async def test_quarantine_list_carries_types_for_paragraphs_only(self, world: World) -> None:
+        paragraph = world.paragraphs["a1_main"]
+        episode = world.episodes["a1"]
+        for memory_type, item_id in (("paragraph", paragraph.id), ("episode", episode.id)):
+            await memory_admin.act_on_memory_item(
+                _current_user=world.tenant,
+                memory_type=memory_type,
+                item_id=item_id,
+                body=MemoryItemActionRequest(action="quarantine"),
+            )
+
+        response = await memory_admin.list_quarantine(
+            _current_user=world.tenant,
+            instance_key="a1",
+            page_size=100,
+        )
+
+        # 两张表的主键各自自增，同一页里 id 可能相同，按 (类型, id) 取
+        by_key = {(item.memory_type, item.id): item for item in response.items}
+        paragraph_item = by_key[("paragraph", paragraph.id)]
+        episode_item = by_key[("episode", episode.id)]
+        assert (paragraph_item.cognitive_type, paragraph_item.knowledge_type) == ("semantic", "fact")
+        # episode 没有认知 / 知识类型这两维：给 None，前端据此不显示那两个标签
+        assert episode_item.cognitive_type is None
+        assert episode_item.knowledge_type is None
 
     async def test_episode_hard_delete_only_removes_the_episode(self, world: World) -> None:
         report = await memory_admin.delete_memory_item(
@@ -1561,6 +1644,53 @@ class TestPromptRoundWorldbook:
         assert platform_detail.worldbook_items[0]["book_name"] == "租户二的书"
         assert platform_detail.worldbook_items[0]["comment"] == "租户二的标题"
 
+    async def test_detail_hides_looked_up_entries_like_injected_ones(self, world: World) -> None:
+        # 模型主动查过的条目与注入条目走同一条可见性判据：看不到的书只留编号与长度。
+        other_book = await self._book("租户二的书", instance_key="b1")
+        other_entry = await self._entry(other_book, uid=0, comment="租户二的标题")
+        own_book = await self._book("域书", instance_key="a1")
+        own_entry = await self._entry(own_book, uid=0, comment="域标题")
+        row = await _prompt_round(
+            CHAT_A1,
+            instance_key="a1",
+            worldbook_state="injected",
+            worldbook_items=[
+                {
+                    "type": "worldbook_lookup",
+                    "id": other_entry.id,
+                    "book_id": other_book.id,
+                    "chars": 10,
+                    "tokens": 8,
+                },
+                {
+                    "type": "worldbook_lookup",
+                    "id": own_entry.id,
+                    "book_id": own_book.id,
+                    "chars": 12,
+                    "tokens": 9,
+                },
+            ],
+        )
+
+        tenant_detail = await memory_admin.get_prompt_round(_current_user=world.tenant, round_pk=row.id)
+        hidden_item, visible_item = tenant_detail.worldbook_items
+        assert hidden_item == {
+            "type": "worldbook_lookup",
+            "id": other_entry.id,
+            "chars": 10,
+            "tokens": 8,
+            "status": "hidden",
+            "book_name": "",
+            "comment": "",
+        }
+        assert visible_item["status"] == "active"
+        assert visible_item["book_id"] == own_book.id
+        assert visible_item["comment"] == "域标题"
+
+        platform_detail = await memory_admin.get_prompt_round(_current_user=world.platform, round_pk=row.id)
+        assert platform_detail.worldbook_items[0]["status"] == "active"
+        assert platform_detail.worldbook_items[0]["book_name"] == "租户二的书"
+
     async def test_count_ignores_record_types_it_does_not_know(self, world: World) -> None:
         # 列表那一栏只数注入的条目：明细行里以后多出一种记录，不该被算成「注入了一条」。
         row = await _prompt_round(
@@ -1570,6 +1700,7 @@ class TestPromptRoundWorldbook:
             worldbook_items=[
                 {"type": "worldbook", "id": 1, "book_id": 1, "chars": 2, "position": "before_history"},
                 {"type": "worldbook_dropped", "id": 2, "book_id": 1, "chars": 9, "reason": "global_chars"},
+                {"type": "worldbook_lookup", "id": 4, "book_id": 1, "chars": 7, "tokens": 6},
                 {"type": "something_else", "id": 3, "book_id": 1, "chars": 3},
                 "not a dict",
             ],

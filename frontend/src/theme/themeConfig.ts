@@ -3,7 +3,15 @@
  * 提供主题获取和切换的核心功能
  */
 import { useColorMode } from '../stores/theme'
-import { themes, ThemeConfig, ThemeKeys, getAlphaColor, getExtendedPalette } from './palette'
+import {
+  themes,
+  ThemeConfig,
+  ThemeKeys,
+  getAlphaColor,
+  getDarkerColor,
+  getExtendedPalette,
+  getMuiPaletteOptions,
+} from './palette'
 import { BORDER_RADIUS } from './variants'
 // 导入高级渐变工具
 import AdvancedGradients from './gradients'
@@ -50,6 +58,86 @@ export const metricColors: Record<string, string> = {
   },
   get success_rate() { 
     return getCurrentExtendedPalette().secondary.main 
+  },
+}
+
+// 当前模式下 MUI 的文字色（扩展调色板里没有文字色，取 MUI 调色板同一份）
+function getCurrentTextColors() {
+  const mode = getCurrentThemeMode()
+  return getMuiPaletteOptions(mode, getCurrentTheme()).text
+}
+
+/**
+ * 图谱的簇色：按「角色」命名，记忆图、好感图（以后还有世界书图）共用
+ *
+ * 簇标题、节点、图例、类型标签都从这里取，换主题预设时一起变。`primary` 不作簇色（留给选中与品牌按钮），
+ * `error` 不作簇色（只表达失败与硬删除）。
+ */
+export type AtlasColorRole = 'core' | 'person' | 'episodic' | 'semantic' | 'entity' | 'relation' | 'context'
+
+export const ATLAS_COLORS: Record<AtlasColorRole, string> = {
+  get core() {
+    return getCurrentExtendedPalette().info
+  },
+  get person() {
+    return getCurrentExtendedPalette().secondary.main
+  },
+  get episodic() {
+    return getCurrentExtendedPalette().warning
+  },
+  get semantic() {
+    return getCurrentExtendedPalette().success
+  },
+  get entity() {
+    return getDarkerColor(getCurrentExtendedPalette().secondary.main, 0.25)
+  },
+  get relation() {
+    return getDarkerColor(getCurrentExtendedPalette().info, 0.3)
+  },
+  get context() {
+    return getCurrentTextColors().secondary
+  },
+}
+
+/**
+ * 状态标签的语气 → 颜色（`StatusChip` 用）
+ *
+ * 一个格子只放一个状态标签；冻结、保护这类附加标记用同色小图标跟在后面。
+ */
+export type StatusTone =
+  | 'active'
+  | 'inactive'
+  | 'disabled'
+  | 'quarantined'
+  | 'paused'
+  | 'failed'
+  | 'frozen'
+  | 'protected'
+
+export const STATUS_TONES: Record<StatusTone, string> = {
+  get active() {
+    return getCurrentExtendedPalette().success
+  },
+  get inactive() {
+    return getCurrentTextColors().secondary
+  },
+  get disabled() {
+    return getCurrentTextColors().disabled
+  },
+  get quarantined() {
+    return getCurrentExtendedPalette().warning
+  },
+  get paused() {
+    return getCurrentExtendedPalette().warning
+  },
+  get failed() {
+    return getCurrentExtendedPalette().error
+  },
+  get frozen() {
+    return getCurrentExtendedPalette().info
+  },
+  get protected() {
+    return getCurrentExtendedPalette().primary.main
   },
 }
 

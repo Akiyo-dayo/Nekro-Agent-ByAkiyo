@@ -12,6 +12,7 @@ import {
   FormControlLabel,
   FormLabel,
   Grid,
+  MenuItem,
   Radio,
   RadioGroup,
   Stack,
@@ -36,11 +37,14 @@ import { useSnackbar } from 'notistack'
 import ActionButton from '../common/ActionButton'
 import IconActionButton from '../common/IconActionButton'
 import QueryErrorState from '../common/QueryErrorState'
+import RemoteBooksSection from './RemoteBooksSection'
 import { ApiError, isNotFoundError } from '../../services/api/axios'
 import {
   tavernApi,
   type PresetCardResponse,
   type PresetCardUpdateRequest,
+  type TavernCleanupHtmlKind,
+  type TavernCleanupOutputMode,
   type TavernCleanupRule,
   type TavernScope,
 } from '../../services/api/tavern'
@@ -57,6 +61,45 @@ const DEPTH_MAX = 100
 
 const SOURCE_KEYS = ['system', 'description', 'personality', 'scenario', 'mes_example'] as const
 type SourceKey = (typeof SOURCE_KEYS)[number]
+
+/** 处理方式的选项与文案；顺序就是下拉框里的顺序 */
+const OUTPUT_MODE_LABEL_KEYS: Record<TavernCleanupOutputMode, string> = {
+  replace: 'extension.rules.outputModeOption.replace',
+  text: 'extension.rules.outputModeOption.text',
+  drop: 'extension.rules.outputModeOption.drop',
+}
+
+const OUTPUT_MODE_HINT_KEYS: Record<TavernCleanupOutputMode, string> = {
+  replace: 'extension.rules.outputModeHint.replace',
+  text: 'extension.rules.outputModeHint.text',
+  drop: 'extension.rules.outputModeHint.drop',
+}
+
+/** 替换文字带 HTML 时的类别名；空串（不带 HTML）没有文案 */
+const HTML_KIND_LABEL_KEYS: Record<TavernCleanupHtmlKind, string> = {
+  '': '',
+  display: 'extension.rules.htmlKind.display',
+  external: 'extension.rules.htmlKind.external',
+  interactive: 'extension.rules.htmlKind.interactive',
+  remote: 'extension.rules.htmlKind.remote',
+}
+
+/** 缺键或不认识的值按 `replace`（旧数据都是这样存的） */
+function readOutputMode(value: unknown): TavernCleanupOutputMode {
+  return value === 'text' || value === 'drop' || value === 'replace' ? value : 'replace'
+}
+
+function readHtmlKind(value: unknown): TavernCleanupHtmlKind {
+  switch (value) {
+    case 'display':
+    case 'external':
+    case 'interactive':
+    case 'remote':
+      return value
+    default:
+      return ''
+  }
+}
 
 const SOURCE_LABEL_KEYS: Record<SourceKey, string> = {
   system: 'extension.source.system',
@@ -116,6 +159,8 @@ function readRules(rules: TavernCleanupRule[] | undefined): TavernCleanupRule[] 
     trim: Array.isArray(rule.trim) ? rule.trim.filter((item): item is string => typeof item === 'string') : [],
     enabled: Boolean(rule.enabled),
     disabled_reason: typeof rule.disabled_reason === 'string' ? rule.disabled_reason : '',
+    output_mode: readOutputMode(rule.output_mode),
+    html_kind: readHtmlKind(rule.html_kind),
   }))
 }
 
@@ -162,6 +207,7 @@ function sameRule(left: TavernCleanupRule, right: TavernCleanupRule): boolean {
     left.replace === right.replace &&
     left.enabled === right.enabled &&
     left.disabled_reason === right.disabled_reason &&
+    left.output_mode === right.output_mode &&
     sameStringArray(cleanTrim(left.trim), cleanTrim(right.trim))
   )
 }
@@ -455,7 +501,7 @@ export default function TavernExtensionPanel({
             ...previous,
             cleanup_rules: [
               ...previous.cleanup_rules,
-              { name: '', find: '', replace: '', trim: [], enabled: false, disabled_reason: '' },
+              { name: '', find: '', replace: '', trim: [], enabled: false, disabled_reason: '', output_mode: 'replace' },
             ],
           }
         : previous
@@ -620,9 +666,15 @@ export default function TavernExtensionPanel({
           mb: 1,
         }}
       >
-        <Typography variant="caption" color="text.secondary">
-          {t('extension.rules.limit', { n: MAX_CLEANUP_RULES })}
-        </Typography>
+        <Box>
+          <Typography variant="caption" color="text.secondary" display="block">
+            {t('extension.rules.limit', { n: MAX_CLEANUP_RULES })}
+          </Typography>
+          {/* NA 里对 HTML 规则的启用与处理方式不写进导出的卡：重新导入就回到卡里的启用状态与默认处理方式 */}
+          <Typography variant="caption" color="text.secondary" display="block">
+            {t('extension.rules.reimportNote')}
+          </Typography>
+        </Box>
         <ActionButton
           size="small"
           tone="ghost"
@@ -634,10 +686,11 @@ export default function TavernExtensionPanel({
         </ActionButton>
       </Box>
       <Box sx={{ overflowX: 'auto', ...(SCROLLBAR_VARIANTS.thin.styles as object) }}>
-        <Table size="small" sx={{ minWidth: 860 }}>
+        <Table size="small" sx={{ minWidth: 1000 }}>
           <TableHead>
             <TableRow>
               <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('extension.rules.enabled')}</TableCell>
+              <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('extension.rules.outputMode')}</TableCell>
               <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('extension.rules.name')}</TableCell>
               <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('extension.rules.find')}</TableCell>
               <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('extension.rules.replace')}</TableCell>
@@ -649,7 +702,7 @@ export default function TavernExtensionPanel({
           <TableBody>
             {form.cleanup_rules.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} sx={UNIFIED_TABLE_STYLES.cell}>
+                <TableCell colSpan={8} sx={UNIFIED_TABLE_STYLES.cell}>
                   <Typography variant="body2" color="text.secondary">
                     {t('extension.rules.empty')}
                   </Typography>
@@ -672,28 +725,72 @@ export default function TavernExtensionPanel({
                 return (
                   <TableRow key={index}>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      <Switch
-                        size="small"
-                        checked={rule.enabled}
-                        disabled={readOnly}
-                        onChange={event =>
-                          // 原因只描述导入时的判定；手动改过之后它就不再准确，清掉
-                          updateRule(index, { enabled: event.target.checked, disabled_reason: '' })
-                        }
-                        inputProps={{
-                          'aria-label': `${t('extension.rules.enabled')} ${t('extension.rules.item', { n: index + 1 })}`,
-                        }}
-                      />
+                      {/* 输出 HTML 的规则：这里的开关与处理方式只管 NA 怎么发，不写进导出的卡 */}
+                      <Tooltip title={rule.html_kind ? t('extension.rules.htmlEnableHint') : ''}>
+                        <span>
+                          <Switch
+                            size="small"
+                            checked={rule.enabled}
+                            disabled={readOnly}
+                            onChange={event =>
+                              // 原因只描述导入时的判定；手动改过之后它就不再准确，清掉
+                              updateRule(index, { enabled: event.target.checked, disabled_reason: '' })
+                            }
+                            inputProps={{
+                              'aria-label': `${t('extension.rules.enabled')} ${t('extension.rules.item', { n: index + 1 })}`,
+                            }}
+                          />
+                        </span>
+                      </Tooltip>
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                       <TextField
+                        select
                         size="small"
                         fullWidth
-                        value={rule.name}
-                        onChange={event => updateRule(index, { name: event.target.value })}
+                        label={t('extension.rules.outputMode')}
+                        value={rule.output_mode}
+                        onChange={event =>
+                          updateRule(index, {
+                            output_mode: readOutputMode(event.target.value),
+                          })
+                        }
                         disabled={readOnly}
-                        inputProps={{ 'aria-label': `${t('extension.rules.name')} ${index + 1}` }}
-                      />
+                        helperText={t(OUTPUT_MODE_HINT_KEYS[rule.output_mode])}
+                        FormHelperTextProps={{ sx: { mx: 0 } }}
+                        inputProps={{
+                          'aria-label': `${t('extension.rules.outputMode')} ${index + 1}`,
+                        }}
+                      >
+                        {(Object.keys(OUTPUT_MODE_LABEL_KEYS) as TavernCleanupOutputMode[]).map(
+                          mode => (
+                            <MenuItem key={mode} value={mode}>
+                              {t(OUTPUT_MODE_LABEL_KEYS[mode])}
+                            </MenuItem>
+                          )
+                        )}
+                      </TextField>
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
+                        <TextField
+                          size="small"
+                          fullWidth
+                          value={rule.name}
+                          onChange={event => updateRule(index, { name: event.target.value })}
+                          disabled={readOnly}
+                          inputProps={{ 'aria-label': `${t('extension.rules.name')} ${index + 1}` }}
+                        />
+                        {rule.html_kind ? (
+                          <Tooltip title={t('extension.rules.htmlKindHint')}>
+                            <Chip
+                              size="small"
+                              label={t(HTML_KIND_LABEL_KEYS[rule.html_kind])}
+                              sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.warning.main, true)}
+                            />
+                          </Tooltip>
+                        ) : null}
+                      </Box>
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                       <TextField
@@ -1014,6 +1111,9 @@ export default function TavernExtensionPanel({
         </Section>
 
         <Section title={t('extension.section.rules')}>{renderRuleTable()}</Section>
+
+        {/* 远程世界书放在清理规则之后：它靠下载才能拿到条目，与手填的字段没有先后关系 */}
+        <RemoteBooksSection presetId={presetId} scope={scope} readOnly={readOnly} />
 
         {saveError ? <Alert severity="error">{saveError}</Alert> : null}
 

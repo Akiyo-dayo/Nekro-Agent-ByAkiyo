@@ -600,9 +600,12 @@ async def _release_instance_mail_grants(
 
     from nekro_agent.models.db_email_outbox import DBEmailOutbox
     from nekro_agent.services.email_accounts import rewrite_platform_share_instances
+    from nekro_agent.services.ssh_gateway.duty_instances import rewrite_duty_instances
 
     for instance_row, _is_released in rows:
         revoked = rewrite_platform_share_instances(f"{instance_row.adapter_key}:{instance_row.instance_key}", None)
+        # SSH 值守的实例名单同理：换了主人就摘掉，以后要值守由平台方重新加
+        rewrite_duty_instances(f"{instance_row.adapter_key}:{instance_row.instance_key}", None)
         # 查询集的 `update()` 不触发 `auto_now`：`update_time` 要手写，否则 7 天清理按入队时刻算
         voided = await DBEmailOutbox.filter(
             adapter_key=instance_row.adapter_key,

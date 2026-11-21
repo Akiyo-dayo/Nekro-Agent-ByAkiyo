@@ -199,7 +199,11 @@
       "affection": "Affection",
       "affection_event": "Affection events",
       "announcement_delivery": "Announcement deliveries",
-      "plugin_settings": "Plugins with instance settings"
+      "plugin_settings": "Plugins with instance settings",
+      "state_channel": "Character states",
+      "state_snapshot": "Character state snapshots",
+      "state_person": "Character state profiles",
+      "state_person_snapshot": "Profile snapshots"
     }
   },
   "unclaimedPanel": {

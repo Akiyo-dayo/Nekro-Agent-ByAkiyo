@@ -452,9 +452,9 @@ async def test_未配置与不支持的类型不发起请求(monkeypatch: Monkey
 async def test_outbound_recheck_is_skipped_for_platform_group() -> None:
     """平台组对租户不做出站复检
 
-    复检失败的文案里带主机名与解析出的 IP。平台方用本地推理服务是主流用法，
-    对租户复检等于把平台方的内网拓扑念给他听，而租户又控制不了这个地址，
-    跳过不增加任何出站能力。
+    平台方用本地推理服务是主流用法，对租户复检会被拒，而「被拒」本身就告诉了租户平台方的组指向内网
+    （复检失败的文案已不带主机名与解析出的地址，统一成一句，但拒与不拒仍分得出来）；租户又控制不了
+    这个地址，跳过不增加任何出站能力。
     """
     internal_group = platform_group()
     internal_group.BASE_URL = "http://127.0.0.1:11434/v1"
@@ -464,7 +464,7 @@ async def test_outbound_recheck_is_skipped_for_platform_group() -> None:
 
     with pytest.raises(ValidationError) as exc_info:
         await assert_test_target_allowed(TENANT_ADMIN, internal_group, credential_visible=True)
-    assert "127.0.0.1" in str(exc_info.value), "该报错确实会暴露地址，正是上面必须跳过的理由"
+    assert "127.0.0.1" not in str(exc_info.value), "租户看到的报错不带地址"
 
 
 async def test_平台方自身不受出站校验限制() -> None:

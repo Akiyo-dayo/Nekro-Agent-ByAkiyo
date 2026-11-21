@@ -18,7 +18,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 # 要剥掉的不可见字符：Unicode 类别 Cc（控制符，保留 \t \n \r 交给空白处理）、Cf（格式符：零宽字符、双向文本控制、
 # 软连字符、BOM、行间注释锚点、阿拉伯数字符号……）、Cs（落单的代理）、Zl / Zp（行 / 段分隔符），
@@ -186,6 +186,19 @@ def echo_inline(value: object, max_length: int = MAX_ECHO_CHARS) -> str:
     return json.dumps(cleaned, ensure_ascii=False)
 
 
+# 形如 `<令牌 | …>` 的开头：边界标签（`wrap_untrusted_block`）与聊天记录的消息分隔都长这样
+_TAG_OPENER_PATTERN = re.compile(r"<(?=\s*/?[\w-]+\s*\|)")
+
+
+def defang_boundary_tags(text: str) -> str:
+    """把不可信文字里像边界标签的片段拆掉：开头的 `<` 换成全角 `＜`
+
+    两处会认这种形状：模型读到的不可信边界，以及发送前 `fix_raw_response` 截断用的
+    `<xxxxxxxx | message separator>`（截掉其后的全部内容）。普通的 `<` / `>`（重定向、比较）不动。
+    """
+    return _TAG_OPENER_PATTERN.sub("＜", text)
+
+
 def sanitize_block_text(text: str, max_length: int) -> str:
     """清洗多行不可信文本
 
@@ -244,12 +257,21 @@ class UntrustedToolResult:
         summary: 插件自己算出来的可信说明，不得含外部内容。它会进 `content_text`，
             被记忆整理、好感评估读到，所以正文不放这里
         attrs: 开标签上的数字属性
+        history_body: 落库、广播给前端、之后轮次回放用的正文；为 `None` 时就是 `body`（现状）。
+            设了的话，完整的 `body` 只在本轮这一次交给模型，聊天记录、消息接口和之后的历史里只有它。
+            它同样当不可信内容处理（回放时照样包裹）。见 :meth:`stored_body`
     """
 
     kind: str
     body: str
     summary: str = ""
     attrs: Dict[str, int] = field(default_factory=dict)
+    history_body: Optional[str] = None
+
+    @property
+    def stored_body(self) -> str:
+        """落库、给人看、之后轮次回放的那一份正文"""
+        return self.body if self.history_body is None else self.history_body
 
 
 def render_untrusted_result(one_time_code: str, result: UntrustedToolResult) -> str:

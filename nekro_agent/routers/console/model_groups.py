@@ -30,7 +30,11 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from nekro_agent.core.config import ModelConfigGroup
+from nekro_agent.core.config import (
+    MODEL_GROUP_CONTEXT_LENGTH_MAX,
+    MODEL_GROUP_TOKEN_FACTOR_MAX,
+    ModelConfigGroup,
+)
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_model_group import ModelGroupVisibility
 from nekro_agent.models.db_user import DBUser
@@ -79,6 +83,24 @@ class ModelGroupPayload(BaseModel):
     # 预填方式落在模型组上而不是槽位配置上：它决定「这个组的请求末尾要不要跟一条
     # assistant 消息」，同一个频道换组就跟着换。
     prefill_mode: Optional[Literal["off", "assistant", "deepseek"]] = Field(default=None, description="预填方式")
+    api_format: Optional[Literal["openai", "gemini"]] = Field(
+        default=None,
+        description="聊天接口格式：openai=OpenAI 兼容（默认）/ gemini=Gemini 原生",
+    )
+    # 世界书每轮预算按上下文长度的百分比算；分词系数让 token 计数贴近这个模型自己的分词器
+    context_length: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=MODEL_GROUP_CONTEXT_LENGTH_MAX,
+        description="上下文长度（token）；0 表示未填，按 32768 估",
+    )
+    token_count_factor: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=MODEL_GROUP_TOKEN_FACTOR_MAX,
+        allow_inf_nan=False,
+        description="分词系数（相对 o200k_base）；0 表示按模型名自动取",
+    )
     token_input_rate: Optional[float] = Field(default=None, description="输入 Token 倍率")
     token_completion_rate: Optional[float] = Field(default=None, description="补全 Token 倍率")
     model_price_rate: Optional[float] = Field(default=None, description="模型价格倍率")
@@ -184,6 +206,9 @@ class ModelGroupTestResult(BaseModel):
     error_detail: str = Field(default="", description="上游原文（已脱敏）；凭据不可见时恒为空")
 
 
+_ZERO_WHEN_CLEARED = frozenset({"context_length", "token_count_factor"})
+
+
 def _merge_payload(base: ModelConfigGroup, payload: ModelGroupPayload) -> ModelConfigGroup:
     """把提交的小写字段合并进 `ModelConfigGroup`
 
@@ -194,6 +219,9 @@ def _merge_payload(base: ModelConfigGroup, payload: ModelGroupPayload) -> ModelC
     for field, value in payload.model_dump(exclude_unset=True).items():
         if field == "visibility":
             continue
+        if value is None and field in _ZERO_WHEN_CLEARED:
+            # 这两项在组上不可为空：「清空」就是回到 0（未填 / 按模型名自动取）
+            value = 0
         data[field.upper()] = value
     return ModelConfigGroup.model_validate(data)
 
@@ -331,6 +359,7 @@ async def test_console_model_group(
         credential_visible=credential_visible,
         group_name=name,
         tenant_id=identity.tenant_id,
+        tenant_egress=not row.is_platform_owned,
     )
 
     return ModelGroupTestResult(

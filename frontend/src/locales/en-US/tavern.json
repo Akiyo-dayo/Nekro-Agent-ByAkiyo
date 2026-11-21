@@ -59,6 +59,8 @@
     "bookDecorated": "{{n}} entries with decorators",
     "bookNotes": "Parse notes",
     "includeBook": "Import the character book",
+    "rewriteNameVars": "Replace name-reading variables with {{userMacro}} / {{charMacro}}",
+    "rewriteNameVarsHint": "When the card stores the user's or character's name in a variable, NA cannot read it; replacing it with a macro is what makes the name show up. Only writes that output a name are replaced, and the import report lists what was changed.",
     "bookGateOn": "Entries only take effect when worldbook is enabled on the channel (currently enabled on this instance)",
     "bookGateOff": "Entries only take effect when worldbook is enabled on the channel (currently disabled on this instance)",
     "bookReferenceHint": "Imported entries are treated as reference material; the platform can promote them one by one on the worldbook page",
@@ -71,6 +73,18 @@
     "ruleReplace": "Replace",
     "ruleEnabled": "Enabled",
     "ruleDisabledReason": "Why it is off by default",
+    "ruleOutputMode": {
+      "replace": "Use replacement text",
+      "text": "Keep the text only",
+      "drop": "Drop the whole match"
+    },
+    "htmlKindHint": "The replacement is web code that QQ cannot display and NA does not render; use \"keep the text only\" or \"drop the whole match\" instead",
+    "htmlKindReveal": {
+      "display": "Display only",
+      "external": "Needs external resources",
+      "interactive": "Interactive program",
+      "remote": "Remote code or worldbook edits"
+    },
     "unsupported": "Parts of this card the platform cannot use",
     "notes": "Parse notes",
     "gates": "Gates on the target instance",
@@ -95,7 +109,9 @@
     "slotsResultEnabled": "Advanced prompt slots are now on for this instance; post-history instructions will be sent.",
     "slotsResultAlready": "Advanced prompt slots were already on for this instance; nothing changed.",
     "slotsResultFailed": "Imported, but the slots were not turned on: {{reason}}",
-    "slotsResultChannelsOff": "These chats turn the slots off on their own and still won't send:"
+    "slotsResultChannelsOff": "These chats turn the slots off on their own and still won't send:",
+    "remoteBooks": "Worldbooks the card scripts download",
+    "remoteBooksHint": "After importing the preset you can download them here or on the preset page."
   },
   "export": {
     "open": "Export",
@@ -114,7 +130,7 @@
       "depth_limited": "It applies only to messages deeper than a set depth; the platform only cleans the message just sent, so this rule is off by default",
       "invalid_regex": "The regular expression does not compile, so it cannot run; this rule is off by default",
       "unsafe_regex": "The regular expression failed the safety check because it could stall the service; this rule is off by default",
-      "html_output": "The replacement contains HTML tags; QQ cannot render status bars, so enable it here if you need it"
+      "html_output": "The replacement contains HTML tags; enabling it as \"keep the text only\" would fail the save check, so it stays off. Edit out the tags and then enable it"
     }
   },
   "extension": {
@@ -185,7 +201,7 @@
       "pick": "Selection",
       "pickFirst": "First one",
       "pickRandom": "Random one",
-      "hint": "After the channel switches to this preset or runs /reset, the next time it is called it sends one greeting first and then replies normally. In group chats the group-only list is used when it has entries."
+      "hint": "Greetings are no longer sent to the chat; they are kept with the card and exported unchanged."
     },
     "slots": {
       "postHistory": "Post-history instructions",
@@ -207,6 +223,26 @@
       "replace": "Replace",
       "trim": "Trim strings",
       "enabled": "Enabled",
+      "outputMode": "Handling",
+      "outputModeOption": {
+        "replace": "Use replacement text",
+        "text": "Keep the text only",
+        "drop": "Drop the whole match"
+      },
+      "outputModeHint": {
+        "replace": "Replace the match with the replacement text (the original behavior)",
+        "text": "Keep only the text in the captured groups; HTML and fixed text are dropped",
+        "drop": "Remove the matched part entirely"
+      },
+      "htmlKind": {
+        "display": "Display only",
+        "external": "Needs external resources",
+        "interactive": "Interactive program",
+        "remote": "Remote code or worldbook edits"
+      },
+      "htmlKindHint": "The replacement is web code that QQ cannot display and NA does not render; use \"keep the text only\" or \"drop the whole match\" instead",
+      "reimportNote": "For HTML rules, the on/off state and handling chosen here only decide what NA sends; they are not written into the exported card, and importing the card again restores the card's on/off state and the default handling",
+      "htmlEnableHint": "This rule's replacement is web code: the switch and handling here only decide what NA sends; they are not written into the exported card, and importing it again restores the card's settings",
       "status": "Status",
       "add": "Add rule",
       "remove": "Remove rule",
@@ -220,6 +256,45 @@
       "slowDisabled": "Disabled (too slow)",
       "slowDisabledHint": "This rule timed out 3 times in this process and has been paused; saving the rule table once resets the count"
     }
+  },
+  "remoteBooks": {
+    "title": "Remote worldbooks",
+    "intro": "Scripts in the card download these worldbooks while running in SillyTavern. NA does not run scripts: after you confirm, it downloads them on your behalf and imports them as reference material for this preset (entries are not treated as trusted content). They are not updated automatically.",
+    "proxy": "Download through the system proxy",
+    "fileName": "File name",
+    "host": "Primary host",
+    "versionHint": "Version hint",
+    "status": "Status",
+    "actions": "Actions",
+    "scripts": "Used by scripts",
+    "pointsTo": "URL points at {{hint}}",
+    "mirrors": "{{n}} more mirrors",
+    "notImported": "Not imported",
+    "versionLine": "Version {{version}}",
+    "noVersion": "No version written",
+    "entries": "{{n}} entries",
+    "fromHost": "From {{host}}",
+    "manualSource": "Uploaded manually",
+    "downloadedAt": "Downloaded {{time}}",
+    "download": "Download and import",
+    "check": "Check for updates",
+    "update": "Update to the new version",
+    "upload": "Upload manually",
+    "retry": "Retry",
+    "checkSame": "Already up to date",
+    "checkNewer": "New version available: {{remote}} (current {{local}})",
+    "checkChanged": "Content changed (same version number)",
+    "checkNotImported": "This book is not imported yet; refresh to download it again",
+    "importedDone": "Imported \"{{name}}\", {{n}} entries",
+    "updatedDone": "Updated \"{{name}}\", {{n}} entries",
+    "notesHint": "{{n}} import notes; see the worldbook page",
+    "downloadFailed": "Could not download the remote worldbook",
+    "checkFailed": "Could not check for updates",
+    "uploadFailed": "Could not upload the worldbook",
+    "confirmTitle": "Replace this book",
+    "confirmBody": "The new version replaces every entry in this book, including entries you edited by hand.",
+    "confirmReplace": "Replace",
+    "cancel": "Cancel"
   },
   "rounds": {
     "title": "Character card and slots",
@@ -277,13 +352,27 @@
     "tabs": {
       "preview": "Preview",
       "trial": "Trial",
+      "presets": "Presets",
       "audit": "Changes"
     },
+    "menu": {
+      "changeLog": "Change log"
+    },
     "preview": {
+      "nav": {
+        "overview": "Overview",
+        "rp": "Preset layout",
+        "greeting": "Greeting",
+        "slots": "Slots",
+        "messages": "Messages"
+      },
+      "greetingNotSent": "This preview will not send a greeting",
       "channel": "Channel",
       "channelPlaceholder": "Select a channel",
       "preset": "Preset",
       "presetCurrent": "Current preset of the channel",
+      "rpPreset": "Preview preset",
+      "rpPresetCurrent": "Follow the channel's current setting",
       "sample": "Sample message",
       "samplePlaceholder": "Optional; it is appended to the chat history as the last message",
       "sampleHelper": "Optional, up to {{max}} chars ({{count}}/{{max}})",
@@ -292,6 +381,29 @@
       "notice": "Preview does not run memory recall or plugin dynamic injection; those two show placeholders. It does not call the model and writes nothing.",
       "botOffline": "The bot of this channel is offline, so its own platform account is shown as a placeholder in the prompt; everything else matches a real round.",
       "presetOverrideNote": "Previewing another persona: its text, advanced slots, greeting, depth prompt and persona worldbook are used; the chat summary and affection block still follow the chat's current persona (they belong to the persona's memory partition, which the preview does not switch).",
+      "rpTitle": "Laid out by preset: {{name}}",
+      "rpStats": {
+        "system": "System prompt: {{count}} segments",
+        "tail": "After chat history: {{count}} segments",
+        "depth": "Depth injection: {{count}} segments"
+      },
+      "rpColumns": {
+        "name": "Name",
+        "where": "Where",
+        "chars": "Chars"
+      },
+      "rpWhere": {
+        "system": "System prompt",
+        "tail": "After chat history",
+        "depth": "Depth {{depth}}"
+      },
+      "rpEmpty": "This preset produced no segments",
+      "rpPrefill": "Prefill: not sent in this version",
+      "rpInactive": {
+        "slots_off": "This channel has not enabled \"Advanced prompt slots\", so the preset will not take effect",
+        "tavern_off": "This channel's persona does not use the Tavern-compatible runtime, so the preset will not take effect",
+        "unavailable": "The preset selected for this channel no longer exists or does not belong to this instance, so it will not take effect"
+      },
       "summarySlots": "Advanced slots",
       "slotsOn": "On",
       "slotsOff": "Off",
@@ -351,6 +463,103 @@
       "codeEmpty": "No code block in the reply",
       "usage": "Usage: input {{input}} / output {{output}} / total {{total}} tokens"
     },
+    "presets": {
+      "import": "Import preset",
+      "emptyTitle": "No presets yet. Import a SillyTavern chat completion preset (.json)",
+      "globalReadOnly": "Global presets are read-only for instances",
+      "segmentsCount": "{{enabled}} enabled / {{total}} total",
+      "columns": {
+        "name": "Name",
+        "segments": "Segments",
+        "owner": "Scope",
+        "updatedAt": "Updated"
+      },
+      "owner": {
+        "global": "Global",
+        "instance": "This instance"
+      },
+      "actions": {
+        "export": "Export",
+        "delete": "Delete"
+      },
+      "importDialog": {
+        "title": "Import preset",
+        "chooseFile": "Choose file",
+        "fileHint": "JSON only, up to {{max}} MiB each",
+        "jsonOnly": "Only .json files are supported",
+        "noFile": "Choose a preset file first",
+        "inspecting": "Parsing…",
+        "name": "Name",
+        "nameRequired": "Name is required",
+        "notesTitle": "Notes",
+        "notesEmpty": "No extra notes",
+        "summaryTitle": "Segment summary",
+        "back": "Back",
+        "submit": "Import",
+        "importing": "Importing…",
+        "success": "Preset imported"
+      },
+      "deleteDialog": {
+        "title": "Delete preset",
+        "body": "Delete \"{{name}}\"? Channels using it will fall back to no preset.",
+        "confirm": "Delete",
+        "deleted": "Preset deleted",
+        "referencedHint": "{{count}} places still use this preset: {{names}}. After deletion they will behave as if no preset were chosen.",
+        "referenceJoin": ", ",
+        "referenceMore": " etc.",
+        "referenceLayer": {
+          "system": "global config",
+          "adapter": "adapter {{label}}",
+          "instance": "instance {{label}}",
+          "channel": "channel {{label}}"
+        }
+      },
+      "detail": {
+        "name": "Name",
+        "nameRequired": "Name is required",
+        "notice": "To use it for an instance or channel: open \"Settings\" in the top-right of this page, set \"Roleplay preset\" to it, and turn on \"Enable advanced prompt slots\".",
+        "report": "Import report ({{count}})",
+        "reportEmpty": "No extra notes",
+        "search": "Search segments",
+        "searchPlaceholder": "Filter by name",
+        "onlyEnabled": "Enabled only",
+        "shown": "Showing {{shown}} / {{total}} segments",
+        "noMatch": "No matching segments",
+        "columns": {
+          "name": "Name",
+          "role": "Role",
+          "position": "Position",
+          "chars": "Chars",
+          "enabled": "Enabled"
+        },
+        "enabledYes": "Enabled",
+        "enabledNo": "Disabled",
+        "position": {
+          "before": "Before chat history",
+          "after": "After chat history",
+          "depth": "Depth {{depth}}"
+        },
+        "marker": {
+          "chatHistory": "—— Chat history ——",
+          "fillPrefix": "Filled by NA",
+          "fills": {
+            "charDescription": "Character description",
+            "charPersonality": "Personality",
+            "scenario": "Scenario",
+            "dialogueExamples": "Example dialogue",
+            "worldInfo": "Worldbook",
+            "chatHistory": "Chat history"
+          }
+        },
+        "emptyContent": "This segment has no text",
+        "toggleSegment": "Enable \"{{name}}\"",
+        "unsaved": "{{count}} unsaved changes",
+        "discard": "Discard",
+        "save": "Save",
+        "saving": "Saving…",
+        "saved": "Preset saved"
+      }
+    },
     "audit": {
       "columns": {
         "time": "Time",
@@ -367,6 +576,7 @@
       "targetPreset": "Preset {{id}}",
       "field": {
         "advancedSlots": "Advanced slots switch",
+        "stablePrefixOrder": "Stable prompt prefix order",
         "postHistory": "Post-history",
         "auxiliary": "Auxiliary",
         "prefill": "Prefill",

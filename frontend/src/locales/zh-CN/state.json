@@ -1,0 +1,307 @@
+{
+  "title": "角色状态",
+  "subtitle": "这个实例下每个频道的状态树、每个人的人设档案、状态模板与改动记录",
+  "scopeBanner": "状态按实例分开存：这里只显示这个实例的频道与档案",
+  "selectInstance": "角色状态是按实例分的：请先在顶栏选一个实例",
+  "notEnabled": "这个实例没有启用角色状态，或者你看不到它",
+  "tabs": {
+    "channels": "频道状态",
+    "people": "个人档案",
+    "templates": "模板",
+    "audit": "审计"
+  },
+  "menu": {
+    "changeLog": "变更记录"
+  },
+  "setup": {
+    "loading": "正在检查启用状态…",
+    "summary": "角色状态已在运行：{{channels}} 个频道、{{people}} 份个人档案",
+    "collapse": "收起",
+    "expand": "展开",
+    "steps": {
+      "plugin": {
+        "title": "启用插件",
+        "todo": "角色状态插件还没有在这个实例上启用。要在实例这一层打开，只在某个群里打开的话这一页进不来。",
+        "done": "角色状态插件已在这个实例上启用。",
+        "action": "去插件管理"
+      },
+      "template": {
+        "title": "给人设建模板",
+        "todo": "还没有任何人设有状态模板。选一个人设，套用现成的『场景』模板就能开始。",
+        "done": "已有 {{count}} 个人设有状态模板。",
+        "action": "去建模板"
+      },
+      "modelGroup": {
+        "title": "更新用的模型组",
+        "fallback": "没有单独指定，正在用主对话模型组 {{group}}。每隔若干条消息会多一次模型调用，建议指一个便宜的组。",
+        "configured": "用 {{group}}。",
+        "missing": "没有可用的模型组，状态不会自动更新。",
+        "action": "去设置"
+      },
+      "firstState": {
+        "title": "产生第一份状态",
+        "todo": "在群里和 Bot 聊一句，或发 `/状态`，这个群的状态就会建出来。",
+        "done": "已有 {{count}} 个频道产生了状态。"
+      }
+    }
+  },
+  "enums": {
+    "source": {
+      "update": "分步更新",
+      "inline": "顺手更新",
+      "compat": "兼容解析",
+      "admin": "管理员改动",
+      "rollback": "回滚",
+      "reset": "重置"
+    },
+    "result": {
+      "applied": "已应用",
+      "partial": "部分应用",
+      "rejected": "全部被拒",
+      "parse_failed": "解析失败",
+      "error": "出错",
+      "conflict": "版本冲突",
+      "busy": "忙",
+      "paused": "已暂停",
+      "no_model_group": "没有模型组",
+      "no_template": "没有模板"
+    },
+    "state": {
+      "injected": "已注入",
+      "empty": "没有内容",
+      "disabled": "没启用",
+      "no_template": "没有模板",
+      "suppressed": "被抑制",
+      "paused": "已暂停",
+      "error": "出错"
+    }
+  },
+  "channels": {
+    "searchPlaceholder": "搜频道名或标识",
+    "onlyPaused": "只看暂停的",
+    "paused": "已暂停",
+    "normal": "正常",
+    "failures": "连续失败 {{count}} 次",
+    "columns": {
+      "name": "频道",
+      "preset": "人设",
+      "updatedAt": "更新时间",
+      "status": "状态",
+      "lastUpdate": "最近一次更新"
+    },
+    "emptyTitle": "还没有频道状态",
+    "emptyHint": "看上面的启用步骤；插件在频道里第一次生效、并且人设有模板时，会给这个频道建一份状态"
+  },
+  "people": {
+    "uidPlaceholder": "按账号精确查",
+    "columns": {
+      "person": "人物",
+      "nickname": "昵称",
+      "account": "账号",
+      "preset": "人设",
+      "domain": "域",
+      "updatedAt": "更新时间"
+    },
+    "instanceGroup": "实例组",
+    "localGroup": "本实例",
+    "emptyTitle": "还没有个人档案",
+    "emptyHint": "看上面的启用步骤；频道里写过某个人的状态之后，这里就会有一行",
+    "personNotFound": "要看的那份档案在这里看不到：可能属于别的实例，或者已经不在了"
+  },
+  "detail": {
+    "currentState": "当前状态",
+    "snapshots": "快照与更新记录",
+    "jsonLabel": "状态数据",
+    "invalidJson": "不是合法的 JSON 对象",
+    "conflict": "别处刚改过，已重新加载",
+    "saveSuccess": "已保存",
+    "reset": "重置为初值",
+    "resume": "恢复更新",
+    "resetSuccess": "已重置为初值",
+    "resumeSuccess": "已恢复更新",
+    "resetConfirmTitle": "重置为初值",
+    "resetConfirmBody": "重置后状态回到模板的初值，这一步会记进审计",
+    "previewImage": "预览状态图",
+    "previewLoading": "正在画…",
+    "previewFailed": "状态图没画出来"
+  },
+  "snapshot": {
+    "source": "来源",
+    "result": "结果",
+    "editor": "编辑人",
+    "modelGroup": "模型组",
+    "applied": "改了",
+    "rejected": "拒了",
+    "appliedOp": "{{op}} {{path}}",
+    "rejectedOp": "{{path}}：{{reason}}",
+    "noReason": "没写原因",
+    "view": "查看",
+    "rollback": "回滚到这一版",
+    "viewTitle": "这一版的状态",
+    "emptyTitle": "还没有快照",
+    "emptyHint": "每次更新、管理员改动、回滚与重置都会在这里留一行",
+    "rollbackConfirmTitle": "回滚到这一版",
+    "rollbackConfirmBody": "回滚会把当前状态换成这一版，这一步会记进审计",
+    "rollbackSuccess": "已回滚到这一版"
+  },
+  "templates": {
+    "searchPlaceholder": "搜人设",
+    "global": "全局",
+    "exists": "有模板",
+    "missing": "没模板",
+    "fieldCount": "{{count}} 个字段",
+    "source": {
+      "initvar": "来自书",
+      "manual": "手写",
+      "builtin": "现成模板"
+    },
+    "noTemplate": "这个人设还没有状态模板",
+    "noTemplateHint": "可以从书里的初始变量推一份，也可以套用现成的模板",
+    "fromInitvar": "按书重推",
+    "fromBuiltin": "套用现成模板",
+    "readonlyAlert": "全局人设的模板只有平台方能改",
+    "emptyTitle": "没有人设",
+    "emptyHint": "这个实例下还没有可用的人设",
+    "selectTitle": "选一个人设",
+    "selectHint": "左边选一个人设，这里显示它的状态模板",
+    "sections": {
+      "fields": "字段",
+      "initial": "初值",
+      "theme": "主题"
+    },
+    "theme": {
+      "default": "默认",
+      "night": "夜",
+      "sakura": "樱",
+      "forest": "林",
+      "ink": "墨"
+    },
+    "table": {
+      "path": "路径",
+      "type": "类型",
+      "description": "说明",
+      "flags": "标签位",
+      "actions": "操作",
+      "expand": "展开字段设置",
+      "collapse": "收起字段设置",
+      "readonly": "只读",
+      "private": "私密",
+      "hidden": "隐藏",
+      "person": "个人范围",
+      "headline": "页头",
+      "affection": "好感映射",
+      "priority": "优先级",
+      "minimum": "最小值",
+      "maximum": "最大值",
+      "maxLength": "最长",
+      "maxItems": "最多条数"
+    },
+    "pathPlaceholder": "例如 主角信息/名字",
+    "fieldType": {
+      "string": "文本",
+      "number": "数字",
+      "boolean": "布尔",
+      "object": "对象",
+      "array": "列表"
+    },
+    "affection": {
+      "none": "无",
+      "score": "分数",
+      "stage": "阶段"
+    },
+    "addField": "加一个字段",
+    "removeField": "删除这一行",
+    "saveSuccess": "模板已保存",
+    "initialInvalid": "初值必须是合法的 JSON 对象",
+    "initvarDialog": {
+      "title": "按书重推",
+      "description": "选一条 [initvar] 条目，按它的内容重新生成字段；选「全部」时会把所有条目合起来看",
+      "all": "全部条目",
+      "entryLabel": "用哪一条",
+      "empty": "这本书里没有 [initvar] 条目",
+      "confirm": "开始重推",
+      "success": "重推完成，现在有 {{count}} 个字段"
+    },
+    "builtinDialog": {
+      "title": "套用现成模板",
+      "description": "勾一个或两个都勾，已有的字段会跳过",
+      "scene": "场景",
+      "inventory": "物品栏",
+      "confirm": "套用",
+      "needOne": "至少勾一个",
+      "success": "新增 {{added}} 个，跳过 {{skipped}} 个"
+    }
+  },
+  "audit": {
+    "filters": {
+      "kind": "目标",
+      "source": "来源"
+    },
+    "kind": {
+      "all": "全部",
+      "channel": "频道",
+      "person": "个人档案",
+      "template": "模板"
+    },
+    "source": {
+      "all": "全部",
+      "admin": "管理员改动",
+      "rollback": "回滚",
+      "reset": "重置"
+    },
+    "columns": {
+      "time": "时间",
+      "target": "目标",
+      "source": "来源",
+      "ops": "改了哪几处",
+      "editor": "操作人"
+    },
+    "emptyTitle": "还没有审计记录",
+    "emptyHint": "管理员改动、回滚与重置都会记一条"
+  },
+  "summary": {
+    "injected": "状态块已注入",
+    "tokens": "{{tokens}} token",
+    "chars": "{{chars}} 字",
+    "trimmed": "截掉 {{count}} 组"
+  },
+  "promptRound": {
+    "title": "角色状态",
+    "status": "状态",
+    "tokens": "token",
+    "chars": "字数",
+    "budget": "预算",
+    "position": "位置",
+    "people": "人数",
+    "privateOmitted": "省略的私密字段",
+    "trimmed": "截掉的组",
+    "paused": "暂停中",
+    "provider": "给了变量",
+    "lastUpdate": "上次更新",
+    "at": "时间",
+    "result": "结果",
+    "applied": "改了几处",
+    "rejected": "拒了几处",
+    "source": "来源",
+    "step": "分步更新",
+    "stepSkipped": "跳过",
+    "yes": "是",
+    "no": "否"
+  },
+  "import": {
+    "title": "角色状态模板",
+    "status": {
+      "preview": "预览",
+      "generated": "已生成",
+      "exists": "已有模板未改动",
+      "inactive": "插件未启用",
+      "no_initvar": "没有 [initvar] 条目",
+      "failed": "生成失败"
+    },
+    "fields": "字段 {{fields}} 个，其中隐藏 {{hidden}} 个，来自 {{entries}} 条 [initvar] 条目",
+    "privatePaths": "自动标为私密的字段"
+  },
+  "affection": {
+    "openPerson": "角色状态档案"
+  }
+}

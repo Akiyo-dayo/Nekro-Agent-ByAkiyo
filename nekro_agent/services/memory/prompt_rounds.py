@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -67,20 +67,29 @@ class _MemoryItemDraft:
     item_id: int
     chars: int = 0
     renders: int = 0
+    # 这一条在本轮检索里的相似度（闸开时记）；旧行与闸关路径没有这个键，以后调阈值靠它。
+    score: Optional[float] = None
 
     def as_dict(self) -> dict[str, Any]:
         """转成 JSON 列里的条目。"""
-        return {
+        item: dict[str, Any] = {
             "type": self.item_type,
             "id": self.item_id,
             "chars": self.chars,
             "renders": self.renders,
         }
+        if self.score is not None:
+            item["score"] = round(self.score, 4)
+        return item
 
 
 @dataclass
 class _WorldbookItemDraft:
-    """一条世界书条目在本轮里的引用与渲染次数。"""
+    """一条世界书条目在本轮里的引用与渲染次数。
+
+    `tokens` 是预算口径（宏展开前的正文按这一轮的分词系数数）；`chars` 仍记渲染出来的字数，
+    方便对照。0.4.7 之前的旧行没有 `tokens`。
+    """
 
     entry_id: int
     book_id: int
@@ -88,10 +97,14 @@ class _WorldbookItemDraft:
     position: str = ""
     trusted: bool = False
     renders: int = 0
+    tokens: Optional[int] = None
+    # 命中方式是语义时记 `semantic` 与相似度；旧行没有这两个键，读的地方要能缺省。
+    reason: Optional[str] = None
+    score: Optional[float] = None
 
     def as_dict(self) -> dict[str, Any]:
         """转成 JSON 列里的条目。"""
-        return {
+        item: dict[str, Any] = {
             "type": "worldbook",
             "id": self.entry_id,
             "book_id": self.book_id,
@@ -99,6 +112,37 @@ class _WorldbookItemDraft:
             "position": self.position,
             "trusted": self.trusted,
             "renders": self.renders,
+        }
+        if self.tokens is not None:
+            item["tokens"] = self.tokens
+        if self.reason is not None:
+            item["reason"] = self.reason
+        if self.score is not None:
+            item["score"] = round(self.score, 2)
+        return item
+
+
+@dataclass
+class _WorldbookLookupDraft:
+    """模型在轮内主动查过的一条世界书条目
+
+    `chars` / `tokens` 是这一轮真正交回给模型的正文长度；同一条查多次取最大值，
+    预览与全文都查过时记全文那一份。它只用于明细与撞甲计数，不影响「注入了几条」。
+    """
+
+    entry_id: int
+    book_id: int
+    chars: int = 0
+    tokens: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        """转成 JSON 列里的条目。"""
+        return {
+            "type": "worldbook_lookup",
+            "id": self.entry_id,
+            "book_id": self.book_id,
+            "chars": self.chars,
+            "tokens": self.tokens,
         }
 
 
@@ -114,10 +158,17 @@ class _RoundDraft:
     preset_id: Optional[int] = None
     workspace_id: Optional[int] = None
     render_count: int = 0
+    # 这一轮的首次请求被上游按内容拦下、并少带内容重发过。落库时写进明细的
+    # `tavern_items["lean_retry"]`，同时让这轮即使 outcome 是 ok 也推进撞甲计数：
+    # 第一次带着这些记忆 / 世界书条目被拦过，它们本来就该记一次。
+    blocked_attempt: bool = False
     memory_state: str = "disabled"
     memory_items: dict[tuple[str, int], _MemoryItemDraft] = field(default_factory=dict)
     memory_block_chars: int = 0
     cooldown_skipped: int = 0
+    # 自动注入前的模型筛选结果：`mode` / `pool` / `kept`。落库时放进 `tavern_items`
+    # 现有的 JSON 列（键名 `memory_judge`），不新增迁移；旧行没有这个键。
+    memory_judge: Optional[dict[str, Any]] = None
     summary_state: str = "disabled"
     summary_id: Optional[int] = None
     summary_version: Optional[int] = None
@@ -131,21 +182,34 @@ class _RoundDraft:
     affection_milestone_ids: list[int] = field(default_factory=list)
     worldbook_state: str = "disabled"
     worldbook_items: dict[int, _WorldbookItemDraft] = field(default_factory=dict)
-    worldbook_dropped: list[tuple[int, int, int, str]] = field(default_factory=list)
+    # 模型在轮内主动查过的条目：只进明细与撞甲计数，不参与世界书注入条数 / 字数的统计。
+    worldbook_lookups: dict[int, _WorldbookLookupDraft] = field(default_factory=dict)
+    # 被预算跳过的条目 `(条目 ID, 书 ID, 字数, token 数, 原因)`
+    worldbook_dropped: list[tuple[int, int, int, int, str]] = field(default_factory=list)
+    # 这一轮的预算与它的算法（`WorldbookBudget.as_dict()`），以及入选条目的 token 数
+    worldbook_budget: dict[str, Any] = field(default_factory=dict)
+    worldbook_tokens: dict[int, int] = field(default_factory=dict)
     # 酒馆兼容的运行时状态：闸、三个槽位、深度注入与宏计数。只写字数、层名与状态，
     # 不写任何原文——它是管理员手写（或卡片带进来）的文字，同 L3 只存引用同一个取舍。
     tavern_items: dict[str, Any] = field(default_factory=dict)
+    # 角色状态（插件）的本轮状态：块的 token 数、截掉的组、上次更新的结果。状态值来自聊天，
+    # 这里只记计数与名字，不记任何值——同 `tavern_items` 只记字数的取舍。
+    state_items: dict[str, Any] = field(default_factory=dict)
 
     def memory_items_json(self) -> list[dict[str, Any]]:
         """按条目类型与 ID 排序后转成 JSON 列；顺序稳定便于比对。"""
         return [item.as_dict() for item in sorted(self.memory_items.values(), key=lambda item: (item.item_type, item.item_id))]
 
     def worldbook_items_json(self) -> list[dict[str, Any]]:
-        """注入条目按 ID 排序，后面接被预算跳过的条目。
+        """注入条目按 ID 排序，后面接被预算跳过的条目，最后接模型主动查过的条目。
 
         跳过的条目只供明细解释「为什么没进来」，**不参与撞甲计数**：它没进提示词，把它的
-        被拦次数往上加等于让一条从没出现在上下文里的条目被隔离。
+        被拦次数往上加等于让一条从没出现在上下文里的条目被隔离。主动查过的条目单独一种
+        `type`：它不进 `worldbook_chars`，也不算「注入了几条」。
         """
+        for item in self.worldbook_items.values():
+            if item.tokens is None and item.entry_id in self.worldbook_tokens:
+                item.tokens = self.worldbook_tokens[item.entry_id]
         injected = [item.as_dict() for item in sorted(self.worldbook_items.values(), key=lambda item: item.entry_id)]
         dropped = [
             {
@@ -153,15 +217,20 @@ class _RoundDraft:
                 "id": entry_id,
                 "book_id": book_id,
                 "chars": chars,
+                "tokens": tokens,
                 "reason": reason,
             }
-            for entry_id, book_id, chars, reason in sorted(self.worldbook_dropped, key=lambda item: item[0])
+            for entry_id, book_id, chars, tokens, reason in sorted(self.worldbook_dropped, key=lambda item: item[0])
         ]
-        return injected + dropped
+        looked_up = [
+            item.as_dict()
+            for item in sorted(self.worldbook_lookups.values(), key=lambda item: item.entry_id)
+        ]
+        return injected + dropped + looked_up
 
     @property
     def worldbook_chars(self) -> int:
-        """本轮注入的世界书正文总字数（与预算同一个口径：原文长度）"""
+        """本轮注入的世界书正文总字数（渲染出来的字数，与 `tokens` 对照用）"""
         return sum(item.chars for item in self.worldbook_items.values())
 
 
@@ -200,11 +269,16 @@ def note_memory(
     items: Sequence[tuple[str, int, int]] = (),
     block_chars: int = 0,
     cooldown_skipped: int = 0,
+    scores: Optional[Mapping[tuple[str, int], float]] = None,
+    judge: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """记一次记忆块渲染。
 
     `items` 是这一行真正进了记忆块的条目 `(类型, ID, 这一条渲染出来的字数)`。
     同一轮多次渲染时按 `(类型, ID)` 合并：字数取最后一次，渲染次数累加。
+    `scores` 是这些条目在本轮检索里的相似度，按 `(类型, ID)` 对上；没有就不记。
+    `judge` 是这一轮自动注入前的筛选结果 `mode / pool / kept`。同一轮只留第一次渲染
+    记下的值：增量渲染不覆盖它。
     """
     try:
         draft = _rounds.get(code)
@@ -216,14 +290,25 @@ def note_memory(
             draft.workspace_id = int(workspace_id)
         if preset_id is not None:
             draft.preset_id = int(preset_id)
+        if judge is not None and draft.memory_judge is None:
+            draft.memory_judge = {str(key): value for key, value in judge.items()}
         for item_type, item_id, chars in items:
             key = (str(item_type), int(item_id))
+            score = scores.get(key) if scores else None
             existing = draft.memory_items.get(key)
             if existing is None:
-                draft.memory_items[key] = _MemoryItemDraft(item_type=str(item_type), item_id=int(item_id), chars=int(chars), renders=1)
+                draft.memory_items[key] = _MemoryItemDraft(
+                    item_type=str(item_type),
+                    item_id=int(item_id),
+                    chars=int(chars),
+                    renders=1,
+                    score=float(score) if score is not None else None,
+                )
                 continue
             existing.chars = int(chars)
             existing.renders += 1
+            if score is not None:
+                existing.score = float(score)
         draft.memory_block_chars = int(block_chars)
         draft.cooldown_skipped = int(cooldown_skipped)
     except Exception as e:
@@ -286,30 +371,39 @@ def note_worldbook(
     code: str,
     *,
     state: str,
-    dropped: Sequence[tuple[int, int, int, str]] = (),
+    dropped: Sequence[tuple[int, int, int, int, str]] = (),
+    budget: Optional[Mapping[str, Any]] = None,
+    tokens: Optional[Mapping[int, int]] = None,
 ) -> None:
     """记一次世界书解析的结果；同一轮多次调用时取最后一次。
 
-    `dropped` 是被预算跳过的条目 `(条目 ID, 书 ID, 字数, 原因)`，只供明细解释「为什么
-    这条没进来」，不参与撞甲计数。
+    `dropped` 是被预算跳过的条目 `(条目 ID, 书 ID, 字数, token 数, 原因)`，只供明细解释「为什么
+    这条没进来」，不参与撞甲计数。`budget` 是这一轮的预算与它的算法，`tokens` 是入选条目的
+    token 数（条目 ID → token）。
     """
     try:
         draft = _rounds.get(code)
         if draft is None:
             return
         draft.worldbook_state = str(state)
-        draft.worldbook_dropped = [(int(entry_id), int(book_id), int(chars), str(reason)) for entry_id, book_id, chars, reason in dropped]
+        draft.worldbook_dropped = [
+            (int(entry_id), int(book_id), int(chars), int(size), str(reason))
+            for entry_id, book_id, chars, size, reason in dropped
+        ]
+        draft.worldbook_budget = dict(budget) if budget else {}
+        draft.worldbook_tokens = {int(entry_id): int(size) for entry_id, size in (tokens or {}).items()}
     except Exception as e:
         logger.debug(f"提示词明细记录世界书状态失败（已忽略）: code={code}, error={e}")
 
 
 def note_worldbook_items(
     code: str,
-    items: Sequence[tuple[int, int, int, str, bool]],
+    items: Sequence[tuple[Any, ...]],
 ) -> None:
     """记一次世界书块渲染。
 
-    `items` 是这一块里真正渲染出来的条目 `(条目 ID, 书 ID, 字数, 位置, 是否宿主内容)`。
+    `items` 是这一块里真正渲染出来的条目 `(条目 ID, 书 ID, 字数, 位置, 是否宿主内容)`，
+    可选的第六、七项是命中原因与相似度（语义命中时才带）。旧调用方仍可只传五项。
     同一轮多次渲染时按条目 ID 合并：字数取最后一次，渲染次数累加——同一轮里系统提示词与
     历史各渲染一次时，模型确实看到了两遍，`renders` 必须能反映这一点。
     """
@@ -317,7 +411,10 @@ def note_worldbook_items(
         draft = _rounds.get(code)
         if draft is None:
             return
-        for entry_id, book_id, chars, position, trusted in items:
+        for raw_item in items:
+            entry_id, book_id, chars, position, trusted = raw_item[:5]
+            reason = str(raw_item[5]) if len(raw_item) > 5 and raw_item[5] is not None else None
+            score = float(raw_item[6]) if len(raw_item) > 6 and raw_item[6] is not None else None
             key = int(entry_id)
             existing = draft.worldbook_items.get(key)
             if existing is None:
@@ -328,14 +425,66 @@ def note_worldbook_items(
                     position=str(position),
                     trusted=bool(trusted),
                     renders=1,
+                    reason=reason,
+                    score=score,
                 )
                 continue
             existing.chars = int(chars)
             existing.position = str(position)
             existing.trusted = bool(trusted)
             existing.renders += 1
+            if reason is not None:
+                existing.reason = reason
+                existing.score = score
     except Exception as e:
         logger.debug(f"提示词明细记录世界书条目失败（已忽略）: code={code}, error={e}")
+
+
+def note_worldbook_lookup(
+    code: str,
+    items: Sequence[tuple[int, int, int, int]],
+) -> None:
+    """记一次模型主动查询世界书的结果。
+
+    `items` 是这一轮真正交回给模型的条目 `(条目 ID, 书 ID, 字数, token 数)`；同一条查
+    多次时字数与 token 数取最大值（先看预览、后读全文时记全文那一份），书 ID 覆盖。
+    没有 `begin` 过的令牌是空操作。
+    """
+    try:
+        draft = _rounds.get(code)
+        if draft is None:
+            return
+        for entry_id, book_id, chars, tokens in items:
+            key = int(entry_id)
+            existing = draft.worldbook_lookups.get(key)
+            if existing is None:
+                draft.worldbook_lookups[key] = _WorldbookLookupDraft(
+                    entry_id=key,
+                    book_id=int(book_id),
+                    chars=int(chars),
+                    tokens=int(tokens),
+                )
+                continue
+            existing.book_id = int(book_id)
+            existing.chars = max(existing.chars, int(chars))
+            existing.tokens = max(existing.tokens, int(tokens))
+    except Exception as e:
+        logger.debug(f"提示词明细记录世界书查询失败（已忽略）: code={code}, error={e}")
+
+
+def note_blocked_attempt(code: str) -> None:
+    """记下这一轮的首次请求被拦、并做了少带内容重发。
+
+    只改草稿上的一个标记：明细落库时写进 `tavern_items["lean_retry"]`，撞甲计数也从
+    「outcome == blocked」放宽到「outcome == blocked 或 有过这次重发」。
+    """
+    try:
+        draft = _rounds.get(code)
+        if draft is None:
+            return
+        draft.blocked_attempt = True
+    except Exception as e:
+        logger.debug(f"提示词明细记录被拦重发失败（已忽略）: code={code}, error={e}")
 
 
 def note_tavern(
@@ -385,6 +534,21 @@ def note_tavern(
         logger.debug(f"提示词明细记录酒馆状态失败（已忽略）: code={code}, error={e}")
 
 
+def note_state(code: str, **fields: Any) -> None:
+    """记一次角色状态的本轮状态；没有 `begin` 过的令牌是空操作
+
+    `fields` 浅合并进 `state_items`。调用方只传计数、token 数、组名与结果这类不含状态值的东西：
+    这一列进后台明细，状态值只在角色状态自己的表里、按作用域给管理员看。
+    """
+    try:
+        draft = _rounds.get(code)
+        if draft is None:
+            return
+        draft.state_items.update(fields)
+    except Exception as e:
+        logger.debug(f"提示词明细记录角色状态失败（已忽略）: code={code}, error={e}")
+
+
 def finish(code: str, outcome: str) -> None:
     """弹出一轮草稿并交给后台落库。
 
@@ -396,7 +560,15 @@ def finish(code: str, outcome: str) -> None:
         draft = _rounds.pop(code, None)
         if draft is None:
             return
-        if draft.render_count == 0 and not draft.affection_recorded and not draft.worldbook_items and not draft.tavern_items:
+        if (
+            draft.render_count == 0
+            and not draft.affection_recorded
+            and not draft.worldbook_items
+            and not draft.worldbook_lookups
+            and not draft.tavern_items
+            and not draft.state_items
+            and not draft.blocked_attempt
+        ):
             return
         normalized = outcome if outcome in _OUTCOMES else "failed"
         task = asyncio.create_task(_persist(draft, normalized))
@@ -543,6 +715,7 @@ async def round_detail(row: DBMemPromptRound) -> dict[str, Any]:
         item["status"] = "unknown"
         item["preview"] = ""
 
+    tavern_items = row.tavern_items if isinstance(row.tavern_items, dict) else {}
     detail: dict[str, Any] = {
         "id": row.id,
         "round_id": row.round_id,
@@ -557,6 +730,7 @@ async def round_detail(row: DBMemPromptRound) -> dict[str, Any]:
         "memory_items": items,
         "memory_block_chars": row.memory_block_chars,
         "cooldown_skipped": row.cooldown_skipped,
+        "memory_judge": tavern_items.get("memory_judge"),
         "summary_state": row.summary_state,
         "summary_id": row.summary_id,
         "summary_version": row.summary_version,
@@ -568,7 +742,9 @@ async def round_detail(row: DBMemPromptRound) -> dict[str, Any]:
         "worldbook_state": row.worldbook_state,
         "worldbook_items": row.worldbook_items or [],
         "worldbook_chars": row.worldbook_chars,
+        "worldbook_budget": row.worldbook_budget or {},
         "tavern_items": row.tavern_items or {},
+        "state_items": row.state_items or {},
         "started_at": row.started_at,
         "finished_at": row.finished_at,
         "summary": await _summary_detail(row),
@@ -577,16 +753,27 @@ async def round_detail(row: DBMemPromptRound) -> dict[str, Any]:
 
 
 async def _summary_detail(row: DBMemPromptRound) -> dict[str, Any]:
-    """摘要那一版当前还在不在、是不是最新一版。"""
+    """摘要那一版当前还在不在、是不是最新一版；还在的话带上它的生成时间与正文
+
+    正文就是这一轮注入的那一版（截断之前的全文）：后台要能点开看「这一轮 Bot 看到的摘要」，
+    而版号本身不说明任何事。摘要只留最近几版，那一版已经不保留时只有版号。
+
+    纵深防御：明细行的可见性已经按频道判过，但摘要行是按主键取的；它的频道或人设与这一轮
+    对不上（不该发生，比如脏数据）时按「已不保留」处理，不把别处的正文带出来。
+    """
     if row.summary_id is None:
-        return {"id": None, "version": None, "state": "none", "is_latest": False}
+        return {"id": None, "version": None, "state": "none", "is_latest": False, "create_time": None, "content": ""}
     summary = await DBMemChannelSummary.get_or_none(id=row.summary_id)
+    if summary is not None and (summary.chat_key != row.chat_key or summary.preset_id != row.preset_id):
+        summary = None
     if summary is None:
         return {
             "id": row.summary_id,
             "version": row.summary_version,
             "state": "deleted",
             "is_latest": False,
+            "create_time": None,
+            "content": "",
         }
     latest = (
         await DBMemChannelSummary.filter(chat_key=summary.chat_key, preset_id=summary.preset_id)
@@ -599,6 +786,8 @@ async def _summary_detail(row: DBMemPromptRound) -> dict[str, Any]:
         "version": summary.version,
         "is_latest": is_latest,
         "state": "current" if is_latest else "outdated",
+        "create_time": summary.create_time,
+        "content": summary.content,
     }
 
 
@@ -625,7 +814,7 @@ async def _persist(draft: _RoundDraft, outcome: str) -> None:
         await _write_round(draft, outcome)
     except Exception as e:
         logger.warning(f"提示词明细落库失败（可忽略）: chat_key={draft.chat_key}, outcome={outcome}, error={e}")
-    if outcome != "blocked":
+    if outcome != "blocked" and not draft.blocked_attempt:
         return
     try:
         await _auto_quarantine(draft)
@@ -648,6 +837,13 @@ async def _write_round(draft: _RoundDraft, outcome: str) -> None:
     worldbook_state = draft.worldbook_state
     if worldbook_state == "injected" and not draft.worldbook_items:
         worldbook_state = "none"
+    # 被拦后少带内容重发过的轮次在现有 JSON 列里留一个标记（照 `note_tavern` 放进
+    # `tavern_items`）：后台能看出这一轮第一次被拦、重发过，而只存引用与字数。
+    tavern_items = dict(draft.tavern_items)
+    if draft.blocked_attempt:
+        tavern_items["lean_retry"] = True
+    if draft.memory_judge is not None:
+        tavern_items["memory_judge"] = draft.memory_judge
     await DBMemPromptRound.create(
         round_id=secrets.token_hex(16),
         chat_key=draft.chat_key,
@@ -672,7 +868,9 @@ async def _write_round(draft: _RoundDraft, outcome: str) -> None:
         worldbook_state=worldbook_state,
         worldbook_items=draft.worldbook_items_json(),
         worldbook_chars=draft.worldbook_chars,
-        tavern_items=draft.tavern_items,
+        worldbook_budget=draft.worldbook_budget,
+        tavern_items=tavern_items,
+        state_items=draft.state_items,
         started_at=draft.started_at,
         finished_at=datetime.now(timezone.utc),
     )
@@ -690,7 +888,7 @@ async def _write_round(draft: _RoundDraft, outcome: str) -> None:
 
 
 async def _auto_quarantine(draft: _RoundDraft) -> None:
-    """给被拦轮次里注入过的段落 / episode / 世界书条目加计数，达到阈值就隔离。
+    """给被拦轮次里注入过 / 查过的段落、episode 与世界书条目加计数，达到阈值就隔离。
 
     加计数与转隔离在**同一个事务**里：分开提交的话，计数到了阈值、隔离那一步却失败
     （或进程在两步之间退出），这条记忆下一轮照样注入，而只有**再一次**被拦才会重新
@@ -708,9 +906,9 @@ async def _auto_quarantine(draft: _RoundDraft) -> None:
     # 分两套计数会让同一条内容在两条路径上各攒一半、永远到不了阈值。
     paragraph_ids = sorted(set(paragraph_ids) | set(draft.affection_milestone_ids))
     episode_ids = sorted({item.item_id for item in items if item.item_type == "episode"})
-    # 只算真正注入过的条目：`worldbook_dropped` 里的条目没进提示词，把它的被拦次数往上
-    # 加等于让一条从没出现在上下文里的条目被隔离。
-    worldbook_ids = sorted(draft.worldbook_items)
+    # 只算真正注入过的条目与模型主动查过的条目：`worldbook_dropped` 里的条目没进提示词，
+    # 把它的被拦次数往上加等于让一条从没出现在上下文里的条目被隔离。
+    worldbook_ids = sorted(set(draft.worldbook_items) | set(draft.worldbook_lookups))
     if not paragraph_ids and not episode_ids and not worldbook_ids:
         return
     threshold = int(config.MEMORY_AUTO_QUARANTINE_BLOCKED_ROUNDS)

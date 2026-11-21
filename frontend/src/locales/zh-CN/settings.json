@@ -7,6 +7,23 @@
     "spaceCleanup": "空间回收"
   },
   "system": {
+    "searchLabel": "搜索配置",
+    "searchPlaceholder": "名称、键名或说明，跨全部分类",
+    "groups": {
+      "runtime": "基础与运行",
+      "conversation": "对话与模型",
+      "quota": "额度与过滤",
+      "extension": "插件与沙盒",
+      "ops": "运维与通知",
+      "data": "数据与存储",
+      "domains": "功能页设置",
+      "other": "其他"
+    },
+    "nav": {
+      "label": "配置分类",
+      "searching": "搜索结果（全部分类）",
+      "domainHint": "在「{{page}}」页的「设置」里修改"
+    },
     "emptyMessage": "暂无系统配置项",
     "otherCategory": "其他"
   },
@@ -58,6 +75,11 @@
       "prefillModeOff": "关（默认）",
       "prefillModeAssistant": "末尾 assistant 消息（Anthropic 原生、OpenRouter 等）",
       "prefillModeDeepseek": "DeepSeek 前缀续写（要把接口地址设成 DeepSeek 的 beta 地址）",
+      "apiFormat": "接口格式",
+      "apiFormatOpenai": "OpenAI 兼容",
+      "apiFormatGemini": "Gemini 原生",
+      "contextLength": "上下文长度（token）",
+      "tokenCountFactor": "分词系数",
       "temperature": "Temperature (随机性)",
       "topP": "Top P (多样性)",
       "presencePenalty": "Presence Penalty (新话题)",
@@ -75,6 +97,12 @@
       "vision": "启用模型视觉能力。仅在确认该模型支持多模态输入时开启——对不支持的模型开启会让每一轮对话都被上游拒绝",
       "cot": "启用NA提供的思维链进行分析，如果模型原生支持请关闭",
       "prefillMode": "只有确认这个服务支持把末尾的 assistant 消息当作回答开头时才打开。服务商拒绝时会自动去掉预填重发一次，并在一段时间内不再对这个组发预填。",
+      "apiFormat": "选 Gemini 原生时接口地址填到版本号为止，例如 https://generativelanguage.googleapis.com/v1beta；思考预算、安全阈值等原生参数写在额外请求体的 generationConfig / safetySettings 里。",
+      "contextLength": "填这个模型真实的上下文窗口。世界书每轮预算按它的百分比算；0 表示未填，按 32768 估。填大了世界书注入更多、费用跟着涨",
+      "tokenCountFactor": "这个模型的分词器相对 o200k_base 多数还是少数；0 表示按模型名自动取（DeepSeek 0.80、Gemini 0.89、Qwen 0.90、Claude 1.29 等）",
+      "budgetEstimate": "按全局设置，世界书每轮最多约 {{budget}} token（约 {{approx}} 字）",
+      "budgetEstimateAutoFactor": "（分词系数按模型名自动取）",
+      "smallContext": "上下文长度只填了 {{contextLength}}，不超过世界书的回复预留 {{outputReserve}}：用这一组时世界书每轮预算只有 1 token，实际上注入不了任何条目。这里填的是 token 数；不确定就填 0（按 32768 算）",
       "advanced": "高级选项",
       "expandAdvanced": "展开高级选项 ▶",
       "collapseAdvanced": "收起高级选项 ▼",
@@ -248,6 +276,11 @@
       "shared": "开放给租户",
       "private": "仅平台方"
     }
+  },
+  "worldbookBudgetNotice": {
+    "title": "世界书预算已改为按 token 计",
+    "hint": "想换成 SillyTavern 的默认玩法：把占上下文的百分比改成 25、token 上限改成 0",
+    "ack": "知道了"
   },
   "theme": {
     "title": "主题设置",

@@ -35,7 +35,11 @@ from nekro_agent.core.logger import get_sub_logger
 logger = get_sub_logger("plugin_system")
 
 # 要「默认启用」的内置插件键（`作者.module_name`）。只往里加新插件；从这里删掉一项不会关掉已启用的插件
-DEFAULT_ON_BUILTIN_PLUGINS: Tuple[str, ...] = ("Akiyo_dayo.message_recall", "Akiyo_dayo.affection_tools")
+DEFAULT_ON_BUILTIN_PLUGINS: Tuple[str, ...] = (
+    "Akiyo_dayo.message_recall",
+    "Akiyo_dayo.affection_tools",
+    "Akiyo_dayo.worldbook_tools",
+)
 
 
 def apply_default_on_plugins(cfg: Any, plugin_keys: Tuple[str, ...] = DEFAULT_ON_BUILTIN_PLUGINS) -> List[str]:

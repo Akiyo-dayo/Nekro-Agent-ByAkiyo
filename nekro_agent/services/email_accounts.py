@@ -1110,7 +1110,7 @@ async def assert_custom_mail_host_allowed(host: str, port: int) -> None:
 
     保存时校验一次，建立连接前再校验一次。真正连接时客户端还会自己解析一次、只连校验过的地址
     （`ImapSmtpPasswordClient._checked_addresses`），这里是给页面一句明确的话、并在连不上之前就停下。
-    透明代理的 Fake-IP 段对租户也拒绝（见 `common_util._FAKE_IP_NETWORKS`）。
+    判据与下载同一份：`DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 照认（默认放行透明代理的 Fake-IP 段）。
 
     Raises:
         ValueError: 主机解析失败、指向非公网地址，或端口不在白名单里
@@ -1125,7 +1125,7 @@ async def assert_custom_mail_host_allowed(host: str, port: int) -> None:
     if not host_text:
         raise ValueError(CUSTOM_HOST_UNAVAILABLE)
     try:
-        await assert_tenant_host_safe(host_text, port_value, subject="邮箱服务器", exclude_fake_ip=True)
+        await assert_tenant_host_safe(host_text, port_value, subject="邮箱服务器")
     except UnsafeDownloadUrlError as e:
         logger.warning(f"自定义邮箱服务器地址被拒绝: host={host_text}, port={port_value}, reason={e}")
         raise ValueError(CUSTOM_HOST_UNAVAILABLE) from e
@@ -1225,6 +1225,8 @@ def to_runtime_account(row: DBEmailAccount) -> "EmailAccount":
     # 自定义服务器是租户填的：客户端在连上之后、登录之前核对实际对端 IP（见 EmailAccount 上的说明）。
     # 预设已被删掉的那种（主机留空、本来就连不上）也一并打上，不留一个不核对的口子
     account._tenant_endpoint = bool(is_custom or preset is None)
+    # 实例自有邮箱是租户的，证书一律校验（见 `EmailAccount.tls_verify_required`）
+    account._instance_owned = True
     return account
 
 

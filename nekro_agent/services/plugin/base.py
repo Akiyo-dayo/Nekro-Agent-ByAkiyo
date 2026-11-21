@@ -46,7 +46,8 @@ from nekro_agent.services.plugin.scope import (
 from nekro_agent.services.plugin.task import TaskRunner
 from nekro_agent.tools.text_sanitize import strip_nul
 
-from .schema import PromptInjectMethod, SandboxMethod, SandboxMethodType, WebhookMethod
+from .injection import render_injection_inline
+from .schema import PromptInjectMethod, PromptInjectResult, SandboxMethod, SandboxMethodType, WebhookMethod
 
 if TYPE_CHECKING:
     from nekro_agent.models.db_chat_channel import DBChatChannel
@@ -155,6 +156,7 @@ class NekroPlugin:
             on_system_message_method: 系统消息回调方法
             sandbox_methods: 沙盒方法
             on_reset_method: 重置频道回调方法
+            on_round_finished_method: 一轮对话收尾回调方法（带本轮结局）
             cleanup_method: 清理方法
             mount_router: 挂载路由方法
         """
@@ -164,6 +166,7 @@ class NekroPlugin:
         self.cleanup_method: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None
         self.prompt_inject_method: Optional[PromptInjectMethod] = None
         self.on_reset_method: Optional[Callable[[AgentCtx], Coroutine[Any, Any, Any]]] = None
+        self.on_round_finished_method: Optional[Callable[[AgentCtx, str], Coroutine[Any, Any, Any]]] = None
         self.on_user_message_method: Optional[Callable[[AgentCtx, ChatMessage], Coroutine[Any, Any, MsgSignal | None]]] = None
         self.on_system_message_method: Optional[Callable[[AgentCtx, str], Coroutine[Any, Any, MsgSignal | None]]] = None
 
@@ -222,6 +225,7 @@ class NekroPlugin:
         self.cleanup_method = None
         self.prompt_inject_method = None
         self.on_reset_method = None
+        self.on_round_finished_method = None
         self.sandbox_methods = []
         self.webhook_methods = {}
         self._collect_methods_func = None
@@ -606,10 +610,15 @@ class NekroPlugin:
         self,
         name: str,
         description: str = "",
-    ) -> Callable[[Callable[[AgentCtx], Coroutine[Any, Any, str]]], Callable[[AgentCtx], Coroutine[Any, Any, str]]]:
+    ) -> Callable[
+        [Callable[[AgentCtx], Coroutine[Any, Any, PromptInjectResult]]],
+        Callable[[AgentCtx], Coroutine[Any, Any, PromptInjectResult]],
+    ]:
         """挂载提示注入方法
 
-        用于挂载提示注入方法，在对话开始前执行，返回内容会注入到对话提示中。
+        用于挂载提示注入方法，在对话开始前执行，返回内容会注入到对话提示中。返回 `str` 时
+        原样放进历史消息开头的插件上下文；返回 :class:`PromptInjection` 时可以要求按不可信内容
+        包裹、或插到聊天记录的某个深度（见 `services/plugin/injection.py`）。
 
         Args:
             name (str): 挂载的提示注入方法的名称
@@ -619,7 +628,9 @@ class NekroPlugin:
             装饰器函数
         """
 
-        def decorator(func: Callable[[AgentCtx], Coroutine[Any, Any, str]]) -> Callable[[AgentCtx], Coroutine[Any, Any, str]]:
+        def decorator(
+            func: Callable[[AgentCtx], Coroutine[Any, Any, PromptInjectResult]],
+        ) -> Callable[[AgentCtx], Coroutine[Any, Any, PromptInjectResult]]:
             self.prompt_inject_method = PromptInjectMethod(name, description, func)
             return func
 
@@ -638,6 +649,37 @@ class NekroPlugin:
 
         def decorator(func: Callable[[AgentCtx], Coroutine[Any, Any, Any]]) -> Callable[[AgentCtx], Coroutine[Any, Any, Any]]:
             self.on_reset_method = func
+            return func
+
+        return decorator
+
+    def mount_on_round_finished(
+        self,
+    ) -> Callable[
+        [Callable[[AgentCtx, str], Coroutine[Any, Any, Any]]],
+        Callable[[AgentCtx, str], Coroutine[Any, Any, Any]],
+    ]:
+        """挂载一轮对话收尾时的回调
+
+        每轮对话（真正发给模型的那种，不含预览）收尾时调用一次，第二个参数是本轮结局：
+        `ok`（正常收尾）、`blocked`（被内容审核拦下或被服务商拒答）、`failed`、`cancelled`。
+        只想在回复成功后做事的插件判断 `outcome == "ok"`。
+
+        回调在后台任务里跑，核心不等它的结果，也不让它影响这一轮：抛错、超时只记在这个回调
+        自己的故障统计里（单独计数、单独隔离，不连带插件的提示注入等回调）。只对在这个频道生效
+        的插件调用。
+
+        **回调要快速返回**：超时取全局插件超时，最多 30 秒（全局设成不限时也一样）。要调模型、
+        写库这类长活，在回调里自己另起任务（并持有它的引用），不要在回调里等。
+
+        Returns:
+            装饰器函数
+        """
+
+        def decorator(
+            func: Callable[[AgentCtx, str], Coroutine[Any, Any, Any]],
+        ) -> Callable[[AgentCtx, str], Coroutine[Any, Any, Any]]:
+            self.on_round_finished_method = func
             return func
 
         return decorator
@@ -1076,17 +1118,32 @@ class NekroPlugin:
         """
         return get_text(self.i18n_description, self.description, lang)
 
-    async def render_inject_prompt(self, ctx: AgentCtx) -> str:
-        """渲染提示注入提示词
+    async def render_prompt_injection(self, ctx: AgentCtx) -> PromptInjectResult:
+        """调用提示注入方法，取回原始返回值（`str` 或 :class:`PromptInjection`）
 
-        Returns:
-            str: 插件提示
+        包裹与落点由核心按本轮令牌决定（`services/plugin/injection.py`），插件自己不拼标签。
         """
         if self.prompt_inject_method:
             # 提示注入直接坐在主对话链路上：这里抛异常或卡住，整轮回复就没了。
             # 回落到空串等于本轮少一段插件上下文，主对话照常。
             return await call_plugin(self, "prompt_inject", self.prompt_inject_method.func, ctx, default="")
         return ""
+
+    async def render_inject_prompt(self, ctx: AgentCtx) -> str:
+        """渲染提示注入提示词
+
+        返回 `str` 的注入方法与以前逐字相同。这个入口的调用方之一是沙盒里激活插件的方法，
+        返回值会回到沙盒、还会落成一条系统消息，所以**这里绝不用本轮令牌**：结构化返回只在
+        `untrusted=False` 且不指定深度时给出正文，其余（不可信的、要插到深度的）一律不给。
+        核心组装提示词走的是 :meth:`render_prompt_injection`，由核心按令牌包裹。
+
+        Returns:
+            str: 插件提示
+        """
+        raw = await self.render_prompt_injection(ctx)
+        if isinstance(raw, str):
+            return raw
+        return render_injection_inline(raw, module_name=self.module_name)
 
     async def render_sandbox_methods_prompt(self, ctx: AgentCtx) -> str:
         """渲染沙盒方法提示词

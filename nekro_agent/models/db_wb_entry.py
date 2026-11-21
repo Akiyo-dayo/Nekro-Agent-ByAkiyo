@@ -57,7 +57,14 @@ class DBWbEntry(Model):
     cooldown = fields.IntField(null=True, description="命中后多少条消息内不再命中；空或 0 表示不用")
     delay = fields.IntField(null=True, description="频道消息少于这个数时不命中；空或 0 表示不用")
     enabled = fields.BooleanField(default=True, description="条目是否启用")
+    vectorized = fields.BooleanField(default=False, description="这条参与语义触发（向量激活）")
+    vector_hash = fields.CharField(
+        max_length=64,
+        default="",
+        description="已入库向量对应的正文哈希；空串表示还没有可用向量",
+    )
     trusted = fields.BooleanField(default=False, description="按宿主内容注入")
+    ignore_budget = fields.BooleanField(default=False, description="命中后不受全局与书预算拦（酒馆的 ignoreBudget）；只对宿主条目生效")
     status = fields.CharField(max_length=16, default="active", description="状态 active / quarantined")
     quarantined_at = fields.DatetimeField(null=True, description="被隔离的时间")
     quarantine_reason = fields.CharField(max_length=16, default="", description="隔离原因 manual / auto_blocked")

@@ -17,6 +17,7 @@ Qdrant、不调模型。要钉住四件事：
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import json
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ from nekro_agent.schemas.worldbook import (
 )
 from nekro_agent.services.memory.instance_scope import AdminMemoryScope
 from nekro_agent.services.user.role import Role
+from nekro_agent.services.worldbook import purpose as wb_purpose
 from nekro_agent.services.worldbook import render, safe_regex, st_format
 from nekro_agent.services.worldbook import service as wb_service
 from nekro_agent.services.worldbook.types import (
@@ -199,8 +201,9 @@ async def _book(
     person_account: str = "",
     enabled: bool = True,
     scan_depth: int = 4,
-    budget_chars: int = 0,
+    budget_tokens: int = 0,
     description: str = "",
+    scan_names: bool = False,
 ) -> DBWbBook:
     return await DBWbBook.create(
         name=name,
@@ -213,7 +216,8 @@ async def _book(
         person_account=person_account,
         enabled=enabled,
         scan_depth=scan_depth,
-        budget_chars=budget_chars,
+        budget_tokens=budget_tokens,
+        scan_names=scan_names,
     )
 
 
@@ -239,6 +243,7 @@ async def _entry(
     cooldown: Optional[int] = None,
     delay: Optional[int] = None,
     comment: str = "",
+    ignore_budget: bool = False,
 ) -> DBWbEntry:
     return await DBWbEntry.create(
         book=book,
@@ -259,6 +264,7 @@ async def _entry(
         delay=delay,
         enabled=enabled,
         trusted=trusted,
+        ignore_budget=ignore_budget,
         status=status,
         ext=ext or {},
     )
@@ -346,7 +352,7 @@ async def _seed_world() -> World:
             scope_kind="domain",
             adapter_key=ADAPTER,
             instance_key="t1a",
-            budget_chars=5,
+            budget_tokens=1,
         ),
         "disabled_t1a": await _book(
             "租户一停用书",
@@ -446,9 +452,13 @@ async def _import_new(
     person_account: str = "",
     enabled: bool = True,
     scan_depth: Optional[int] = None,
-    budget_chars: int = 0,
+    budget_tokens: int = 0,
+    inject_mode: str = "both",
+    active_scene: str = "both",
     case_sensitive: bool = False,
     match_whole_words: bool = False,
+    rewrite_name_vars: bool = True,
+    scan_names: bool = True,
 ) -> Any:
     """调导入建书接口；表单字段全部显式传
 
@@ -466,9 +476,13 @@ async def _import_new(
         person_account=person_account,
         enabled=enabled,
         scan_depth=scan_depth,
-        budget_chars=budget_chars,
+        budget_tokens=budget_tokens,
+        inject_mode=inject_mode,
+        active_scene=active_scene,
         case_sensitive=case_sensitive,
         match_whole_words=match_whole_words,
+        rewrite_name_vars=rewrite_name_vars,
+        scan_names=scan_names,
         instance_key=instance_key,
         adapter_key=adapter_key,
         _current_user=user,
@@ -842,11 +856,11 @@ class TestCreateRules:
         book = world.books["channel_t1a"]
         detail = await worldbook.update_book(
             book.id,
-            BookUpdateRequest(name="改过名的频道书", budget_chars=1200),
+            BookUpdateRequest(name="改过名的频道书", budget_tokens=1200),
             _current_user=world.platform,
         )
         assert detail.name == "改过名的频道书"
-        assert detail.budget_chars == 1200
+        assert detail.budget_tokens == 1200
         assert detail.scope_kind == "channel"
         assert detail.chat_key == CHAT_T1A
         assert detail.instance_key == "t1a"
@@ -1143,6 +1157,51 @@ class TestEntryStatus:
         response = await worldbook.list_entries(book.id, _current_user=world.platform)
         assert [item.id for item in response.items] == [high.id, same_a.id, same_b.id, low.id]
 
+    async def test_entry_list_is_paged_and_searched_on_the_server(self, world: World) -> None:
+        book = await _book("分页书", scope_kind="domain", adapter_key=ADAPTER, instance_key="t1a")
+        rows = [
+            await _entry(book, uid=index, keys=(f"词{index}",), content=f"正文{index}", order=100 - index)
+            for index in range(7)
+        ]
+
+        first = await worldbook.list_entries(book.id, page=1, page_size=3, _current_user=world.platform)
+        assert (first.total, first.page, first.page_size) == (7, 1, 3)
+        assert [item.id for item in first.items] == [row.id for row in rows[:3]]
+        last = await worldbook.list_entries(book.id, page=3, page_size=3, _current_user=world.platform)
+        assert [item.id for item in last.items] == [rows[6].id]
+        beyond = await worldbook.list_entries(book.id, page=9, page_size=3, _current_user=world.platform)
+        assert beyond.items == [] and beyond.total == 7
+        # 页大小越界会被夹住
+        clamped = await worldbook.list_entries(book.id, page=0, page_size=10_000, _current_user=world.platform)
+        assert (clamped.page, clamped.page_size) == (1, worldbook.ENTRY_PAGE_SIZE_MAX)
+        huge = await worldbook.list_entries(book.id, page=10**30, page_size=3, _current_user=world.platform)
+        assert huge.page == worldbook.ENTRY_PAGE_MAX and huge.items == [] and huge.total == 7
+
+        by_key = await worldbook.list_entries(book.id, q="词5", _current_user=world.platform)
+        assert [item.id for item in by_key.items] == [rows[5].id] and by_key.total == 1
+        by_content = await worldbook.list_entries(book.id, q="正文", page_size=2, _current_user=world.platform)
+        assert by_content.total == 7 and len(by_content.items) == 2
+        # 搜索词里的空字符：PostgreSQL 会直接报错，这里先按参数错误拒掉
+        with pytest.raises(ValidationError):
+            await worldbook.list_entries(book.id, q="a" + chr(0), _current_user=world.platform)
+
+    async def test_entry_list_marks_unanalysed_entries_pending(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        book = await _book("大模板书", scope_kind="domain", adapter_key=ADAPTER, instance_key="t1a")
+        dense = "<%=1%>" * 2000
+        for index in range(3):
+            await _entry(book, uid=index, keys=(f"词{index}",), content=dense, order=100 - index)
+        wb_purpose.clear_cache()
+        monkeypatch.setattr(wb_purpose, "LIST_ANALYSIS_CHARS", len(dense))
+
+        response = await worldbook.list_entries(book.id, _current_user=world.platform)
+        assert [item.analysis_pending for item in response.items] == [False, True, True]
+        # 下一次请求接着算
+        response = await worldbook.list_entries(book.id, _current_user=world.platform)
+        assert [item.analysis_pending for item in response.items] == [False, False, True]
+        wb_purpose.clear_cache()
+
 
 class TestImportExport:
     async def test_full_entry_survives_a_round_trip(self, world: World) -> None:
@@ -1181,6 +1240,43 @@ class TestImportExport:
         assert by_comment["标题"].ext["uid"] == 0
         assert by_comment["不撞号甲"].uid == 10
         assert by_comment["不撞号乙"].uid == 11
+
+    async def test_name_vars_are_rewritten_by_default_and_the_export_keeps_the_original(self, world: World) -> None:
+        original = world_of([full_entry(0, content="你好，{{getvar::数据库用户名}}。")])
+
+        report = await _import_new(world.platform, dump(original), name="换名的书")
+
+        assert report.notes["name_var"] == 1
+        rows = list(await DBWbEntry.filter(book_id=report.book_id))
+        assert rows[0].content == "你好，{{user}}。"
+
+        # 导出以原始条目为底：正文还原成导入前的写法，导入时的改写不写回文件。
+        response = await worldbook.export_book(report.book_id, _current_user=world.platform)
+        assert json.loads(response.body)["entries"]["0"]["content"] == "你好，{{getvar::数据库用户名}}。"
+
+    async def test_name_vars_can_be_kept_as_written_on_new_and_append_imports(self, world: World) -> None:
+        content = "你好，{{getvar::数据库用户名}}。"
+
+        report = await _import_new(
+            world.platform,
+            dump(world_of([full_entry(0, content=content)])),
+            name="不改名的书",
+            rewrite_name_vars=False,
+        )
+        assert report.notes["name_var"] == 0
+        rows = list(await DBWbEntry.filter(book_id=report.book_id))
+        assert rows[0].content == content
+
+        book = await _book("追加不改名", scope_kind="domain", adapter_key=ADAPTER, instance_key="t1a")
+        appended = await worldbook.import_into_book(
+            book.id,
+            file=_upload(dump(world_of([full_entry(1, content=content)]))),
+            rewrite_name_vars=False,
+            _current_user=world.platform,
+        )
+        assert appended.notes["name_var"] == 0
+        row = await DBWbEntry.get(book_id=book.id, uid=1)
+        assert row.content == content
 
     async def test_dangerous_regex_is_imported_and_marked(self, world: World) -> None:
         incoming = world_of(
@@ -1238,7 +1334,9 @@ class TestImportExport:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """几百条、每条上百个关键词、长正文：一字不截地进库；比每轮预算还长的条目只给提示"""
-        monkeypatch.setattr(config, "WORLDBOOK_MAX_CHARS", 3000)
+        # 百分比 100、上限 1000 token：这条五千字的正文放不下，其余短正文放得下
+        monkeypatch.setattr(config, "WORLDBOOK_BUDGET_PERCENT", 100)
+        monkeypatch.setattr(config, "WORLDBOOK_BUDGET_CAP_TOKENS", 1000)
         long_body = "设定" * 2500
         entries = [
             full_entry(index, comment=f"条目{index}", content=long_body if index == 7 else f"正文{index}",
@@ -1252,7 +1350,7 @@ class TestImportExport:
         assert report.notes["over_budget"] == 1
         hint = [item for item in report.details if item.kind == "over_budget"]
         assert [(item.entry_key, item.field) for item in hint] == [("7", "content")]
-        assert "WORLDBOOK_MAX_CHARS（3000）" in hint[0].detail
+        assert "每轮世界书预算 1000 token" in hint[0].detail
 
         row = await DBWbEntry.get(book_id=report.book_id, uid=7)
         assert row.content == long_body
@@ -1285,11 +1383,11 @@ class TestImportExport:
         calls: list[str] = []
         original = st_format.st_entry_to_columns
 
-        def explode(raw: Any) -> Any:
+        def explode(raw: Any, **kwargs: Any) -> Any:
             calls.append("called")
             if len(calls) > 1:
                 raise RuntimeError("导入中途出错")
-            return original(raw)
+            return original(raw, **kwargs)
 
         monkeypatch.setattr(st_format, "st_entry_to_columns", explode)
 
@@ -1299,6 +1397,86 @@ class TestImportExport:
 
         assert await DBWbBook.all().count() == before
         assert not await DBWbBook.filter(name="中途失败的书").exists()
+
+
+_ROUTING_FILLER = "这是一段与设定无关的说明文字，用来凑够长度。" * 60
+
+
+class TestTemplateRoutingApi:
+    """按用途路由与模板：触发测试、书详情、导入报告（样本现写，不取自真实卡片）"""
+
+    async def test_trigger_test_lists_routed_out_hits_with_reasons(self, world: World) -> None:
+        book = world.books["domain_t1a"]
+        update = await _entry(book, uid=901, comment="[mvu_update]变量规则", content="写 <UpdateVariable>", constant=True)
+        trap = await _entry(
+            book,
+            uid=902,
+            comment="菜单存档",
+            content=f"<% if (window.__x) {{ %>{_ROUTING_FILLER}<% }} %>",
+            keys=("菜单",),
+        )
+        rendered = await _entry(
+            book,
+            uid=903,
+            comment="角色",
+            content="<% if (getvar('x') === undefined) { %>初次见面<% } else { %>老朋友<% } %>",
+            constant=True,
+        )
+
+        response = await worldbook.test_trigger(
+            TriggerTestRequest(chat_key=CHAT_T1A, text="看看菜单", preset_id=world.presets["t1a"].id),
+            _current_user=world.platform,
+        )
+
+        hit_ids = {item.entry_id for item in response.hits}
+        assert {update.id, trap.id, rendered.id} <= hit_ids
+        reasons = {item.entry_id: item.reason for item in response.dropped}
+        assert reasons[update.id] == "state_only"
+        assert reasons[trap.id] == "template_unsupported"
+        assert rendered.id in response.selected
+        assert "初次见面" in response.rendered.before_history
+        assert "<%" not in response.rendered.before_history
+        assert _ROUTING_FILLER[:20] not in response.rendered.before_history
+
+    async def test_entry_list_carries_purpose_and_trap(self, world: World) -> None:
+        book = world.books["domain_t1a"]
+        await _entry(book, uid=911, comment="[initvar]初值", content="{}")
+        await _entry(book, uid=912, comment="排序", content=f"<% if (false) {{ %>{_ROUTING_FILLER}<% }} %>")
+        await _entry(book, uid=913, comment="插图", content="<% for (const n of names) { %>x<% } %>")
+
+        response = await worldbook.list_entries(book.id, _current_user=world.platform)
+
+        by_uid = {item.uid: item for item in response.items}
+        assert by_uid[911].purpose == "initvar"
+        assert by_uid[912].purpose == "normal" and by_uid[912].suspected_trap
+        assert "永远不成立" in by_uid[912].trap_reason
+        assert by_uid[913].purpose == "unsupported_template" and by_uid[913].template_note
+        # 普通条目没有标记。
+        plain = [item for item in response.items if item.uid not in (911, 912, 913)]
+        assert all(item.purpose == "normal" and not item.suspected_trap for item in plain)
+
+    async def test_import_report_counts_template_notes_and_keeps_entries_enabled(self, world: World) -> None:
+        data = json.dumps(
+            {
+                "entries": {
+                    "0": {"uid": 0, "comment": "[mvu_update]规则", "content": "x", "key": []},
+                    "1": {"uid": 1, "comment": "陷阱", "content": f"<% if (localStorage.k) {{ %>{_ROUTING_FILLER}<% }} %>", "key": ["海边"]},
+                    "2": {"uid": 2, "comment": "普通", "content": "纯文字", "key": []},
+                },
+            },
+            ensure_ascii=False,
+        ).encode()
+
+        report = await _import_new(world.platform, data)
+
+        assert report.notes["state_only"] == 1
+        assert report.notes["unsupported_template"] == 1
+        assert report.notes["suspected_trap"] == 1
+        kinds = {(item.entry_key, item.kind) for item in report.details}
+        assert ("1", "suspected_trap") in kinds
+        # 只是提示：三条都照样导入、都还是启用状态。
+        rows = await DBWbEntry.filter(book_id=report.book_id).order_by("uid")
+        assert [row.enabled for row in rows] == [True, True, True]
 
 
 class TestTriggerTest:
@@ -1321,9 +1499,9 @@ class TestTriggerTest:
         assert key_hit.matched_key == "龙"
         constant_hit = next(item for item in response.hits if item.entry_id == world.entries["domain_constant"].id)
         assert constant_hit.reason_kind == "constant"
-        # 书预算只有 5 字，这条 7 字正文放不下：整条跳过并记下原因。
+        # 书预算只有 1 token，这条 7 字正文放不下：整条跳过并记下原因与 token 数。
         assert [(item.entry_id, item.reason) for item in response.dropped] == [
-            (world.entries["budget_key"].id, "book_chars"),
+            (world.entries["budget_key"].id, "book_tokens"),
         ]
         assert world.entries["budget_key"].id not in response.selected
         assert response.timed_ignored is True
@@ -1479,9 +1657,9 @@ class TestTriggerTest:
         world: World,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # 生效配置的字数上限压到 1 字：两条正文都放不下，于是全部进 dropped。
+        # 生效配置的 token 上限压到 1：正文都放不下，于是全部进 dropped。
         # 用「读不到配置就用全局默认值」的实现时这里会仍然选中它们。
-        monkeypatch.setattr(config, "WORLDBOOK_MAX_CHARS", 1)
+        monkeypatch.setattr(config, "WORLDBOOK_BUDGET_CAP_TOKENS", 1)
         world.channels["t1a"].invalidate_effective_config()
 
         response = await worldbook.test_trigger(
@@ -1490,7 +1668,8 @@ class TestTriggerTest:
         )
 
         assert response.selected == []
-        assert {item.reason for item in response.dropped} == {"global_chars"}
+        assert {item.reason for item in response.dropped} == {"global_tokens"}
+        assert response.budget is not None and response.budget.budget == 1 and response.budget.cap_tokens == 1
 
     async def test_platform_global_book_bodies_are_shown_to_tenants(self, world: World) -> None:
         # 平台方给全局人设建的书对租户只读开放：触发测试里正文照常显示，不再换成占位。
@@ -1561,16 +1740,16 @@ class TestTriggerTest:
         assert "WorldInfo source:host" not in response.rendered.after_persona
         assert "宿主常驻正文" in response.rendered.after_persona
 
-    async def test_char_budget_is_the_channels_not_the_global_one(
+    async def test_token_budget_is_the_channels_not_the_global_one(
         self,
         world: World,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # 全局仍是默认值，只有这个频道的生效配置压到 1 字：读全局配置的实现会照样选中它们。
+        # 全局仍是默认值，只有这个频道的生效配置把 token 上限压到 1：读全局配置的实现会照样选中它们。
         original = DBChatChannel.get_effective_config
 
         async def effective(self: DBChatChannel) -> Any:
-            return (await original(self)).model_copy(update={"WORLDBOOK_MAX_CHARS": 1})
+            return (await original(self)).model_copy(update={"WORLDBOOK_BUDGET_CAP_TOKENS": 1})
 
         monkeypatch.setattr(DBChatChannel, "get_effective_config", effective)
 
@@ -1580,7 +1759,7 @@ class TestTriggerTest:
         )
 
         assert response.selected == []
-        assert {item.reason for item in response.dropped} == {"global_chars"}
+        assert {item.reason for item in response.dropped} == {"global_tokens"}
 
     async def test_entry_limit_comes_from_the_global_config(
         self,
@@ -2100,11 +2279,11 @@ class TestGuardEdges:
         calls: list[int] = []
         original = st_format.st_entry_to_columns
 
-        def explode(raw: Any) -> Any:
+        def explode(raw: Any, **kwargs: Any) -> Any:
             calls.append(1)
             if len(calls) > 1:
                 raise RuntimeError("追加导入中途出错")
-            return original(raw)
+            return original(raw, **kwargs)
 
         monkeypatch.setattr(st_format, "st_entry_to_columns", explode)
 
@@ -2247,3 +2426,327 @@ class TestPlatformGlobalBookReadOnly:
             page_size=100,
         )
         assert _book_ids(by_preset) == {world.books["global_preset"].id}
+
+
+class TestImportAnalysisIsolation:
+    """导入的分析在事务之外、导入专用的执行器里跑：不占数据库连接，同一个租户一次一个"""
+
+    async def test_analysis_runs_outside_the_transaction_and_blocks_no_one(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+
+        from nekro_agent.schemas.errors import WorldbookAnalysisBusyError
+
+        started = threading.Event()
+        release = threading.Event()
+        real = wb_purpose.template_import_notes
+
+        def slow(columns_list: Any, **kwargs: Any) -> Any:
+            started.set()
+            release.wait(5)
+            return real(columns_list, **kwargs)
+
+        monkeypatch.setattr(wb_purpose, "template_import_notes", slow)
+        task = asyncio.ensure_future(_import_new(world.platform, dump(world_of([full_entry(0)])), name="慢导入"))
+        try:
+            for _ in range(200):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert started.is_set()
+            # 分析期间，另一个租户读库、平台方别的查询都照常（分析没开事务，不占连接）
+            other = await asyncio.wait_for(
+                worldbook.list_entries(world.books["global_preset"].id, _current_user=world.tenant),
+                timeout=3,
+            )
+            assert other.total >= 1
+            assert await asyncio.wait_for(DBWbBook.filter(name="慢导入").count(), timeout=3) == 0
+            # 同一个租户（这里是平台方）再来一个导入：直接 409，不排队
+            with pytest.raises(WorldbookAnalysisBusyError):
+                await _import_new(world.platform, dump(world_of([full_entry(1)])), name="第二个")
+        finally:
+            release.set()
+        report = await asyncio.wait_for(task, timeout=5)
+        assert report.created == 1
+        # 跑完名额就还回来了
+        again = await _import_new(world.platform, dump(world_of([full_entry(2)])), name="第三个")
+        assert again.created == 1
+
+    async def test_import_does_not_count_tokens_through_the_default_pool(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from nekro_agent.services.worldbook import tokens as wb_tokens
+
+        async def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("导入的 token 预数应在导入执行器里同步做")
+
+        monkeypatch.setattr(wb_tokens, "base_counts", forbidden)
+        monkeypatch.setattr(wb_tokens, "prefetch", forbidden)
+        report = await _import_new(world.platform, dump(world_of([full_entry(0)])), name="不走默认线程池")
+        assert report.created == 1
+
+    async def test_analysis_cap_marks_the_rest_not_analysed(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(wb_purpose, "IMPORT_ANALYSIS_CHARS", 1)
+        entries = [full_entry(index, content="<% if (true) { %>有<% } %>") for index in range(3)]
+        report = await _import_new(world.platform, dump(world_of(entries)), name="分析上限")
+        assert report.created == 3
+        assert report.notes["template_not_analyzed"] == 2
+
+
+class TestIgnoreBudgetAndScanNames:
+    """「忽略预算」与「扫描时带上说话人名字」：存取、导入导出、触发测试三处都要对上"""
+
+    async def test_book_and_entry_flags_are_stored_and_returned(self, world: World) -> None:
+        created = await worldbook.create_book(
+            BookCreateRequest(name="带名字的书", scope_kind="domain", scan_names=True),
+            instance_key="t1a",
+            _current_user=world.platform,
+        )
+        assert created.scan_names is True
+        assert (await DBWbBook.get(id=created.id)).scan_names is True
+
+        listed = await worldbook.list_books(_current_user=world.platform, q="带名字的书", page_size=100)
+        assert next(item for item in listed.items if item.id == created.id).scan_names is True
+
+        updated = await worldbook.update_book(
+            created.id,
+            BookUpdateRequest(scan_names=False),
+            _current_user=world.platform,
+        )
+        assert updated.scan_names is False
+        assert (await DBWbBook.get(id=created.id)).scan_names is False
+
+        entry = await worldbook.create_entry(
+            created.id,
+            EntryCreateRequest(keys=["必进"], content="必进的正文", ignore_budget=True),
+            _current_user=world.platform,
+        )
+        assert entry.ignore_budget is True
+        assert (await DBWbEntry.get(id=entry.id)).ignore_budget is True
+
+        edited = await worldbook.update_entry(
+            entry.id,
+            EntryUpdateRequest(ignore_budget=False),
+            _current_user=world.platform,
+        )
+        assert edited.ignore_budget is False
+        assert (await DBWbEntry.get(id=entry.id)).ignore_budget is False
+
+        entries = await worldbook.list_entries(created.id, _current_user=world.platform)
+        assert next(item for item in entries.items if item.id == entry.id).ignore_budget is False
+
+    async def test_creating_an_entry_without_the_flag_means_false(self, world: World) -> None:
+        item = await worldbook.create_entry(
+            world.books["domain_t1a"].id,
+            EntryCreateRequest(keys=["普通"], content="普通正文"),
+            _current_user=world.platform,
+        )
+        assert item.ignore_budget is False
+
+    async def test_import_reads_ignore_budget_and_defaults_scan_names_on(self, world: World) -> None:
+        # 直接调路由函数时 `Form(...)` 的默认值拿到的是 `FieldInfo`，所以这里显式传参；
+        # 接口本身的默认值（新导入默认开）单独断言，免得「默认值改成 False」悄悄漏过去。
+        scan_names_default = inspect.signature(worldbook.import_new_book).parameters["scan_names"].default
+        assert getattr(scan_names_default, "default", scan_names_default) is True
+
+        incoming = world_of(
+            [
+                full_entry(0, comment="必进的", ignoreBudget=True),
+                full_entry(1, comment="普通的", key=["凤"]),
+            ],
+        )
+
+        report = await _import_new(world.platform, dump(incoming), name="忽略预算书")
+
+        rows = {row.comment: row for row in await DBWbEntry.filter(book_id=report.book_id)}
+        assert rows["必进的"].ignore_budget is True
+        assert rows["普通的"].ignore_budget is False
+        # 表单没传 scan_names 时新导入的书默认带说话人名字
+        assert (await DBWbBook.get(id=report.book_id)).scan_names is True
+
+        explicit = await _import_new(world.platform, dump(incoming), name="不带名字的书", scan_names=False)
+        assert (await DBWbBook.get(id=explicit.book_id)).scan_names is False
+
+    async def test_append_import_keeps_the_books_scan_names(self, world: World) -> None:
+        book = await _book(
+            "不带名字的追加书",
+            scope_kind="domain",
+            adapter_key=ADAPTER,
+            instance_key="t1a",
+            scan_names=False,
+        )
+
+        report = await worldbook.import_into_book(
+            book.id,
+            file=_upload(dump(world_of([full_entry(0)]))),
+            _current_user=world.platform,
+        )
+
+        assert report.created == 1
+        assert (await DBWbBook.get(id=book.id)).scan_names is False
+
+    async def test_export_writes_ignore_budget_and_survives_a_reimport(self, world: World) -> None:
+        incoming = world_of([full_entry(0, comment="必进的", ignoreBudget=True)])
+        report = await _import_new(world.platform, dump(incoming), name="导出忽略预算")
+
+        response = await worldbook.export_book(report.book_id, _current_user=world.platform)
+        exported = json.loads(response.body)
+        assert exported["entries"]["0"]["ignoreBudget"] is True
+        # 没映射的字段不重复留在条目里：`ignoreBudget` 只出现一次，且就是映射后的那个值
+        assert sum(1 for key in exported["entries"]["0"] if key == "ignoreBudget") == 1
+
+        again = await _import_new(world.platform, response.body, name="再导入的书")
+        row = await DBWbEntry.get(book_id=again.book_id, uid=0)
+        assert row.ignore_budget is True
+
+    async def test_trigger_test_marks_entries_that_ignored_the_budget(self, world: World) -> None:
+        book = await _book(
+            "触发测试的忽略预算书",
+            scope_kind="domain",
+            adapter_key=ADAPTER,
+            instance_key="t1a",
+            budget_tokens=1,
+        )
+        exempt = await _entry(book, uid=0, constant=True, content="必进的正文", trusted=True, ignore_budget=True)
+        tenant_entry = await _entry(
+            book,
+            uid=1,
+            constant=True,
+            content="租户写的正文",
+            trusted=False,
+            ignore_budget=True,
+        )
+
+        response = await worldbook.test_trigger(
+            TriggerTestRequest(chat_key=CHAT_T1A, text="", use_recent=False, preset_id=world.presets["t1a"].id),
+            _current_user=world.platform,
+        )
+
+        hits = {item.entry_id: item for item in response.hits}
+        assert exempt.id in hits and hits[exempt.id].ignored_budget is True
+        # 租户条目上的标记不起作用：书预算只有 1 token，它照旧被挡掉
+        assert tenant_entry.id in hits
+        assert hits[tenant_entry.id].ignored_budget is False
+        assert tenant_entry.id not in response.selected
+        assert tenant_entry.id in {item.entry_id for item in response.dropped}
+
+
+class TestImportBusyIsCheckedFirst:
+    async def test_busy_tenant_is_refused_before_the_upload_is_read(
+        self, world: World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from nekro_agent.schemas.errors import WorldbookAnalysisBusyError
+
+        async def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("忙着的租户不该先把上传读完、解析完")
+
+        monkeypatch.setattr(worldbook, "_read_upload", forbidden)
+        key = wb_purpose.tenant_slot_key(None)
+        wb_purpose._import_running.add(key)
+        try:
+            with pytest.raises(WorldbookAnalysisBusyError):
+                await _import_new(world.platform, dump(world_of([full_entry(0)])), name="忙")
+            with pytest.raises(WorldbookAnalysisBusyError):
+                await worldbook.import_into_book(
+                    world.books["domain_t1a"].id,
+                    file=_upload(dump(world_of([full_entry(0)]))),
+                    _current_user=world.platform,
+                )
+        finally:
+            wb_purpose._import_running.discard(key)
+
+
+class TestBookInjectModeAndScene:
+    async def test_create_stores_and_returns_both_columns(self, world: World) -> None:
+        detail = await worldbook.create_book(
+            BookCreateRequest(
+                name="只能查的私聊书",
+                scope_kind="domain",
+                inject_mode="lookup",
+                active_scene="private",
+            ),
+            instance_key="t1a",
+            _current_user=world.tenant,
+        )
+
+        assert detail.inject_mode == "lookup"
+        assert detail.active_scene == "private"
+        row = await DBWbBook.get(id=detail.id)
+        assert row.inject_mode == "lookup"
+        assert row.active_scene == "private"
+
+    async def test_create_defaults_to_both(self, world: World) -> None:
+        detail = await worldbook.create_book(
+            BookCreateRequest(name="默认书", scope_kind="domain"),
+            instance_key="t1a",
+            _current_user=world.tenant,
+        )
+
+        assert detail.inject_mode == "both"
+        assert detail.active_scene == "both"
+
+    async def test_update_changes_both_and_keeps_omitted_values(self, world: World) -> None:
+        book = await _book("要改的书", scope_kind="domain", adapter_key=ADAPTER, instance_key="t1a")
+
+        changed = await worldbook.update_book(
+            book.id,
+            BookUpdateRequest(inject_mode="lookup", active_scene="group"),
+            _current_user=world.platform,
+        )
+        assert changed.inject_mode == "lookup"
+        assert changed.active_scene == "group"
+
+        # 只改书名：没传的两列保持原值，不该被写回默认的 `both`。
+        renamed = await worldbook.update_book(
+            book.id,
+            BookUpdateRequest(name="改过名的书"),
+            _current_user=world.platform,
+        )
+        assert renamed.name == "改过名的书"
+        assert renamed.inject_mode == "lookup"
+        assert renamed.active_scene == "group"
+        row = await DBWbBook.get(id=book.id)
+        assert row.inject_mode == "lookup"
+        assert row.active_scene == "group"
+
+    async def test_invalid_values_are_rejected(self, world: World) -> None:
+        with pytest.raises(PydanticValidationError):
+            BookCreateRequest(name="坏注入方式", scope_kind="domain", inject_mode="nope")
+        with pytest.raises(PydanticValidationError):
+            BookUpdateRequest(active_scene="nope")
+
+        with pytest.raises(ValidationError) as exc:
+            await _import_new(
+                world.platform,
+                dump(world_of([full_entry(0)])),
+                name="坏注入方式导入",
+                inject_mode="nope",
+            )
+        assert "inject_mode" in str(exc.value)
+
+    async def test_import_form_carries_both_columns(self, world: World) -> None:
+        report = await _import_new(
+            world.platform,
+            dump(world_of([full_entry(0)])),
+            name="带模式的导入书",
+            inject_mode="lookup",
+            active_scene="private",
+        )
+
+        row = await DBWbBook.get(id=report.book_id)
+        assert row.inject_mode == "lookup"
+        assert row.active_scene == "private"
+
+    async def test_import_form_defaults_to_both(self, world: World) -> None:
+        report = await _import_new(
+            world.platform,
+            dump(world_of([full_entry(0)])),
+            name="默认模式的导入书",
+        )
+
+        row = await DBWbBook.get(id=report.book_id)
+        assert row.inject_mode == "both"
+        assert row.active_scene == "both"

@@ -2,6 +2,68 @@
   "title": "好感度",
   "subtitle": "Bot 对每个人的感觉，按实例隔离",
   "scopeBanner": "只显示并调整该实例下的好感度，其他实例的数据互不可见",
+  "view": {
+    "list": "列表",
+    "graph": "关系图"
+  },
+  "graph": {
+    "clusters": {
+      "preset": "人设",
+      "person": "人",
+      "milestone": "关系里程碑",
+      "channel": "频道"
+    },
+    "kind": {
+      "preset": "人设",
+      "person": "人",
+      "milestone": "关系里程碑",
+      "channel": "频道"
+    },
+    "toolbar": {
+      "zoom": "缩放",
+      "zoomIn": "放大",
+      "zoomOut": "缩小",
+      "viewStar": "星形视图",
+      "viewClusters": "分区视图",
+      "densityLow": "低密度",
+      "densityMedium": "信息适中",
+      "densityHigh": "高密度"
+    },
+    "focus": {
+      "title": "当前焦点",
+      "hint": "人设在中间，人围在外面；线越粗分数越高，颜色是关系阶段，虚线是提防或厌恶。点一个人看他的好感、称呼、关系里程碑与最近一次出现。拖动或滚轮平移，按住 Ctrl 或 Command 再滚动可缩放。"
+    },
+    "stats": {
+      "preset": "人设 {{count}}",
+      "person": "人 {{count}}",
+      "milestone": "里程碑 {{count}}",
+      "channel": "频道 {{count}}"
+    },
+    "truncated": "只画了最近更新的 {{drawn}} 份（共 {{total}} 份），可用搜索或关系筛选缩小范围",
+    "skippedMerged": "另有 {{count}} 份是合并后的副号，没有画",
+    "empty": "当前范围与筛选下还没有好感记录。",
+    "notFound": "没有这个实例，或它不在你能管理的范围里。",
+    "panel": {
+      "title": "详情",
+      "close": "收起",
+      "none": "—",
+      "callName": "称呼",
+      "callNameLine": "称呼：{{name}}",
+      "lastSeen": "最近一次出现",
+      "lastChannel": "最近出现的频道",
+      "records": "各人设下的好感",
+      "stageScore": "{{stage}} · {{score}}",
+      "recordMeta": "最近互动 {{time}} · 共 {{count}} 轮",
+      "openDetail": "完整详情",
+      "milestones": "关系里程碑（{{count}}）",
+      "milestoneHidden": "（正文不可见）",
+      "eventTime": "时间",
+      "person": "属于",
+      "seenHere": "最近在这里出现的人",
+      "personCount": "人数",
+      "inUseChannels": "在用的频道"
+    }
+  },
   "filters": {
     "searchPlaceholder": "搜索昵称或用户 ID",
     "clearSearch": "清空搜索",
@@ -22,12 +84,14 @@
     "feeling": "TA 在 Bot 眼里",
     "feelingEmpty": "还没什么印象",
     "interactions": "互动",
+    "interactionsInline": "互动 {{count}} 次",
     "actions": "操作",
     "mergedInto": "已并入 {{person}}，这一行是休眠数据，改它不生效",
     "inUse": "在用 · {{count}} 个频道",
     "notInUse": "没有频道在用",
     "showOtherPresets": "还有 {{count}} 个人设下的好感",
-    "hideOtherPresets": "收起其他人设"
+    "hideOtherPresets": "收起其他人设",
+    "instanceTooltip": "实例 {{instance}}"
   },
   "empty": {
     "title": "还没有谁被记住",
@@ -47,6 +111,13 @@
   },
   "detail": {
     "title": "这段关系",
+    "keyFacts": "关键事实",
+    "facts": {
+      "domain": "所属域",
+      "preset": "人设",
+      "interactions": "互动",
+      "inUse": "频道"
+    },
     "loadFailed": "这一份好感看不到或已不存在（可能已被重置、或不属于当前实例）",
     "timeline": "都发生过什么",
     "timelineEmpty": "还没有留下记录",

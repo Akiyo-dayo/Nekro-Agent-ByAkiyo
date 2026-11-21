@@ -189,13 +189,7 @@ async def render_affection_prompt(
         if not blocks:
             return _record_affection_state(one_time_code, shown=False, text="", people=0)
 
-        scene_hint = (
-            "This is a group chat: keep the intimacy proportionate to the setting, "
-            "do not expose private closeness in front of others.\n"
-            if db_chat_channel.chat_type.value != "private"
-            else ""
-        )
-        text = _HEADER + scene_hint + "\n" + "\n".join(blocks) + "\n"
+        text = _HEADER + "\n" + "\n".join(blocks) + "\n"
         return _record_affection_state(
             one_time_code,
             shown=True,

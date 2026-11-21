@@ -19,7 +19,14 @@
 ## 列表为什么在路由里补「涉及的人」
 
 服务层只返回段落行；列表页要显示"涉及的人"，由路由用 `load_person_accounts` **一次**批量取。
-逐行查会在每页 100 条时变成 100 次往返。
+逐行查会在每页 100 条时变成 100 次往返。显示名（来源频道里的昵称、好感里的称呼）同样批量配，
+见 `services/memory/person_labels.py`。
+
+## 分组视图
+
+`/persons` 与 `/topics` 是只读的聚合：满足筛选的段落里出现过哪些人、按所属事件各几段。
+它们与段落列表走同一个范围（`_resolve_admin_scope` + `AdminMemoryScope.apply`）和同一套
+筛选参数，展开一组时用段落列表的 `person` / `episode` 参数取组内段落。
 """
 
 from __future__ import annotations
@@ -48,14 +55,22 @@ from nekro_agent.schemas.memory_admin import (
     EpisodeListResponse,
     HardDeleteReportResponse,
     InstanceOption,
+    MemoryGraphEdge,
+    MemoryGraphNode,
+    MemoryGraphResponse,
     MemoryItemActionRequest,
     MemoryItemDetail,
     MemoryItemUpdateRequest,
+    MemoryPersonItem,
+    MemoryPersonListResponse,
+    MemoryTopicItem,
+    MemoryTopicListResponse,
     MemoryTraceMessage,
     MemoryTraceResponse,
     ParagraphFilterSelection,
     ParagraphListItem,
     ParagraphListResponse,
+    PersonLabelItem,
     PresetOption,
     PromptRoundDetailResponse,
     PromptRoundListItem,
@@ -79,12 +94,14 @@ from nekro_agent.services.memory.admin_service import (
     ParagraphListFilters,
     QuarantineEntry,
 )
+from nekro_agent.services.memory.graph_view import GRAPH_LIMIT_DEFAULT, build_admin_memory_graph
 from nekro_agent.services.memory.instance_scope import (
     AdminFilter,
     AdminMemoryScope,
     admin_row_visible,
     resolve_admin_scope,
 )
+from nekro_agent.services.memory.person_labels import PersonLabel, label_paragraph_persons
 from nekro_agent.services.memory.persons import load_person_accounts
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
@@ -145,6 +162,33 @@ def _parse_origin_kind(value: str) -> Optional[str]:
         raise ValidationError(reason=f"未知的来源类型筛选: {value}") from e
 
 
+# 事件 ID 是 32 位有符号整数列：超过它的值在 PostgreSQL 上会溢出成 500，超长的数字串
+# 换成整数也要白算一遍，都在这里挡成 400
+_EPISODE_ID_MAX = 2**31 - 1
+_EPISODE_ID_MAX_DIGITS = 10
+
+
+def _parse_episode(value: str) -> Optional[int]:
+    """事件筛选：空串不筛，`none` 是「没归入任何事件」，正整数是事件 ID。
+
+    与来源类型同一个理由在这里校验：写错的值到了 SQL 里只会安静地返回零行。列表、分组视图与
+    批量「按筛选全选」（请求体里的 `episode`）都走这里。
+    """
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text == "none":
+        return admin_service.NO_EPISODE
+    if (
+        text.isascii()
+        and text.isdigit()
+        and len(text) <= _EPISODE_ID_MAX_DIGITS
+        and 0 < int(text) <= _EPISODE_ID_MAX
+    ):
+        return int(text)
+    raise ValidationError(reason=f"未知的事件筛选: {value[:32]}")
+
+
 def _paragraph_filters(
     *,
     status: str,
@@ -156,17 +200,21 @@ def _paragraph_filters(
     time_to: str,
     q: str,
     origin_kind: str = "",
+    episode: str = "",
+    sensitive: Optional[bool] = None,
 ) -> ParagraphListFilters:
     return ParagraphListFilters(
         status=status.strip().lower() or "all",
         frozen=frozen,
         protected=protected,
+        sensitive=sensitive,
         cognitive_type=cognitive_type.strip() or None,
         knowledge_type=knowledge_type.strip() or None,
         time_from=_parse_iso_datetime(time_from, "time_from"),
         time_to=_parse_iso_datetime(time_to, "time_to"),
         q=q.strip() or None,
         origin_kind=_parse_origin_kind(origin_kind),
+        episode=_parse_episode(episode),
     )
 
 
@@ -271,8 +319,18 @@ def _worldbook_injected_count(raw: Any) -> int:
     return sum(1 for item in raw if isinstance(item, dict) and item.get("type") == "worldbook")
 
 
-# 租户看不到的书里的条目只留这些键：哪一条、多长、落在哪、信不信任、渲染了几次、为什么被跳过。
-_HIDDEN_ITEM_KEYS = ("type", "id", "chars", "position", "trusted", "renders", "reason")
+def _worldbook_injected_tokens(raw: Any) -> Optional[int]:
+    """明细行里注入条目的 token 总数；0.4.7 之前的旧行条目上没有 `tokens`，返回 None（界面按字数显示）"""
+    if not isinstance(raw, list):
+        return None
+    injected = [item for item in raw if isinstance(item, dict) and item.get("type") == "worldbook"]
+    if not injected or any(not isinstance(item.get("tokens"), int) for item in injected):
+        return None
+    return sum(int(item["tokens"]) for item in injected)
+
+
+# 租户看不到的书里的条目只留这些键：哪一条、多长（字数与 token）、落在哪、信不信任、渲染了几次、为什么被跳过。
+_HIDDEN_ITEM_KEYS = ("type", "id", "chars", "tokens", "position", "trusted", "renders", "reason")
 
 
 async def _visible_worldbook_items(user: DBUser, raw: Any) -> list[dict[str, Any]]:
@@ -341,7 +399,7 @@ async def _visible_worldbook_items(user: DBUser, raw: Any) -> list[dict[str, Any
     return enriched
 
 
-def _prompt_round_item(row: DBMemPromptRound) -> PromptRoundListItem:
+def _prompt_round_item(row: DBMemPromptRound, summary_created_at: Optional[datetime] = None) -> PromptRoundListItem:
     return PromptRoundListItem(
         id=row.id,
         chat_key=row.chat_key,
@@ -353,6 +411,7 @@ def _prompt_round_item(row: DBMemPromptRound) -> PromptRoundListItem:
         memory_block_chars=row.memory_block_chars,
         summary_state=row.summary_state,
         summary_version=row.summary_version,
+        summary_created_at=summary_created_at,
         summary_chars=row.summary_chars,
         affection_shown=row.affection_shown,
         affection_chars=row.affection_chars,
@@ -361,7 +420,9 @@ def _prompt_round_item(row: DBMemPromptRound) -> PromptRoundListItem:
         worldbook_state=row.worldbook_state,
         worldbook_count=_worldbook_injected_count(row.worldbook_items),
         worldbook_chars=row.worldbook_chars,
+        worldbook_tokens=_worldbook_injected_tokens(row.worldbook_items),
         tavern_items=row.tavern_items or {},
+        state_items=row.state_items or {},
         started_at=row.started_at,
         finished_at=row.finished_at,
     )
@@ -389,7 +450,11 @@ async def _person_accounts(
     )
 
 
-def _paragraph_item(row: DBMemParagraph, accounts: list[str]) -> ParagraphListItem:
+def _paragraph_item(
+    row: DBMemParagraph,
+    accounts: list[str],
+    labels: Optional[list[PersonLabel]] = None,
+) -> ParagraphListItem:
     # 来源类型在库里是枚举，列表对外给字符串：前端拿到的是可比较的 `"affection"`，
     # 而不是某个 Python 枚举的表示形式。
     origin_kind = row.origin_kind.value if row.origin_kind is not None else None
@@ -410,12 +475,18 @@ def _paragraph_item(row: DBMemParagraph, accounts: list[str]) -> ParagraphListIt
         status=admin_service.paragraph_status(row),
         is_frozen=row.is_frozen,
         is_protected=row.is_protected,
+        is_sensitive=row.is_sensitive,
         blocked_round_hits=row.blocked_round_hits,
         quarantined_at=row.quarantined_at,
         quarantine_reason=row.quarantine_reason,
         create_time=row.create_time,
         update_time=row.update_time,
         person_accounts=accounts,
+        persons=[
+            PersonLabelItem.model_validate(label.as_dict())
+            for label in (labels if labels is not None else [PersonLabel(account=account) for account in accounts])
+        ],
+        episode_id=row.episode_id,
     )
 
 
@@ -450,13 +521,22 @@ def _quarantine_item(entry: QuarantineEntry) -> QuarantineListItem:
         quarantined_at=entry.quarantined_at,
         quarantine_reason=entry.quarantine_reason,
         blocked_round_hits=entry.blocked_round_hits,
+        cognitive_type=entry.cognitive_type,
+        knowledge_type=entry.knowledge_type,
     )
 
 
-async def _detail_payload(memory_type: str, row: Any) -> MemoryItemDetail:
-    """单条详情：段落用服务层的详情构造，其余类型 `to_dict` 后补状态。"""
+async def _detail_payload(memory_type: str, row: Any, user: DBUser) -> MemoryItemDetail:
+    """单条详情：段落用服务层的详情构造，其余类型 `to_dict` 后补状态。
+
+    段落所属的事件按事件行自己的实例对再判一次范围（与「按事件分组」一致），范围外只给编号。
+    """
     if isinstance(row, DBMemParagraph):
-        payload = await admin_service.build_paragraph_detail(row)
+
+        async def episode_visible(episode: DBMemEpisode) -> bool:
+            return await admin_row_visible(user, episode.adapter_key, episode.instance_key)
+
+        payload = await admin_service.build_paragraph_detail(row, episode_visible=episode_visible)
     else:
         payload = row.to_dict()
         if isinstance(row, DBMemEpisode):
@@ -672,7 +752,33 @@ async def list_prompt_rounds(
         page=page,
         page_size=page_size,
     )
-    return PromptRoundListResponse(total=total, items=[_prompt_round_item(row) for row in rows])
+    # 「第 N 版」换成那一版的生成时间：明细行记着摘要行的主键，一次批量取回。摘要只留最近
+    # 几版，取不到的（已经不保留）留空，界面退回显示版号。摘要行的频道与人设要与这一轮对得上
+    # （与详情同一条纵深防御），对不上的同样留空。
+    summary_ids = sorted({row.summary_id for row in rows if row.summary_id is not None})
+    summaries: dict[int, tuple[str, int, Optional[datetime]]] = {}
+    if summary_ids:
+        summary_rows = await DBMemChannelSummary.filter(id__in=summary_ids, chat_key=normalized_chat_key).values(
+            "id",
+            "chat_key",
+            "preset_id",
+            "create_time",
+        )
+        summaries = {
+            int(item["id"]): (str(item["chat_key"]), int(item["preset_id"]), item["create_time"])
+            for item in summary_rows
+        }
+
+    def created_at(row: DBMemPromptRound) -> Optional[datetime]:
+        found = summaries.get(row.summary_id) if row.summary_id is not None else None
+        if found is None or (found[0], found[1]) != (row.chat_key, row.preset_id):
+            return None
+        return found[2]
+
+    return PromptRoundListResponse(
+        total=total,
+        items=[_prompt_round_item(row, created_at(row)) for row in rows],
+    )
 
 
 @router.get(
@@ -700,6 +806,66 @@ async def get_prompt_round(
     # 实例、或压根是平台方的全局人设书。
     detail["worldbook_items"] = await _visible_worldbook_items(_current_user, detail.get("worldbook_items"))
     return PromptRoundDetailResponse.model_validate(detail)
+
+
+@router.get("/graph", summary="记忆图谱", response_model=MemoryGraphResponse)
+@require_role(Role.Admin)
+async def get_memory_graph(
+    partition: str = "all",
+    chat_key: str = "",
+    preset_id: Optional[int] = None,
+    person: str = "",
+    include_inactive: bool = False,
+    time_from: str = "",
+    time_to: str = "",
+    limit: int = GRAPH_LIMIT_DEFAULT,
+    instance_key: str = "",
+    adapter_key: str = "",
+    domain: str = "self",
+    group_id: Optional[int] = None,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> MemoryGraphResponse:
+    """段落、事件、实体、关系与「涉及的人」的图谱；只读
+
+    组装照搬工作区记忆页的图谱接口，取数换成与段落列表同一个范围（`_resolve_admin_scope` +
+    `AdminMemoryScope.apply`），所以看得到域记忆；筛选参数与段落列表同名同义。`limit` 夹在
+    50 ~ 600 之间。单个节点的详情用 `/items/{type}/{id}`（「人」节点没有详情，信息在元数据里）。
+    """
+    from nekro_agent.services.identity_scope import resolve_memory_domain
+
+    scope, instance = await _resolve_admin_scope(
+        _current_user,
+        instance_key=instance_key,
+        adapter_key=adapter_key,
+        domain=domain,
+        group_id=group_id,
+    )
+    person_accounts = await _person_accounts(scope, person, instance)
+    f = _admin_filter(
+        partition=partition,
+        chat_key=chat_key,
+        preset_id=preset_id,
+        person_accounts=person_accounts,
+    )
+    memory_domain = (
+        await resolve_memory_domain(instance.adapter_key, instance.instance_key) if instance is not None else None
+    )
+    graph = await build_admin_memory_graph(
+        scope,
+        f,
+        include_inactive=include_inactive,
+        time_from=_parse_iso_datetime(time_from, "time_from"),
+        time_to=_parse_iso_datetime(time_to, "time_to"),
+        limit=limit,
+        domain=memory_domain,
+    )
+    return MemoryGraphResponse(
+        generated_at=datetime.now(timezone.utc),
+        node_count=len(graph.nodes),
+        edge_count=len(graph.edges),
+        nodes=[MemoryGraphNode.model_validate(node) for node in graph.nodes],
+        edges=[MemoryGraphEdge.model_validate(edge) for edge in graph.edges],
+    )
 
 
 @router.get("/scope-options", summary="记忆管理筛选项", response_model=ScopeOptionsResponse)
@@ -737,12 +903,14 @@ async def list_paragraphs(
     status: str = "active",
     frozen: Optional[bool] = None,
     protected: Optional[bool] = None,
+    sensitive: Optional[bool] = None,
     cognitive_type: str = "",
     knowledge_type: str = "",
     time_from: str = "",
     time_to: str = "",
     q: str = "",
     origin_kind: str = "",
+    episode: str = "",
     sort: str = "create_time",
     order: str = "desc",
     page: int = 1,
@@ -753,7 +921,11 @@ async def list_paragraphs(
     group_id: Optional[int] = None,
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ParagraphListResponse:
-    """段落列表。`status` 默认只看正常行，隔离区与已删除要显式选。"""
+    """段落列表。`status` 默认只看正常行，隔离区与已删除要显式选。
+
+    `episode` 按所属事件筛：`none` 是没归入任何事件的段落，正整数是事件 ID。每行带上
+    「涉及的人」的显示名（`persons`，与 `person_accounts` 一一对应）。
+    """
     scope, instance = await _resolve_admin_scope(
         _current_user,
         instance_key=instance_key,
@@ -778,6 +950,8 @@ async def list_paragraphs(
         time_to=time_to,
         q=q,
         origin_kind=origin_kind,
+        episode=episode,
+        sensitive=sensitive,
     )
     total, rows = await admin_service.list_paragraphs(
         scope,
@@ -785,21 +959,183 @@ async def list_paragraphs(
         status=filters.status,
         frozen=filters.frozen,
         protected=filters.protected,
+        sensitive=filters.sensitive,
         cognitive_type=filters.cognitive_type,
         knowledge_type=filters.knowledge_type,
         time_from=filters.time_from,
         time_to=filters.time_to,
         q=filters.q,
         origin_kind=filters.origin_kind,
+        episode=filters.episode,
         sort=sort,
         order=order,
         page=page,
         page_size=page_size,
     )
     accounts = await load_person_accounts([row.id for row in rows])
+    labels = await label_paragraph_persons(rows, accounts)
     return ParagraphListResponse(
         total=total,
-        items=[_paragraph_item(row, accounts.get(row.id, [])) for row in rows],
+        items=[_paragraph_item(row, accounts.get(row.id, []), labels.get(row.id)) for row in rows],
+    )
+
+
+@router.get("/persons", summary="记忆里出现过的人", response_model=MemoryPersonListResponse)
+@require_role(Role.Admin)
+async def list_memory_persons(
+    partition: str = "all",
+    chat_key: str = "",
+    preset_id: Optional[int] = None,
+    status: str = "active",
+    frozen: Optional[bool] = None,
+    protected: Optional[bool] = None,
+    sensitive: Optional[bool] = None,
+    cognitive_type: str = "",
+    knowledge_type: str = "",
+    time_from: str = "",
+    time_to: str = "",
+    q: str = "",
+    origin_kind: str = "",
+    episode: str = "",
+    account_q: str = "",
+    page: int = 1,
+    page_size: int = 50,
+    instance_key: str = "",
+    adapter_key: str = "",
+    domain: str = "self",
+    group_id: Optional[int] = None,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> MemoryPersonListResponse:
+    """满足筛选的段落里出现过哪些人、各几段，按段数倒序；只读
+
+    给「按人筛选」的候选与「按人分组」的视图用。筛选参数与段落列表同名同义（没有 `person`：
+    这里列的就是人）；`account_q` 只按账号匹配，名字由界面在拿到的这一页里再筛。
+    选了实例时同一个人的几个账号并成一行（与按人筛选的别名展开同一个域）。
+    范围与段落列表同一个：`_resolve_admin_scope` + `AdminMemoryScope.apply`。
+    """
+    from nekro_agent.services.identity_scope import resolve_memory_domain
+
+    scope, instance = await _resolve_admin_scope(
+        _current_user,
+        instance_key=instance_key,
+        adapter_key=adapter_key,
+        domain=domain,
+        group_id=group_id,
+    )
+    f = _admin_filter(partition=partition, chat_key=chat_key, preset_id=preset_id, person_accounts=None)
+    filters = _paragraph_filters(
+        status=status,
+        frozen=frozen,
+        protected=protected,
+        cognitive_type=cognitive_type,
+        knowledge_type=knowledge_type,
+        time_from=time_from,
+        time_to=time_to,
+        q=q,
+        origin_kind=origin_kind,
+        episode=episode,
+        sensitive=sensitive,
+    )
+    memory_domain = (
+        await resolve_memory_domain(instance.adapter_key, instance.instance_key) if instance is not None else None
+    )
+    total, entries = await admin_service.list_memory_persons(
+        scope,
+        f,
+        filters,
+        domain=memory_domain,
+        q=account_q,
+        page=page,
+        page_size=page_size,
+    )
+    return MemoryPersonListResponse(
+        total=total,
+        items=[
+            MemoryPersonItem(
+                account=entry.account,
+                accounts=list(entry.accounts),
+                display_name=entry.display_name,
+                call_name=entry.call_name,
+                name_source=entry.name_source,
+                paragraph_count=entry.paragraph_count,
+                last_paragraph_id=entry.last_paragraph_id,
+            )
+            for entry in entries
+        ],
+    )
+
+
+@router.get("/topics", summary="段落按事件分组", response_model=MemoryTopicListResponse)
+@require_role(Role.Admin)
+async def list_memory_topics(
+    partition: str = "all",
+    chat_key: str = "",
+    preset_id: Optional[int] = None,
+    person: str = "",
+    status: str = "active",
+    frozen: Optional[bool] = None,
+    protected: Optional[bool] = None,
+    sensitive: Optional[bool] = None,
+    cognitive_type: str = "",
+    knowledge_type: str = "",
+    time_from: str = "",
+    time_to: str = "",
+    q: str = "",
+    origin_kind: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    instance_key: str = "",
+    adapter_key: str = "",
+    domain: str = "self",
+    group_id: Optional[int] = None,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> MemoryTopicListResponse:
+    """满足筛选的段落按所属事件分组，各几段、组内最新一段的时间；只读
+
+    给「按事件分组」的视图用；展开一组时用段落列表的 `episode` 参数取组内段落。筛选参数与
+    段落列表同名同义（没有 `episode`：这里分的就是事件）。
+    范围与段落列表同一个，事件标题按同一个范围查，范围外的事件只给编号。
+    """
+    scope, instance = await _resolve_admin_scope(
+        _current_user,
+        instance_key=instance_key,
+        adapter_key=adapter_key,
+        domain=domain,
+        group_id=group_id,
+    )
+    person_accounts = await _person_accounts(scope, person, instance)
+    f = _admin_filter(
+        partition=partition,
+        chat_key=chat_key,
+        preset_id=preset_id,
+        person_accounts=person_accounts,
+    )
+    filters = _paragraph_filters(
+        status=status,
+        frozen=frozen,
+        protected=protected,
+        cognitive_type=cognitive_type,
+        knowledge_type=knowledge_type,
+        time_from=time_from,
+        time_to=time_to,
+        q=q,
+        origin_kind=origin_kind,
+        sensitive=sensitive,
+    )
+    total, entries = await admin_service.list_memory_topics(scope, f, filters, page=page, page_size=page_size)
+    return MemoryTopicListResponse(
+        total=total,
+        items=[
+            MemoryTopicItem(
+                episode_id=entry.episode_id,
+                title=entry.title,
+                narrative_summary=entry.narrative_summary,
+                paragraph_count=entry.paragraph_count,
+                last_time=entry.last_time,
+                visible=entry.visible,
+            )
+            for entry in entries
+        ],
     )
 
 
@@ -939,7 +1275,7 @@ async def get_memory_item(
 ) -> MemoryItemDetail:
     """按 ID 取一条；不存在与不是自己的响应逐字相同。"""
     row = await _load_visible_item(_current_user, memory_type, item_id)
-    return await _detail_payload(memory_type, row)
+    return await _detail_payload(memory_type, row, _current_user)
 
 
 @router.put("/items/{memory_type}/{item_id}", summary="编辑记忆", response_model=MemoryItemDetail)
@@ -975,7 +1311,7 @@ async def update_memory_item(
     logger.info(
         f"记忆已编辑: operator={_current_user.username}, memory_type={memory_type}, item_id={item_id}",
     )
-    return await _detail_payload(memory_type, row)
+    return await _detail_payload(memory_type, row, _current_user)
 
 
 @router.post(
@@ -1064,12 +1400,14 @@ async def bulk_paragraphs(
             status=spec.status,
             frozen=spec.frozen,
             protected=spec.protected,
+            sensitive=spec.sensitive,
             cognitive_type=spec.cognitive_type or "",
             knowledge_type=spec.knowledge_type or "",
             time_from=spec.time_from or "",
             time_to=spec.time_to or "",
             q=spec.q or "",
             origin_kind=spec.origin_kind or "",
+            episode=spec.episode or "",
         )
     else:
         f = AdminFilter()

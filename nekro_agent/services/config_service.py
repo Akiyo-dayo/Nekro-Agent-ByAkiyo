@@ -23,6 +23,7 @@ from typing import (
 
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
+from pydantic_core import PydanticUndefined, to_jsonable_python
 
 from nekro_agent.core.config import CHANNEL_CONFIG_DIR, CoreConfig
 from nekro_agent.core.config import reload_config as core_reload_config
@@ -58,6 +59,17 @@ def _field_range_text(config_cls: type, key: str) -> str:
     if high is not None:
         return f"必须小于 {high}" if high_open else f"不能大于 {high}"
     return ""
+
+
+def _field_bounds(field: Any) -> Dict[str, Any]:
+    """闭区间约束 `ge` / `le` 写成配置项里的 `minimum` / `maximum`（前端滑块、数字框用）；没有就不写"""
+    bounds: Dict[str, Any] = {}
+    for meta in getattr(field, "metadata", ()) or ():
+        if getattr(meta, "ge", None) is not None:
+            bounds["minimum"] = meta.ge
+        if getattr(meta, "le", None) is not None:
+            bounds["maximum"] = meta.le
+    return bounds
 
 
 def _describe_value_error(config_cls: type, key: str, err: Dict[str, Any]) -> str:
@@ -324,8 +336,44 @@ def _get_simple_type_name(type_annotation: Any) -> str:
     return "str"
 
 
+# 只有这几个内置容器的 `default_factory` 会在配置页结构里当场调用一次取默认值：它们没有副作用、
+# 每次给一个新的空容器，结果也一定能 JSON 化
+_EMPTY_CONTAINER_FACTORIES = (list, dict, set, frozenset, tuple)
+
+
+def _schema_default(field: Any) -> Any:
+    """字段在配置页结构（`field_schema`）里的默认值；没有、或给不出能 JSON 化的值时为 None
+
+    前端只在「列表里新增一项」时用它预填新对象的各个字段，拿到 null 就按字段类型补空值
+    （`ConfigTable.tsx` 的 `getDefaultValueForType`：列表 `[]`、字典 `{}`、字符串 `''`……）。
+
+    pydantic v2 里没有默认值的字段（必填、或用 `default_factory` 的）`field.default` 都是
+    `PydanticUndefined`，不是 `...`；它原样进了结构，整个 `/config/list/...` 序列化失败成 500
+    （例：邮件适配器 `EmailAccount.SEND_SHARE_INSTANCES`、表情包插件 `PersonaSetRule.SET_IDS`）。
+
+    - 必填字段：None。
+    - `default_factory` 是内置空容器（`list` / `dict` 等）：调一次，给一个新的空容器。
+    - 别的 `default_factory`：None。工厂可能有副作用（读配置、生成随机值），每次读配置页都调一遍
+      不合适，返回的也未必能 JSON 化；预填空值与「没写」在保存时同样回落到工厂给的默认值。
+    - 普通默认值：转成 JSON 能表示的形态（枚举取值、集合变列表……），转不了的给 None。
+    """
+    if field.default_factory is not None:
+        factory = field.default_factory
+        return to_jsonable_python(factory()) if factory in _EMPTY_CONTAINER_FACTORIES else None
+    default = field.default
+    if default is PydanticUndefined or default is ...:
+        return None
+    try:
+        return to_jsonable_python(default)
+    except Exception:  # noqa: BLE001 - 结构里的一个预填值，给不出就当没有，不能让整页 500
+        logger.debug(f"配置页结构里的默认值不能 JSON 化，按没有默认值给: {type(default).__name__}")
+        return None
+
+
 def _get_model_schema(model_class: Any) -> Dict[str, Any]:
     """获取Pydantic模型的字段模式信息
+
+    结果会原样进 `/config/list/...` 的响应，所以每个值都必须能 JSON 化（默认值见 `_schema_default`）。
 
     Args:
         model_class: Pydantic模型类
@@ -339,7 +387,7 @@ def _get_model_schema(model_class: Any) -> Dict[str, Any]:
     schema = {}
     for field_name, field in model_class.model_fields.items():
         # 获取字段的默认值来辅助类型分析
-        default_value = field.default if field.default is not ... else None
+        default_value = _schema_default(field)
 
         # 使用更强大的类型分析函数
         type_info = _analyze_field_type(field.annotation, default_value)
@@ -643,6 +691,7 @@ class ConfigService:
                 "title": config_obj.__class__.get_field_title(key) or key,
                 "description": field.description,
                 "placeholder": config_obj.__class__.get_field_placeholder(key),
+                **_field_bounds(field),
             }
 
             # 添加特殊字段标记
@@ -692,6 +741,7 @@ class ConfigService:
             "title": config_obj.__class__.get_field_title(key) or key,
             "description": field.description,
             "placeholder": config_obj.__class__.get_field_placeholder(key),
+            **_field_bounds(field),
         }
 
         # 添加特殊字段标记。
@@ -742,6 +792,10 @@ class ConfigService:
                 return False, None, f"配置项 {key} 的取值无效：输入必须是有效的列表格式"
             if isinstance(current_value, dict) and not isinstance(parsed_value, dict):
                 return False, None, f"配置项 {key} 的取值无效：输入必须是有效的对象格式"
+            # 配置类可以给个别字段一条写入前的规整（例如去掉占位项）；没有就原样写
+            normalizer = getattr(type(config_obj), "normalize_config_value", None)
+            if callable(normalizer):
+                parsed_value = normalizer(key, parsed_value)
             return True, parsed_value, ""
         return False, None, f"不支持的配置类型: {type(current_value)}"
 

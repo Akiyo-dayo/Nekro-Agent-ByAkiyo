@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import re
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -33,6 +34,7 @@ from nekro_agent.services.config_service import (
     UnifiedConfigService,
     instance_override_config_key,
 )
+from nekro_agent.services.config_write_guard import assert_config_not_stale, view_values
 from nekro_agent.services.model_group_service import (
     assert_model_group_selectable,
     assert_outbound_urls_allowed,
@@ -41,6 +43,7 @@ from nekro_agent.services.model_group_service import (
     delete_platform_group,
     get_visible_group,
     is_model_group_ref_item,
+    is_platform_owner,
     mask_config_group,
     resolve_console_identity,
     upsert_platform_group,
@@ -72,9 +75,14 @@ from nekro_agent.tools.redaction import is_credential_mask, redact_text
 
 
 class BatchUpdateConfig(BaseModel):
-    """批量更新配置请求体"""
+    """批量更新配置请求体
+
+    `base`：页面读取时每个改动项的值（与读接口返回的 `value` 同一形态）。带上它服务端就比对现值，
+    有一项在读取之后被别处改过就整批拒绝（见 `services/config_write_guard.py`）；不带就不比对。
+    """
 
     configs: Dict[str, str]
+    base: Optional[Dict[str, Any]] = None
 
 
 class ActionResponse(BaseModel):
@@ -120,6 +128,7 @@ class ConfigItem(BaseModel):
     is_textarea: Optional[bool] = None
     ref_model_groups: Optional[bool] = None
     ref_presets: Optional[bool] = None
+    ref_rp_presets: Optional[bool] = None
     ref_presets_multiple: Optional[bool] = None
     is_hidden: Optional[bool] = None
     required: Optional[bool] = None
@@ -149,6 +158,7 @@ class FetchModelsRequest(BaseModel):
     base_url: str
     api_key: str
     proxy_url: Optional[str] = None
+    api_format: Literal["openai", "gemini"] = "openai"
 
 
 class FetchModelsResponse(BaseModel):
@@ -200,6 +210,7 @@ class ModelGroupInlineTestRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     extra_body: Optional[str] = None
+    api_format: Literal["openai", "gemini"] = "openai"
 
 
 class ModelGroupTestResponse(BaseModel):
@@ -223,11 +234,13 @@ router = APIRouter(prefix="/config", tags=["Config"])
 # `ExtraField(is_secret=True)` 是权威标记，但适配器与插件的配置分散在各自目录下，
 # 漏标一处就等于泄露一份平台方凭据，所以再叠一层按名兜底。
 # 只收录确凿的凭据词：裸 `KEY` 不在其中，否则 `CHAT_KEY` / `INSTANCE_KEY` 这类业务标识会被误伤；
-# `TOKEN` 排除掉计量/超时语义的用法（`TOKEN_INPUT_RATE`、`FIRST_TOKEN_TIMEOUT` 等）。
+# `TOKEN` 排除掉计量/超时语义的用法（`TOKEN_INPUT_RATE`、`FIRST_TOKEN_TIMEOUT` 等），
+# 以及前面是 `CAP_` / `MAX_` / `MIN_` 的「多少个 token」（`WORLDBOOK_BUDGET_CAP_TOKENS`）——只排除这几个
+# 计数前缀，`BOT_TOKENS` 这类复数的凭据名照样按凭据处理。
 _CREDENTIAL_NAME_PATTERN = re.compile(
     r"SECRET|PASSWORD|PASSWD|CREDENTIAL|SESSDATA|COOKIE"
     r"|API_?KEY|APP_?KEY|ACCESS_?KEY|AUTH_?KEY|PRIVATE_?KEY|AES_?KEY|SIGN_?KEY"
-    r"|TOKEN(?!_?(RATE|TIMEOUT|INPUT|OUTPUT|COMPLETION|COUNT|LIMIT|USAGE|EXPIRE|NUM|SIZE))",
+    r"|(?<!CAP_)(?<!MAX_)(?<!MIN_)TOKEN(?!_?(RATE|TIMEOUT|INPUT|OUTPUT|COMPLETION|COUNT|LIMIT|USAGE|EXPIRE|NUM|SIZE))",
     re.IGNORECASE,
 )
 
@@ -436,12 +449,22 @@ PLATFORM_ONLY_SYSTEM_CONFIG_KEYS = frozenset(
         "EMAIL_MAX_ACCOUNTS_PER_INSTANCE",
         "EMAIL_OUTBOX_INTERVAL_SECONDS",
         "EMAIL_FESTIVAL_MAIL_ENABLED",
+        # 世界书预算迁移的记录逐层写着「实例 <适配器>/<实例>」「频道 <会话标识>」，会话标识里有
+        # QQ 号：租户读到就是别的租户的实例与群聊 / 私聊清单。迁移标记跟着一起只给平台方
+        "WORLDBOOK_BUDGET_MIGRATION_NOTICE",
+        "WORLDBOOK_BUDGET_MIGRATED",
+        # 向量激活回填标记与迁移标记同档：由系统维护、平台方专属，租户既不该改也不该看到。
+        "WORLDBOOK_VECTOR_BACKFILLED",
     },
 )
 
-# 平台方一侧也只有 `Role.Super` 能改的项：写进超级用户名单就能在聊天里 `sh`，
-# 与 `/commands/webui-execute` 同档（那一条也是 `Role.Super`）
-SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS = frozenset({"SUPER_USERS"})
+# 平台方一侧也只有 `Role.Super` 能改的项：
+# - 写进超级用户名单就能在聊天里 `sh`，与 `/commands/webui-execute` 同档（那一条也是 `Role.Super`）；
+# - SSH 网关值守的默认模式与实例名单：改成值守、放宽名单，平台方实例上任何人报故障都能让 Bot 连
+#   平台方服务器，与逐行改模式的接口（只给 `Role.Super`）同档
+SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS = frozenset(
+    {"SUPER_USERS", "SSH_GATEWAY_DEFAULT_DUTY_MODE", "SSH_GATEWAY_DUTY_INSTANCES"},
+)
 
 
 def _is_platform_only_config(config_key: str, item_key: str) -> bool:
@@ -474,10 +497,25 @@ def _assert_super_role_items_unchanged(user: DBUser, config_key: str, configs: D
     for item_key, raw_value in configs.items():
         if item_key not in SUPER_ROLE_ONLY_SYSTEM_CONFIG_KEYS:
             continue
-        submitted = _normalized_list_value(raw_value)
-        current = _normalized_list_value(_current_config_value(config_key, item_key))
-        if submitted is None or submitted != current:
+        current_value = _current_config_value(config_key, item_key)
+        if isinstance(current_value, list):
+            submitted = _normalized_list_value(raw_value)
+            unchanged = submitted is not None and submitted == _normalized_list_value(current_value)
+        else:
+            unchanged = _normalized_scalar_value(raw_value) == _normalized_scalar_value(current_value)
+        if not unchanged:
             raise PermissionDeniedError(detail=f"配置项 {config_key}.{item_key} 只有超级管理员可以修改")
+
+
+def _normalized_scalar_value(value: Any) -> str:
+    """单值配置项的当前值或提交值规整成字符串：提交值可能是 JSON 字符串（`"duty"`），也可能是原文"""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            decoded = value
+        value = decoded if isinstance(decoded, str) else value
+    return str(value if value is not None else "").strip()
 
 
 # 覆盖层的配置键前缀。写在这些层上的取值只对该作用域生效，因此"这份值归谁"
@@ -584,7 +622,19 @@ def _int_value(value: Any, default: int) -> int:
         return default
 
 
-def _int_raise_denied(before: int, after: int, inherited: int) -> bool:
+def _int_rank(field_name: str, value: int) -> float:
+    """整数上限项用来比高低的数：标了 `zero_means_unlimited` 的项 0 是「不设上限」，按无穷大比
+
+    不这样换算的话 0 是最小值，租户把上限写成 0 就「往下调」到了不设上限，绕过平台方给的上限。
+    """
+    field = CoreConfig.model_fields.get(field_name)
+    extra = field.json_schema_extra if field is not None else None
+    if value == 0 and isinstance(extra, dict) and extra.get("zero_means_unlimited"):
+        return math.inf
+    return float(value)
+
+
+def _int_raise_denied(before: float, after: float, inherited: float) -> bool:
     """整数型上限项：这次写入是否把这一层的生效值抬高了
 
     规则：写完以后这一层的生效值不能超过「写之前的生效值」与「上层值」两者中较大的那个，
@@ -655,7 +705,11 @@ async def _assert_tenant_may_not_raise_only_field(user: DBUser, config_key: str,
             inherited_value = _int_value(inherited_values.get(field_name, default), default)
             before = current_value if current_toggle else inherited_value
             after = new_value if new_toggle else inherited_value
-            if _int_raise_denied(before, after, inherited_value):
+            if _int_raise_denied(
+                _int_rank(field_name, before),
+                _int_rank(field_name, after),
+                _int_rank(field_name, inherited_value),
+            ):
                 raise PermissionDeniedError(detail=f"配置项 {field_name} 的上限由平台方设定，租户管理员只能调低")
             continue
 
@@ -722,7 +776,11 @@ async def _assert_tenant_layer_swap_may_not_raise(user: DBUser, config_key: str,
                 inherited_values,
             )
             before, after = (on_disk, in_memory) if persisting else (in_memory, on_disk)
-            if _int_raise_denied(before, after, inherited_value):
+            if _int_raise_denied(
+                _int_rank(field_name, before),
+                _int_rank(field_name, after),
+                _int_rank(field_name, inherited_value),
+            ):
                 raise PermissionDeniedError(detail=f"配置项 {field_name} 的上限由平台方设定，租户管理员只能调低")
             continue
 
@@ -741,6 +799,58 @@ async def _assert_tenant_layer_swap_may_not_raise(user: DBUser, config_key: str,
         before, after = (on_disk, in_memory) if persisting else (in_memory, on_disk)
         if after and not before:
             raise PermissionDeniedError(detail=f"配置项 {field_name} 只能由平台方打开，租户管理员只能关闭")
+
+
+async def _config_scope_instance_key(config_key: str) -> str:
+    """从配置键还原这次写入落在哪个实例；共享层或认不出时返回空串
+
+    与 `_assert_config_key_accessible` 用同一套前缀与分隔符；频道层要查一次频道行，
+    查不到按空串处理（调用方在此之前已经做过存在性 / 归属校验）。
+    """
+    if config_key.startswith(INSTANCE_OVERRIDE_KEY_PREFIX):
+        _adapter_key, _sep, instance_key = config_key[len(INSTANCE_OVERRIDE_KEY_PREFIX) :].partition(
+            INSTANCE_OVERRIDE_KEY_SEP,
+        )
+        return instance_key
+    if config_key.startswith(CHANNEL_OVERRIDE_KEY_PREFIX):
+        from nekro_agent.models.db_chat_channel import DBChatChannel
+
+        chat_key = config_key[len(CHANNEL_OVERRIDE_KEY_PREFIX) :]
+        channel = await DBChatChannel.filter(chat_key=chat_key).first()
+        return str(channel.instance_key) if channel is not None else ""
+    return ""
+
+
+async def _assert_rp_preset_reference(user: DBUser, config_key: str, configs: Dict[str, str]) -> None:
+    """校验 `PROMPT_RP_PRESET_ID` 这类引用了角色扮演预设的字段
+
+    平台方写入任意层时只要求预设存在；租户往实例层 / 频道层写时，非 0 的取值必须是
+    全局预设或属于这个实例的预设——否则租户可以引用另一个租户的导入结果，预览与
+    运行时都会把它当成「看不见的预设」而静默失效。
+    """
+    for item_key, raw_value in configs.items():
+        if raw_value == CREDENTIAL_MASK:
+            continue
+        current_item = UnifiedConfigService.get_config_item(config_key, item_key)
+        if not current_item or not current_item.get("ref_rp_presets"):
+            continue
+        try:
+            preset_id = int(json.loads(raw_value)) if isinstance(raw_value, str) else int(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if preset_id <= 0:
+            continue
+
+        from nekro_agent.models.db_rp_preset import DBRpPreset
+
+        row = await DBRpPreset.filter(id=preset_id).first()
+        if row is None:
+            raise ValidationError(reason=f"角色扮演预设 {preset_id} 不存在")
+        if get_tenant_scope(user) is None:
+            continue
+        instance_key = await _config_scope_instance_key(config_key)
+        if row.owner_instance_key not in ("", instance_key):
+            raise PermissionDeniedError(detail="只能选择全局的或本实例的角色扮演预设")
 
 
 async def _assert_tenant_may_write(user: DBUser, config_key: str, configs: Dict[str, str]) -> None:
@@ -813,6 +923,8 @@ async def _assert_tenant_may_write(user: DBUser, config_key: str, configs: Dict[
     # 「租户只能关、不能开」的开关单独一判：它看的是写入前后该作用域的**生效值**，
     # 与逐提交项循环里的凭据 / 边界判据正交。
     await _assert_tenant_may_not_raise_only_field(user, config_key, configs)
+    # 引用角色扮演预设的字段：非 0 的取值必须是全局的或属于这个实例的。
+    await _assert_rp_preset_reference(user, config_key, configs)
 
 
 def _sanitize_config_updates(config_key: str, configs: Dict[str, str]) -> Dict[str, str]:
@@ -1129,6 +1241,142 @@ async def get_ui_onboarding_guide_status(
     return UiOnboardingGuideStatus(should_show=config.ENABLE_UI_ONBOARDING_GUIDE)
 
 
+class WorldbookBudgetBasis(BaseModel):
+    """某个配置作用域上世界书预算的算法与此刻的结果，给配置页的滑块旁实时换算用
+
+    前端拿 `context_length`、`output_reserve` 与滑块上的两个值按同一个公式算（见
+    `services/worldbook/budget.py`），「约 M 字」= token ÷ `tokens_per_char`。
+    `inherited_percent` / `inherited_cap_tokens` 是上一层此刻生效的值（全局层没有上一层，为 None）：
+    租户只能往下调，滑块的可选范围据此收窄（上限为 0 表示上一层不设上限）。
+    """
+
+    config_key: str
+    model_group: str = ""
+    context_length: int
+    context_length_set: bool
+    default_context_length: int
+    output_reserve: int
+    factor: float
+    factor_source: str
+    factor_family: str = ""
+    tokens_per_char: float
+    estimator: str
+    percent: int
+    cap_tokens: int
+    base: int
+    budget: int
+    approx_chars: int
+    inherited_percent: Optional[int] = None
+    inherited_cap_tokens: Optional[int] = None
+    fallback_model_group: str = ""
+    fallback_context_length: int = 0
+
+
+_WORLDBOOK_BUDGET_FIELDS = (
+    "USE_MODEL_GROUP",
+    "FALLBACK_MODEL_GROUP",
+    "WORLDBOOK_BUDGET_PERCENT",
+    "WORLDBOOK_BUDGET_CAP_TOKENS",
+)
+
+
+@router.get(
+    "/worldbook-budget/{config_key}",
+    summary="世界书预算的算法（按这个作用域的主模型组）",
+    response_model=WorldbookBudgetBasis,
+)
+@require_role(Role.Admin)
+async def get_worldbook_budget_basis(
+    config_key: str,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> WorldbookBudgetBasis:
+    """全局（`system`）与适配器 / 实例 / 频道覆盖层都可以查；读权限与 `/list/{config_key}` 同一个判据"""
+    from types import SimpleNamespace
+
+    from nekro_agent.services.worldbook import tokens as wb_tokens
+    from nekro_agent.services.worldbook.budget import DEFAULT_CONTEXT_LENGTH, resolve_budget
+
+    await _assert_config_key_accessible(_current_user, config_key, for_write=False)
+    inherited: Optional[Dict[str, Any]] = None
+    if config_key == "system":
+        effective: Any = config
+    else:
+        inherited = await config_resolver.inherited_values(config_key)
+        if inherited is None:
+            raise ConfigNotFoundError(key=config_key)
+        layer = UnifiedConfigService._get_config_instance(config_key)  # noqa: SLF001
+        values = {name: inherited.get(name) for name in _WORLDBOOK_BUDGET_FIELDS}
+        for name in _WORLDBOOK_BUDGET_FIELDS:
+            if layer is not None and getattr(layer, f"enable_{name}", False):
+                values[name] = getattr(layer, name)
+        effective = SimpleNamespace(**values)
+
+    await wb_tokens.ensure_loaded_async()
+    budget = resolve_budget(effective)
+    return WorldbookBudgetBasis(
+        config_key=config_key,
+        model_group=budget.model_group,
+        context_length=budget.context_length,
+        context_length_set=budget.context_length_set,
+        default_context_length=DEFAULT_CONTEXT_LENGTH,
+        output_reserve=budget.output_reserve,
+        factor=budget.factor,
+        factor_source=budget.factor_source,
+        factor_family=budget.factor_family,
+        tokens_per_char=round(wb_tokens.ESTIMATE_CJK_TOKENS_PER_CHAR * budget.factor, 4),
+        estimator=budget.estimator,
+        percent=budget.percent,
+        cap_tokens=budget.cap_tokens,
+        base=budget.base,
+        budget=budget.budget,
+        approx_chars=wb_tokens.approx_chars(budget.budget, budget.factor),
+        inherited_percent=int(inherited["WORLDBOOK_BUDGET_PERCENT"]) if inherited is not None else None,
+        inherited_cap_tokens=int(inherited["WORLDBOOK_BUDGET_CAP_TOKENS"]) if inherited is not None else None,
+        fallback_model_group=budget.fallback_model_group,
+        fallback_context_length=budget.fallback_context_length,
+    )
+
+
+class WorldbookBudgetNotice(BaseModel):
+    """世界书预算迁移的一次性提示：逐层的迁移记录；空表示不显示"""
+
+    lines: List[str] = []
+
+
+@router.get(
+    "/worldbook-budget-notice",
+    summary="世界书预算迁移的一次性提示",
+    response_model=WorldbookBudgetNotice,
+)
+@require_role(Role.Admin)
+async def get_worldbook_budget_notice(
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> WorldbookBudgetNotice:
+    """只给平台方看：迁移改的是全局与各层的配置，租户只看得到自己那一层的结果，记录里还有别的租户的频道"""
+    if _is_tenant_view(_current_user):
+        return WorldbookBudgetNotice()
+    return WorldbookBudgetNotice(lines=list(config.WORLDBOOK_BUDGET_MIGRATION_NOTICE or []))
+
+
+@router.post(
+    "/worldbook-budget-notice/ack",
+    summary="世界书预算迁移提示：知道了",
+    response_model=ActionResponse,
+)
+@require_role(Role.Admin)
+async def ack_worldbook_budget_notice(
+    _current_user: DBUser = Depends(get_current_active_user),
+    _owner: DBUser = Depends(require_platform_owner()),
+) -> ActionResponse:
+    """清空迁移记录并落盘，之后不再显示；只有平台方能点"""
+    from nekro_agent.core.config import save_config
+
+    if config.WORLDBOOK_BUDGET_MIGRATION_NOTICE:
+        config.WORLDBOOK_BUDGET_MIGRATION_NOTICE = []
+        save_config()
+    return ActionResponse(ok=True)
+
+
 def _output_filter_rule_texts(adapter_key: str, instance_key: str) -> tuple[str, str]:
     """某实例生效的过滤词与正则（实例 > 适配器 > 全局）
 
@@ -1216,13 +1464,21 @@ async def get_config_list(
 ) -> List[ConfigItem]:
     """获取指定配置的配置列表（租户身份下凭据一律为掩码，且只能读自己的作用域）"""
     await _assert_config_key_accessible(_current_user, config_key, for_write=False)
+    return [ConfigItem(**item) for item in await _config_list_view(_current_user, config_key)]
 
+
+async def _config_list_view(user: DBUser, config_key: str) -> List[Dict[str, Any]]:
+    """`/config/list/{config_key}` 给这个身份看的那份配置列表
+
+    写侧比对「页面读取时的值」也按这一份取现值（`/batch/{config_key}`）：比的必须是调用方当时看到的
+    同一个视图，掩码、继承值、按租户过滤的模型组都一样算，否则会凭空冲突或漏掉冲突。
+    """
     try:
         config_list = UnifiedConfigService.get_config_list(config_key)
     except ValueError:
         raise ConfigNotFoundError(key=config_key) from None
     config_list = await _with_inherited_override_values(config_key, config_list)
-    if _is_tenant_view(_current_user):
+    if _is_tenant_view(user):
         # 平台方权限边界类配置对租户整体不可见：运维频道与运维人员名单本身
         # 就是伪造运维指令所需的全部情报，读得到就等于把攻击面画好递过去
         config_list = _mask_config_items(
@@ -1231,12 +1487,12 @@ async def get_config_list(
         if config_key == "system":
             # 理由见 `MODEL_GROUPS_CONFIG_ITEM_KEY`：这条读接口是绕开
             # `/config/model-groups` 归属过滤的一条等价路径，同一份数据不能两个口径
-            visible_groups = await _visible_model_groups(_current_user)
+            visible_groups = await _visible_model_groups(user)
             config_list = [
                 {**item, "value": visible_groups} if item.get("key") == MODEL_GROUPS_CONFIG_ITEM_KEY else item
                 for item in config_list
             ]
-    return [ConfigItem(**item) for item in config_list]
+    return config_list
 
 
 @router.get("/get/{config_key}/{item_key}", summary="获取配置项值", response_model=ConfigItem)
@@ -1279,6 +1535,9 @@ async def set_config_value(
     await _assert_config_key_accessible(_current_user, config_key)
     if _is_tenant_view(_current_user):
         await _assert_tenant_may_write(_current_user, config_key, {item_key: value})
+    else:
+        # 平台方写也要求引用的预设真的存在；归属不设限。
+        await _assert_rp_preset_reference(_current_user, config_key, {item_key: value})
     _assert_super_role_items_unchanged(_current_user, config_key, {item_key: value})
 
     sanitized = _sanitize_config_updates(config_key, {item_key: value})
@@ -1312,15 +1571,22 @@ async def batch_update_config(
 
     取值等于 `CREDENTIAL_MASK` 的字段（含嵌套结构里的位置）视为"保持不变"。
     平台方也过可访问性判据：实例层 / 频道层的目标必须存在（见 `_assert_config_key_accessible`）。
+    带了 `base` 时比对读取之后有没有被别处改过（`services/config_write_guard.py`），有就整批拒绝。
     """
     await _assert_config_key_accessible(_current_user, config_key)
     if _is_tenant_view(_current_user):
         await _assert_tenant_may_write(_current_user, config_key, body.configs)
+    else:
+        await _assert_rp_preset_reference(_current_user, config_key, body.configs)
     _assert_super_role_items_unchanged(_current_user, config_key, body.configs)
 
     target = await _audit_target_for(config_key)
     before = _audit_values(config_key) if target is not None else {}
 
+    if body.base:
+        current_view = view_values(await _config_list_view(_current_user, config_key))
+        # 比对之后到写入之前没有 await：同一进程里别的协程插不进这一段
+        assert_config_not_stale(body.configs.keys(), body.base, current_view)
     success, error_msg = UnifiedConfigService.batch_update_config(config_key, _sanitize_config_updates(config_key, body.configs))
     if not success:
         _raise_config_error(
@@ -1462,14 +1728,19 @@ async def get_instance_config(
     config_key = _instance_override_config_key(adapter_key, instance_key)
     if not _is_tenant_view(_current_user):
         await _assert_override_target_exists(config_key)
+    return [ConfigItem(**item) for item in await _instance_config_view(_current_user, config_key)]
+
+
+async def _instance_config_view(user: DBUser, config_key: str) -> List[Dict[str, Any]]:
+    """`GET /config/instance/...` 给这个身份看的那份覆盖配置（写侧比对读取时的值也按这一份取现值）"""
     try:
         config_list = UnifiedConfigService.get_config_list(config_key)
     except ValueError:
         raise ConfigNotFoundError(key=config_key) from None
     config_list = await _with_inherited_override_values(config_key, config_list)
-    if _is_tenant_view(_current_user):
+    if _is_tenant_view(user):
         config_list = _mask_config_items(config_list)
-    return [ConfigItem(**item) for item in config_list]
+    return config_list
 
 
 @router.put("/instance/{adapter_key}/{instance_key}", summary="写入实例级覆盖配置", response_model=ActionResponse)
@@ -1484,6 +1755,7 @@ async def update_instance_config(
 
     租户身份只能写自己名下的实例（他人实例一律 404），且不得改动承载凭据的字段。
     平台方写也要求这个（适配器, 实例）存在，否则 404。
+    带了 `base` 时比对读取之后有没有被别处改过（`services/config_write_guard.py`），有就整批拒绝。
     """
     config_key = _instance_override_config_key(adapter_key, instance_key)
 
@@ -1492,10 +1764,15 @@ async def update_instance_config(
         await _assert_tenant_may_write(_current_user, config_key, body.configs)
     else:
         await _assert_override_target_exists(config_key)
+        await _assert_rp_preset_reference(_current_user, config_key, body.configs)
 
     target = await _audit_target_for(config_key)
     before = _audit_values(config_key) if target is not None else {}
 
+    if body.base:
+        current_view = view_values(await _instance_config_view(_current_user, config_key))
+        # 比对之后到写入之前没有 await
+        assert_config_not_stale(body.configs.keys(), body.base, current_view)
     success, error_msg = UnifiedConfigService.batch_update_config(config_key, _sanitize_config_updates(config_key, body.configs))
     if not success:
         _raise_config_error(
@@ -1672,6 +1949,7 @@ async def fetch_model_groups_models(
     本端点由后端代替浏览器发起请求，因此租户提交的地址等价于"让 NA 服务器替我打这个地址"，
     必须先过公网校验，否则填 `http://127.0.0.1:8021/x` 就能拿 NA 自己的身份探内网。
     """
+    from nekro_agent.services.agent.gemini_native import list_gemini_models
     from nekro_agent.services.agent.openai import list_openai_models
 
     await assert_outbound_urls_allowed(
@@ -1681,11 +1959,20 @@ async def fetch_model_groups_models(
     )
 
     try:
-        models = await list_openai_models(
-            base_url=body.base_url,
-            api_key=body.api_key,
-            proxy_url=body.proxy_url,
-        )
+        if body.api_format == "gemini":
+            models = await list_gemini_models(
+                base_url=body.base_url,
+                api_key=body.api_key,
+                proxy_url=body.proxy_url,
+                tenant_egress=not is_platform_owner(resolve_console_identity(_current_user)),
+            )
+        else:
+            models = await list_openai_models(
+                base_url=body.base_url,
+                api_key=body.api_key,
+                proxy_url=body.proxy_url,
+                tenant_egress=not is_platform_owner(resolve_console_identity(_current_user)),
+            )
     except Exception as e:
         # 上游报错常把整段请求头回显出来，直接透传等于把刚提交的凭据再送回前端与日志
         raise OperationFailedError(
@@ -1750,6 +2037,7 @@ async def test_model_groups(
                 credential_visible=credential_visible,
                 group_name=group_name,
                 tenant_id=identity.tenant_id,
+                tenant_egress=not row.is_platform_owned,
             ),
         )
 
@@ -1820,6 +2108,7 @@ async def test_model_group_inline(
         PRESENCE_PENALTY=body.presence_penalty,
         FREQUENCY_PENALTY=body.frequency_penalty,
         EXTRA_BODY=body.extra_body,
+        API_FORMAT=body.api_format,
     )
 
     await prepare_model_group_test(identity, group, credential_visible=True)
@@ -1832,6 +2121,8 @@ async def test_model_group_inline(
             credential_visible=True,
             group_name=body.group_name,
             tenant_id=identity.tenant_id,
+            # inline 测试的地址就是请求体里填的：租户填的按租户出站连
+            tenant_egress=not is_platform_owner(identity),
         ),
     )
 

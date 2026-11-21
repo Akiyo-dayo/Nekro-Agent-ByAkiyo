@@ -19,6 +19,7 @@ from nekro_agent.services.agent.templates.generator import (
     GeneratorUserPrompt,
 )
 from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 logger = get_sub_logger("plugin_system")
 
@@ -55,6 +56,8 @@ def _build_model_params(model_group: str) -> dict:
         "extra_body": model_config.EXTRA_BODY,
         "base_url": model_config.BASE_URL,
         "api_key": model_config.API_KEY,
+        "api_format": model_config.API_FORMAT,
+        "tenant_egress": is_tenant_owned_group(model_group),
     }
 
 

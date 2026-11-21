@@ -47,6 +47,7 @@ from nekro_agent.schemas.signal import MsgSignal
 from nekro_agent.services.message_service import message_service
 from nekro_agent.services.plugin import scope as plugin_scope
 from nekro_agent.services.plugin.collector import plugin_collector
+from nekro_agent.tools.common_util import tenant_target_unavailable_message
 from plugins.builtin.video_analysis import main, source
 from plugins.builtin.video_analysis.media import VideoAnalysisError
 from plugins.builtin.video_analysis.plugin import VideoAnalysisConfig, plugin
@@ -398,6 +399,8 @@ class TestInstanceOverrideDirection:
 
 
 class TestRefusalReasons:
+    """对外一句话，原因在日志里"""
+
     @pytest.fixture
     def logged(self) -> Iterator[List[str]]:
         captured: List[str] = []
@@ -410,19 +413,19 @@ class TestRefusalReasons:
         monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
         monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
 
-    async def test_an_unresolvable_host_is_not_called_a_policy_refusal(self, tmp_path: Path, logged: List[str]) -> None:
+    async def test_an_unresolvable_host_reads_the_same_as_a_refusal_but_the_log_tells_them_apart(self, tmp_path: Path, logged: List[str]) -> None:
+        """对外不分「解析不到」与「被拒」（分开说就成了查 NA 所在网络 DNS 的工具）；日志里分得清"""
         with pytest.raises(VideoAnalysisError) as raised:
             await source.download_video(f"http://no-such-host.invalid/v.mp4?ticket={URL_SECRET}", tmp_path / "out", max_bytes=10, max_redirects=0)
-        assert "无法解析" in str(raised.value)
-        assert "出站防护" not in str(raised.value)
+        assert str(raised.value) == tenant_target_unavailable_message("视频链接")
         text = "".join(logged)
-        assert "no-such-host.invalid" in text, "日志里要有原因，运维才知道是 DNS 还是策略"
+        assert "no-such-host.invalid" in text and "解析失败" in text, "日志里要有原因，运维才知道是 DNS 还是策略"
         assert URL_SECRET not in text
 
     async def test_a_policy_refusal_keeps_the_fixed_text_and_leaves_the_reason_in_the_log(self, tmp_path: Path, logged: List[str]) -> None:
         with pytest.raises(VideoAnalysisError) as raised:
             await source.download_video(f"http://10.0.0.1/v.mp4?ticket={URL_SECRET}", tmp_path / "out", max_bytes=10, max_redirects=0)
-        assert str(raised.value) == "视频链接被出站防护拒绝"
+        assert str(raised.value) == tenant_target_unavailable_message("视频链接")
         text = "".join(logged)
         assert "10.0.0.1" in text and "视频下载被拒绝" in text
         assert URL_SECRET not in text
@@ -432,8 +435,9 @@ class TestRefusalReasons:
             return None
 
         monkeypatch.setattr(source, "assert_download_url_safe", resolved_public)
-        with pytest.raises(VideoAnalysisError, match="出站防护"):
+        with pytest.raises(VideoAnalysisError) as raised:
             await source.download_video(f"{upstream.base_url}/video.mp4", tmp_path / "out", max_bytes=10, max_redirects=0)
+        assert str(raised.value) == tenant_target_unavailable_message("视频链接"), "建连接那一步拒的，与预检拒的同一句"
         assert "视频下载被拒绝" in "".join(logged)
 
     def test_the_unresolvable_error_is_still_an_unsafe_url_error(self) -> None:

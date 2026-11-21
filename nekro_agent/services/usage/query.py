@@ -70,6 +70,7 @@ MAX_TREND_BUCKETS = 92
 # 同名字段撞车。列在一处，免得四种分组各写一遍 `Sum(...)`（同一判据的第 N 处实现）。
 _AGGREGATE_SOURCES = {
     "agg_token_input": "token_input",
+    "agg_token_input_cached": "token_input_cached",
     "agg_token_output": "token_output",
     "agg_token_total": "token_total",
     "agg_cost": "cost",
@@ -324,6 +325,7 @@ def _normalize_row(row: Dict[str, object]) -> Dict[str, float]:
     return {
         "records": int(row.get("agg_records") or 0),
         "token_input": int(row.get("agg_token_input") or 0),
+        "token_input_cached": int(row.get("agg_token_input_cached") or 0),
         "token_output": int(row.get("agg_token_output") or 0),
         "token_total": int(row.get("agg_token_total") or 0),
         "cost": float(row.get("agg_cost") or 0.0),

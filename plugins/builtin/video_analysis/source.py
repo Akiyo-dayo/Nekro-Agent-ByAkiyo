@@ -9,14 +9,16 @@
   `<数据目录>/configs/...` 的符号链接就能让校验失效（#73 是同一类窗口）。所以打开之后按**已打开的 fd**
   复核真实路径，再从这个 fd 复制，此后沙盒怎么改都影响不到分析。
 
-DNS 重绑定：校验解析一次、httpx 连接时再解析一次，所以读响应之前按实际对端再判一次
-（`assert_connected_peer_safe`）。这要求连接是直连的，走代理时对端是代理，因此 `trust_env=False`。
+DNS 重绑定：每一跳先预检（`assert_download_url_safe`），真正建连接时由 `download_http_transport`
+（`tools/tenant_egress.py`）再解析一次、按同一判据校验、直接连校验过的地址并核对对端，两次解析之间改口
+也连不进内网（连都不会连）。环境变量里的代理照用（与 `download_file` 一样），经 HTTP(S) 代理时让它
+`CONNECT` 校验过的地址。被拒时不管是预检还是建连接那一步、不管是解析不到还是指向内网，给出去的都是同一句话。
 """
 
 import asyncio
 import os
 from pathlib import Path, PurePosixPath
-from typing import Awaitable, Callable, Iterable, Optional, TypeVar
+from typing import Awaitable, Callable, Iterable, TypeVar
 from urllib.parse import urljoin, urlsplit
 
 import aiofiles
@@ -33,13 +35,13 @@ from nekro_agent.adapters.onebot_v11.tools.video import (
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.schemas.agent_ctx import AgentCtx
 from nekro_agent.tools.common_util import (
-    UnresolvableDownloadHostError,
     UnsafeDownloadUrlError,
-    assert_connected_peer_safe,
     assert_download_url_safe,
+    tenant_target_unavailable_message,
 )
 from nekro_agent.tools.file_utils import FileSystem
 from nekro_agent.tools.path_convertor import LocalFileRefused, is_url_path, open_regular_file_within
+from nekro_agent.tools.tenant_egress import download_http_transport
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 from .media import INPUT_NAME, VideoAnalysisError
@@ -77,20 +79,12 @@ def safe_url_for_log(url: str) -> str:
 def _refused(url: str, error: UnsafeDownloadUrlError) -> VideoAnalysisError:
     """给模型 / 用户的是固定文案，原因只进日志
 
-    校验的异常文本里有 `主机 -> IP`，那是内网探测的回显，不能回显给调用方；但运维要能分清
-    是链接指向了内网、对端校验没过，还是单纯解析不出主机名（后者与策略无关，文案也不该说成“被拒绝”）。
-    日志里只放协议、主机、路径（`safe_url_for_log`），查询串里的签名不进日志。
+    「解析不到」与「指向不允许的地址」说成同一句：分开说的话，任何能让 bot 下视频的人都能拿它查 NA 所在网络的
+    DNS（这个名字在不在、指不指向内网）。具体原因只进日志，运维照样分得清；日志里只放协议、主机、路径
+    （`safe_url_for_log`），查询串里的签名不进日志。
     """
     logger.warning(f"视频下载被拒绝: {safe_url_for_log(url)}: {error}")
-    if isinstance(error, UnresolvableDownloadHostError):
-        return VideoAnalysisError("视频链接的主机名无法解析，请检查链接是否正确")
-    return VideoAnalysisError("视频链接被出站防护拒绝")
-
-
-def _peer_ip(response: httpx.Response) -> Optional[str]:
-    stream = response.extensions.get("network_stream")
-    address = stream.get_extra_info("server_addr") if stream is not None else None
-    return address[0] if address else None
+    return VideoAnalysisError(tenant_target_unavailable_message("视频链接"))
 
 
 def _too_large(max_bytes: int) -> VideoAnalysisError:
@@ -103,9 +97,11 @@ async def download_video(url: str, dest: Path, *, max_bytes: int, max_redirects:
     错误文案不带 URL：httpx 的异常文本里是完整链接，签名会顺着错误进模型与日志。
     """
     current = url
+    # 建连接那一步固定校验过的地址并核对对端；环境代理由传输层处理，所以客户端自己 `trust_env=False`
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(_DOWNLOAD_READ_TIMEOUT_SECONDS),
         follow_redirects=False,
+        transport=download_http_transport(),
         trust_env=False,
     ) as client:
         for _ in range(max_redirects + 1):
@@ -115,10 +111,6 @@ async def download_video(url: str, dest: Path, *, max_bytes: int, max_redirects:
                 raise _refused(current, e) from e
             try:
                 async with client.stream("GET", current) as response:
-                    try:
-                        assert_connected_peer_safe(_peer_ip(response))
-                    except UnsafeDownloadUrlError as e:
-                        raise _refused(current, e) from e
                     if response.status_code in _REDIRECT_STATUS:
                         location = response.headers.get("location")
                         if not location:
@@ -138,6 +130,9 @@ async def download_video(url: str, dest: Path, *, max_bytes: int, max_redirects:
                                 raise _too_large(max_bytes)
                             await output.write(chunk)
                     return
+            except UnsafeDownloadUrlError as e:
+                # 建连接那一步拒的（两次解析之间改口、对端不对）：与预检拒的同一句
+                raise _refused(current, e) from e
             except httpx.HTTPError as e:
                 raise _LinkFailed(f"下载视频失败（{type(e).__name__}）") from e
     raise VideoAnalysisError(f"视频链接重定向超过 {max_redirects} 次")

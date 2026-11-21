@@ -3,6 +3,7 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   Dialog,
   DialogActions,
@@ -26,6 +27,7 @@ import {
   TableRow,
   TextField,
   Typography,
+  useTheme,
 } from '@mui/material'
 import {
   Add as AddIcon,
@@ -39,9 +41,8 @@ import {
 } from '@mui/icons-material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { CARD_VARIANTS } from '../../../theme/variants'
+import { CARD_VARIANTS, CHIP_VARIANTS } from '../../../theme/variants'
 import { useNotification } from '../../../hooks/useNotification'
-import { INSTANCE_SCOPE_QUERY_KEY } from '../../../hooks/useInstanceScope'
 import { ApiError } from '../../../services/api/axios'
 import { consoleApi } from '../../../services/api/console'
 import {
@@ -53,6 +54,7 @@ import {
   emailApi,
 } from '../../../services/api/email'
 import { mailboxApi } from '../../../services/api/mailbox'
+import { tenantApi } from '../../../services/api/tenant'
 
 // 服务端的预设表取不到时的兜底（与改造前的五项相同）
 const FALLBACK_PROVIDERS: EmailProvider[] = ['QQ邮箱', '163邮箱', 'Gmail', 'Outlook', '自定义']
@@ -107,7 +109,9 @@ const defaultAccount: EmailAccount = {
   CUSTOM_SMTP_PORT: 587,
   CUSTOM_SMTP_SSL_PORT: 465,
   CUSTOM_SMTP_USE_SSL: true,
+  SKIP_TLS_VERIFY: false,
   ENABLED: true,
+  RECEIVE_ENABLED: false,
   USE_PROXY: false,
   USERNAME: '',
   PASSWORD: '',
@@ -138,6 +142,7 @@ function buildPayload(form: EmailAccount, editing: boolean): Partial<EmailAccoun
 }
 
 export default function EmailAccountsPage() {
+  const theme = useTheme()
   const { t } = useTranslation('adapter')
   const notification = useNotification()
   const queryClient = useQueryClient()
@@ -161,22 +166,68 @@ export default function EmailAccountsPage() {
     queryFn: mailboxApi.listProviders,
     staleTime: 10 * 60_000,
   })
-  // 共享发信的「指定实例」与「转为实例自有」都要实例清单；与顶栏切换器同一个查询
-  const { data: instanceOptionsData } = useQuery({
-    queryKey: INSTANCE_SCOPE_QUERY_KEY,
-    queryFn: () => consoleApi.listInstanceOptions(),
+  // 共享发信的「指定实例」与「转为实例自有」都要实例清单。实例切换器候选接口不带租户，
+  // 这里改用总后台的实例列表（带 `tenant_id`），再配租户列表把 id 翻成名字。
+  const { data: instanceListData } = useQuery({
+    queryKey: ['email-accounts', 'instances'],
+    queryFn: consoleApi.listInstances,
+    staleTime: 60_000,
+  })
+  const { data: tenantListData } = useQuery({
+    queryKey: ['email-accounts', 'tenants'],
+    queryFn: tenantApi.listTenants,
     staleTime: 60_000,
   })
   const providers: EmailProvider[] = providerPresets?.length
     ? providerPresets.map(preset => preset.key)
     : FALLBACK_PROVIDERS
-  const instanceOptions = (instanceOptionsData?.items ?? [])
-    .filter(instance => instance.status !== 'archived')
-    .map(instance => ({
-      value: `${instance.adapter_key}:${instance.instance_key}`,
-      label: `${instance.display_name || instance.instance_key} (${instance.adapter_key}:${instance.instance_key})`,
+  const activeInstances = (instanceListData?.items ?? []).filter(instance => instance.status !== 'archived')
+  const instanceOptions = activeInstances.map(instance => ({
+    value: `${instance.adapter_key}:${instance.instance_key}`,
+    label: `${instance.display_name || instance.instance_key} (${instance.adapter_key}:${instance.instance_key})`,
+    tenantId: instance.tenant_id ?? null,
+  }))
+  const tenants = tenantListData?.items ?? []
+  const selectedShareInstances = form.SEND_SHARE_INSTANCES ?? []
+  const selectedShareInstanceSet = new Set(selectedShareInstances)
+  const knownTenantIds = new Set(tenants.map(tenant => tenant.id))
+  const platformOptions = instanceOptions.filter(option => option.tenantId === null)
+  const tenantGroups = tenants
+    .map(tenant => ({
+      key: `tenant-${tenant.id}`,
+      label: tenant.display_name || tenant.name,
+      options: instanceOptions.filter(option => option.tenantId === tenant.id),
     }))
-  const instanceLabel = new Map(instanceOptions.map(option => [option.value, option.label]))
+    .filter(group => group.options.length > 0)
+  const unknownTenantGroups = Array.from(
+    new Set(
+      instanceOptions
+        .map(option => option.tenantId)
+        .filter((tenantId): tenantId is number => tenantId !== null && !knownTenantIds.has(tenantId))
+    )
+  ).map(tenantId => ({
+    key: `tenant-${tenantId}`,
+    label: t('emailAccounts.share.tenantGroupFallback', { id: tenantId }),
+    options: instanceOptions.filter(option => option.tenantId === tenantId),
+  }))
+  // 已经不在实例清单里、却还留在共享名单上的旧值也要能看到并取消，不能让它们只存在于保存载荷里
+  const knownInstanceValues = new Set(instanceOptions.map(option => option.value))
+  const unavailableSelected = selectedShareInstances.filter(value => !knownInstanceValues.has(value))
+  const unavailableGroups = unavailableSelected.length > 0
+    ? [{
+        key: 'unavailable',
+        label: t('emailAccounts.share.unavailableGroup'),
+        options: unavailableSelected.map(value => ({ value, label: value, tenantId: null })),
+      }]
+    : []
+  const instanceGroups = [
+    ...(platformOptions.length > 0
+      ? [{ key: 'platform', label: t('emailAccounts.share.platformGroup'), options: platformOptions }]
+      : []),
+    ...tenantGroups,
+    ...unknownTenantGroups,
+    ...unavailableGroups,
+  ]
 
   const invalidateAccounts = async () => {
     await queryClient.invalidateQueries({ queryKey: ['email-accounts'] })
@@ -277,7 +328,8 @@ export default function EmailAccountsPage() {
 
   const openEditDialog = (account: EmailAccount) => {
     setEditingIndex(account.index ?? null)
-    setForm({ ...defaultAccount, ...account, PASSWORD: '' })
+    // 收信开关显示账户实际的值：默认账户里它是关的（新建时默认只发信）
+    setForm({ ...defaultAccount, ...account, RECEIVE_ENABLED: account.RECEIVE_ENABLED ?? true, PASSWORD: '' })
     setDialogOpen(true)
   }
 
@@ -308,6 +360,25 @@ export default function EmailAccountsPage() {
 
   const updateForm = <K extends keyof EmailAccount>(key: K, value: EmailAccount[K]) => {
     setForm(prev => ({ ...prev, [key]: value }))
+  }
+
+  const toggleShareInstance = (value: string, checked: boolean) => {
+    updateForm(
+      'SEND_SHARE_INSTANCES',
+      checked
+        ? Array.from(new Set([...selectedShareInstances, value]))
+        : selectedShareInstances.filter(item => item !== value)
+    )
+  }
+
+  const toggleShareTenant = (options: Array<{ value: string }>, checked: boolean) => {
+    const values = new Set(options.map(option => option.value))
+    updateForm(
+      'SEND_SHARE_INSTANCES',
+      checked
+        ? Array.from(new Set([...selectedShareInstances, ...values]))
+        : selectedShareInstances.filter(item => !values.has(item))
+    )
   }
 
   useEffect(() => {
@@ -467,7 +538,18 @@ export default function EmailAccountsPage() {
                     title={account.LAST_TEST_MESSAGE || undefined}
                   />
                 </TableCell>
-                <TableCell>{account.SEND_ENABLED ? t('emailAccounts.yes') : t('emailAccounts.no')}</TableCell>
+                <TableCell>
+                  <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap" useFlexGap>
+                    <span>{account.SEND_ENABLED ? t('emailAccounts.yes') : t('emailAccounts.no')}</span>
+                    {account.RECEIVE_ENABLED === false && (
+                      <Chip
+                        size="small"
+                        label={t('emailAccounts.sendOnly')}
+                        sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.text.secondary, true)}
+                      />
+                    )}
+                  </Stack>
+                </TableCell>
                 <TableCell>{account.IS_DEFAULT_SENDER ? t('emailAccounts.yes') : t('emailAccounts.no')}</TableCell>
                 <TableCell>
                   {account.SEND_SHARE === 'listed'
@@ -731,6 +813,19 @@ export default function EmailAccountsPage() {
                 label={t('emailAccounts.sendEnabled')}
                 sx={{ m: 0 }}
               />
+              <Box>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={form.RECEIVE_ENABLED ?? true}
+                      onChange={event => updateForm('RECEIVE_ENABLED', event.target.checked)}
+                    />
+                  }
+                  label={t('emailAccounts.receiveEnabled')}
+                  sx={{ m: 0 }}
+                />
+                <FormHelperText sx={{ mt: 0, mx: 0 }}>{t('emailAccounts.receiveEnabledHelp')}</FormHelperText>
+              </Box>
               <FormControlLabel
                 control={<Switch checked={form.IS_DEFAULT_SENDER} onChange={event => updateForm('IS_DEFAULT_SENDER', event.target.checked)} />}
                 label={t('emailAccounts.defaultSender')}
@@ -790,6 +885,22 @@ export default function EmailAccountsPage() {
                   }
                   label={t('emailAccounts.customSmtpUseSsl')}
                 />
+                <Box>
+                  <FormControlLabel
+                    control={
+                      <Switch
+                        checked={form.SKIP_TLS_VERIFY ?? false}
+                        onChange={event => updateForm('SKIP_TLS_VERIFY', event.target.checked)}
+                      />
+                    }
+                    label={t('emailAccounts.skipTlsVerify')}
+                  />
+                  {form.SKIP_TLS_VERIFY && (
+                    <Typography variant="caption" color="warning.main" display="block">
+                      {t('emailAccounts.skipTlsVerifyHint')}
+                    </Typography>
+                  )}
+                </Box>
               </Stack>
             )}
 
@@ -811,26 +922,92 @@ export default function EmailAccountsPage() {
                 <FormHelperText>{t('emailAccounts.share.hint')}</FormHelperText>
               </FormControl>
               {form.SEND_SHARE === 'listed' && (
-                <FormControl fullWidth size="small">
-                  <InputLabel>{t('emailAccounts.share.instances')}</InputLabel>
-                  <Select<string[]>
-                    multiple
-                    label={t('emailAccounts.share.instances')}
-                    value={form.SEND_SHARE_INSTANCES ?? []}
-                    onChange={event => {
-                      const value = event.target.value
-                      updateForm('SEND_SHARE_INSTANCES', typeof value === 'string' ? value.split(',') : value)
+                <Box>
+                  <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                    {t('emailAccounts.share.instances')}
+                  </Typography>
+                  <Box
+                    sx={{
+                      border: '1px solid',
+                      borderColor: 'divider',
+                      borderRadius: 2,
+                      maxHeight: 320,
+                      overflowY: 'auto',
                     }}
-                    renderValue={selected => selected.map(item => instanceLabel.get(item) ?? item).join('、')}
                   >
-                    {instanceOptions.map(option => (
-                      <MenuItem key={option.value} value={option.value}>
-                        {option.label}
-                      </MenuItem>
-                    ))}
-                  </Select>
-                  <FormHelperText>{t('emailAccounts.share.instancesHint')}</FormHelperText>
-                </FormControl>
+                    {instanceGroups.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary" sx={{ p: 2 }}>
+                        {t('emailAccounts.share.noInstances')}
+                      </Typography>
+                    ) : instanceGroups.map(group => {
+                      const selectedCount = group.options.filter(option => selectedShareInstanceSet.has(option.value)).length
+                      const allSelected = selectedCount === group.options.length
+                      const someSelected = selectedCount > 0 && !allSelected
+                      return (
+                        <Box key={group.key}>
+                          <Box
+                            sx={{
+                              position: 'sticky',
+                              top: 0,
+                              zIndex: 1,
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 0.5,
+                              px: 1,
+                              py: 0.25,
+                              bgcolor: 'background.paper',
+                              borderBottom: '1px solid',
+                              borderColor: 'divider',
+                            }}
+                          >
+                            <Checkbox
+                              size="small"
+                              checked={allSelected}
+                              indeterminate={someSelected}
+                              onChange={event => toggleShareTenant(group.options, event.target.checked)}
+                              inputProps={{
+                                'aria-label': t('emailAccounts.share.selectTenantAria', { tenant: group.label }),
+                              }}
+                            />
+                            <Typography variant="body2" fontWeight={600} noWrap sx={{ minWidth: 0, flex: 1 }}>
+                              {group.label}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ pr: 1 }}>
+                              {`${selectedCount}/${group.options.length}`}
+                            </Typography>
+                          </Box>
+                          {group.options.map(option => (
+                            <FormControlLabel
+                              key={option.value}
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={selectedShareInstanceSet.has(option.value)}
+                                  onChange={event => toggleShareInstance(option.value, event.target.checked)}
+                                />
+                              }
+                              label={option.label}
+                              sx={{
+                                display: 'flex',
+                                mx: 0,
+                                pl: 2,
+                                pr: 1,
+                                py: 0.25,
+                                '& .MuiFormControlLabel-label': { minWidth: 0, wordBreak: 'break-all' },
+                              }}
+                            />
+                          ))}
+                        </Box>
+                      )
+                    })}
+                  </Box>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                    {t('emailAccounts.share.instancesHint')}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                    {t('emailAccounts.share.tenantGroupHint')}
+                  </Typography>
+                </Box>
               )}
             </Stack>
           </Stack>

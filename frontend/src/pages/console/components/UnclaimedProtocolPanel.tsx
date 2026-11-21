@@ -41,6 +41,7 @@ import NekroDialog from '../../../components/common/NekroDialog'
 import SegmentedControl from '../../../components/common/SegmentedControl'
 import { useIdentity } from '../../../hooks/useIdentity'
 import { useNotification } from '../../../hooks/useNotification'
+import { CHIP_VARIANTS } from '../../../theme/variants'
 import { INSTANCE_KEY_PATTERN } from '../../../services/api/consoleContainer'
 import {
   consoleApi,
@@ -257,12 +258,12 @@ export default function UnclaimedProtocolPanel({
               </Box>
               <Chip
                 size="small"
-                variant="outlined"
+                sx={CHIP_VARIANTS.getPaletteChip(theme, 'default', true)}
                 label={t('card.channelCount', { count: item.channel_count })}
               />
               <Chip
                 size="small"
-                variant="outlined"
+                sx={CHIP_VARIANTS.getPaletteChip(theme, 'default', true)}
                 label={t('card.messageToday', { count: item.message_count_today })}
               />
               <ActionButton

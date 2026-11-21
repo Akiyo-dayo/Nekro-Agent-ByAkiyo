@@ -223,6 +223,13 @@ class DBMemParagraph(Model):
         description="最后一次手动操作时间",
     )
 
+    # === 隐私 ===
+    is_sensitive = fields.BooleanField(
+        default=False,
+        index=True,
+        description="关于具体某人的敏感事：只在来源频道召回",
+    )
+
     # === 多模态关联 ===
     media_refs = fields.JSONField(
         default=list,

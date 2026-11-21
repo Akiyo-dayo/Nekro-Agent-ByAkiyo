@@ -150,6 +150,22 @@ function MainLayoutContent() {
   const isChatChannelManagementLike =
     location.pathname.startsWith('/chat-channel') &&
     !location.pathname.startsWith('/chat-channel/announcement')
+  // 「额度与用量」的三个标签共用一格菜单（落在 `/console/channel-quota`）。
+  // 另外两条标签路径在菜单里没有自己的格子，选中态与展开态要跟着那一格走。
+  const isQuotaHubLike =
+    location.pathname === '/console/quota' ||
+    location.pathname.startsWith('/console/quota/') ||
+    location.pathname === '/console/usage' ||
+    location.pathname.startsWith('/console/usage/')
+  // 这三个 `/console/*` 入口已经从「总后台」移到「运维」组。`/console` 那一格的
+  // 前缀匹配会把它们也算进总后台，选中态与展开态必须显式排除。
+  const isOpsConsolePath =
+    location.pathname === '/console/ops-audit' ||
+    location.pathname.startsWith('/console/ops-audit/') ||
+    location.pathname === '/console/network-rules' ||
+    location.pathname.startsWith('/console/network-rules/') ||
+    location.pathname === '/console/ssh-gateway' ||
+    location.pathname.startsWith('/console/ssh-gateway/')
   const pageTransitionBaseKey = (() => {
     const segments = location.pathname.split('/').filter(Boolean)
 
@@ -278,12 +294,16 @@ function MainLayoutContent() {
   useEffect(() => {
     menuItems.forEach(item => {
       if (item.children && item.key) {
-        const hasActiveChild = item.children.some(
-          child =>
-            location.pathname === child.path || location.pathname.startsWith(child.path + '/')
-        )
+        const hasActiveChild =
+          item.children.some(
+            child =>
+              location.pathname === child.path || location.pathname.startsWith(child.path + '/')
+          ) &&
+          !(item.key === 'console' && isOpsConsolePath)
         const shouldOpen =
-          hasActiveChild || (item.key === 'chatManagement' && isChatChannelManagementLike)
+          hasActiveChild ||
+          (item.key === 'chatManagement' && isChatChannelManagementLike) ||
+          (item.key === 'console' && isQuotaHubLike)
         if (shouldOpen) {
           setOpenMenus(prev => ({
             ...prev,
@@ -292,7 +312,7 @@ function MainLayoutContent() {
         }
       }
     })
-  }, [location.pathname, menuItems, isChatChannelManagementLike])
+  }, [location.pathname, menuItems, isChatChannelManagementLike, isQuotaHubLike, isOpsConsolePath])
 
   const getCurrentPage = () => {
     return getCurrentPageFromConfigs(location.pathname)
@@ -568,6 +588,7 @@ function MainLayoutContent() {
                       selected={Boolean(
                         (location.pathname === child.path ||
                           location.pathname.startsWith(child.path + '/')) &&
+                          !(item.key === 'console' && isOpsConsolePath) &&
                           !item.children.some(
                             sibling =>
                               sibling.path !== child.path &&
@@ -579,6 +600,10 @@ function MainLayoutContent() {
                         item.key === 'chatManagement' &&
                           child.path === '/chat-channel/management' &&
                           isChatChannelManagementLike
+                      ) || Boolean(
+                        item.key === 'console' &&
+                          child.path === '/console/channel-quota' &&
+                          isQuotaHubLike
                       )}
                       sx={{
                         pl: 4,

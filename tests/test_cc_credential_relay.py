@@ -66,8 +66,15 @@ from nekro_agent.services.workspace.credential_policy import (
     METADATA_DIRECT_WITHHELD_KEY,
     METADATA_SECRET_DELIVERED_KEY,
 )
-from nekro_agent.services.workspace.manager import WorkspaceService
+from nekro_agent.services.workspace.manager import ClaudeHome, WorkspaceService
 from nekro_agent.tools.redaction import REDACTED_CREDENTIAL
+
+
+def _home(ws_dir: Path, *, create: bool = True) -> ClaudeHome:
+    """这组用例按旧布局（`{ws}/.claude_home`）写；`create` 时先建好它（NA 只修旧布局的 home，不新建）"""
+    if create:
+        (ws_dir / ".claude_home").mkdir(parents=True, exist_ok=True)
+    return ClaudeHome(base=ws_dir, parts=(".claude_home",), legacy=True, workspace_id=0)
 
 # 平台方真实凭据。测试里到处断言「这个串不出现在 X 里」，所以取一个足够独特的取值。
 PLATFORM_TOKEN = "sk-platform-REAL-KEY-do-not-leak-0123456789"
@@ -459,7 +466,7 @@ class TestTokenLifetime:
         assert again.auth_token != first.auth_token
         assert await resolve_relay_grant(first.auth_token) is None
 
-        WorkspaceService._write_settings_files(tmp_path, PRESET, again, "热更新", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(tmp_path, PRESET, again, "热更新", allow_platform_secrets=True, home=_home(tmp_path))
         assert PLATFORM_TOKEN not in (tmp_path / "settings.json").read_text(encoding="utf-8")
 
 
@@ -503,7 +510,7 @@ class TestSettingsOnDisk:
         """整条改造的判据：容器挂载进去的目录里 0 命中真实 Key"""
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
-        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入", allow_platform_secrets=True, home=_home(tmp_path))
 
         written = sorted(path for path in tmp_path.rglob("*") if path.is_file())
         assert [path.relative_to(tmp_path).as_posix() for path in written] == [
@@ -529,7 +536,9 @@ class TestSettingsOnDisk:
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, preset_tier)
 
-        WorkspaceService._write_settings_files(tmp_path, preset_tier, credential, "写入", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(
+            tmp_path, preset_tier, credential, "写入", allow_platform_secrets=True, home=_home(tmp_path)
+        )
 
         user_settings = json.loads((tmp_path / ".claude_home" / "settings.json").read_text(encoding="utf-8"))
         assert user_settings["model"] == "opus"
@@ -552,14 +561,15 @@ class TestSettingsOnDisk:
         credential = await resolve_workspace_credential(workspace, with_extra)
         user_settings_path = tmp_path / ".claude_home" / "settings.json"
 
-        WorkspaceService._write_settings_files(tmp_path, with_extra, credential, "写入", allow_platform_secrets=True)
+        home = _home(tmp_path)
+        WorkspaceService._write_settings_files(tmp_path, with_extra, credential, "写入", allow_platform_secrets=True, home=home)
         assert "OLD_SWITCH" in user_settings_path.read_text(encoding="utf-8")
 
-        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "热更新", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "热更新", allow_platform_secrets=True, home=home)
         assert "OLD_SWITCH" not in user_settings_path.read_text(encoding="utf-8")
         assert not user_settings_path.with_name("settings.json.tmp").exists()
 
-        WorkspaceService._write_settings_files(tmp_path, None, credential, "热更新", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(tmp_path, None, credential, "热更新", allow_platform_secrets=True, home=home)
         assert not user_settings_path.exists()
 
     @staticmethod
@@ -585,7 +595,7 @@ class TestSettingsOnDisk:
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
 
-        WorkspaceService._write_settings_files(ws_dir, PRESET, credential, "写入", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(ws_dir, PRESET, credential, "写入", allow_platform_secrets=True, home=_home(ws_dir))
 
         assert host_file.read_text(encoding="utf-8") == "host"
         for path in (ws_dir / "settings.json", ws_dir / ".claude_home" / "settings.json"):
@@ -595,7 +605,7 @@ class TestSettingsOnDisk:
         # 没有预设时删掉的也是链接本身
         (ws_dir / ".claude_home" / "settings.json").unlink()
         self._symlink(host_file, ws_dir / ".claude_home" / "settings.json")
-        WorkspaceService._write_settings_files(ws_dir, None, credential, "热更新", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(ws_dir, None, credential, "热更新", allow_platform_secrets=True, home=_home(ws_dir))
         assert not os.path.lexists(ws_dir / ".claude_home" / "settings.json")
         assert host_file.read_text(encoding="utf-8") == "host"
 
@@ -616,7 +626,9 @@ class TestSettingsOnDisk:
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
 
-        WorkspaceService._write_settings_files(ws_dir, PRESET, credential, "写入", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(
+            ws_dir, PRESET, credential, "写入", allow_platform_secrets=True, home=_home(ws_dir, create=False)
+        )
 
         assert list(host_dir.iterdir()) == []
         if os.name == "posix":
@@ -647,7 +659,7 @@ class TestSettingsOnDisk:
         monkeypatch.setenv("NEKRO_CC_CREDENTIAL_MODE", "direct")
         workspace = await make_workspace()
         credential = await resolve_workspace_credential(workspace, PRESET)
-        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入", allow_platform_secrets=True)
+        WorkspaceService._write_settings_files(tmp_path, PRESET, credential, "写入", allow_platform_secrets=True, home=_home(tmp_path))
 
         settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
         assert settings["providers"]["anthropic"] == {

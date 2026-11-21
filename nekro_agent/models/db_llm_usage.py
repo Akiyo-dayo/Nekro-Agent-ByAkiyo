@@ -95,6 +95,10 @@ class DBLLMUsageRecord(Model):
 
     # ==== 烧了多少 ====
     token_input = fields.IntField(default=0, description="输入（prompt）token 数")
+    token_input_cached = fields.IntField(
+        default=0,
+        description="输入里命中上游缓存的 token 数（上游不回时为 0）",
+    )
     token_output = fields.IntField(default=0, description="输出（completion）token 数")
     token_total = fields.IntField(default=0, description="上游给出的总 token 数")
 

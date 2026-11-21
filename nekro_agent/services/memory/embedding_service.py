@@ -17,6 +17,7 @@ from nekro_agent.services.agent.upstream_redaction import (
     collect_llm_secret_values,
     redact_upstream_text,
 )
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 logger = get_sub_logger("memory.embedding")
 
@@ -162,6 +163,7 @@ class EmbeddingService:
                         api_key=model_config["api_key"],
                         base_url=model_config["base_url"],
                         timeout=self.timeout,
+                        tenant_egress=is_tenant_owned_group(self.resolved_model_group),
                     )
 
                 # 验证维度

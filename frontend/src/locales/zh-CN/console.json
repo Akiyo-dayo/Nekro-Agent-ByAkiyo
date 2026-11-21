@@ -197,7 +197,11 @@
       "affection": "好感度",
       "affection_event": "好感度变化流水",
       "announcement_delivery": "公告投递流水",
-      "plugin_settings": "有实例级设置的插件"
+      "plugin_settings": "有实例级设置的插件",
+      "state_channel": "角色状态",
+      "state_snapshot": "角色状态快照",
+      "state_person": "角色状态个人档案",
+      "state_person_snapshot": "个人档案快照"
     }
   },
   "unclaimedPanel": {

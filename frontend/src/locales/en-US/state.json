@@ -1,0 +1,307 @@
+{
+  "title": "Character State",
+  "subtitle": "State trees per channel, persona profiles per person, state templates and the audit trail for this instance",
+  "scopeBanner": "State is stored per instance: only this instance's channels and profiles show here",
+  "selectInstance": "Character state is per instance: pick one in the top bar first",
+  "notEnabled": "This instance does not have character state enabled, or you cannot see it",
+  "tabs": {
+    "channels": "Channels",
+    "people": "Profiles",
+    "templates": "Templates",
+    "audit": "Audit"
+  },
+  "menu": {
+    "changeLog": "Change log"
+  },
+  "setup": {
+    "loading": "Checking setup status…",
+    "summary": "Character state is running: {{channels}} channels, {{people}} profiles",
+    "collapse": "Collapse",
+    "expand": "Expand",
+    "steps": {
+      "plugin": {
+        "title": "Enable the plugin",
+        "todo": "The character state plugin is not enabled on this instance. It has to be turned on at the instance level; enabling it only in a chat does not make this page reachable.",
+        "done": "The character state plugin is enabled on this instance.",
+        "action": "Open plugin management"
+      },
+      "template": {
+        "title": "Create a preset template",
+        "todo": "No preset has a state template yet. Pick a preset and apply the built-in \"Scene\" template to get started.",
+        "done": "{{count}} presets have a state template.",
+        "action": "Create template"
+      },
+      "modelGroup": {
+        "title": "Model group for updates",
+        "fallback": "Not set separately; using the main chat model group {{group}}. Every so many messages adds one more model call, so a cheaper group is recommended.",
+        "configured": "Using {{group}}.",
+        "missing": "No model group is available, so state will not update automatically.",
+        "action": "Open settings"
+      },
+      "firstState": {
+        "title": "Generate the first state",
+        "todo": "Say something to the bot in a chat, or send `/state`, and that chat's state will be created.",
+        "done": "{{count}} channels have generated state."
+      }
+    }
+  },
+  "enums": {
+    "source": {
+      "update": "Stepped update",
+      "inline": "Inline update",
+      "compat": "Compat parse",
+      "admin": "Admin edit",
+      "rollback": "Rollback",
+      "reset": "Reset"
+    },
+    "result": {
+      "applied": "Applied",
+      "partial": "Partially applied",
+      "rejected": "All rejected",
+      "parse_failed": "Parse failed",
+      "error": "Error",
+      "conflict": "Version conflict",
+      "busy": "Busy",
+      "paused": "Paused",
+      "no_model_group": "No model group",
+      "no_template": "No template"
+    },
+    "state": {
+      "injected": "Injected",
+      "empty": "Empty",
+      "disabled": "Disabled",
+      "no_template": "No template",
+      "suppressed": "Suppressed",
+      "paused": "Paused",
+      "error": "Error"
+    }
+  },
+  "channels": {
+    "searchPlaceholder": "Search channel name or key",
+    "onlyPaused": "Paused only",
+    "paused": "Paused",
+    "normal": "Normal",
+    "failures": "{{count}} failures in a row",
+    "columns": {
+      "name": "Channel",
+      "preset": "Preset",
+      "updatedAt": "Updated",
+      "status": "Status",
+      "lastUpdate": "Last update"
+    },
+    "emptyTitle": "No channel state yet",
+    "emptyHint": "See the setup steps above; a channel gets its state the first time the plugin takes effect there with a preset that has a template"
+  },
+  "people": {
+    "uidPlaceholder": "Exact account lookup",
+    "columns": {
+      "person": "Person",
+      "nickname": "Nickname",
+      "account": "Account",
+      "preset": "Preset",
+      "domain": "Domain",
+      "updatedAt": "Updated"
+    },
+    "instanceGroup": "Instance group",
+    "localGroup": "This instance",
+    "emptyTitle": "No profiles yet",
+    "emptyHint": "See the setup steps above; a row shows up once a channel has written someone's state",
+    "personNotFound": "The profile you came for cannot be shown here: it may belong to another instance or no longer exist"
+  },
+  "detail": {
+    "currentState": "Current state",
+    "snapshots": "Snapshots and update log",
+    "jsonLabel": "State data",
+    "invalidJson": "Not a valid JSON object",
+    "conflict": "Someone else just changed it, reloaded",
+    "saveSuccess": "Saved",
+    "reset": "Reset to initial values",
+    "resume": "Resume updates",
+    "resetSuccess": "Reset to the initial values",
+    "resumeSuccess": "Updates resumed",
+    "resetConfirmTitle": "Reset to initial values",
+    "resetConfirmBody": "Resetting puts the state back to the template's initial values, and the audit keeps a record of it",
+    "previewImage": "Preview state image",
+    "previewLoading": "Drawing…",
+    "previewFailed": "The state image could not be drawn"
+  },
+  "snapshot": {
+    "source": "Source",
+    "result": "Result",
+    "editor": "Editor",
+    "modelGroup": "Model group",
+    "applied": "Changed",
+    "rejected": "Rejected",
+    "appliedOp": "{{op}} {{path}}",
+    "rejectedOp": "{{path}}: {{reason}}",
+    "noReason": "No reason given",
+    "view": "View",
+    "rollback": "Roll back to this version",
+    "viewTitle": "State of this version",
+    "emptyTitle": "No snapshots yet",
+    "emptyHint": "Updates, admin edits, rollbacks and resets each leave a row here",
+    "rollbackConfirmTitle": "Roll back to this version",
+    "rollbackConfirmBody": "Rolling back replaces the current state with this version, and the audit keeps a record of it",
+    "rollbackSuccess": "Rolled back to this version"
+  },
+  "templates": {
+    "searchPlaceholder": "Search presets",
+    "global": "Global",
+    "exists": "Has template",
+    "missing": "No template",
+    "fieldCount": "{{count}} fields",
+    "source": {
+      "initvar": "From book",
+      "manual": "Hand-written",
+      "builtin": "Ready-made"
+    },
+    "noTemplate": "This preset has no state template yet",
+    "noTemplateHint": "You can derive one from the initial variables in the book, or apply a ready-made template",
+    "fromInitvar": "Rebuild from book",
+    "fromBuiltin": "Apply ready-made",
+    "readonlyAlert": "Only the platform side can edit a global preset's template",
+    "emptyTitle": "No presets",
+    "emptyHint": "This instance has no presets available yet",
+    "selectTitle": "Pick a preset",
+    "selectHint": "Pick a preset on the left to see its state template here",
+    "sections": {
+      "fields": "Fields",
+      "initial": "Initial values",
+      "theme": "Theme"
+    },
+    "theme": {
+      "default": "Default",
+      "night": "Night",
+      "sakura": "Sakura",
+      "forest": "Forest",
+      "ink": "Ink"
+    },
+    "table": {
+      "path": "Path",
+      "type": "Type",
+      "description": "Description",
+      "flags": "Tags",
+      "actions": "Actions",
+      "expand": "Show advanced field settings",
+      "collapse": "Hide advanced field settings",
+      "readonly": "Read-only",
+      "private": "Private",
+      "hidden": "Hidden",
+      "person": "Person scope",
+      "headline": "Headline",
+      "affection": "Affection mapping",
+      "priority": "Priority",
+      "minimum": "Minimum",
+      "maximum": "Maximum",
+      "maxLength": "Max length",
+      "maxItems": "Max items"
+    },
+    "pathPlaceholder": "e.g. protagonist/name",
+    "fieldType": {
+      "string": "Text",
+      "number": "Number",
+      "boolean": "Boolean",
+      "object": "Object",
+      "array": "List"
+    },
+    "affection": {
+      "none": "None",
+      "score": "Score",
+      "stage": "Stage"
+    },
+    "addField": "Add a field",
+    "removeField": "Delete this row",
+    "saveSuccess": "Template saved",
+    "initialInvalid": "Initial values must be a valid JSON object",
+    "initvarDialog": {
+      "title": "Rebuild from book",
+      "description": "Pick one [initvar] entry to regenerate the fields from; picking All merges every entry",
+      "all": "All entries",
+      "entryLabel": "Which entry",
+      "empty": "This book has no [initvar] entries",
+      "confirm": "Rebuild",
+      "success": "Rebuilt, {{count}} fields now"
+    },
+    "builtinDialog": {
+      "title": "Apply ready-made template",
+      "description": "Tick one or both; fields that already exist are skipped",
+      "scene": "Scene",
+      "inventory": "Inventory",
+      "confirm": "Apply",
+      "needOne": "Tick at least one",
+      "success": "{{added}} added, {{skipped}} skipped"
+    }
+  },
+  "audit": {
+    "filters": {
+      "kind": "Target",
+      "source": "Source"
+    },
+    "kind": {
+      "all": "All",
+      "channel": "Channel",
+      "person": "Profile",
+      "template": "Template"
+    },
+    "source": {
+      "all": "All",
+      "admin": "Admin edit",
+      "rollback": "Rollback",
+      "reset": "Reset"
+    },
+    "columns": {
+      "time": "Time",
+      "target": "Target",
+      "source": "Source",
+      "ops": "What changed",
+      "editor": "Operator"
+    },
+    "emptyTitle": "No audit rows yet",
+    "emptyHint": "Admin edits, rollbacks and resets each leave a row"
+  },
+  "summary": {
+    "injected": "State block injected",
+    "tokens": "{{tokens}} tokens",
+    "chars": "{{chars}} chars",
+    "trimmed": "{{count}} groups trimmed"
+  },
+  "promptRound": {
+    "title": "Character state",
+    "status": "Status",
+    "tokens": "Tokens",
+    "chars": "Chars",
+    "budget": "Budget",
+    "position": "Position",
+    "people": "People",
+    "privateOmitted": "Private fields omitted",
+    "trimmed": "Groups trimmed",
+    "paused": "Paused",
+    "provider": "Variables provided",
+    "lastUpdate": "Last update",
+    "at": "Time",
+    "result": "Result",
+    "applied": "Applied",
+    "rejected": "Rejected",
+    "source": "Source",
+    "step": "Stepped update",
+    "stepSkipped": "Skipped",
+    "yes": "Yes",
+    "no": "No"
+  },
+  "import": {
+    "title": "Character state template",
+    "status": {
+      "preview": "Preview",
+      "generated": "Generated",
+      "exists": "Template exists, unchanged",
+      "inactive": "Plugin not enabled",
+      "no_initvar": "No [initvar] entries",
+      "failed": "Generation failed"
+    },
+    "fields": "{{fields}} fields, {{hidden}} hidden, from {{entries}} [initvar] entries",
+    "privatePaths": "Fields marked private automatically"
+  },
+  "affection": {
+    "openPerson": "Character state profile"
+  }
+}

@@ -23,11 +23,12 @@ NA 可能跑在宿主上、且 uid 既不是 0 也不是 1000。它直接写出�
 
 ## 不跟随容器能改的符号链接
 
-整个工作区目录（含 `.claude_home`）以读写方式挂进容器，`~/.claude` 又是 0777：容器里的
-appuser 能把 `nk-ssh`、甚至 `.claude_home` 换成符号链接，或者在 `nk-ssh` 里放
-`id_gateway -> /etc/shadow` 这样的链接。所以：
+CC home（容器里的 `~/.claude`，宿主上在哪由 `WorkspaceService.claude_home` 定）是 0777：
+容器里的 appuser 能把 `nk-ssh` 换成符号链接，或者在 `nk-ssh` 里放
+`id_gateway -> /etc/shadow` 这样的链接；还没迁移的旧布局下 home 本身（`{工作区}/.claude_home`）
+也在读写挂载的工作区目录里，能被整个换掉。所以：
 
-- 宿主侧逐级用 `O_NOFOLLOW` 打开 `.claude_home`、`nk-ssh`，在目录句柄上写临时文件再
+- 宿主侧从 home 所在的根逐级用 `O_NOFOLLOW` 打开 home、`nk-ssh`，在目录句柄上写临时文件再
   `rename`；途中任何一级是符号链接就不写（`nk-ssh` 本身是链接或普通文件时先删掉它再
   建目录——那是 NA 自己的路径）。
 - 容器里以 root 收权限时先 `cd -P` 进目录、核对物理路径没被换，再把目录本身收成
@@ -49,7 +50,6 @@ appuser 能把 `nk-ssh`、甚至 `.claude_home` 换成符号链接，或者在 `
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -59,7 +59,7 @@ from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.services.ssh_gateway import constants as C
 from nekro_agent.services.ssh_gateway import keys
 from nekro_agent.services.workspace import safe_fs
-from nekro_agent.services.workspace.manager import WorkspaceService
+from nekro_agent.services.workspace.manager import WorkspaceService, home_lock
 
 logger = get_sub_logger("ssh_gateway.container_files")
 
@@ -87,8 +87,8 @@ _ssh_servers_section_cache: Dict[int, str] = {}
 
 
 def nk_ssh_host_dir(workspace_id: int) -> Path:
-    """工作区挂载目录下的 `nk-ssh` 目录（容器里看到的是 `~/.claude/nk-ssh`）"""
-    return WorkspaceService.get_workspace_dir(int(workspace_id)) / ".claude_home" / NK_SSH_DIRNAME
+    """宿主上这个工作区 CC home 里的 `nk-ssh` 目录（容器里看到的是 `~/.claude/nk-ssh`）"""
+    return WorkspaceService.claude_home(int(workspace_id)).path / NK_SSH_DIRNAME
 
 
 def _row_status(row: object) -> str:
@@ -209,7 +209,7 @@ async def refresh_ssh_servers_section(workspace_id: int) -> str:
 
 
 class UnsafeNkSshPathError(OSError):
-    """`.claude_home` / `nk-ssh` 路径上有容器放的符号链接，不往里写"""
+    """CC home / `nk-ssh` 路径上有容器放的符号链接，不往里写"""
 
 
 _NK_SSH_FILES = ("config", "known_hosts", "id_gateway")
@@ -218,25 +218,32 @@ _DIR_FD_SUPPORTED = safe_fs.DIR_FD_SUPPORTED
 
 
 def _write_nk_ssh_files_on_host(workspace_id: int, files: Dict[str, str]) -> None:
-    """把几份文件写进 `nk-ssh`；`.claude_home` 是容器放的链接时抛 `UnsafeNkSshPathError`
+    """把几份文件写进 `nk-ssh`；路径被容器换成链接时抛 `UnsafeNkSshPathError`
 
-    走 `safe_fs`（与 CC 镜像那边写 `.claude_home/settings.json` 是同一套函数）：从工作区根
-    逐级 `O_NOFOLLOW`，`nk-ssh` 是 NA 自己的路径，被换成链接或文件时删掉链接本身重建；
-    文件写临时文件再 rename。`.claude_home` 本身是链接时不替它做主（它还挂着 CC 的会话），
-    这一次不写。
+    走 `safe_fs`（与写 CC 用户级 `settings.json` 是同一套函数）：从 home 所在的根逐级
+    `O_NOFOLLOW`，`nk-ssh` 是 NA 自己的路径，被换成链接或文件时删掉链接本身重建；
+    文件写临时文件再 rename。home 在哪由 `WorkspaceService.claude_home` 定；旧布局的
+    `.claude_home` 本身是链接时不替它做主（它还挂着 CC 的会话），这一次不写。
     """
-    base = WorkspaceService.get_workspace_dir(int(workspace_id))
-    try:
-        if not os.path.lexists(str(base / ".claude_home")):
-            # 与建工作区时同一种建法（`WorkspaceService` 里也是 0777，容器里的 appuser 要写）
-            safe_fs.ensure_dir(base, (".claude_home",))
-            safe_fs.chmod(base, (".claude_home",), 0o777)
-        with safe_fs.open_dir(base, (".claude_home",)) as claude_home:
-            with claude_home.subdir(NK_SSH_DIRNAME, create=True, replace_links=True) as nk_ssh:
-                for name, text in files.items():
-                    nk_ssh.write_text(name, text, mode=0o600 if name == "id_gateway" else 0o644)
-    except safe_fs.UnsafePathError as exc:
-        raise UnsafeNkSshPathError(str(exc)) from exc
+    # 定位与写入拿着 `home_lock` 一口气做完：建容器的迁移在线程里跑，网关开关、补发钥匙这些路径
+    # 不拿工作区锁
+    with home_lock(int(workspace_id)):
+        home = WorkspaceService.claude_home(int(workspace_id))
+        try:
+            if not home.legacy:
+                # 与建容器时同一种建法（上级 0700，home 本身 0777，容器里的 appuser 要写）
+                home = WorkspaceService.ensure_claude_home(home)
+            with safe_fs.open_dir(home.base, home.parts) as claude_home:
+                with claude_home.subdir(NK_SSH_DIRNAME, create=True, replace_links=True) as nk_ssh:
+                    for name, text in files.items():
+                        nk_ssh.write_text(name, text, mode=0o600 if name == "id_gateway" else 0o644)
+                    if "id_gateway" in files:
+                        # 与容器里的收权限脚本同一口径：目录与两个配置文件留给 root（容器里的 appuser
+                        # 换不掉目录里的条目，ssh 也认 root 的配置），私钥交给 appuser、照旧 0600——
+                        # 不然 ssh 读不了它，要等容器起来以后那一步才补上
+                        WorkspaceService.give_to_container(nk_ssh, "id_gateway")
+        except safe_fs.UnsafePathError as exc:
+            raise UnsafeNkSshPathError(str(exc)) from exc
 
 
 def _fix_permissions_script() -> str:
@@ -363,9 +370,14 @@ async def write_nk_ssh_files(
 
 
 def _remove_nk_ssh_files_on_host(workspace_id: int) -> None:
-    base = WorkspaceService.get_workspace_dir(int(workspace_id))
+    with home_lock(int(workspace_id)):
+        _remove_nk_ssh_files_locked(int(workspace_id))
+
+
+def _remove_nk_ssh_files_locked(workspace_id: int) -> None:
+    home = WorkspaceService.claude_home(workspace_id)
     try:
-        claude_home = safe_fs.open_dir(base, (".claude_home",))
+        claude_home = safe_fs.open_dir(home.base, home.parts)
     except FileNotFoundError:
         return
     with claude_home:

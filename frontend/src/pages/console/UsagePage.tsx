@@ -28,17 +28,20 @@ import {
   LinearProgress,
   MenuItem,
   Stack,
+  type SxProps,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableRow,
   TextField,
+  type Theme,
   Typography,
   useTheme,
 } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
+import CachedRoundedIcon from '@mui/icons-material/CachedRounded'
 import PaidRoundedIcon from '@mui/icons-material/PaidRounded'
 import TokenRoundedIcon from '@mui/icons-material/TokenRounded'
 import ForumRoundedIcon from '@mui/icons-material/ForumRounded'
@@ -48,7 +51,7 @@ import ActionButton from '../../components/common/ActionButton'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import StatCard from '../../components/common/StatCard'
 import TablePaginationStyled from '../../components/common/TablePaginationStyled'
-import { UNIFIED_TABLE_STYLES } from '../../theme/variants'
+import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 import {
   CONSOLE_USAGE_QUERY_KEYS,
   consoleUsageApi,
@@ -72,6 +75,10 @@ const formatInt = (value: number): string => value.toLocaleString()
  */
 const formatCost = (value: number): string =>
   value >= 100 ? value.toFixed(0) : value.toFixed(2)
+
+/** 输入缓存命中率；没有输入 token 时显示破折号而不是 0% */
+const formatCacheHitRate = (cached: number, input: number): string =>
+  input > 0 ? `${((cached / input) * 100).toFixed(1)}%` : '—'
 
 function windowRange(days: number): { startTime: string; endTime: string } {
   const end = new Date()
@@ -102,12 +109,14 @@ function BreakdownTable({
             {emptyText}
           </Typography>
         ) : (
-          <Table size="small" sx={UNIFIED_TABLE_STYLES.getTableBase(false, false)}>
+          <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+          <Table size="small" sx={{ minWidth: 420 }}>
             <TableHead>
               <TableRow>
                 <TableCell>{keyHeader}</TableCell>
                 <TableCell align="right">{t('columns.records')}</TableCell>
                 <TableCell align="right">{t('columns.tokens')}</TableCell>
+                <TableCell align="right">{t('columns.cacheHitRate')}</TableCell>
                 <TableCell align="right">{t('columns.cost')}</TableCell>
               </TableRow>
             </TableHead>
@@ -119,18 +128,27 @@ function BreakdownTable({
                   </TableCell>
                   <TableCell align="right">{formatInt(item.records)}</TableCell>
                   <TableCell align="right">{formatInt(item.token_total)}</TableCell>
+                  <TableCell align="right">
+                    {formatCacheHitRate(item.token_input_cached, item.token_input)}
+                  </TableCell>
                   <TableCell align="right">{formatCost(item.cost)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
+          </Box>
         )}
       </CardContent>
     </Card>
   )
 }
 
-export default function UsagePage() {
+interface UsagePageProps {
+  /** 嵌在「额度与用量」页壳里时，不再画自己的大标题与外层页面内边距 */
+  embedded?: boolean
+}
+
+export default function UsagePage({ embedded = false }: UsagePageProps) {
   const theme = useTheme()
   const { t } = useTranslation('console-usage')
 
@@ -184,6 +202,8 @@ export default function UsagePage() {
   })
 
   const total = summaryQuery.data?.total
+  const cachedInput = total?.token_input_cached ?? 0
+  const inputTokens = total?.token_input ?? 0
   /** `?? []` 每次渲染都会造一个新数组，直接当依赖会让下面两个 useMemo 恒失效 */
   const byStatus = useMemo(() => summaryQuery.data?.by_status ?? [], [summaryQuery.data])
   /** 成功率按**条数**算：它回答的是"打出去的请求有多少拿到了回复" */
@@ -210,15 +230,24 @@ export default function UsagePage() {
   const refreshing = summaryQuery.isFetching || recordsQuery.isFetching
 
   return (
-    <Box sx={{ p: { xs: 2, md: 3 }, display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <Box>
-        <Typography variant="h5" fontWeight={700}>
-          {t('title')}
-        </Typography>
-        <Typography variant="body2" color="text.secondary">
-          {t('subtitle')}
-        </Typography>
-      </Box>
+    <Box
+      sx={{
+        p: embedded ? 0 : { xs: 2, md: 3 },
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+      }}
+    >
+      {!embedded && (
+        <Box>
+          <Typography variant="h5" fontWeight={700}>
+            {t('title')}
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            {t('subtitle')}
+          </Typography>
+        </Box>
+      )}
 
       <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap alignItems="center">
         <TextField
@@ -318,6 +347,13 @@ export default function UsagePage() {
           loading={summaryQuery.isLoading}
         />
         <StatCard
+          label={`${t('stats.inputCacheHitRate')} · ${t('stats.cachedTokens')} ${formatInt(cachedInput)}`}
+          value={formatCacheHitRate(cachedInput, inputTokens)}
+          icon={<CachedRoundedIcon />}
+          color={theme.palette.secondary.main}
+          loading={summaryQuery.isLoading}
+        />
+        <StatCard
           label={t('stats.records')}
           value={total ? formatInt(total.records) : '0'}
           icon={<ForumRoundedIcon />}
@@ -392,7 +428,7 @@ export default function UsagePage() {
             />
           ) : (
             <>
-              <Box sx={{ overflowX: 'auto' }}>
+              <Box sx={UNIFIED_TABLE_STYLES.embedded}>
                 <Table size="small" sx={UNIFIED_TABLE_STYLES.getTableBase(false, false)}>
                   <TableHead>
                     <TableRow>
@@ -402,6 +438,7 @@ export default function UsagePage() {
                       <TableCell>{t('columns.scene')}</TableCell>
                       <TableCell>{t('columns.status')}</TableCell>
                       <TableCell align="right">{t('columns.input')}</TableCell>
+                      <TableCell align="right">{t('columns.cached')}</TableCell>
                       <TableCell align="right">{t('columns.output')}</TableCell>
                       <TableCell align="right">{t('columns.cost')}</TableCell>
                     </TableRow>
@@ -416,7 +453,14 @@ export default function UsagePage() {
                         <TableCell sx={{ wordBreak: 'break-all' }}>
                           {row.model_name}
                           {row.is_fallback && (
-                            <Chip size="small" label={t('value.fallback')} sx={{ ml: 0.5 }} />
+                            <Chip
+                              size="small"
+                              label={t('value.fallback')}
+                              sx={[
+                                CHIP_VARIANTS.getPaletteChip(theme, 'warning', true),
+                                { ml: 0.5 },
+                              ] as SxProps<Theme>}
+                            />
                           )}
                           {row.attempt_index > 1 && (
                             <Chip
@@ -425,7 +469,10 @@ export default function UsagePage() {
                                 index: row.attempt_index,
                                 total: row.attempt_total,
                               })}
-                              sx={{ ml: 0.5 }}
+                              sx={[
+                                CHIP_VARIANTS.getPaletteChip(theme, 'default', true),
+                                { ml: 0.5 },
+                              ] as SxProps<Theme>}
                             />
                           )}
                         </TableCell>
@@ -441,6 +488,7 @@ export default function UsagePage() {
                           )}
                         </TableCell>
                         <TableCell align="right">{formatInt(row.token_input)}</TableCell>
+                        <TableCell align="right">{formatInt(row.token_input_cached)}</TableCell>
                         <TableCell align="right">{formatInt(row.token_output)}</TableCell>
                         <TableCell align="right">{formatCost(row.cost)}</TableCell>
                       </TableRow>

@@ -12,9 +12,17 @@ export interface ConfigItem {
   is_secret?: boolean
   is_textarea?: boolean
   ref_model_groups?: boolean
+  /** 从已导入的角色扮演预设里选一个；值是预设 ID，0 表示不使用 */
+  ref_rp_presets?: boolean
   is_hidden?: boolean
   required?: boolean // 添加必填属性
   model_type?: string
+  minimum?: number // 字段的 ge
+  maximum?: number // 字段的 le
+  /** 这个整数项用滑块编辑 */
+  slider?: boolean
+  /** 0 表示「不设上限」 */
+  zero_means_unlimited?: boolean
   /**
    * 从关切到开时先弹的确认文案
    *
@@ -44,6 +52,12 @@ export interface ModelGroupConfig {
   ENABLE_COT?: boolean
   /** 预填方式；后端默认 off */
   PREFILL_MODE?: 'off' | 'assistant' | 'deepseek'
+  /** 聊天接口格式；后端默认 openai（OpenAI 兼容） */
+  API_FORMAT?: 'openai' | 'gemini'
+  /** 模型上下文窗口（token）；0 = 未填 */
+  CONTEXT_LENGTH?: number
+  /** 分词系数（相对 o200k_base）；0 = 按模型名自动取 */
+  TOKEN_COUNT_FACTOR?: number
 }
 
 export interface ModelTypeOption {

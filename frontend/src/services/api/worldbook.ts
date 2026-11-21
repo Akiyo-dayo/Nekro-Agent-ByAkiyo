@@ -20,6 +20,14 @@ export interface WorldbookScopeParams {
 export const WORLDBOOK_SCOPE_KINDS = ['domain', 'preset', 'channel', 'person'] as const
 export type WorldbookScopeKind = (typeof WORLDBOOK_SCOPE_KINDS)[number]
 
+/** 书的注入方式：关键词命中就推送、留给模型自己查，或两样都行 */
+export const WORLDBOOK_INJECT_MODES = ['push', 'lookup', 'both'] as const
+export type WorldbookInjectMode = (typeof WORLDBOOK_INJECT_MODES)[number]
+
+/** 书的生效场景：私聊和群聊、只在私聊，或只在群聊 */
+export const WORLDBOOK_ACTIVE_SCENES = ['both', 'private', 'group'] as const
+export type WorldbookActiveScene = (typeof WORLDBOOK_ACTIVE_SCENES)[number]
+
 export const WORLDBOOK_POSITIONS = ['after_persona', 'before_history', 'at_depth'] as const
 export type WorldbookPosition = (typeof WORLDBOOK_POSITIONS)[number]
 
@@ -54,8 +62,30 @@ export const WORLDBOOK_IMPORT_NOTE_KINDS = [
   'renumbered',
   'bad_value',
   'over_budget',
+  'name_var',
+  'state_only',
+  'unsupported_template',
+  'suspected_trap',
+  'template_not_analyzed',
+  'budget_check',
+  'unsupported',
 ] as const
 export type WorldbookImportNoteKind = (typeof WORLDBOOK_IMPORT_NOTE_KINDS)[number]
+
+/**
+ * 条目的用途（`services/worldbook/purpose.py`，由标题与正文现算、不存库）
+ *
+ * `normal` / `mvu_plot` 照常注入；`mvu_update` / `initvar` / `state_render` 仅在开启角色状态时
+ * 使用，不进主提示词；`unsupported_template` 含不支持的模板，不注入。
+ */
+export type WorldbookEntryPurpose =
+  | 'normal'
+  | 'mvu_plot'
+  | 'mvu_update'
+  | 'initvar'
+  | 'state_render'
+  | 'unsupported_template'
+export const WORLDBOOK_STATE_ONLY_PURPOSES: readonly string[] = ['mvu_update', 'initvar', 'state_render']
 
 /** 与后端 `services/worldbook/types.py` 同值：表单校验与展示都用这一份 */
 export const WORLDBOOK_NAME_MAX_LENGTH = 128
@@ -71,7 +101,7 @@ export const WORLDBOOK_SCAN_DEPTH_MAX = 50
 export const WORLDBOOK_DEPTH_MIN = 0
 export const WORLDBOOK_DEPTH_MAX = 100
 export const WORLDBOOK_TIMED_MAX = 200
-export const WORLDBOOK_BUDGET_MAX = 100_000
+export const WORLDBOOK_BUDGET_MAX = 65_536
 export const WORLDBOOK_ORDER_MIN = -100_000
 export const WORLDBOOK_ORDER_MAX = 100_000
 export const WORLDBOOK_IMPORT_MAX_BYTES = 32 * 1024 * 1024
@@ -79,8 +109,74 @@ export const WORLDBOOK_PERSON_NOTE_MAX_LENGTH = 500
 
 /** 触发测试命中的原因：常驻，或某个关键词 */
 export type WorldbookTriggerReasonKind = 'constant' | 'key'
-/** 被预算跳过的原因 */
-export type WorldbookTriggerDropReason = 'global_chars' | 'book_chars' | 'max_entries'
+/** 命中了但没注入的原因：前三个是预算，后面是用途与模板（含每轮模板预算） */
+export type WorldbookTriggerDropReason =
+  | 'global_tokens'
+  | 'book_tokens'
+  | 'max_entries'
+  | 'state_only'
+  | 'template_unsupported'
+  | 'template_trap'
+  | 'template_error'
+  | 'template_empty'
+  | 'template_budget'
+
+/** 触发测试与提示词明细共用的预算换算结果 */
+export interface WorldbookBudgetInfo {
+  model_group: string
+  context_length: number
+  context_length_set: boolean
+  output_reserve: number
+  percent: number
+  cap_tokens: number
+  base: number
+  budget: number
+  factor: number
+  factor_source: string
+  factor_family: string
+  estimator: string
+  fallback_model_group: string
+  fallback_context_length: number
+  approx_chars: number
+}
+
+/**
+ * 预算体检里一条在「只有常驻条目命中」时被跳过的常驻条目；`reason` 是 `global_tokens` /
+ * `book_tokens` / `max_entries`。只有 `alone_over` 为真的才是永远进不来，其余的在关键词条目
+ * 命中后可能反而放得下
+ */
+export interface BudgetDroppedItem {
+  entry_id: number
+  uid: number
+  title: string
+  tokens: number
+  reason: string
+  /** 这一条单独就超过预算：再怎么腾也进不来 */
+  alone_over: boolean
+}
+
+/**
+ * 书的预算体检：把书里启用的常驻条目当作这一轮全都命中，按每轮预算装一遍
+ *
+ * `budget` 为 null 表示没有体检结果（预算读不到，或这本书对当前租户只读）；
+ * `truncated` 为真表示常驻条目太多，只看了编号最小的一批。
+ */
+export interface BookBudgetCheck {
+  budget: WorldbookBudgetInfo | null
+  book_budget: number
+  max_entries: number
+  constant_count: number
+  constant_tokens: number
+  fit_count: number
+  fit_tokens: number
+  routed_out: number
+  dropped: BudgetDroppedItem[]
+  truncated: boolean
+  /** 这个账号下已经有一个体检在算，这次没算；`summary` 写着稍后再看 */
+  busy: boolean
+  /** 一句中文结论，可以直接显示 */
+  summary: string
+}
 
 export interface WorldbookInstanceOption {
   adapter_key: string
@@ -119,9 +215,21 @@ export interface WorldbookBookItem {
   person_account: string
   enabled: boolean
   scan_depth: number
-  budget_chars: number
+  budget_tokens: number
+  inject_mode: WorldbookInjectMode
+  active_scene: WorldbookActiveScene
   case_sensitive: boolean
   match_whole_words: boolean
+  /** 扫描时每条消息前带上说话人名字（Bot 用人设名、群友用昵称） */
+  scan_names: boolean
+  /** 本书全部非常驻条目都参与语义触发 */
+  vector_all: boolean
+  /** 语义查询取最近几条非空消息 */
+  vector_query_messages: number
+  /** 本书每轮最多语义命中几条 */
+  vector_max_entries: number
+  /** 语义相似度下限 */
+  vector_threshold: number
   entry_count: number
   quarantined_count: number
   update_time: string | null
@@ -132,6 +240,10 @@ export interface WorldbookBookItem {
 
 export interface WorldbookBookDetail extends WorldbookBookItem {
   ext_keys: string[]
+  /** 参与语义触发的条目数 */
+  vector_participating: number
+  /** 参与语义触发但还没生成向量的条目数 */
+  vector_pending: number
 }
 
 export interface WorldbookBookListResponse {
@@ -166,6 +278,10 @@ export interface WorldbookEntryItem {
   delay: number | null
   enabled: boolean
   trusted: boolean
+  /** 这条参与语义触发（向量激活） */
+  vectorized: boolean
+  /** 命中后不受全局与这本书的预算限制；只对宿主条目生效 */
+  ignore_budget: boolean
   status: string
   quarantined_at: string | null
   quarantine_reason: string
@@ -174,10 +290,31 @@ export interface WorldbookEntryItem {
   update_time: string | null
   invalid_keys: WorldbookInvalidKeyItem[]
   slow_disabled_keys: string[]
+  purpose: WorldbookEntryPurpose
+  /** 含不支持的模板时的原因 */
+  template_note: string
+  suspected_trap: boolean
+  trap_reason: string
+  /** 这次请求的分析预算用完、还没分析的条目：用途与防盗标记稍后再取 */
+  analysis_pending: boolean
+}
+
+/** 书详情每页条数（后端默认 50、最多 200） */
+export const WORLDBOOK_ENTRY_PAGE_SIZE = 50
+
+export interface WorldbookEntryListParams {
+  /** 从 1 开始 */
+  page?: number
+  page_size?: number
+  /** 按标题、关键词、正文搜（不区分大小写） */
+  q?: string
 }
 
 export interface WorldbookEntryListResponse {
   items: WorldbookEntryItem[]
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface WorldbookQuarantineItem {
@@ -263,15 +400,28 @@ export interface WorldbookTriggerHitItem {
   comment: string
   reason_kind: string
   matched_key: string
+  /** 语义命中的余弦相似度；其余原因为 null */
+  score: number | null
   position: string
   order: number
   chars: number
+  /** 这一轮分词系数下的 token 数 */
+  tokens: number | null
   trusted: boolean
+  /** 这一条是靠「忽略预算」进来的 */
+  ignored_budget: boolean
 }
 
 export interface WorldbookTriggerDroppedItem {
   entry_id: number
-  reason: string
+  reason: WorldbookTriggerDropReason
+  /** 这一轮分词系数下的 token 数 */
+  tokens: number | null
+  /**
+   * 因预算（`global_tokens` / `book_tokens`）被跳过时，在它前面入选、占掉预算的条目 ID
+   * （按入选顺序）；其它原因为空数组
+   */
+  ahead: number[]
 }
 
 export interface WorldbookTriggerGroups {
@@ -296,6 +446,9 @@ export interface WorldbookTriggerTestResponse {
   timed_ignored: boolean
   gate_enabled: boolean
   rendered: WorldbookTriggerRendered
+  budget: WorldbookBudgetInfo | null
+  /** 入选条目合计 token */
+  total_tokens: number
 }
 
 export interface WorldbookBookCreateRequest {
@@ -307,9 +460,17 @@ export interface WorldbookBookCreateRequest {
   person_account?: string
   enabled?: boolean
   scan_depth?: number | null
-  budget_chars?: number
+  budget_tokens?: number
+  inject_mode?: WorldbookInjectMode
+  active_scene?: WorldbookActiveScene
   case_sensitive?: boolean
   match_whole_words?: boolean
+  /** 扫描时每条消息前带上说话人名字；不传时按后端默认 */
+  scan_names?: boolean
+  vector_all?: boolean
+  vector_query_messages?: number
+  vector_max_entries?: number
+  vector_threshold?: number
 }
 
 export interface WorldbookBookUpdateRequest {
@@ -317,9 +478,16 @@ export interface WorldbookBookUpdateRequest {
   description?: string
   enabled?: boolean
   scan_depth?: number
-  budget_chars?: number
+  budget_tokens?: number
+  inject_mode?: WorldbookInjectMode
+  active_scene?: WorldbookActiveScene
   case_sensitive?: boolean
   match_whole_words?: boolean
+  scan_names?: boolean
+  vector_all?: boolean
+  vector_query_messages?: number
+  vector_max_entries?: number
+  vector_threshold?: number
 }
 
 export interface WorldbookEntryCreateRequest {
@@ -340,7 +508,11 @@ export interface WorldbookEntryCreateRequest {
   cooldown: number | null
   delay: number | null
   enabled: boolean
+  /** 这条参与语义触发（向量激活） */
+  vectorized?: boolean
   trusted?: boolean
+  /** 命中后不受全局与这本书的预算限制；只对宿主条目生效 */
+  ignore_budget?: boolean
 }
 
 export interface WorldbookEntryUpdateRequest {
@@ -361,7 +533,106 @@ export interface WorldbookEntryUpdateRequest {
   cooldown?: number | null
   delay?: number | null
   enabled?: boolean
+  /** 这条参与语义触发（向量激活） */
+  vectorized?: boolean
   trusted?: boolean
+  /** 命中后不受全局与这本书的预算限制；只对宿主条目生效 */
+  ignore_budget?: boolean
+}
+
+/** 图谱节点 / 边上的业务字段。后端按节点类型只填其中一部分，所以全部可选 */
+export interface WorldbookGraphMetadata {
+  scope_kind?: WorldbookScopeKind
+  entry_count?: number
+  constant_count?: number
+  quarantined_count?: number
+  inject_mode?: WorldbookInjectMode
+  active_scene?: WorldbookActiveScene
+  vector_all?: boolean
+  read_only?: boolean
+  instance_key?: string
+  preset_id?: number
+  preset_name?: string
+  chat_key?: string
+  channel_name?: string
+  person_account?: string
+  book_ids?: number[]
+  book_id?: number
+  uid?: number
+  keys?: string[]
+  constant?: boolean
+  vectorized?: boolean
+  ignore_budget?: boolean
+  trusted?: boolean
+  position?: WorldbookPosition
+  injected?: number
+  dropped?: number
+  lookups?: number
+  /** 最近只被预算挤掉、一次都没进去过 */
+  starved?: boolean
+  preview?: string
+  /** 关键词引用是推导出来的，不是模型给的 */
+  derived?: boolean
+  /** 后端可能加字段；面板用字符串键读，不因为多一个字段就报类型错 */
+  [key: string]: unknown
+}
+
+export interface WorldbookGraphNode {
+  id: string
+  /** `book` / `entry` / `preset` / `channel` / `person` */
+  memory_type: string
+  ref_id: number
+  label: string
+  subtitle: string
+  /** `active` / `inactive` / `quarantined` */
+  status: string
+  cognitive_type: string | null
+  weight: number
+  size: number
+  importance: number
+  paragraph_id: number | null
+  metadata: WorldbookGraphMetadata
+}
+
+export interface WorldbookGraphEdge {
+  id: string
+  source: string
+  target: string
+  /** `book_entry` / `book_binding` / `key_reference` */
+  edge_type: string
+  label: string
+  weight: number
+  strength: number
+  status: string
+  cognitive_type: string | null
+  metadata: WorldbookGraphMetadata
+}
+
+export interface WorldbookGraphResponse {
+  generated_at: string
+  nodes: WorldbookGraphNode[]
+  edges: WorldbookGraphEdge[]
+  node_count: number
+  edge_count: number
+  books_total: number
+  books_drawn: number
+  entries_total: number
+  entries_drawn: number
+  /** 最近扫了多少轮提示词明细 */
+  rounds_scanned: number
+  books_truncated: boolean
+  entries_truncated: boolean
+  references_truncated: boolean
+}
+
+export interface WorldbookGraphParams extends WorldbookScopeParams {
+  /** 只看一本书；不传是作用域内全部书 */
+  book_id?: number
+  /** 条目标题 / 关键词 / 正文包含；与条目列表搜索同义 */
+  q?: string
+  include_inactive?: boolean
+  /** 条目节点上限；后端夹在 50 ~ 600 */
+  limit?: number
 }
 
 export interface WorldbookBookListParams {
@@ -413,6 +684,14 @@ export const worldbookApi = {
     return response.data
   },
 
+  /** 世界书图谱：书、条目、绑定对象，以及条目间的关键词引用 */
+  getGraph: async (params: WorldbookGraphParams = {}): Promise<WorldbookGraphResponse> => {
+    const response = await axios.get<WorldbookGraphResponse>('/worldbook/graph', {
+      params: compact(params),
+    })
+    return response.data
+  },
+
   createBook: async (
     body: WorldbookBookCreateRequest,
     scope: WorldbookScopeParams
@@ -425,6 +704,12 @@ export const worldbookApi = {
 
   getBook: async (bookId: number): Promise<WorldbookBookDetail> => {
     const response = await axios.get<WorldbookBookDetail>(`/worldbook/books/${bookId}`)
+    return response.data
+  },
+
+  /** 预算体检：常驻条目合计、按每轮预算能进几条、哪几条永远进不来 */
+  getBookBudgetCheck: async (bookId: number): Promise<BookBudgetCheck> => {
+    const response = await axios.get<BookBudgetCheck>(`/worldbook/books/${bookId}/budget-check`)
     return response.data
   },
 
@@ -441,9 +726,13 @@ export const worldbookApi = {
     return response.data
   },
 
-  listEntries: async (bookId: number): Promise<WorldbookEntryListResponse> => {
+  listEntries: async (
+    bookId: number,
+    params: WorldbookEntryListParams = {}
+  ): Promise<WorldbookEntryListResponse> => {
     const response = await axios.get<WorldbookEntryListResponse>(
-      `/worldbook/books/${bookId}/entries`
+      `/worldbook/books/${bookId}/entries`,
+      { params }
     )
     return response.data
   },
@@ -467,6 +756,12 @@ export const worldbookApi = {
       `/worldbook/entries/${entryId}`,
       body
     )
+    return response.data
+  },
+
+  /** 按 ID 取一条；供图谱详情里「在书里打开这一条」与地址参数 `?entry=` 用 */
+  getEntry: async (entryId: number): Promise<WorldbookEntryItem> => {
+    const response = await axios.get<WorldbookEntryItem>(`/worldbook/entries/${entryId}`)
     return response.data
   },
 
@@ -501,7 +796,8 @@ export const worldbookApi = {
   importNewBook: async (
     file: File,
     fields: WorldbookBookCreateRequest,
-    scope: WorldbookScopeParams
+    scope: WorldbookScopeParams,
+    rewriteNameVars = true
   ): Promise<WorldbookImportReport> => {
     const formData = new FormData()
     formData.append('file', file)
@@ -515,9 +811,13 @@ export const worldbookApi = {
     if (fields.scan_depth !== undefined && fields.scan_depth !== null) {
       formData.append('scan_depth', String(fields.scan_depth))
     }
-    formData.append('budget_chars', String(fields.budget_chars ?? 0))
+    formData.append('budget_tokens', String(fields.budget_tokens ?? 0))
+    formData.append('inject_mode', fields.inject_mode ?? 'both')
+    formData.append('active_scene', fields.active_scene ?? 'both')
     formData.append('case_sensitive', String(fields.case_sensitive ?? false))
     formData.append('match_whole_words', String(fields.match_whole_words ?? false))
+    formData.append('rewrite_name_vars', String(rewriteNameVars))
+    formData.append('scan_names', String(fields.scan_names ?? true))
     const response = await axios.post<WorldbookImportReport>(
       '/worldbook/books/import',
       formData,
@@ -529,9 +829,14 @@ export const worldbookApi = {
     return response.data
   },
 
-  importIntoBook: async (bookId: number, file: File): Promise<WorldbookImportReport> => {
+  importIntoBook: async (
+    bookId: number,
+    file: File,
+    rewriteNameVars = true
+  ): Promise<WorldbookImportReport> => {
     const formData = new FormData()
     formData.append('file', file)
+    formData.append('rewrite_name_vars', String(rewriteNameVars))
     const response = await axios.post<WorldbookImportReport>(
       `/worldbook/books/${bookId}/import`,
       formData,

@@ -43,9 +43,13 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
+from .name_vars import rewrite_name_vars
 from .safe_regex import validate_regex_key
+
+if TYPE_CHECKING:
+    from .budget import WorldbookBudget
 from .types import (
     DEPTH_MAX,
     DEPTH_MIN,
@@ -69,6 +73,9 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 IMPORT_MAX_BYTES = MAX_FILE_BYTES
 MAX_ENTRIES = 50_000
 MAX_JSON_DEPTH = 32
+# 条目编号能存下的范围（`wb_entry.uid` 是 32 位整数列）
+UID_MIN = -(2**31)
+UID_MAX = 2**31 - 1
 
 # 条目字段的默认值，逐个照抄酒馆 `newWorldInfoEntryDefinition` 的 `default`（2026-02 核对，
 # 源文件 `public/scripts/world-info.js` 的 `newWorldInfoEntryDefinition`）。`uid` 不在里面：
@@ -162,15 +169,25 @@ _COLUMN_TO_ST_FIELD: dict[str, str] = {
     "scan_depth": "scanDepth",
     "case_sensitive": "caseSensitive",
     "match_whole_words": "matchWholeWords",
+    "ignore_budget": "ignoreBudget",
     "sticky": "sticky",
     "cooldown": "cooldown",
     "delay": "delay",
     "enabled": "disable",
+    "vectorized": "vectorized",
 }
 
 # 导入报告的类别。`summarize_notes` 按这些键计数，全部键始终存在（0 也要在），前端才能
 # 无条件读某个键。`truncated` 留着只为前端与旧报告的键不变：导入超了安全上限现在是整份
 # 拒绝，这个类别恒为 0。`over_budget` 只是提示：正文比每轮注入预算还长，照样完整导入。
+# 最后三类来自 `purpose.template_import_notes`，同样只是提示，条目照样完整导入、启用状态
+# 不改：`state_only` 仅在开启角色状态时使用、`unsupported_template` 含不支持的模板（两者
+# 都不进主提示词）、`suspected_trap` 疑似防盗条目、`template_not_analyzed` 一次导入的模板分析
+# 超过上限、这一条导入时没有逐条分析（运行时命中后照常分析）。`budget_check` 是整本书的预算体检
+# （`budget_check` 模块：常驻条目合计、能进几条、哪几条永远进不来），`unsupported` 是「不生效清单」
+# （`unsupported` 模块：EJS 模板块、NA 不支持的条目功能），都是一本书一条，只是提示。`name_var`
+# 是正文里读用户 / 角色名字的变量换成了 `{{user}}` / `{{char}}` 宏，条目照样完整导入。
+# `vector_pending` 是「有 n 条标了向量激活，导入后会在后台生成向量」，同样只是提示。
 NOTE_KINDS = (
     "skipped",
     "truncated",
@@ -180,6 +197,14 @@ NOTE_KINDS = (
     "renumbered",
     "bad_value",
     "over_budget",
+    "name_var",
+    "state_only",
+    "unsupported_template",
+    "suspected_trap",
+    "template_not_analyzed",
+    "budget_check",
+    "unsupported",
+    "vector_pending",
 )
 
 
@@ -238,11 +263,10 @@ def _ensure_depth_within_limit(data: Any) -> None:
                 stack.append((value, depth + 1))
 
 
-def parse_world_file(data: bytes) -> ParsedWorld:
-    """把一个世界书文件读成书级附加字段与条目列表
+def _load_json(data: bytes) -> Any:
+    """读 JSON 并检查大小与嵌套深度；所有拒绝都抛 :class:`WorldFileRejected`
 
-    所有拒绝都抛 :class:`WorldFileRejected`，消息是中文原因。含 BOM 的文件按
-    `utf-8-sig` 解：酒馆导出的文件在 Windows 上偶尔带 BOM，为它报「不是 UTF-8」没意义。
+    含 BOM 的文件按 `utf-8-sig` 解：酒馆导出的文件在 Windows 上偶尔带 BOM，为它报「不是 UTF-8」没意义。
     """
     if len(data) > MAX_FILE_BYTES:
         raise WorldFileRejected(f"文件超过 {MAX_FILE_BYTES // (1024 * 1024)} MiB，整份未导入")
@@ -258,10 +282,23 @@ def parse_world_file(data: bytes) -> ParsedWorld:
         raise WorldFileRejected(f"JSON 嵌套超过 {MAX_JSON_DEPTH} 层") from exc
     except ValueError as exc:
         raise WorldFileRejected(f"不是合法的 JSON：{exc}") from exc
+    _ensure_depth_within_limit(parsed)
+    return parsed
+
+
+def parse_world_file(data: bytes) -> ParsedWorld:
+    """把一个世界书文件读成书级附加字段与条目列表
+
+    所有拒绝都抛 :class:`WorldFileRejected`，消息是中文原因。
+    """
+    parsed = _load_json(data)
     if not isinstance(parsed, dict):
         raise WorldFileRejected("顶层必须是一个对象")
-    _ensure_depth_within_limit(parsed)
+    return _parse_st_world(parsed)
 
+
+def _parse_st_world(parsed: Mapping[str, Any]) -> ParsedWorld:
+    """酒馆世界书格式：`entries` 是按 `uid` 挂条目的对象"""
     raw_entries = parsed.get("entries")
     if not isinstance(raw_entries, dict):
         raise WorldFileRejected("entries 必须是一个对象")
@@ -271,8 +308,206 @@ def parse_world_file(data: bytes) -> ParsedWorld:
         if isinstance(raw, dict):
             check_entry_limits(raw, label=f"第 {entry_key} 号条目")
 
-    book_ext = {key: value for key, value in parsed.items() if key != "entries"}
-    return ParsedWorld(book_ext=book_ext, entries=list(raw_entries.items()))
+    return ParsedWorld(book_ext=_file_book_ext(parsed), entries=list(raw_entries.items()))
+
+
+def _file_book_ext(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    """文件顶层除 `entries` 外的键，去掉 `na_` 开头的：那是本插件自己记在书级 `ext` 里的（远程来源、卡内书原文），
+    文件里带了也不认——否则一份普通的世界书文件就能冒充「已经导入的远程世界书」。导出时同样不带（`export_world`）。
+    """
+    return {key: value for key, value in parsed.items() if key != "entries" and not str(key).startswith("na_")}
+
+
+# ---------------------------------------------------------------------------
+# 酒馆助手的世界书格式（卡片脚本下载、用 `createOrReplaceWorldbook` 建书的那种）
+# ---------------------------------------------------------------------------
+
+# 书级 `ext` 里记下文件原来是哪种格式
+SOURCE_FORMAT_KEY = "na_source_format"
+TAVERN_HELPER_FORMAT = "tavern-helper-worldbook"
+
+# 下面几张表与默认值照抄酒馆助手（JS-Slash-Runner）`src/function/worldbook.ts` 的 `fromWorldbookEntry`
+# 与 `_default_implicit_keys`：它的条目把关键词、位置、递归、定时效果收进几个对象，存进酒馆时再
+# 摊平成酒馆的字段。这里照它的规则摊平，后面就是普通的酒馆条目了。
+_TH_LOGIC = {"and_any": 0, "not_all": 1, "not_any": 2, "and_all": 3}
+_TH_POSITION = {
+    "before_character_definition": 0,
+    "after_character_definition": 1,
+    "before_example_messages": 5,
+    "after_example_messages": 6,
+    "before_author_note": 2,
+    "after_author_note": 3,
+    "at_depth": 4,
+    "outlet": 7,
+}
+_TH_ROLE = {"system": 0, "user": 1, "assistant": 2}
+_TH_IMPLICIT_DEFAULTS: dict[str, Any] = {
+    "addMemo": True,
+    "matchPersonaDescription": False,
+    "matchCharacterDescription": False,
+    "matchCharacterPersonality": False,
+    "matchCharacterDepthPrompt": False,
+    "matchScenario": False,
+    "matchCreatorNotes": False,
+    "group": "",
+    "groupOverride": False,
+    "groupWeight": 100,
+    "caseSensitive": None,
+    "matchWholeWords": None,
+    "useGroupScoring": None,
+    "automationId": "",
+    "ignoreBudget": False,
+    "outletName": "",
+    "triggers": [],
+    "characterFilter": {"isExclude": False, "names": [], "tags": []},
+}
+
+
+def _nullish(value: Any, default: Any) -> Any:
+    """JS 的 `value ?? default`"""
+    return default if value is None else value
+
+
+def _object(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _th_key(value: Any) -> Any:
+    """关键词照 lodash 的 `_.toString` 转成字符串（酒馆助手会把数字关键词转成字符串）
+
+    对象与数组不转，原样交给后面的映射按「非字符串关键词」丢弃并记一条说明。
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e21:
+        return str(int(value))
+    return value
+
+
+def _th_keys(value: Any) -> Any:
+    """`keys?.map(_.toString) ?? []`；不是数组的原样留着，由后面的映射记 `bad_value`"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return value
+    return [_th_key(item) for item in value]
+
+
+def tavern_helper_entry_to_st(entry: Mapping[str, Any], display_index: int) -> dict[str, Any]:
+    """把一条酒馆助手条目摊平成酒馆的原始条目（照 `fromWorldbookEntry`）
+
+    认不出的枚举值（未知的位置、次关键词逻辑、角色）原样写进酒馆字段，由 :func:`st_entry_to_columns`
+    按「未知的值」记进报告并取默认，不在这里悄悄改掉。`uid` 不是整数时不写，交给导入时重新编号。
+    """
+    strategy = _object(entry.get("strategy"))
+    secondary = _object(strategy.get("keys_secondary"))
+    position = _object(entry.get("position"))
+    recursion = _object(entry.get("recursion"))
+    effect = _object(entry.get("effect"))
+    strategy_type = strategy.get("type")
+    scan_depth = strategy.get("scan_depth")
+    logic = _nullish(secondary.get("logic"), "and_any")
+    position_type = _nullish(position.get("type"), "at_depth")
+    position_value = _TH_POSITION.get(position_type, position_type) if isinstance(position_type, str) else position_type
+    role = _nullish(position.get("role"), "system")
+
+    raw: dict[str, Any] = {}
+    uid = entry.get("uid")
+    if isinstance(uid, int) and not isinstance(uid, bool):
+        raw["uid"] = uid
+    raw.update(
+        {
+            "displayIndex": display_index,
+            "comment": _nullish(entry.get("name"), ""),
+            "disable": not _nullish(entry.get("enabled"), True),
+            # 没写类型时酒馆助手按常驻处理（`type ? type === 'constant' : true`）
+            "constant": strategy_type == "constant" if strategy_type else True,
+            "selective": strategy_type == "selective",
+            "key": _th_keys(strategy.get("keys")),
+            "selectiveLogic": _TH_LOGIC.get(logic, logic) if isinstance(logic, str) else logic,
+            "keysecondary": _th_keys(secondary.get("keys")),
+            "scanDepth": None if scan_depth == "same_as_global" else scan_depth,
+            "vectorized": strategy_type == "vectorized",
+            "position": position_value,
+            "role": _TH_ROLE.get(role, role) if isinstance(role, str) else role,
+            "depth": _nullish(position.get("depth"), 4),
+            "order": _nullish(position.get("order"), 100),
+            "content": _nullish(entry.get("content"), ""),
+            "useProbability": True,
+            "probability": _nullish(entry.get("probability"), 100),
+            "excludeRecursion": _nullish(recursion.get("prevent_incoming"), False),
+            "preventRecursion": _nullish(recursion.get("prevent_outgoing"), False),
+            "delayUntilRecursion": _nullish(recursion.get("delay_until"), False),
+            "sticky": effect.get("sticky"),
+            "cooldown": effect.get("cooldown"),
+            "delay": effect.get("delay"),
+        }
+    )
+    if entry.get("extra"):
+        raw["extra"] = copy.deepcopy(entry["extra"])
+    for key, default in _TH_IMPLICIT_DEFAULTS.items():
+        value = entry[key] if key in entry else default
+        if key == "characterFilter" and isinstance(value, Mapping):
+            # lodash 的 merge 是按键合并：条目只写了其中几项时，别的项仍是默认值
+            value = {**default, **value}
+        raw[key] = copy.deepcopy(value)
+    return raw
+
+
+def _looks_like_tavern_helper(entries: list[Any]) -> bool:
+    """条目里有 `strategy` 或 `position` 对象：酒馆助手的格式（酒馆的条目里 `position` 是数字）"""
+    return any(
+        isinstance(item, Mapping)
+        and (isinstance(item.get("strategy"), Mapping) or isinstance(item.get("position"), Mapping))
+        for item in entries
+    )
+
+
+def parse_world_payload(data: bytes) -> ParsedWorld:
+    """世界书文件：酒馆的世界书格式，或酒馆助手的格式（`entries` 是条目数组，或顶层就是条目数组）
+
+    酒馆助手的条目逐条摊平成酒馆的原始条目（见 :func:`tavern_helper_entry_to_st`），之后的映射、
+    安全上限与导入分析与酒馆格式完全相同。书级 `ext` 原样保留文件顶层除 `entries` 外的字段
+    （`book_name`、`version` 之类），另记 `na_source_format`。别的形状整份拒绝。
+    """
+    parsed = _load_json(data)
+    if isinstance(parsed, list):
+        raw_entries: Any = parsed
+        book_ext: dict[str, Any] = {}
+    elif isinstance(parsed, dict):
+        raw_entries = parsed.get("entries")
+        if isinstance(raw_entries, dict):
+            return _parse_st_world(parsed)
+        if not isinstance(raw_entries, list):
+            raise WorldFileRejected("认不出的世界书格式：entries 既不是对象也不是数组")
+        book_ext = _file_book_ext(parsed)
+    else:
+        raise WorldFileRejected("顶层必须是一个对象或数组")
+    if not raw_entries:
+        raise WorldFileRejected("文件里没有条目")
+    if not _looks_like_tavern_helper(raw_entries):
+        raise WorldFileRejected("认不出的世界书格式：条目既不是酒馆的格式，也不是酒馆助手的格式")
+    if len(raw_entries) > MAX_ENTRIES:
+        raise WorldFileRejected(f"条目数 {len(raw_entries)} 超过安全上限 {MAX_ENTRIES}，整份未导入")
+
+    entries: list[tuple[str, Any]] = []
+    for index, item in enumerate(raw_entries):
+        if not isinstance(item, Mapping):
+            # 非对象的条目照酒馆格式的规矩：导入时整条跳过并记一条说明
+            entries.append((f"#{index + 1}", item))
+            continue
+        raw = tavern_helper_entry_to_st(item, index)
+        check_entry_limits(raw, label=f"第 {index + 1} 条")
+        uid = raw.get("uid")
+        entries.append((str(uid) if uid is not None else f"#{index + 1}", raw))
+    book_ext[SOURCE_FORMAT_KEY] = TAVERN_HELPER_FORMAT
+    return ParsedWorld(book_ext=book_ext, entries=entries)
 
 
 def check_entry_limits(raw: Mapping[str, Any], *, label: str) -> None:
@@ -300,25 +535,32 @@ def check_entry_limits(raw: Mapping[str, Any], *, label: str) -> None:
                 )
 
 
-def budget_notes(columns_list: Iterable[tuple[str, Mapping[str, Any]]], *, max_chars: int) -> list[ImportNote]:
-    """正文比每轮注入预算还长的条目，各记一条 `over_budget` 提示
+def budget_notes(
+    columns_list: Iterable[tuple[str, Mapping[str, Any]]],
+    *,
+    budget: Optional["WorldbookBudget"],
+) -> list[ImportNote]:
+    """正文比每轮世界书预算还长的条目，各记一条 `over_budget` 提示
 
     只提示、不截断：预算是配置项，管理员调大以后这一条就进得去；在导入时截掉，就再也
-    找不回原文了。`max_chars <= 0` 表示这个实例根本不注入世界书正文，逐条提示没有意义。
+    找不回原文了。预算读不到（`None`）就不提示。token 数按这个实例主模型组的分词系数算，
+    与运行时同一个数法。
     """
-    if max_chars <= 0:
+    if budget is None:
         return []
     notes: list[ImportNote] = []
     for entry_key, columns in columns_list:
-        length = len(str(columns.get("content") or ""))
-        if length > max_chars:
+        content = str(columns.get("content") or "")
+        size = budget.count(content)
+        if size > budget.budget:
             notes.append(
                 ImportNote(
                     entry_key,
                     "content",
                     "over_budget",
-                    f"这一条正文有 {length} 字，比每轮注入上限 WORLDBOOK_MAX_CHARS（{max_chars}）还长，"
-                    "按现在的设置注入不进去",
+                    f"这一条正文约 {size} token（{len(content)} 字），比每轮世界书预算 {budget.budget} token 还长"
+                    f"（按模型组 {budget.model_group or '（未设置）'} 算，见 WORLDBOOK_BUDGET_PERCENT / "
+                    "WORLDBOOK_BUDGET_CAP_TOKENS），按现在的设置注入不进去",
                 ),
             )
     return notes
@@ -386,6 +628,25 @@ def _bool_or_default(value: Any, default: bool) -> bool:
     return default
 
 
+def _bool_with_note(
+    value: Any,
+    *,
+    entry_key: str,
+    field: str,
+    notes: list[ImportNote],
+) -> bool:
+    """读一个非空布尔列：读不懂按 False，并记一条 `bad_value`
+
+    判据与 `_bool_or_default` 相同（非布尔一律当假），区别只是把「读不懂」写进导入报告：
+    这个开关会让一条宿主条目绕过预算，静默按假处理会让管理员以为文件里写的那个 true 生效了。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is not None:
+        notes.append(ImportNote(entry_key, field, "bad_value", "不是布尔值，按 False 处理"))
+    return False
+
+
 def _optional_bool(value: Any) -> bool | None:
     """三态布尔：`None` 表示「跟书」"""
     if value is None:
@@ -451,12 +712,19 @@ def _map_text(
     return value
 
 
-def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[ImportNote]]:
+def st_entry_to_columns(
+    raw: Mapping[str, Any],
+    *,
+    rewrite_names: bool = True,
+) -> tuple[dict[str, Any], list[ImportNote]]:
     """把一条酒馆条目映射成 `wb_entry` 的列
 
     返回的字典键名与 :class:`~nekro_agent.models.db_wb_entry.DBWbEntry` 的字段同名，但
     不含 `book`、`trusted`、`status`、`ext`：前三个由调用方按权限与导入人决定，`ext` 存
     原始条目。
+
+    `rewrite_names` 为假时不把正文里读名字的变量换成宏（导入对话框的开关）；导出时算基线
+    的调用保持默认值，这样「列值」与「把原始条目再映射一遍」的比较仍然一致。
 
     `uid` 不是整数时给 `None`：追加导入时调用方要重编号，新建时取书内最大值加一。这里
     不擅自造一个编号，否则「原 `uid` 丢了」会变成静默的。
@@ -468,6 +736,10 @@ def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[Im
     uid = _as_int(raw_uid, 0)
     if uid is None:
         notes.append(ImportNote(entry_key, "uid", "bad_value", "uid 不是整数，交由调用方编号"))
+    elif not UID_MIN <= uid <= UID_MAX:
+        # `wb_entry.uid` 是 32 位整数列：超出范围的编号写库时会报错，整份导入失败成 500
+        notes.append(ImportNote(entry_key, "uid", "bad_value", f"uid {uid} 超出可存的范围，交由调用方编号"))
+        uid = None
 
     logic_value = _as_int(raw.get("selectiveLogic", ST_ENTRY_DEFAULTS["selectiveLogic"]), 0)
     logic = _LOGIC_FROM_ST.get(logic_value) if logic_value is not None else None
@@ -503,6 +775,17 @@ def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[Im
         )
         enabled = False
 
+    content = _map_text(
+        raw.get("content", ST_ENTRY_DEFAULTS["content"]),
+        limit=MAX_CONTENT_CHARS,
+        entry_key=entry_key,
+        field="content",
+        notes=notes,
+    )
+    name_replacements = []
+    if rewrite_names:
+        content, name_replacements = rewrite_name_vars(content)
+
     columns: dict[str, Any] = {
         "uid": uid,
         "comment": _map_text(
@@ -512,6 +795,7 @@ def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[Im
             field="comment",
             notes=notes,
         ),
+        "vectorized": _bool_or_default(raw.get("vectorized", ST_ENTRY_DEFAULTS["vectorized"]), False),
         "keys": _map_keys(raw.get("key", ST_ENTRY_DEFAULTS["key"]), entry_key=entry_key, field="key", notes=notes),
         "secondary_keys": _map_keys(
             raw.get("keysecondary", ST_ENTRY_DEFAULTS["keysecondary"]),
@@ -524,13 +808,7 @@ def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[Im
         # 假的；用户在本插件里打开它之后，导出也不写回任何酒馆字段。
         "use_regex": False,
         "constant": _bool_or_default(raw.get("constant", ST_ENTRY_DEFAULTS["constant"]), False),
-        "content": _map_text(
-            raw.get("content", ST_ENTRY_DEFAULTS["content"]),
-            limit=MAX_CONTENT_CHARS,
-            entry_key=entry_key,
-            field="content",
-            notes=notes,
-        ),
+        "content": content,
         "order": _clamp_int(
             raw.get("order", ST_ENTRY_DEFAULTS["order"]),
             default=ST_ENTRY_DEFAULTS["order"],
@@ -560,6 +838,12 @@ def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[Im
         ),
         "case_sensitive": _optional_bool(raw.get("caseSensitive", ST_ENTRY_DEFAULTS["caseSensitive"])),
         "match_whole_words": _optional_bool(raw.get("matchWholeWords", ST_ENTRY_DEFAULTS["matchWholeWords"])),
+        "ignore_budget": _bool_with_note(
+            raw.get("ignoreBudget", ST_ENTRY_DEFAULTS["ignoreBudget"]),
+            entry_key=entry_key,
+            field="ignoreBudget",
+            notes=notes,
+        ),
         "sticky": _clamp_optional(
             raw.get("sticky", ST_ENTRY_DEFAULTS["sticky"]),
             low=0,
@@ -586,6 +870,11 @@ def st_entry_to_columns(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[Im
         ),
         "enabled": enabled,
     }
+    if name_replacements:
+        detail = "读名字的变量换成了宏：" + "、".join(
+            f"「{item.var_name}」→ {item.macro} ×{item.count}" for item in name_replacements
+        )
+        notes.append(ImportNote(entry_key, "content", "name_var", detail))
     return columns, notes
 
 

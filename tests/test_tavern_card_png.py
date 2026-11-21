@@ -203,8 +203,12 @@ class TestZtxt:
         info = read_png(png)
 
         assert info.compressed == {}
-        with pytest.raises(CardFileRejected, match="没有酒馆人设卡数据"):
+        with pytest.raises(CardFileRejected) as caught:
             card_text_from_png(info)
+        message = str(caught.value)
+        assert "没有酒馆人设卡数据" in message
+        assert "卡数据丢了" in message
+        assert "原始 PNG 或 JSON" in message
 
     def test_duplicate_ztxt_keyword_keeps_first(self) -> None:
         png = _insert_before_iend(_base_png(), [_ztxt_chunk("chara", _b64("first")), _ztxt_chunk("chara", _b64("second"))])

@@ -43,6 +43,7 @@ from nekro_agent.services.model_group_service import (
 )
 from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
 from nekro_agent.services.usage.ledger import record_llm_usage
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group, tenant_http_client
 from nekro_agent.tools.untrusted_content import sanitize_block_text, wrap_untrusted_block
 
 from .media import Frame, VideoAnalysisError
@@ -178,6 +179,8 @@ async def _ask_model(
                 proxy_url=group.CHAT_PROXY or None,
                 extra_body=group.EXTRA_BODY,
                 max_wait_time=wait_seconds,
+                api_format=group.API_FORMAT,
+                tenant_egress=is_tenant_owned_group(group),
             )
     except Exception as e:
         if classify_llm_failure(e, request_has_image=has_images) is LLMFailureKind.VISION_UNSUPPORTED:
@@ -288,7 +291,17 @@ async def transcribe_audio(resolved: ResolvedGroup, audio_path: Path, *, chat_ke
     headers = {"Authorization": f"Bearer {group.API_KEY.strip()}"} if group.API_KEY.strip() else {}
     try:
         audio = await asyncio.to_thread(audio_path.read_bytes)
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), proxy=group.CHAT_PROXY or None) as client:
+        if is_tenant_owned_group(group):
+            # 租户建的组：地址与组上的代理都是租户填的，按租户出站连（`tools/tenant_egress.py`）
+            client_cm = tenant_http_client(
+                proxy=group.CHAT_PROXY or None,
+                proxy_is_tenant=True,
+                subject="转写模型组接口地址",
+                timeout=httpx.Timeout(60.0),
+            )
+        else:
+            client_cm = httpx.AsyncClient(timeout=httpx.Timeout(60.0), proxy=group.CHAT_PROXY or None)
+        async with client_cm as client:
             response = await client.post(
                 url,
                 headers=headers,

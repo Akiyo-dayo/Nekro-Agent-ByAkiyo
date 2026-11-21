@@ -1,0 +1,72 @@
+{
+  "toolbar": {
+    "view": "视图",
+    "viewEpisode": "事件",
+    "viewAtomic": "原子",
+    "density": "密度",
+    "densityLow": "疏",
+    "densityMedium": "中",
+    "densityHigh": "密",
+    "showInactive": "显示失活"
+  },
+  "zoom": {
+    "zoomIn": "放大",
+    "zoomOut": "缩小",
+    "fit": "适配",
+    "hint": "拖动或滚轮平移，按住 Ctrl 或 Command 再滚动可缩放"
+  },
+  "legend": {
+    "title": "图例",
+    "show": "展开图例",
+    "hide": "收起图例",
+    "count": "显示 {{shown}} / 共 {{total}}",
+    "countPending": "显示 — / 共 —",
+    "byImportance": "按重要度",
+    "onlyThis": "只看这一簇",
+    "showAll": "恢复全部",
+    "heavy": "只画了最重要的 {{count}} 个",
+    "edges": "线型"
+  },
+  "edges": {
+    "episode": "事件 — 段落 / 实体",
+    "paragraphEntity": "段落 — 实体",
+    "paragraphPerson": "段落 — 人",
+    "relation": "关系",
+    "affection": "好感（颜色是关系阶段）",
+    "affectionNegative": "提防 / 厌恶",
+    "milestone": "人 — 关系里程碑",
+    "lastSeen": "人 — 最近出现的频道"
+  },
+  "node": {
+    "inactive": "失活",
+    "quarantined": "已隔离",
+    "frozen": "已冻结",
+    "protected": "已保护"
+  },
+  "empty": {
+    "memoryTitle": "这个范围里还没有记忆",
+    "memoryFiltered": "换个频道，或清空筛选",
+    "memoryUnfiltered": "记忆沉淀后会出现在这里",
+    "affectionTitle": "这个范围里还没有好感记录",
+    "affectionFiltered": "换个搜索词或关系阶段",
+    "affectionUnfiltered": "和人聊过之后会出现在这里",
+    "clearFilters": "清空筛选"
+  },
+  "panel": {
+    "close": "关闭",
+    "more": "更多操作",
+    "expand": "展开",
+    "collapse": "收起",
+    "persons": "涉及的人",
+    "channel": "频道",
+    "time": "时间",
+    "weight": "权重",
+    "weightLine": "{{weight}} · 强化 {{count}} 次",
+    "blockedHits": "被拦次数",
+    "related": "关联",
+    "relatedEpisode": "事件",
+    "relatedPerson": "人",
+    "relatedEntity": "实体",
+    "relatedOther": "其它"
+  }
+}

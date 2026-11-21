@@ -20,6 +20,14 @@
 这一轮就不算「本人叫醒的」，一行都不覆盖。宁可少给一次，也不能把服务器交给一个只是
 在同一个群里说话的人。
 
+## 值守模式
+
+平台方行可以标成「值守」（行上 `duty_mode`，空则跟随 `SSH_GATEWAY_DEFAULT_DUTY_MODE`）。
+值守行在严格判据不过时还有第二条路：本轮快照非空、不「不完整」、至少一条 `human` 触发，
+频道所属实例归平台方、且在 `SSH_GATEWAY_DUTY_INSTANCES`（非空时）里。不看是谁、不看来源
+可信。按这条覆盖的行记进 `Coverage.duty_ids`；严格判据过了的（所有者本人叫醒）照旧按严格记。
+复核时 `duty_ids` 里的行不比所有者名单，改判「仍是值守、实例仍合格」。用户行与严格行一字不变。
+
 ## 关闸与故障
 
 总开关关着时不做任何查询，直接返回空覆盖：存量部署的行为必须与改造前逐字一致。
@@ -32,7 +40,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 
 from nekro_agent.core.config import config
-from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+from nekro_agent.models.db_adapter_instance import NON_DISPATCHABLE_STATUSES, DBAdapterInstance
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.models.db_workspace import DBWorkspace
 from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
@@ -57,10 +65,12 @@ class Coverage:
         credential_ids: 被覆盖的行 id。租约把这组 id 定格在拍下的那一刻，任务中途新登记
             的行不在里面
         triggered_by: 本轮快照里的发送者账号，去重保序。审计用它回答「谁叫醒的」
+        duty_ids: 其中按值守判据覆盖的行（`credential_ids` 的子集）；所有者本人叫醒的不算
     """
 
     credential_ids: frozenset[int] = frozenset()
     triggered_by: tuple[str, ...] = ()
+    duty_ids: frozenset[int] = frozenset()
 
     def __bool__(self) -> bool:
         return bool(self.credential_ids)
@@ -118,6 +128,55 @@ def covers_platform_row(batch: TriggerBatch, owner_entries: Iterable[str]) -> bo
         batch,
         lambda trigger: matches_super_users(trigger.adapter_key, trigger.sender_id, entries),
     )
+
+
+def effective_duty_mode(row: DBWsSshCredential) -> str:
+    """这一行此刻生效的模式：只有平台方行可能是值守；认不出的取值一律按严格"""
+    if str(row.owner_kind or "") != C.OWNER_PLATFORM:
+        return C.DUTY_MODE_STRICT
+    mode = str(getattr(row, "duty_mode", "") or "").strip()
+    if mode == C.DUTY_MODE_INHERIT:
+        mode = str(config.SSH_GATEWAY_DEFAULT_DUTY_MODE or "").strip()
+    return C.DUTY_MODE_DUTY if mode == C.DUTY_MODE_DUTY else C.DUTY_MODE_STRICT
+
+
+def duty_instance_entries() -> List[str]:
+    """`SSH_GATEWAY_DUTY_INSTANCES` 去空白、去空项"""
+    return [str(item).strip() for item in (config.SSH_GATEWAY_DUTY_INSTANCES or []) if str(item).strip()]
+
+
+def duty_instance_ref(adapter_key: str, instance_key: str) -> str:
+    """名单条目的写法：`适配器:实例`（与邮箱的 `SEND_SHARE_INSTANCES` 同一种）"""
+    return f"{adapter_key}:{instance_key}"
+
+
+async def duty_instance_eligible(adapter_key: str, instance_key: str) -> bool:
+    """这个实例上的频道此刻能不能触发值守：实例行存在、归平台方、名单非空时在名单里
+
+    与 `instance_belongs_to_tenant` 不同，查不到实例行按「不合格」处理：这是放宽的那一侧，
+    判不出来就不放。名单只能收窄：租户实例写进名单也不合格。
+    """
+    if not adapter_key or not instance_key:
+        return False
+    entries = duty_instance_entries()
+    if entries and duty_instance_ref(adapter_key, instance_key) not in entries:
+        return False
+    row = await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=instance_key).first()
+    if row is None or row.tenant_id is not None:
+        return False
+    # 停用、归档、软删除的实例不再能触发值守
+    return bool(row.enabled) and str(row.status or "").strip().lower() not in NON_DISPATCHABLE_STATUSES
+
+
+def covers_duty_row(batch: TriggerBatch) -> bool:
+    """值守行的触发条件：快照非空、不是「不完整」、至少一条 `human`
+
+    不要求触发的人是所有者，也不要求每一条都是真人、来源可信；只靠定时器、系统推送、
+    不可信推送叫醒的一轮不给（值守的前提是有人来找 Bot）。实例条件由调用方另判。
+    """
+    if not batch.triggers or batch.incomplete:
+        return False
+    return any(trigger.kind == TRIGGER_KIND_HUMAN for trigger in batch.triggers)
 
 
 def covers_user_row(
@@ -211,26 +270,40 @@ async def compute_chat_coverage(workspace_id: int, db_chat_channel: "DBChatChann
 
     workspace: Optional[DBWorkspace] = None
     platform_allowed = False
+    strict_ok = False
+    duty_ok: Optional[bool] = None  # 用到值守行时才查实例
     if any(row.owner_kind == C.OWNER_PLATFORM for row in rows):
         workspace = await DBWorkspace.get_or_none(id=workspace_id)
         platform_allowed = workspace is not None and await platform_credentials_allowed(workspace)
+        strict_ok = platform_allowed and covers_platform_row(batch, config.SSH_GATEWAY_OWNER_ACCOUNTS)
 
     covered: set[int] = set()
+    duty: set[int] = set()
     tenant_instances: dict[tuple[str, str], bool] = {}
     for row in rows:
         if not _row_is_decryptable(row):
             # 解不开的行不是「可用凭据」：不把密文当钥匙使，也不在这里替人删
             continue
         if row.owner_kind == C.OWNER_PLATFORM:
-            if platform_allowed and covers_platform_row(batch, config.SSH_GATEWAY_OWNER_ACCOUNTS):
+            if strict_ok:
+                # 所有者本人叫醒的按严格记，值守行也不进 duty_ids
                 covered.add(int(row.id))
+            elif platform_allowed and effective_duty_mode(row) == C.DUTY_MODE_DUTY:
+                if duty_ok is None:
+                    duty_ok = covers_duty_row(batch) and await duty_instance_eligible(
+                        str(getattr(db_chat_channel, "adapter_key", "") or ""),
+                        str(getattr(db_chat_channel, "instance_key", "") or ""),
+                    )
+                if duty_ok:
+                    covered.add(int(row.id))
+                    duty.add(int(row.id))
         elif row.owner_kind == C.OWNER_USER:
             pair = (str(row.adapter_key or ""), str(row.instance_key or ""))
             if pair not in tenant_instances:
                 tenant_instances[pair] = await instance_belongs_to_tenant(*pair)
             if _user_row_covered(batch, row, db_chat_channel, tenant_instance=tenant_instances[pair]):
                 covered.add(int(row.id))
-    return Coverage(credential_ids=frozenset(covered), triggered_by=triggered_by)
+    return Coverage(credential_ids=frozenset(covered), triggered_by=triggered_by, duty_ids=frozenset(duty))
 
 
 def round_trigger_book_batch(chat_key: str) -> TriggerBatch:
@@ -337,6 +410,22 @@ async def recheck(lease: "SshLease", row: DBWsSshCredential) -> Optional[str]:
         workspace = await DBWorkspace.get_or_none(id=row.workspace_id)
         if workspace is None or not await platform_credentials_allowed(workspace):
             return C.REASON_WORKSPACE_NOT_PLATFORM
+        # 聊天来源：叫醒这一轮的 Bot 停了（停用、归档、软删除，或所属租户停用），以它名义开着的
+        # 服务器访问一并断，严格行与值守行都一样。用户行在下面按行上的实例判，本来就断。
+        # 实例行不存在、实例标识为空时 `is_instance_active` 放行，与消息闸门同一口径
+        if lease.origin == "chat" and not await DBAdapterInstance.is_instance_active(
+            str(lease.adapter_key or ""),
+            str(lease.instance_key or ""),
+        ):
+            return C.REASON_INSTANCE_INACTIVE
+        if lease.origin == "chat" and int(row.id) in getattr(lease, "duty_ids", frozenset()):
+            # 按值守拍下的行：不比所有者名单，改判「仍是值守、频道实例仍合格」。后台把它改回
+            # 严格会发凭据变更通知；改默认模式、改实例名单靠周期复核（缓存键里带着这两项）
+            if effective_duty_mode(row) != C.DUTY_MODE_DUTY:
+                return C.REASON_DUTY_REVOKED
+            if not await duty_instance_eligible(str(lease.adapter_key or ""), str(lease.instance_key or "")):
+                return C.REASON_INSTANCE_INELIGIBLE
+            return None
         if lease.origin == "chat":
             # 聊天来源必须有「谁叫醒的」才能复核名单；空列表会让下面的 all() 空真通过，
             # 等于把一次授权永久留在名单之外，因此直接拒绝。
@@ -387,8 +476,13 @@ __all__ = [
     "batch_all_trusted_by",
     "compute_chat_coverage",
     "compute_console_coverage",
+    "covers_duty_row",
     "covers_platform_row",
     "covers_user_row",
+    "duty_instance_eligible",
+    "duty_instance_entries",
+    "duty_instance_ref",
+    "effective_duty_mode",
     "recheck",
     "triggered_by_accounts",
 ]

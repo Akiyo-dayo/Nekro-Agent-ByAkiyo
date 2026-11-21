@@ -29,6 +29,7 @@ from nekro_agent.services.memory.round_recall import commit_round_recall, discar
 from nekro_agent.services.ops_agent.round_grant import close_round as close_ops_round
 from nekro_agent.services.ops_agent.round_grant import open_round as open_ops_round
 from nekro_agent.services.ops_agent.triggers import round_trigger_book
+from nekro_agent.services.plugin.collector import plugin_collector
 from nekro_agent.services.plugin.scope import instance_scope
 from nekro_agent.services.sandbox.runner import build_container_key, limited_run_code
 from nekro_agent.services.tavern import runtime as tavern_runtime
@@ -38,7 +39,9 @@ from nekro_agent.services.usage import (
     resolve_model_group_name,
     usage_scope,
 )
+from nekro_agent.services.worldbook import lookup as wb_lookup
 from nekro_agent.services.worldbook import runtime as wb_runtime
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 from .creator import OpenAIChatMessage
 from .model_capability import (
@@ -572,6 +575,17 @@ async def _record_round_reply(chat_key: str, db_chat_channel: DBChatChannel, mar
     await check_and_alert(db_chat_channel)
 
 
+def _bind_round_token(ctx: Any, one_time_code: str) -> None:
+    """给正式一轮的 ctx 绑上本轮令牌（ctx 总是 `AgentCtx`；用例里的轻量替身没有令牌接口，跳过）"""
+    if isinstance(ctx, AgentCtx):
+        ctx.bind_round_token(one_time_code)
+
+
+def _unbind_round_token(ctx: Any, one_time_code: str) -> None:
+    if isinstance(ctx, AgentCtx):
+        ctx.unbind_round_token(one_time_code)
+
+
 async def _run_agent_with_affection_suppression(
     chat_key: str,
     chat_message: Optional[ChatMessage],
@@ -638,8 +652,21 @@ async def _run_agent_with_affection_suppression(
         prompt_rounds.finish(one_time_code, outcome)
         # 世界书的定时锚点同样只在这个位置定音：成功提交，其余一律丢弃。
         wb_runtime.finish_round(one_time_code, outcome)
+        # 插件的回合收尾回调（带结局）：只排后台任务，不等结果，插件出什么事都不影响这里。
+        plugin_collector.schedule_round_finished(ctx, outcome)
+        # 本轮令牌随回合结束解绑。放在排收尾回调之后：回调拿的是 ctx 的副本，仍带着本轮令牌。
+        try:
+            _unbind_round_token(ctx, one_time_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[run_agent] {chat_key} | 解绑本轮令牌失败（已忽略）: {type(exc).__name__}")
         # 酒馆上下文只活一轮：与提示词明细、世界书缓存同一个生命周期，正常收尾就弹出。
         tavern_runtime.discard_tavern_round(one_time_code)
+        # 世界书查询的作用域缓存与每轮次数上限同样只活一轮。包 try 且不 re-raise：
+        # 这里正在往外走异常，收尾失败不能把真正的原因盖掉。
+        try:
+            wb_lookup.discard_round(one_time_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[run_agent] {chat_key} | 清理世界书查询轮次失败（已忽略）: {type(exc).__name__}")
         # 运维授权随回合结束一起失效：回合已经跑完，沙盒里再来的回调没有可依据的授权了。
         # 包 try 且不 re-raise，与下面几条一样：这里正在往外走异常，不能把它盖掉。
         try:
@@ -687,6 +714,9 @@ async def _run_agent_in_instance_scope(
     # 沙盒方法经 RPC 回调进来时会新建 AgentCtx，拿不到这里的局部变量，
     # 只能靠服务端按 container_key 存查——令牌绝不下发进容器，否则模型生成的代码能读到并伪造可信标签。
     register_session_token(build_container_key(chat_key), one_time_code)
+    # 本轮的提示词渲染、沙盒方法清单拿的是这个 ctx：它没有 `container_key`，令牌要单独绑上，
+    # 收尾时在 `_run_agent_with_affection_suppression` 的 finally 里解绑。
+    _bind_round_token(ctx, one_time_code)
 
     # 消息撤回插件的日志要写「这一轮是谁叫的 Bot」：把 `schedule_agent_task` 另记的那份待处理触发整体取走，
     # 作为本轮记录（不借运维工具的触发记录簿，它受运维开关控制，见 `services/agent/round_trigger_accounts.py`）
@@ -727,6 +757,10 @@ async def _run_agent_in_instance_scope(
     used_model_group: ModelConfigGroup = round_prompt.used_model_group
     runtime_prompt = round_prompt.runtime_prompt
     messages = round_prompt.messages
+    # 首次请求被上游按内容拦下后少带内容重发的条数；假配置没有这个属性时等于关着，
+    # 现有拦截相关用例的行为因此逐字不变。
+    blocked_retry_messages = int(getattr(config, "AI_CHAT_BLOCKED_RETRY_MESSAGES", 0) or 0)
+    lean_retry_used = False
 
     from nekro_agent.services.system_broadcast import AgentRuntimeStatusEvent, publish_system_event
 
@@ -772,6 +806,90 @@ async def _run_agent_in_instance_scope(
         except Exception as e:
             logger.debug(f"[run_agent] {chat_key} | 运行阶段广播失败: {e}")
 
+    async def on_first_request_retry(retry_index: int, retry_total: int, model_name: str, error_summary: str) -> None:
+        """首次请求（含被拦后的少带内容重发）的 LLM 重试进度回调"""
+        await publish_runtime_state(
+            phase="llm_retrying",
+            iteration_index=1,
+            llm_retry_index=retry_index,
+            llm_retry_attempts=retry_total,
+            model_name=model_name,
+            error_summary=error_summary,
+        )
+
+    async def on_first_request_attempt(retry_index: int, retry_total: int, model_name: str) -> None:
+        """首次请求（含被拦后的少带内容重发）的 LLM 尝试进度回调"""
+        await publish_runtime_state(
+            phase="llm_generating",
+            iteration_index=1,
+            llm_retry_index=retry_index,
+            llm_retry_attempts=retry_total,
+            model_name=model_name,
+        )
+
+    async def lean_resend(reason: str) -> Tuple[OpenAIResponse, ModelConfigGroup, List[str]]:
+        """首次请求被上游按内容拦下：少带内容、同一轮里再发一次
+
+        只做三件事，且都靠现有机制获得效果：
+
+        1. `suppress_narrative` 先记上「被拦」标记——好感块、插件不可信注入、记忆块、
+           频道摘要、世界书不可信条目与变量、世界书查询工具在重建提示词时自动跳过；
+        2. 丢掉这一轮已经缓存 / 暂存的全量结果（世界书轮缓存与已暂存锚点、记忆召回），
+           否则重建拿到的还是第一次那份；
+        3. 在明细草稿上记下「重发过」，让成功收尾的这一轮也按被拦轮次推进撞甲计数。
+
+        重发用的提示词由 `build_round_prompt(lean_history=n)` 重建：只带最近 n 条消息、
+        只留常驻世界书、不做语义检索、不带记忆 / 摘要 / 好感 / 关键词世界书、不排好感评估、
+        不发开场白、不带预填。拒答原文一次都不进新消息：被拦的那次响应从未被 append 进
+        `addition_prompt_message`，这里用的是全新的 `messages`。
+        """
+        nonlocal messages, used_model_group, round_prompt, runtime_prompt, lean_retry_used
+        lean_retry_used = True
+        message_count = blocked_retry_messages
+        await publish_runtime_state(
+            phase="llm_retrying",
+            iteration_index=1,
+            llm_retry_index=1,
+            llm_retry_attempts=llm_retry_total,
+            model_name=used_model_group.CHAT_MODEL,
+            # 只报我们自己的结论，不带任何上游原文
+            error_summary="首次请求被上游拦下，少带内容重发一次",
+        )
+        # 先把「被拦」标记设上：下面重建提示词时，读这个标记的块会自动按「上一轮被拦」处理。
+        suppress_narrative(chat_key)
+        # 世界书按 code 缓存，同 code 再解析会直接拿到第一次的全量结果；先按 blocked 收尾，
+        # 弹掉缓存并丢弃已暂存的定时锚点。外层收尾还会再调一次，`finish_round` 可重复调用。
+        wb_runtime.finish_round(one_time_code, "blocked")
+        # 第一次暂存的召回不该在重发成功后被当成「用过」而强化。
+        discard_round_recall(one_time_code)
+        prompt_rounds.note_blocked_attempt(one_time_code)
+        lean_prompt = await build_round_prompt(
+            chat_key=chat_key,
+            db_chat_channel=db_chat_channel,
+            ctx=ctx,
+            one_time_code=one_time_code,
+            trigger_message=chat_message,
+            lean_history=message_count,
+        )
+        messages = lean_prompt.messages
+        round_prompt = lean_prompt
+        used_model_group = lean_prompt.used_model_group
+        runtime_prompt = lean_prompt.runtime_prompt
+        logger.info(
+            f"[run_agent] {chat_key} | 首次请求被上游拦下（{reason}），"
+            f"少带内容重发：最近 {message_count} 条消息",
+        )
+        response, model_group, retry_errors = await send_agent_request(
+            messages=messages,
+            config=config,
+            chat_key=chat_key,
+            # 重发不带预填：第一次那份预填已经发过（或被上游拒过），不再叠一次。
+            prefill=None,
+            on_llm_retry=on_first_request_retry,
+            on_llm_attempt=on_first_request_attempt,
+        )
+        return response, model_group, retry_errors
+
     logger.debug(f"[run_agent] {chat_key} | 历史记录渲染完成，发送 LLM 请求 (model={used_model_group.CHAT_MODEL})")
     history_render_until_time = time.time()
     llm_retry_errors: list[str] = []
@@ -781,34 +899,34 @@ async def _run_agent_in_instance_scope(
             config=config,
             chat_key=chat_key,
             prefill=round_prompt.prefill,
-            on_llm_retry=lambda retry_index, retry_total, model_name, error_summary: publish_runtime_state(
-                phase="llm_retrying",
-                iteration_index=1,
-                llm_retry_index=retry_index,
-                llm_retry_attempts=retry_total,
-                model_name=model_name,
-                error_summary=error_summary,
-            ),
-            on_llm_attempt=lambda retry_index, retry_total, model_name: publish_runtime_state(
-                phase="llm_generating",
-                iteration_index=1,
-                llm_retry_index=retry_index,
-                llm_retry_attempts=retry_total,
-                model_name=model_name,
-            ),
+            on_llm_retry=on_first_request_retry,
+            on_llm_attempt=on_first_request_attempt,
         )
         # 预填的最终状态由发送侧写在 `PrefillSpec` 上（sent / unsupported / retried_without），
         # 每发一次覆盖一次，明细里留下的是最后一次的真实结果。
         if round_prompt.prefill is not None:
             prompt_rounds.note_tavern(one_time_code, prefill_state=round_prompt.prefill.state)
     except AllLLMRequestsFailedError as e:
-        await publish_runtime_state(
-            phase="failed",
-            iteration_index=1,
-            llm_retry_index=llm_retry_total,
-            error_summary=_summarize_runtime_text(str(e)),
-        )
-        raise
+        if blocked_retry_messages > 0 and not lean_retry_used and LLMFailureKind.CONTENT_BLOCKED in e.kinds:
+            try:
+                llm_response, used_model_group, llm_retry_errors = await lean_resend("content_blocked")
+            except AllLLMRequestsFailedError as retry_error:
+                # 重发仍被拦：照现在还这样收尾（publish failed → 上抛）。
+                await publish_runtime_state(
+                    phase="failed",
+                    iteration_index=1,
+                    llm_retry_index=llm_retry_total,
+                    error_summary=_summarize_runtime_text(str(retry_error)),
+                )
+                raise
+        else:
+            await publish_runtime_state(
+                phase="failed",
+                iteration_index=1,
+                llm_retry_index=llm_retry_total,
+                error_summary=_summarize_runtime_text(str(e)),
+            )
+            raise
 
     async def raise_if_provider_refusal(
         parsed: ParsedCodeRunData,
@@ -874,7 +992,19 @@ async def _run_agent_in_instance_scope(
 
     logger.debug(f"[run_agent] {chat_key} | LLM 请求完成，开始解析响应")
     parsed_code_data: ParsedCodeRunData = parse_chat_response(llm_response.response_content)
-    await raise_if_provider_refusal(parsed_code_data, llm_response, iteration_index=1)
+    if (
+        blocked_retry_messages > 0
+        and not lean_retry_used
+        and detect_provider_refusal(parsed_code_data, llm_response)
+    ):
+        # 形态二：渠道把拒绝页当正文返回。首次请求先不直接收尾，少带内容重发一次；
+        # 重发仍是拒绝页就交给下面的判定按现状抛出。这次解析与判定同样成对出现，
+        # `TestEveryParseSiteIsGuarded` 的结构断言数得到。
+        llm_response, used_model_group, llm_retry_errors = await lean_resend("provider_refusal")
+        parsed_code_data = parse_chat_response(llm_response.response_content)
+        await raise_if_provider_refusal(parsed_code_data, llm_response, iteration_index=1)
+    else:
+        await raise_if_provider_refusal(parsed_code_data, llm_response, iteration_index=1)
 
     # 本轮的收尾控制状态。两条判据都只在**连续**成立时才提前收尾。
     # 两个阈值走会话覆盖层（会话 > 实例 > 全局），取 0 即为运维把该判据整条关掉；
@@ -991,18 +1121,21 @@ async def _run_agent_in_instance_scope(
         #
         # ⚠️ **`render_history_data` 远不止「一趟 DB 查询 + 模板渲染」**，它自己就带外部副作用，
         # 所以「跳过它」这件事必须单独交代清楚。它一路展开是 `_inject_memory_context`
-        # → `_build_enhanced_memory_recall_plan` → **又一次 `gen_openai_chat_response`**
+        # → `_build_enhanced_memory_recall_plan` → **一次 `gen_openai_chat_response`**
         # （`LLMUsageScene.HISTORY_PLAN`，走计费与用量记账）→ `retrieve_memories_batch`
-        # （每条 query 一次 embedding + 一次 Qdrant 查询）→ `stage_round_recall`（只记录，
-        # 不写库）。也就是说开了增强检索的部署，一个烧满的回合改造前浪费的是**两次** LLM
-        # 请求（迭代请求 + 规划请求），不是一次。
+        # （每条 query 一次 embedding + 一次 Qdrant 查询）→ `stage_round_recall` /
+        # `note_injected`（只记录，不写库）。
+        #
+        # 迭代时的增量渲染现在只在「这次增量里真的有新的人类消息」时才跑召回，没有就整段
+        # 跳过：规划请求、检索、明细记录都不发生。所以这一趟被跳过时，省下的可能是规划请求
+        # 与检索这两段，也可能只是增量历史本身，取决于这期间有没有人说话。
         #
         # 跳过它们**不是回归而是修正**：那次渲染的结果从来没有进沙盒、没有被消费过，现在它
-        # 也不再强化——没被消费的渲染本来就不该按「这条记忆被用上了」记账。跳过它省下的正是
-        # 规划请求与检索这两段开销。
-        # 反过来说，这也意味着 `break` 的**位置**是有含义的：往后挪一行就把这两次请求与那批
-        # 检索全请回来，而请求计数一次都不会变。用例因此**单独数 `render_history_data`
-        # 的调用次数**（`TestNoUnconsumedTailRequest::test_the_skipped_assembly_is_actually_skipped`），
+        # 也不再强化——没被消费的渲染本来就不该按「这条记忆被用上了」记账。
+        # 反过来说，这也意味着 `break` 的**位置**是有含义的：往后挪一行就把这次增量渲染请
+        # 回来（有新人类消息时连规划请求与检索一起回来），而请求计数一次都不会变。用例因此
+        # **单独数 `render_history_data` 的调用次数**
+        # （`TestNoUnconsumedTailRequest::test_the_skipped_assembly_is_actually_skipped`），
         # 只数 `llm_calls` 的话这个变异会活着。
         #
         # 依赖关系逐条核对过，没有一条落在被跳过的那次请求上：
@@ -1099,8 +1232,10 @@ async def _run_agent_in_instance_scope(
                 record_sta_timestamp=history_render_until_time,
                 model_group=used_model_group,
                 config=config,
-                # 世界书的两组已经在本轮第一次渲染的历史里，增量这一条不再带
+                # 世界书的两组已经在本轮第一次渲染的历史里，增量这一条不再带；
+                # 摘要同理不再注入，召回只补本轮还没注入过的记忆。
                 inject_worldbook=False,
+                incremental=True,
             ),
         )
 
@@ -1423,6 +1558,8 @@ async def send_agent_request(
                     first_token_timeout=config.AI_STREAM_FIRST_TOKEN_TIMEOUT,
                     log_path=log_path,
                     error_log_path=err_log_path,
+                    api_format=use_model_group.API_FORMAT,
+                    tenant_egress=is_tenant_owned_group(use_model_group),
                 )
             if not llm_response.response_content.strip():
                 # 兜底闸门：`gen_openai_chat_response` 两条分支都已经自己判过空，这里挡的是

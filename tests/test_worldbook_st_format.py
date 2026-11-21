@@ -14,6 +14,7 @@ export_world`，结果必须与原对象键集合与值都相同。
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -324,6 +325,28 @@ class TestColumnsMapping:
         for forbidden in ("book", "trusted", "status", "ext"):
             assert forbidden not in columns
 
+    def test_ignore_budget_is_read_as_a_plain_boolean(self) -> None:
+        on, notes = st_entry_to_columns({"uid": 1, "ignoreBudget": True})
+        off, _ = st_entry_to_columns({"uid": 1})
+        assert (on["ignore_budget"], off["ignore_budget"]) == (True, False)
+        assert notes == []
+
+    def test_unreadable_ignore_budget_is_false_with_a_note(self) -> None:
+        columns, notes = st_entry_to_columns({"uid": 1, "ignoreBudget": "yes"})
+        assert columns["ignore_budget"] is False
+        assert [(note.field, note.kind) for note in notes] == [("ignoreBudget", "bad_value")]
+
+    def test_edited_ignore_budget_is_exported_as_ignore_budget(self) -> None:
+        original = full_entry(1, ignoreBudget=False)
+        columns, _ = st_entry_to_columns(original)
+        columns["ignore_budget"] = True
+        restored = columns_to_st_entry(columns, original)
+        assert restored["ignoreBudget"] is True
+        # 没改过时保留原值，且不重复存第二份
+        untouched = columns_to_st_entry(columns, dict(original, ignoreBudget=True))
+        assert untouched["ignoreBudget"] is True
+        assert sum(1 for key in untouched if key == "ignoreBudget") == 1
+
 
 class TestNotes:
     def test_truncation_note_is_only_a_fallback_for_old_rows(self) -> None:
@@ -332,17 +355,20 @@ class TestNotes:
         assert [note.kind for note in notes] == ["truncated"]
 
     def test_budget_notes_flag_entries_longer_than_the_round_budget(self) -> None:
+        """按预算对象的数法比：这里用一字一 token 的替身，便于手算"""
+        budget = SimpleNamespace(budget=3000, model_group="stub-group", count=len)
         notes = budget_notes(
             [("1", {"content": "甲" * 3001}), ("2", {"content": "乙" * 3000}), ("3", {"content": ""})],
-            max_chars=3000,
+            budget=budget,
         )
         assert [(note.entry_key, note.kind) for note in notes] == [("1", "over_budget")]
-        assert "WORLDBOOK_MAX_CHARS" in notes[0].detail
-        assert "3001" in notes[0].detail and "3000" in notes[0].detail
+        assert "WORLDBOOK_BUDGET_PERCENT" in notes[0].detail and "WORLDBOOK_BUDGET_CAP_TOKENS" in notes[0].detail
+        assert "3001 token" in notes[0].detail and "3000 token" in notes[0].detail
+        assert "stub-group" in notes[0].detail
 
-    def test_budget_notes_are_silent_when_the_budget_is_zero(self) -> None:
-        """预算 0 表示根本不注入正文，逐条提示没有意义"""
-        assert budget_notes([("1", {"content": "甲" * 10})], max_chars=0) == []
+    def test_budget_notes_are_silent_without_a_budget(self) -> None:
+        """预算读不到（配置坏了）就不提示：提示不该让导入失败"""
+        assert budget_notes([("1", {"content": "甲" * 10})], budget=None) == []
 
     def test_clamped_note(self) -> None:
         _, notes = st_entry_to_columns({"uid": 1, "order": 10**9})

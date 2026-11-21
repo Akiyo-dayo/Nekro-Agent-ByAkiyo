@@ -1,29 +1,50 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Box, Chip, Stack, Typography, useTheme } from '@mui/material'
+import {
+  Box,
+  Chip,
+  Divider,
+  Menu,
+  MenuItem,
+  Stack,
+  Typography,
+  alpha,
+  useTheme,
+} from '@mui/material'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { useSearchParams } from 'react-router-dom'
+import ArrowDropDownRoundedIcon from '@mui/icons-material/ArrowDropDownRounded'
 import { useDeepLinkInstance } from '../../hooks/useDeepLinkInstance'
-import ActionButton, { type ActionButtonTone } from '../../components/common/ActionButton'
+import ActionButton from '../../components/common/ActionButton'
 import FilterSelect from '../../components/common/FilterSelect'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import SegmentedControl from '../../components/common/SegmentedControl'
 import ServerDataTable, {
   type ServerDataTableColumn,
 } from '../../components/common/ServerDataTable'
+import { SimpleTooltip } from '../../components/common/ThemedTooltip'
 import BulkActionDialog from '../../components/memory/BulkActionDialog'
 import MemoryItemDialog from '../../components/memory/MemoryItemDialog'
 import MemoryNotFoundState from '../../components/memory/MemoryNotFoundState'
 import {
   MemoryBlockedHitsChip,
-  MemoryFlagChips,
+  MemoryFlagIcons,
+  MemorySensitiveChip,
   MemoryStatusChip,
 } from '../../components/memory/MemoryStatusChips'
+import ParagraphGroupsView from '../../components/memory/ParagraphGroupsView'
+import PersonNames from '../../components/memory/PersonNames'
 import ScopeFilterBar from '../../components/memory/ScopeFilterBar'
-import { formatDateTime, truncateText } from '../../components/memory/format'
+import {
+  formatFullDateTime,
+  formatListTime,
+  truncateText,
+} from '../../components/memory/format'
+import { labelsOrAccounts } from '../../components/memory/personLabels'
 import {
   DEFAULT_MEMORY_PAGE_SIZE,
   MEMORY_PAGE_SIZE_OPTIONS,
+  MEMORY_TAB_FILTER_FIELDS,
   filtersFromSearchParams,
   filtersToEpisodeQuery,
   filtersToParagraphQuery,
@@ -36,7 +57,7 @@ import {
 } from '../../components/memory/filters'
 import { useMemoryScopeOptions } from '../../components/memory/useMemoryScopeOptions'
 import { isNotFoundError } from '../../services/api/axios'
-import { CHIP_VARIANTS } from '../../theme/variants'
+import { BORDER_RADIUS, CHIP_VARIANTS } from '../../theme/variants'
 import {
   memoryApi,
   type BulkAction,
@@ -53,6 +74,9 @@ import {
  * 段落与事件共用一条查询流程，但筛选字段与列不一样：事件没有「某个人 / 认知类型 /
  * 知识类型」，也没有批量（后端只提供段落批量接口）。所以两种 kind 各建一张表，
  * 而不是在同一张表里塞一堆条件分支。
+ *
+ * 段落另有两种看法：按人、按事件折叠成组（`ParagraphGroupsView`）。分组只是换个角度看
+ * 同一批段落，筛选不变；批量与排序留在平铺列表里，组里「在列表里看」会带着这一组的筛选跳回来。
  */
 
 interface ItemsTabProps {
@@ -60,22 +84,10 @@ interface ItemsTabProps {
   isScopeReady: boolean
 }
 
-const PARAGRAPH_FIELDS: Array<keyof MemoryFilterState> = [
-  'search',
-  'status',
-  'chatKey',
-  'presetId',
-  'partition',
-  'domain',
-  'person',
-  'cognitiveType',
-  'knowledgeType',
-  'originKind',
-  'timeFrom',
-  'timeTo',
-  'sort',
-  'order',
-]
+/** 段落的看法：平铺列表，或按人 / 按事件折叠成组（地址栏 `view`，平铺时不写） */
+type ParagraphView = 'list' | 'person' | 'topic'
+
+const PARAGRAPH_FIELDS: Array<keyof MemoryFilterState> = [...MEMORY_TAB_FILTER_FIELDS.items]
 
 const EPISODE_FIELDS: Array<keyof MemoryFilterState> = [
   'search',
@@ -90,13 +102,13 @@ const EPISODE_FIELDS: Array<keyof MemoryFilterState> = [
   'order',
 ]
 
-const BULK_BUTTONS: Array<{ action: BulkAction; labelKey: string; tone: ActionButtonTone }> = [
-  { action: 'quarantine', labelKey: 'actions.quarantine', tone: 'secondary' },
-  { action: 'restore', labelKey: 'actions.restore', tone: 'secondary' },
-  { action: 'freeze', labelKey: 'actions.freeze', tone: 'secondary' },
-  { action: 'unfreeze', labelKey: 'actions.unfreeze', tone: 'secondary' },
-  { action: 'delete', labelKey: 'actions.delete', tone: 'danger' },
-  { action: 'hard_delete', labelKey: 'actions.hardDelete', tone: 'danger' },
+// 「批量操作」菜单：隔离是主按钮，其余按「放回 / 冻结 / 解冻 / 删除 / 彻底删除」排列
+const BULK_MENU_ACTIONS: Array<{ action: BulkAction; labelKey: string }> = [
+  { action: 'restore', labelKey: 'actions.restore' },
+  { action: 'freeze', labelKey: 'actions.freeze' },
+  { action: 'unfreeze', labelKey: 'actions.unfreeze' },
+  { action: 'delete', labelKey: 'actions.delete' },
+  { action: 'hard_delete', labelKey: 'actions.hardDelete' },
 ]
 
 export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
@@ -111,6 +123,10 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
   const kindParam = searchParams.get('kind')
   const kind: MemoryKind = isMemoryKind(kindParam) ? kindParam : 'paragraph'
   const pageSize = parsePageSize(searchParams.get('pageSize'))
+  // 段落的看法：平铺列表，或按人 / 按事件折叠成组。事件本身没有分组视图
+  const viewParam = searchParams.get('view')
+  const view: ParagraphView =
+    kind === 'paragraph' && (viewParam === 'person' || viewParam === 'topic') ? viewParam : 'list'
   // `?item=<段落编号>`：从好感页「在记忆页查看」跳过来时直接打开那一段的详情
   const itemParam = searchParams.get('item')
   const itemFromUrl = useMemo(() => {
@@ -122,6 +138,7 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string | number>>(new Set())
   const [selectAllFiltered, setSelectAllFiltered] = useState(false)
   const [bulkAction, setBulkAction] = useState<BulkAction | null>(null)
+  const [bulkMenuAnchor, setBulkMenuAnchor] = useState<HTMLElement | null>(null)
   const [detailTarget, setDetailTarget] = useState<{ memoryType: MemoryType; id: number } | null>(
     null
   )
@@ -162,10 +179,12 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
   const writeQuery = (
     nextFilters: MemoryFilterState,
     nextKind: MemoryKind = kind,
-    nextPageSize: number = pageSize
+    nextPageSize: number = pageSize,
+    nextView: ParagraphView = view
   ) => {
     const params = filtersToSearchParams(nextFilters)
     if (nextKind !== 'paragraph') params.set('kind', nextKind)
+    if (nextKind === 'paragraph' && nextView !== 'list') params.set('view', nextView)
     if (nextPageSize !== DEFAULT_MEMORY_PAGE_SIZE) params.set('pageSize', String(nextPageSize))
     // 详情是开着的那一段，翻页 / 改筛选不该把它从地址栏里抹掉
     if (itemFromUrl !== null) params.set('item', String(itemFromUrl))
@@ -192,9 +211,23 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
       person: nextKind === 'episode' ? '' : filters.person,
       cognitiveType: nextKind === 'episode' ? '' : filters.cognitiveType,
       knowledgeType: nextKind === 'episode' ? '' : filters.knowledgeType,
+      sensitive: nextKind === 'episode' ? '' : filters.sensitive,
       originKind: nextKind === 'episode' ? '' : filters.originKind,
+      episode: nextKind === 'episode' ? '' : filters.episode,
     }
-    writeQuery(nextFilters, nextKind)
+    writeQuery(nextFilters, nextKind, pageSize, nextKind === 'episode' ? 'list' : view)
+  }
+
+  const handleViewChange = (nextView: ParagraphView) => {
+    if (nextView === view) return
+    clearSelection()
+    writeQuery({ ...filters, page: 1 }, kind, pageSize, nextView)
+  }
+
+  /** 分组视图里「在列表里看这一组」：回到平铺列表，带上这一组的人 / 事件筛选 */
+  const showGroupInList = (patch: Partial<MemoryFilterState>) => {
+    clearSelection()
+    writeQuery({ ...filters, ...patch, page: 1 }, 'paragraph', pageSize, 'list')
   }
 
   const handlePageSizeChange = (value: string) => {
@@ -205,7 +238,7 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
     queryKey: ['memory', 'paragraphs', scope, filters, pageSize],
     queryFn: () =>
       memoryApi.listParagraphs({ ...filtersToParagraphQuery(filters, pageSize), ...scope }),
-    enabled: isScopeReady && kind === 'paragraph',
+    enabled: isScopeReady && kind === 'paragraph' && view === 'list',
     retry: false,
   })
 
@@ -228,6 +261,11 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
 
   const channelLabel = (chatKey: string | null) =>
     chatKey ? channelNames.get(chatKey) ?? chatKey : '—'
+
+  const partitionLabel = (workspaceId: number) =>
+    workspaceId === 0
+      ? t('partition.domain')
+      : t('partition.workspaceWithId', { id: workspaceId })
 
   const paragraphs = paragraphsQuery.data?.items ?? []
   const episodes = episodesQuery.data?.items ?? []
@@ -254,60 +292,66 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
       // 表格是固定布局：其余列都是像素宽，这一列也给像素宽，百分比会被挤没
       width: 300,
       render: row => (
-        <Box sx={{ minWidth: 0 }}>
-          <Stack direction="row" spacing={0.5} alignItems="center" sx={{ minWidth: 0 }}>
-            {row.origin_kind === 'affection' && (
-              <Chip
-                size="small"
-                label={t('origin.affection')}
-                sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.secondary.main, true)}
-              />
+        // 分区列已删：分区与截断前的全文合在同一个 tooltip 里，不再叠浏览器原生 title
+        <SimpleTooltip
+          title={
+            <Box>
+              <Box>{truncateText(row.summary || row.content, 160)}</Box>
+              <Box sx={{ mt: 0.5, opacity: 0.72 }}>
+                {t('filters.chipValue', {
+                  label: t('filters.partition'),
+                  value: partitionLabel(row.workspace_id),
+                })}
+              </Box>
+            </Box>
+          }
+        >
+          <Box sx={{ minWidth: 0 }}>
+            <Stack direction="row" spacing={0.5} alignItems="center" sx={{ minWidth: 0 }}>
+              {row.origin_kind === 'affection' && (
+                <Chip
+                  size="small"
+                  label={t('origin.affection')}
+                  sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.secondary.main, true)}
+                />
+              )}
+              <Typography variant="body2" noWrap sx={{ minWidth: 0, flex: 1 }}>
+                {row.summary || row.content}
+              </Typography>
+              {row.is_sensitive && <MemorySensitiveChip />}
+              {row.blocked_round_hits > 0 && (
+                <MemoryBlockedHitsChip count={row.blocked_round_hits} />
+              )}
+            </Stack>
+            {row.summary && (
+              <Typography variant="caption" color="text.secondary" noWrap display="block">
+                {truncateText(row.content, 80)}
+              </Typography>
             )}
-            <Typography variant="body2" noWrap title={row.summary || row.content}>
-              {row.summary || row.content}
-            </Typography>
-          </Stack>
-          {row.summary && (
-            <Typography variant="caption" color="text.secondary" noWrap display="block">
-              {truncateText(row.content, 80)}
-            </Typography>
-          )}
-        </Box>
+          </Box>
+        </SimpleTooltip>
       ),
     },
     {
       key: 'status',
       header: t('columns.status'),
-      width: 130,
+      width: 110,
       render: row => (
-        <Stack direction="row" spacing={0.5} sx={{ flexWrap: 'wrap' }}>
+        <Stack direction="row" spacing={0.5} alignItems="center">
           <MemoryStatusChip status={row.status} />
-          <MemoryFlagChips isFrozen={row.is_frozen} isProtected={row.is_protected} />
+          <MemoryFlagIcons isFrozen={row.is_frozen} isProtected={row.is_protected} />
         </Stack>
       ),
     },
     {
       key: 'persons',
       header: t('columns.persons'),
-      width: 150,
+      width: 180,
       hideOnMobile: true,
-      render: row => {
-        const persons = row.person_accounts ?? []
-        if (persons.length === 0) {
-          return (
-            <Typography variant="body2" color="text.secondary">
-              —
-            </Typography>
-          )
-        }
-        const shown = persons.slice(0, 2).join(', ')
-        const rest = persons.length - 2
-        return (
-          <Typography variant="body2" noWrap title={persons.join(', ')}>
-            {rest > 0 ? `${shown} +${rest}` : shown}
-          </Typography>
-        )
-      },
+      // 名字在前、称呼并排，号码进悬停提示（列表里一串号码认不出是谁）
+      render: row => (
+        <PersonNames persons={labelsOrAccounts(row.persons, row.person_accounts ?? [])} />
+      ),
     },
     {
       key: 'channel',
@@ -321,35 +365,16 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
       ),
     },
     {
-      key: 'partition',
-      header: t('columns.partition'),
-      width: 110,
-      hideOnMobile: true,
-      render: row => (
-        <Typography variant="body2" noWrap>
-          {row.workspace_id === 0
-            ? t('partition.domain')
-            : t('partition.workspaceWithId', { id: row.workspace_id })}
-        </Typography>
-      ),
-    },
-    {
-      key: 'hits',
-      header: t('columns.blockedHits'),
-      width: 90,
-      align: 'right',
-      hideOnMobile: true,
-      render: row => <MemoryBlockedHitsChip count={row.blocked_round_hits} />,
-    },
-    {
       key: 'time',
       header: t('columns.time'),
-      width: 160,
+      width: 130,
       hideOnMobile: true,
       render: row => (
-        <Typography variant="body2" noWrap>
-          {formatDateTime(row.create_time)}
-        </Typography>
+        <SimpleTooltip title={formatFullDateTime(row.create_time)}>
+          <Typography variant="body2" noWrap>
+            {formatListTime(row.create_time)}
+          </Typography>
+        </SimpleTooltip>
       ),
     },
   ]
@@ -361,9 +386,14 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
       width: 300,
       render: row => (
         <Box sx={{ minWidth: 0 }}>
-          <Typography variant="body2" noWrap title={row.title}>
-            {row.title || '—'}
-          </Typography>
+          <Stack direction="row" spacing={0.5} alignItems="center" sx={{ minWidth: 0 }}>
+            <Typography variant="body2" noWrap title={row.title} sx={{ minWidth: 0, flex: 1 }}>
+              {row.title || '—'}
+            </Typography>
+            {row.blocked_round_hits > 0 && (
+              <MemoryBlockedHitsChip count={row.blocked_round_hits} />
+            )}
+          </Stack>
           <Typography variant="caption" color="text.secondary" noWrap display="block">
             {truncateText(row.narrative_summary, 80)}
           </Typography>
@@ -373,7 +403,7 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
     {
       key: 'status',
       header: t('columns.status'),
-      width: 130,
+      width: 110,
       render: row => <MemoryStatusChip status={row.status} />,
     },
     {
@@ -388,22 +418,18 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
       ),
     },
     {
-      key: 'hits',
-      header: t('columns.blockedHits'),
-      width: 100,
-      align: 'right',
-      hideOnMobile: true,
-      render: row => <MemoryBlockedHitsChip count={row.blocked_round_hits} />,
-    },
-    {
       key: 'timeRange',
       header: t('columns.time'),
-      width: 230,
+      width: 210,
       hideOnMobile: true,
       render: row => (
-        <Typography variant="body2" noWrap>
-          {formatDateTime(row.time_start)} – {formatDateTime(row.time_end)}
-        </Typography>
+        <SimpleTooltip
+          title={`${formatFullDateTime(row.time_start)} – ${formatFullDateTime(row.time_end)}`}
+        >
+          <Typography variant="body2" noWrap>
+            {formatListTime(row.time_start)} – {formatListTime(row.time_end)}
+          </Typography>
+        </SimpleTooltip>
       ),
     },
   ]
@@ -416,14 +442,30 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
     setSelectAllFiltered(previous => !previous)
   }
 
-  const renderBulkBar = () => (
+  const openBulkAction = (action: BulkAction) => {
+    setBulkMenuAnchor(null)
+    setBulkAction(action)
+  }
+
+  const showSelectionBar = selectedIds.size > 0 || selectAllFiltered
+
+  const renderSelectionBar = () => (
     <Box
       sx={{
         display: 'flex',
         flexWrap: 'wrap',
         alignItems: 'center',
         gap: 1,
-        width: '100%',
+        minHeight: 48,
+        px: 1.5,
+        borderRadius: BORDER_RADIUS.DEFAULT,
+        bgcolor: 'background.paper',
+        backgroundImage: `linear-gradient(${alpha(
+          theme.palette.primary.main,
+          0.06
+        )}, ${alpha(theme.palette.primary.main, 0.06)})`,
+        border: '1px solid',
+        borderColor: 'divider',
       }}
     >
       <Typography variant="body2" fontWeight={600}>
@@ -431,20 +473,53 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
           ? t('bulk.selectedAll', { total })
           : t('bulk.selected', { count: selectedIds.size })}
       </Typography>
+      <Typography variant="body2" color="text.secondary">
+        ·
+      </Typography>
       <ActionButton tone="ghost" size="small" onClick={toggleSelectAllFiltered}>
         {selectAllFiltered ? t('bulk.selectOnlyChecked') : t('bulk.selectAll', { total })}
       </ActionButton>
       <Box sx={{ flex: 1 }} />
-      {BULK_BUTTONS.map(button => (
-        <ActionButton
-          key={button.action}
-          tone={button.tone}
-          size="small"
-          onClick={() => setBulkAction(button.action)}
-        >
-          {t(button.labelKey)}
-        </ActionButton>
-      ))}
+      <ActionButton
+        tone="secondary"
+        size="small"
+        onClick={() => setBulkAction('quarantine')}
+      >
+        {t('actions.quarantine')}
+      </ActionButton>
+      <ActionButton
+        tone="secondary"
+        size="small"
+        endIcon={<ArrowDropDownRoundedIcon />}
+        onClick={event => setBulkMenuAnchor(event.currentTarget)}
+      >
+        {t('bulk.more')}
+      </ActionButton>
+      <Menu
+        anchorEl={bulkMenuAnchor}
+        open={Boolean(bulkMenuAnchor)}
+        onClose={() => setBulkMenuAnchor(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        {BULK_MENU_ACTIONS.slice(0, 3).map(item => (
+          <MenuItem key={item.action} onClick={() => openBulkAction(item.action)}>
+            <Typography variant="body2">{t(item.labelKey)}</Typography>
+          </MenuItem>
+        ))}
+        <Divider sx={{ my: 0.5 }} />
+        {BULK_MENU_ACTIONS.slice(3).map(item => (
+          <MenuItem
+            key={item.action}
+            onClick={() => openBulkAction(item.action)}
+            sx={item.action === 'hard_delete' ? { color: 'error.main' } : undefined}
+          >
+            <Typography variant="body2" color="inherit">
+              {t(item.labelKey)}
+            </Typography>
+          </MenuItem>
+        ))}
+      </Menu>
     </Box>
   )
 
@@ -465,46 +540,86 @@ export default function ItemsTab({ scope, isScopeReady }: ItemsTabProps) {
             onChange={handleKindChange}
           />
         }
+        trailing={
+          kind === 'paragraph' ? (
+            <SegmentedControl
+              value={view}
+              options={[
+                { value: 'list', label: t('view.list') },
+                { value: 'person', label: t('view.byPerson') },
+                { value: 'topic', label: t('view.byTopic') },
+              ]}
+              onChange={handleViewChange}
+            />
+          ) : undefined
+        }
       />
 
-      {kind === 'paragraph' ? (
-        <ServerDataTable<ParagraphListItem>
-          columns={paragraphColumns}
-          rows={paragraphs}
-          getRowId={row => row.id}
-          total={total}
-          page={filters.page}
-          pageSize={pageSize}
-          onPageChange={page => writeQuery({ ...filters, page })}
-          loading={paragraphsQuery.isPending}
-          fetching={paragraphsQuery.isFetching}
-          error={paragraphsQuery.error}
-          onRetry={() => void paragraphsQuery.refetch()}
-          renderError={error =>
-            isNotFoundError(error) ? (
-              <MemoryNotFoundState />
-            ) : (
-              <QueryErrorState
-                error={error}
-                onRetry={() => void paragraphsQuery.refetch()}
-                compact
-              />
-            )
-          }
-          emptyTitle={t('empty.itemsTitle')}
-          emptyHint={t('empty.itemsHint')}
-          onRowClick={row => openRowDetail({ memoryType: 'paragraph', id: row.id })}
-          selection={{
-            selectedIds,
-            onChange: next => {
-              setSelectedIds(next)
-              // 手动改勾选就不再是「当前筛选的全部」
-              setSelectAllFiltered(false)
-            },
-          }}
-          renderBulkBar={renderBulkBar}
-          paginationExtra={pageSizeSelect}
+      {kind === 'paragraph' && filters.episode && (
+        <Box>
+          <Chip
+            size="small"
+            label={
+              filters.episode === 'none'
+                ? t('groups.episodeFilterNone')
+                : t('groups.episodeFilter', { id: filters.episode })
+            }
+            onDelete={() => handleFiltersChange({ ...filters, episode: '' })}
+            sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.info.main, true)}
+          />
+        </Box>
+      )}
+
+      {kind === 'paragraph' && view !== 'list' ? (
+        <ParagraphGroupsView
+          by={view}
+          scope={scope}
+          filters={filters}
+          isScopeReady={isScopeReady}
+          channelLabel={channelLabel}
+          onOpenParagraph={id => openRowDetail({ memoryType: 'paragraph', id })}
+          onShowInList={showGroupInList}
         />
+      ) : kind === 'paragraph' ? (
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, flex: 1, minHeight: 0 }}>
+          {showSelectionBar && renderSelectionBar()}
+          <ServerDataTable<ParagraphListItem>
+            columns={paragraphColumns}
+            rows={paragraphs}
+            getRowId={row => row.id}
+            total={total}
+            page={filters.page}
+            pageSize={pageSize}
+            onPageChange={page => writeQuery({ ...filters, page })}
+            loading={paragraphsQuery.isPending}
+            fetching={paragraphsQuery.isFetching}
+            error={paragraphsQuery.error}
+            onRetry={() => void paragraphsQuery.refetch()}
+            renderError={error =>
+              isNotFoundError(error) ? (
+                <MemoryNotFoundState />
+              ) : (
+                <QueryErrorState
+                  error={error}
+                  onRetry={() => void paragraphsQuery.refetch()}
+                  compact
+                />
+              )
+            }
+            emptyTitle={t('empty.itemsTitle')}
+            emptyHint={t('empty.itemsHint')}
+            onRowClick={row => openRowDetail({ memoryType: 'paragraph', id: row.id })}
+            selection={{
+              selectedIds,
+              onChange: next => {
+                setSelectedIds(next)
+                // 手动改勾选就不再是「当前筛选的全部」
+                setSelectAllFiltered(false)
+              },
+            }}
+            paginationExtra={pageSizeSelect}
+          />
+        </Box>
       ) : (
         <ServerDataTable<EpisodeListItem>
           columns={episodeColumns}

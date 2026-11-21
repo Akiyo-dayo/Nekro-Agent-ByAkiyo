@@ -108,6 +108,13 @@ def _v2_card() -> dict[str, Any]:
     return {"spec": "chara_card_v2", "spec_version": "2.0", "data": _v2_data(), "extra_top": {"keep": True}}
 
 
+def _card_with_name_var() -> dict[str, Any]:
+    """卡内书正文里放一处读用户名字的变量；样本名是这里现编的"""
+    card = _v2_card()
+    card["data"]["character_book"]["entries"][0]["content"] = "你好，{{getvar::数据库用户名}}。"
+    return card
+
+
 def _v3_data() -> dict[str, Any]:
     data = _v2_data()
     data.update(
@@ -341,20 +348,26 @@ class TestRuleOptions:
         assert card.cleanup_rules[0]["disabled_reason"] == "not_ai_output"
         assert any("不能由导入选项覆盖" in note for note in result.notes)
 
-    async def test_enabling_an_html_rule_over_the_save_limit_is_refused(self, db: None) -> None:
-        """替换文字超过扩展页保存上限的 HTML 规则不在导入时打开
+    async def test_long_html_rule_is_imported_as_text_only_and_still_saves(self, db: None) -> None:
+        """替换文字超过 4000 字的 HTML 规则导入后按「只留正文」启用，整张表存回去照样过校验
 
-        放行的话规则表里会有一条启用着、却过不了保存校验的规则，之后改表里任何一条都 400。
+        「只留正文」不输出替换文字，替换文字按停用规则的上限查；否则规则表里会有一条启用着、却过不了
+        保存校验的规则，之后改表里任何一条都 400。
         """
+        from nekro_agent.services.tavern import cleanup
+
         script = dict(_regex_script(), replaceString="<div>" + "状" * 4500 + "</div>")
-        _preset, card, result = await _import_with_result(
+        _preset, card, _result = await _import_with_result(
             json.dumps(self._card(script)).encode("utf-8"),
             rule_enabled={0: True},
         )
 
-        assert card.cleanup_rules[0]["enabled"] is False
-        assert card.cleanup_rules[0]["disabled_reason"] == "html_output"
-        assert any("没有打开" in note and "替换文字" in note for note in result.notes)
+        rule = card.cleanup_rules[0]
+        assert rule["enabled"] is True
+        assert rule["output_mode"] == cleanup.OUTPUT_TEXT
+        assert cleanup.validate_rule(rule) is None
+        # 改回「按替换文字」就要守 4000 字的上限
+        assert cleanup.validate_rule({**rule, "output_mode": cleanup.OUTPUT_REPLACE}) is not None
 
     async def test_enabling_an_unsafe_rule_disabled_in_card_is_refused(self, db: None) -> None:
         """卡里关着的规则导入时不解析正则；打开前要补上这道检查"""
@@ -481,3 +494,68 @@ class TestBookDetails:
         assert script["disabled"] is False
         assert script["runOnEdit"] is True
         assert script["substituteRegex"] == 0
+
+
+class TestCardBookAnalysisOutsideTransaction:
+    async def test_card_book_is_analysed_before_the_transaction(
+        self, db: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import contextlib
+
+        inside: list[bool] = []
+        real_transaction = importer.in_transaction
+
+        @contextlib.asynccontextmanager
+        async def tracked(*args: Any, **kwargs: Any) -> Any:
+            async with real_transaction(*args, **kwargs) as connection:
+                inside.append(True)
+                try:
+                    yield connection
+                finally:
+                    inside.pop()
+
+        seen: list[bool] = []
+        real_prepare = importer.card_book_service.prepare_card_book_for_owner
+
+        def spy(book: Any, owner: Any, **kwargs: Any) -> Any:
+            seen.append(bool(inside))
+            return real_prepare(book, owner, **kwargs)
+
+        monkeypatch.setattr(importer, "in_transaction", tracked)
+        monkeypatch.setattr(importer.card_book_service, "prepare_card_book_for_owner", spy)
+        preset, _card = await _import(json.dumps(_v2_card()).encode("utf-8"))
+        assert seen == [False]
+        assert await DBWbBook.filter(preset_id=preset.id).exists()
+
+
+class TestCardBookNameVars:
+    """卡内书里读名字的变量：导入默认换，关掉就原样，导出仍以原条目为底"""
+
+    async def test_default_import_rewrites_and_export_keeps_the_original(self, db: None) -> None:
+        original = _card_with_name_var()
+
+        preset, card, result = await _import_with_result(json.dumps(original).encode("utf-8"))
+
+        _book, entries = (await _books_for(preset))[0]
+        assert entries[0].content == "你好，{{user}}。"
+        assert result.book_report is not None
+        assert result.book_report.notes["name_var"] == 1
+
+        exported = await _exported_payload(preset, card)
+        assert (
+            exported["data"]["character_book"]["entries"][0]["content"]
+            == "你好，{{getvar::数据库用户名}}。"
+        )
+
+    async def test_import_can_keep_name_vars_as_written(self, db: None) -> None:
+        original = _card_with_name_var()
+
+        preset, _card, result = await _import_with_result(
+            json.dumps(original).encode("utf-8"),
+            rewrite_name_vars=False,
+        )
+
+        _book, entries = (await _books_for(preset))[0]
+        assert entries[0].content == "你好，{{getvar::数据库用户名}}。"
+        assert result.book_report is not None
+        assert result.book_report.notes["name_var"] == 0

@@ -42,6 +42,7 @@ import { CARD_VARIANTS } from '../../../theme/variants'
 import { useMediaQuery } from '@mui/material'
 import { InlineTabs } from '../../../components/common/NekroTabs'
 import { useTranslation } from 'react-i18next'
+import { useSearchParams } from 'react-router-dom'
 import { type ChatChannelDetailTab } from '../../../router/routes'
 import ActionButton from '../../../components/common/ActionButton'
 import IconActionButton from '../../../components/common/IconActionButton'
@@ -72,6 +73,12 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
   const isMobile = useMediaQuery(theme.breakpoints.down('md'))
   const { t } = useTranslation('chat-channel')
   const { refresh } = useChatChannelRefresh(chatKey)
+  const [searchParams] = useSearchParams()
+  const memoryViewParam = searchParams.get('view')
+  const memoryView =
+    memoryViewParam === 'summaries' || memoryViewParam === 'rounds'
+      ? memoryViewParam
+      : undefined
 
   // 查询聊天详情
   const { data: channel, isLoading, isFetching } = useQuery({
@@ -380,6 +387,7 @@ export default function ChatChannelDetail({ chatKey, currentTab, onTabChange, on
                   chatKey={chatKey}
                   adapterKey={channel.adapter_key}
                   instanceKey={channel.instance_key}
+                  view={memoryView}
                 />
               </Card>
             )}

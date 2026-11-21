@@ -4,6 +4,7 @@
   "scopeBanner": "Scope follows the instance in the top bar; platform owners see everything when no instance is selected",
   "tabs": {
     "books": "Books",
+    "graph": "Graph",
     "quarantine": "Quarantine",
     "test": "Trigger Test"
   },
@@ -18,7 +19,8 @@
     "hostContent": "Host",
     "reference": "Reference",
     "globalPreset": "Global preset",
-    "empty": "(empty)"
+    "empty": "(empty)",
+    "reasonSeparator": "; "
   },
   "scope": {
     "domain": "Domain",
@@ -39,10 +41,14 @@
   "roundDetail": {
     "title": "Worldbook",
     "chars": "{{chars}} chars in total",
+    "tokenValue": "{{tokens}} tokens",
+    "charSuffix": "{{chars}} chars",
     "suppressedHint": "The round after a block does not inject tenant-written entries; host entries are injected as usual",
     "injectedTitle": "Injected entries",
-    "droppedTitle": "Skipped by budget",
+    "droppedTitle": "Matched but not injected",
+    "lookupTitle": "Looked up by model",
     "empty": "No worldbook entries in this round",
+    "semanticHit": "Semantic · {{score}}",
     "state": {
       "injected": "Injected",
       "none": "No match",
@@ -56,9 +62,17 @@
       "atDepth": "Depth"
     },
     "dropReason": {
+      "global_tokens": "over the per-round token limit",
+      "book_tokens": "over this book's token limit",
       "global_chars": "over the per-round character limit",
       "book_chars": "over this book's character limit",
-      "max_entries": "over the per-round entry limit"
+      "max_entries": "over the per-round entry limit",
+      "state_only": "only used with character state",
+      "template_unsupported": "contains an unsupported template",
+      "template_trap": "suspected trap (bulk text that only shows when variables are missing)",
+      "template_error": "template evaluation failed",
+      "template_empty": "template rendered to nothing",
+      "template_budget": "template budget for this round used up"
     },
     "status": {
       "active": "Active",
@@ -70,12 +84,14 @@
       "unknown": "Unknown"
     },
     "columns": {
+      "id": "ID",
       "book": "Book",
       "title": "Title",
       "position": "Position",
       "trust": "Type",
       "status": "Current status",
       "chars": "Chars",
+      "tokens": "Tokens / Chars",
       "renders": "Renders",
       "reason": "Reason",
       "actions": "Actions"
@@ -118,17 +134,27 @@
       "enabledOff": "Disabled",
       "search": "Keyword",
       "searchPlaceholder": "Search name and description",
-      "clear": "Clear filters"
+      "more": "More filters",
+      "moreWithCount": "More filters ({{count}})",
+      "clear": "Clear",
+      "done": "Done"
     },
     "columns": {
       "name": "Name",
       "scope": "Scope",
+      "effectiveScope": "Applies to",
       "instance": "Instance",
       "entries": "Entries",
       "enabled": "Enabled",
+      "status": "Status",
       "updatedAt": "Updated"
     },
     "quarantinedCount": "{{count}} quarantined",
+    "toggleStatus": "Enable or disable",
+    "enable": "Enable",
+    "disable": "Disable",
+    "enabledOn": "Enabled",
+    "enabledOff": "Disabled",
     "emptyTitle": "No worldbooks yet",
     "emptyHint": "Create one, or import a SillyTavern worldbook JSON"
   },
@@ -185,24 +211,50 @@
       "position": "Position",
       "order": "Order",
       "chars": "Characters",
+      "tokens": "Tokens",
       "trust": "Type",
       "result": "Result"
     },
     "reasonConstant": "Constant",
     "reasonKey": "Keyword \"{{key}}\"",
+    "reasonSemantic": "Semantic hit · {{score}}",
     "selected": "Selected",
-    "dropped": "Skipped by budget: {{reason}}",
+    "ignoredBudget": "Ignores budget",
+    "tokenWithChars": "{{tokens}} ({{chars}} chars)",
+    "dropped": "Not injected: {{reason}}",
+    "ahead": "Budget taken by: {{titles}}",
+    "aheadMore": "Budget taken by: {{titles}} and {{count}} more",
     "notSelected": "Not selected",
     "dropReason": {
+      "global_tokens": "global token limit",
+      "book_tokens": "book token limit",
       "global_chars": "global character limit",
       "book_chars": "book character limit",
-      "max_entries": "per-round entry limit"
+      "max_entries": "per-round entry limit",
+      "state_only": "only used with character state",
+      "template_unsupported": "unsupported template",
+      "template_trap": "suspected trap",
+      "template_error": "template evaluation failed",
+      "template_empty": "template rendered to nothing",
+      "template_budget": "template budget used up"
     },
     "renderedTitle": "Rendered result",
     "renderedAfterPersona": "After persona",
     "renderedBeforeHistory": "Before chat history",
     "renderedAtDepth": "Depth {{depth}}",
     "renderedCaption": "Tokens are replaced by SESSION_TOKEN; bodies from books you cannot see are replaced with placeholder text (books the platform created for global presets are read-only visible to you and shown as usual)"
+  },
+  "budgetExplain": {
+    "line": "Budget {{budget}} tokens (about {{approx}} chars) = min( {{percent}}% × ({{contextLength}} − {{outputReserve}}), {{cap}} ); model group {{modelGroup}}, token factor {{factor}} ({{source}})",
+    "total": "{{total}} tokens selected this round",
+    "fallback": "The fallback model group {{modelGroup}} only has a context of {{contextLength}}; the worldbook may not fit if the request is retried with it",
+    "cap": "cap {{cap}}",
+    "hardCap": "hard cap {{cap}}",
+    "source": {
+      "group": "source: set on the model group",
+      "modelName": "source: inferred from model name {{family}}",
+      "default": "source: default"
+    }
   },
   "bookForm": {
     "createTitle": "New worldbook",
@@ -237,12 +289,44 @@
     "scanDepthHelper": "Defaults to 4 when empty",
     "scanDepthHelperPerson": "Defaults to 10 when empty",
     "scanDepthHelperEdit": "How many recent messages to scan (1 - 50)",
-    "budget": "Per-round character budget for this book",
-    "budgetInvalid": "The per-round budget must be between 0 and 100000",
+    "budget": "Per-round token budget for this book",
+    "budgetInvalid": "The per-round budget must be between 0 and 65536",
     "budgetHelper": "0 = no separate limit",
+    "injectMode": {
+      "label": "Injection mode",
+      "both": "Push and lookup",
+      "push": "Push only",
+      "lookup": "Lookup only",
+      "helper": "Lookup only: constant entries are injected as usual, keyword hits are no longer injected automatically, and the model looks them up when needed. Recommended for large encyclopedic books with hundreds of entries."
+    },
+    "activeScene": {
+      "label": "Active in",
+      "both": "Private and group chats",
+      "private": "Private chats only",
+      "group": "Group chats only",
+      "helper": "Books written for one-on-one conversation (where the persona refers to the other side as the user a lot) are best limited to private chats."
+    },
     "caseSensitive": "Case sensitive",
     "matchWholeWords": "Whole-word matching",
     "matchWholeWordsHelper": "Only affects English and numeric keywords; Chinese keywords are always matched by containment",
+    "scanNames": "Include speaker names when scanning",
+    "scanNamesHelper": "When on, each message is prefixed with its speaker name before keywords are matched: the Bot's own messages use the persona name, other members use their nickname. An entry whose keyword is the persona name hits whenever the Bot has spoken recently; the cost is that a member who renames themselves can also trigger entries in this book that contain that name.",
+    "scanNamesStDefault": "Matches the SillyTavern default for new installs.",
+    "semantic": {
+      "label": "Semantic activation",
+      "vectorAll": "All entries participate",
+      "vectorAllHelper": "Besides keywords, an entry is also brought in when recent conversation is close in meaning. Constant entries are always present and do not need this.",
+      "advanced": "Adjust",
+      "queryMessages": "Recent messages to use",
+      "queryMessagesHelper": "Counts non-empty messages only, 1 to 10, default 2",
+      "queryMessagesInvalid": "Recent messages to use must be between 1 and 10",
+      "maxEntries": "Max entries per round",
+      "maxEntriesHelper": "Most entries this book can bring in semantically per round, 1 to 20, default 5",
+      "maxEntriesInvalid": "Max entries per round must be between 1 and 20",
+      "threshold": "Similarity floor",
+      "thresholdHelper": "Below this similarity it is not a hit; 0 to 1, default 0.25",
+      "thresholdInvalid": "Similarity floor must be between 0 and 1"
+    },
     "createSuccess": "Worldbook created",
     "updateSuccess": "Settings saved"
   },
@@ -255,6 +339,7 @@
     "noFile": "Choose a file",
     "fileSummary": "{{name}} ({{size}})",
     "macroHint": "Accepts SillyTavern worldbook JSON; unsupported fields are preserved as-is and restored on export; macros such as {{example}} are kept as-is and not replaced",
+    "rewriteNameVars": "Replace name-reading variables with {{userMacro}} / {{charMacro}}",
     "reportTitle": "Import report",
     "created": "Imported {{count}} entries",
     "notesTitle": "Change categories",
@@ -267,7 +352,14 @@
       "position_downgraded": "Position downgraded",
       "renumbered": "Renumbered",
       "bad_value": "Bad value",
-      "over_budget": "Body exceeds per-round injection limit"
+      "over_budget": "Body exceeds per-round injection limit",
+      "name_var": "Name variable replaced with macro",
+      "state_only": "Only used with character state (kept out of the main prompt)",
+      "unsupported_template": "Unsupported template (not injected)",
+      "suspected_trap": "Suspected anti-copy trap",
+      "template_not_analyzed": "Too many templates; not analysed at import (analysed when matched)",
+      "budget_check": "Budget check",
+      "unsupported": "Not effective (unsupported features and templates)"
     },
     "detailsTitle": "Details",
     "detailColumns": {
@@ -292,17 +384,22 @@
     "deleteSuccess": "Book deleted",
     "exportFailed": "Export failed",
     "entriesTitle": "Entries",
+    "semanticParticipating": "Semantic: {{count}}",
+    "semanticPending": "Vectors pending: {{count}}",
     "searchPlaceholder": "Search title, keywords or content",
     "entriesEmpty": "This book has no entries yet",
+    "searchEmpty": "No matching entries",
     "columns": {
       "title": "Title",
       "keys": "Keywords",
       "position": "Position",
+      "positionOrder": "Position · order",
       "order": "Order",
       "status": "Status",
       "trust": "Type",
       "actions": "Actions"
     },
+    "moreActions": "More actions",
     "keywordsMore": "and {{count}} more",
     "secondary": "{{logic}}, {{count}} secondary keywords",
     "status": {
@@ -313,6 +410,25 @@
     "autoQuarantined": "Auto-quarantined after {{count}} blocked hits",
     "invalidKeys": "Invalid keyword: {{key}} ({{reason}})",
     "slowKeys": "Disabled (too slow): {{key}}",
+    "purpose": {
+      "stateOnly": "Only with character state",
+      "unsupported": "Unsupported template",
+      "plot": "Plot only"
+    },
+    "purposeKind": {
+      "mvu_update": "variable update rules",
+      "initvar": "initial variables",
+      "state_render": "state rendering"
+    },
+    "purposeHint": {
+      "stateOnly": "Purpose: {{kind}}. Kept for the future character state feature; never part of the main prompt",
+      "unsupported": "The template uses something NA does not understand ({{reason}}); the whole entry is not injected",
+      "plot": "Title has [mvu_plot]: plot settings, injected as usual"
+    },
+    "trap": "Suspected trap",
+    "analysisPending": "Analyzing",
+    "analysisPendingHint": "The template in this entry has not been analyzed yet; purpose and trap marks update shortly",
+    "trapHint": "{{reason}}. Text like this is bait for clients that do not run templates; NA never injects it",
     "actions": {
       "view": "View",
       "edit": "Edit",
@@ -330,7 +446,10 @@
     },
     "entryDeleteTitle": "Delete entry",
     "entryDeleteDescription": "This cannot be undone",
-    "entryDeleteSuccess": "Deleted"
+    "entryDeleteSuccess": "Deleted",
+    "budgetCheck": {
+      "truncated": "There are too many constant entries; only the lowest-numbered batch was checked"
+    }
   },
   "entryDialog": {
     "createTitle": "New entry",
@@ -358,6 +477,9 @@
     "regexSafety": "The server also runs a safety check on save (no backreferences, nested repetition, etc.); failures are listed one by one",
     "constant": "Constant",
     "constantHelper": "Ignores keywords and is injected whenever the book is active",
+    "vectorized": "Participate in semantic activation",
+    "vectorizedHelper": "Besides keywords, this entry is also brought in when recent conversation is close in meaning",
+    "vectorizedConstant": "Constant entries are always present; this is not needed",
     "content": "Content",
     "contentRequired": "Content cannot be empty",
     "contentTooLong": "Content cannot exceed {{max}} characters",
@@ -395,11 +517,87 @@
     "trustedHelper": "When unchecked, this entry is injected as reference material inside the untrusted block; editing a tenant entry does not automatically make it host content",
     "trustedCreateHelper": "Entries created by the platform are always injected as host content; to make one reference material, uncheck this after it is created",
     "tenantTrustedHint": "Entries you write are injected as reference material (inside the untrusted block)",
+    "ignoreBudget": "Ignore budget",
+    "ignoreBudgetHelper": "After a hit it is not stopped by the global or this book's budget; the per-round entry limit still applies, the tokens it uses still count, and later entries have that much less room. Only takes effect on host entries written by the platform.",
+    "ignoreBudgetNotHost": "This is not a host entry; the switch has no effect",
     "personBookWarning": "This book is bound to a person: when they appear in recent messages, these entries enter the prompt and affect the whole group.",
     "invalidKeysWarning": "Invalid keywords: {{keys}}",
     "slowKeysWarning": "Disabled (too slow): {{keys}}",
     "quarantinedWarning": "This entry is quarantined; after editing it still needs to be restored from the quarantine or the entry table",
     "saveSuccess": "Entry saved"
+  },
+  "graph": {
+    "allBooks": "All books",
+    "searchPlaceholder": "Search title, keywords or body",
+    "clearSearch": "Clear search",
+    "bookPickerError": "The book list could not be loaded; the graph still follows the current scope",
+    "entryNotFound": "This entry does not exist or was deleted",
+    "entryWrongBook": "This entry does not belong to the current book",
+    "clusters": {
+      "book": "Books",
+      "entry": "Entries",
+      "person": "People",
+      "binding": "Bindings"
+    },
+    "edges": {
+      "bookEntry": "Contains",
+      "bookBinding": "Bound to",
+      "keyReference": "Keyword reference (derived)"
+    },
+    "legend": {
+      "booksTruncated": "Too many books: only the {{drawn}} most recently updated of {{total}} are drawn.",
+      "entriesTruncated": "Only the {{drawn}} most recently injected of {{total}} entries are drawn.",
+      "referencesTruncated": "References were not fully computed; some “mentions” are missing."
+    },
+    "empty": {
+      "noBooks": "No worldbooks yet",
+      "noBooksHint": "Create a book first, or select an instance in the top bar",
+      "noEntries": "No entries match",
+      "noEntriesHint": "There are no drawable entries in the current scope",
+      "filteredHint": "Try another keyword or book, or show disabled / quarantined entries",
+      "clearFilters": "Clear filters",
+      "notFound": "Book not found",
+      "notFoundHint": "It may have been deleted or is outside the current scope"
+    },
+    "kind": {
+      "book": "Book",
+      "entry": "Entry",
+      "preset": "Preset",
+      "channel": "Channel",
+      "person": "Person"
+    },
+    "bindingType": {
+      "preset": "Preset",
+      "channel": "Channel",
+      "person": "Person"
+    },
+    "panel": {
+      "none": "None",
+      "boundTo": "Bound to: {{target}}",
+      "entryCount": "Entries {{count}}",
+      "constantCount": "Constants {{count}}",
+      "quarantinedCount": "Quarantined {{count}}",
+      "injectMode": "Injection mode",
+      "activeScene": "Active scene",
+      "vectorAll": "All entries participate in semantic triggering",
+      "openBook": "Open this book",
+      "book": "Book",
+      "injectionSummary": "In the last {{rounds}} rounds: injected {{injected}} times, dropped by budget {{dropped}} times, looked up by the model {{lookups}} times",
+      "starved": "Recently it was only dropped by budget and never made it in. Raise the budget or enable “Ignore budget”.",
+      "starvedShort": "Recently only dropped by budget, never injected",
+      "preview": "Body preview",
+      "mentions": "It mentions",
+      "mentionedBy": "Mentioned by",
+      "openEntry": "Open this entry in its book",
+      "bindingType": "Type",
+      "boundBooks": "Bound books ({{count}})"
+    },
+    "flags": {
+      "constant": "Constant",
+      "vectorized": "Semantic triggering",
+      "ignoreBudget": "Ignore budget",
+      "trusted": "Trusted (host content)"
+    }
   },
   "readOnly": {
     "chip": "Provided by platform (read-only)",

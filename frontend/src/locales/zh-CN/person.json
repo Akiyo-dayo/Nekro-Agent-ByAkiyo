@@ -1,0 +1,27 @@
+{
+  "title": "人物卡",
+  "open": "打开人物卡",
+  "entry": "人物卡",
+  "copyAccount": "复制账号",
+  "accountCopied": "账号已复制",
+  "copyFailed": "复制失败",
+  "retry": "重试",
+  "error": "加载失败",
+  "affection": {
+    "title": "好感",
+    "empty": "还没有好感记录",
+    "callName": "称呼：{{name}}",
+    "lastSeen": "最近见到"
+  },
+  "state": {
+    "title": "状态档案",
+    "empty": "没有状态档案",
+    "open": "去状态页"
+  },
+  "memory": {
+    "title": "记忆",
+    "total": "共 {{count}} 条",
+    "empty": "记忆里还没有提到这个人",
+    "viewAll": "查看全部"
+  }
+}

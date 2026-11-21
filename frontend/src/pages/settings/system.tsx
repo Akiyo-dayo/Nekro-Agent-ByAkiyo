@@ -42,11 +42,21 @@
  */
 
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, AlertTitle, Box, Tab } from '@mui/material'
+import { Alert, AlertTitle, Box, Typography } from '@mui/material'
 import RocketLaunchIcon from '@mui/icons-material/RocketLaunch'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import ConfigTable from '../../components/common/ConfigTable'
+import SearchField from '../../components/common/SearchField'
+import {
+  DOMAIN_SETTINGS_LIST,
+  findDomainByCategory,
+  type DomainSettingsDefinition,
+} from '../../config/domainSettings'
+import {
+  SETTINGS_CATEGORY_GROUPS,
+  findSettingsCategoryGroup,
+} from '../../config/settingsCategoryGroups'
 import InstanceScopeBanner from '../../components/common/InstanceScopeBanner'
 import { useIdentity } from '../../hooks/useIdentity'
 import { INSTANCE_SCOPE_QUERY_KEY, useInstanceScope } from '../../hooks/useInstanceScope'
@@ -54,21 +64,40 @@ import {
   createInstanceConfigService,
   isScopeEndpointUnavailable,
 } from '../../services/api/instance-scope'
-import { createConfigService } from '../../services/api/unified-config'
+import { createConfigService, unifiedConfigApi } from '../../services/api/unified-config'
 import { useTranslation } from 'react-i18next'
 import { getLocalizedText } from '../../services/api/types'
 import type { ConfigItem, ConfigService } from '../../components/common/ConfigTable'
 import { useLocaleStore } from '../../stores/locale'
 import type { SupportedLocale } from '../../config/i18n'
-import { PanelTabs, PanelTabsContainer } from '../../components/common/NekroTabs'
 import ActionButton from '../../components/common/ActionButton'
 import OutputFilterHitsPanel from './components/OutputFilterHitsPanel'
+import SettingsCategoryNav, { type CategoryNavGroup } from './components/SettingsCategoryNav'
+
+/** 分类在导航里的排序键：先按分组表，再是功能页那几类，再是没归组的，「其他」垫底 */
+const categoryRank = (category: string, otherLabel: string, discovered: string[]) => {
+  if (category === otherLabel) {
+    return [3, 0]
+  }
+  const grouped = findSettingsCategoryGroup(category)
+  if (grouped) {
+    return [0, SETTINGS_CATEGORY_GROUPS.indexOf(grouped.group) * 100 + grouped.order]
+  }
+  const domainIndex = DOMAIN_SETTINGS_LIST.findIndex(
+    domain => domain.category === category || domain.categoryEn === category
+  )
+  if (domainIndex >= 0) {
+    return [1, domainIndex]
+  }
+  return [2, discovered.indexOf(category)]
+}
 
 export default function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { t } = useTranslation('settings')
+  const { t: tDomainSettings } = useTranslation('domain-settings')
   const { i18n } = useTranslation()
   const { setLocaleLocal } = useLocaleStore()
   const urlSearchText = searchParams.get('search') ?? ''
@@ -109,6 +138,25 @@ export default function SettingsPage() {
     retry: false,
   })
 
+  // 世界书预算改成按 token 计的一次性迁移提示；租户身份取回来恒为空数组
+  const { data: worldbookBudgetNotice } = useQuery({
+    queryKey: ['worldbook-budget-notice'],
+    queryFn: () => unifiedConfigApi.getWorldbookBudgetNotice(),
+    retry: false,
+  })
+  const ackWorldbookBudgetNotice = useMutation({
+    mutationFn: () => unifiedConfigApi.ackWorldbookBudgetNotice(),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['worldbook-budget-notice'] })
+    },
+  })
+  const worldbookBudgetNoticeLines = worldbookBudgetNotice?.lines ?? []
+
+  // 实例作用域下配置项走实例覆盖接口，预算换算也要取实例层的键
+  const worldbookBudgetConfigKey = currentInstance
+    ? `instance_override_${currentInstance.adapter_key}__${currentInstance.instance_key}`
+    : 'system'
+
   // 「后端未就绪」这个结论只对平台方成立。租户拿到的 404 可能是
   // `assert_instance_accessible` 的越权 404（实例已被划走），把它说成"接口没上线"、
   // 再递一个「切回全局视图」的按钮，两句都是错的——租户根本没有全局视图。
@@ -144,15 +192,8 @@ export default function SettingsPage() {
     return config.category || t('system.otherCategory', '其他')
   }
 
-  const preferredCategoryOrder = useMemo(() => {
-    if (i18n.language.startsWith('zh')) {
-      return ['基础设置', '模型配置', '聊天配置', '沙盒配置', '记忆系统', '世界书']
-    }
-    return ['Basic Settings', 'Model Configuration', 'Chat Configuration', 'Sandbox Configuration', 'Memory System', 'Worldbook']
-  }, [i18n.language])
-
-  // 按分类组织配置，同时提取分类列表
-  const { categories, configsByCategory } = useMemo(() => {
+  // 按分类组织配置，同时提取分类列表（按导航里的分组顺序排好）
+  const { categories, configsByCategory, categoryCounts } = useMemo(() => {
     const visibleConfigs = configs.filter((config: ConfigItem) => !config.is_hidden)
     const seen = new Set<string>()
     const cats: string[] = []
@@ -171,52 +212,33 @@ export default function SettingsPage() {
       }
     })
 
+    // 导航上显示的条数只数配置项本身，不数成对的覆盖开关
+    const counts: Record<string, number> = {}
+
     visibleConfigs.forEach((config: ConfigItem) => {
       const category = toggleOwnerCategory.get(config.key) ?? resolveCategory(config)
       if (!seen.has(category)) {
         seen.add(category)
-        // "其他"分类放到最后
-        if (category !== otherLabel) {
-          cats.push(category)
-        }
+        cats.push(category)
       }
       if (!grouped[category]) {
         grouped[category] = []
       }
       grouped[category].push(config)
+      if (!toggleOwnerCategory.has(config.key)) {
+        counts[category] = (counts[category] ?? 0) + 1
+      }
     })
 
-    // "其他"分类有内容时才追加到末尾
-    if (grouped[otherLabel]?.length) {
-      cats.push(otherLabel)
-    }
-
-    const categoryOrderMap = new Map(preferredCategoryOrder.map((category, index) => [category, index]))
     const sortedCategories = cats.slice().sort((a, b) => {
-      if (a === otherLabel) {
-        return 1
-      }
-      if (b === otherLabel) {
-        return -1
-      }
-
-      const aPriority = categoryOrderMap.get(a)
-      const bPriority = categoryOrderMap.get(b)
-      if (aPriority !== undefined && bPriority !== undefined) {
-        return aPriority - bPriority
-      }
-      if (aPriority !== undefined) {
-        return -1
-      }
-      if (bPriority !== undefined) {
-        return 1
-      }
-      return cats.indexOf(a) - cats.indexOf(b)
+      const [aTier, aOrder] = categoryRank(a, otherLabel, cats)
+      const [bTier, bOrder] = categoryRank(b, otherLabel, cats)
+      return aTier - bTier || aOrder - bOrder
     })
 
-    return { categories: sortedCategories, configsByCategory: grouped }
+    return { categories: sortedCategories, configsByCategory: grouped, categoryCounts: counts }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configs, i18n.language, preferredCategoryOrder, t])
+  }, [configs, i18n.language, t])
 
   const activeTab = useMemo(() => {
     if (categories.length === 0) {
@@ -225,8 +247,62 @@ export default function SettingsPage() {
     if (requestedCategory && categories.includes(requestedCategory)) {
       return requestedCategory
     }
-    return categories[0]
+    // 默认落在第一个还在本页编辑的分类上，而不是一张跳转卡
+    return categories.find(category => !findDomainByCategory(category)) ?? categories[0]
   }, [categories, requestedCategory])
+
+  // 六个功能域的配置已经移到各自页面：导航里合成一组「功能页设置」，点了直接去那一页。
+  // 旧的 `?category=记忆系统` 这类深链仍然有效：落在这里，由下面那张跳转卡接住。
+  const domainForActiveTab = useMemo(() => findDomainByCategory(activeTab), [activeTab])
+
+  const navGroups = useMemo<CategoryNavGroup[]>(() => {
+    const otherLabel = t('system.otherCategory', '其他')
+    const itemOf = (category: string, domain?: DomainSettingsDefinition) => ({
+      category,
+      count: categoryCounts[category] ?? 0,
+      domain,
+    })
+    const groups: CategoryNavGroup[] = SETTINGS_CATEGORY_GROUPS.map(group => ({
+      key: group.key,
+      title: t(group.titleKey),
+      items: categories
+        .filter(category => findSettingsCategoryGroup(category)?.group === group)
+        .map(category => itemOf(category)),
+    }))
+    groups.push({
+      key: 'domains',
+      title: t('system.groups.domains'),
+      items: categories.flatMap(category => {
+        const domain = findDomainByCategory(category)
+        return domain ? [itemOf(category, domain)] : []
+      }),
+    })
+    // 没归进任何一组的分类（含后端没给分类的配置项）都落「其他」
+    groups.push({
+      key: 'other',
+      title: t('system.groups.other'),
+      items: categories
+        .filter(
+          category =>
+            category === otherLabel ||
+            (!findSettingsCategoryGroup(category) && !findDomainByCategory(category))
+        )
+        .map(category => itemOf(category)),
+    })
+    return groups.filter(group => group.items.length > 0)
+  }, [categories, categoryCounts, t])
+
+  const isSearching = Boolean(searchInput.trim())
+
+  const selectCategory = (category: string) => {
+    const nextParams = new URLSearchParams(searchParams)
+    nextParams.set('category', category)
+    // 选分类即退出搜索：搜索结果跨全部分类，和「看某一类」是两种视图
+    nextParams.delete('search')
+    setSearchInput('')
+    setDebouncedSearchInput('')
+    setSearchParams(nextParams, { replace: true })
+  }
 
   useEffect(() => {
     setSearchInput(urlSearchText)
@@ -405,35 +481,68 @@ export default function SettingsPage() {
         p: 2,
       }}
     >
+      {worldbookBudgetNoticeLines.length > 0 && (
+        <Alert
+          severity="info"
+          sx={{ mb: 2, flexShrink: 0 }}
+          action={
+            <ActionButton
+              tone="ghost"
+              size="small"
+              onClick={() => ackWorldbookBudgetNotice.mutate()}
+              disabled={ackWorldbookBudgetNotice.isPending}
+            >
+              {t('worldbookBudgetNotice.ack')}
+            </ActionButton>
+          }
+        >
+          <AlertTitle>{t('worldbookBudgetNotice.title')}</AlertTitle>
+          {worldbookBudgetNoticeLines.map((line, index) => (
+            <Typography key={index} variant="body2">
+              {line}
+            </Typography>
+          ))}
+          <Typography variant="body2" sx={{ mt: 1 }}>
+            {t('worldbookBudgetNotice.hint')}
+          </Typography>
+        </Alert>
+      )}
+
       {currentInstanceKey && (
         <Box sx={{ mb: 2, flexShrink: 0 }}>
           <InstanceScopeBanner description={t('banner.settings', { ns: 'instance-scope' })} />
         </Box>
       )}
 
-      {/* 分类选项卡 */}
+      {/* 搜索 + 分组分类导航。搜索跨全部分类出结果，此时导航上不标当前项 */}
       <Box
         sx={{
           mb: 2,
           flexShrink: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 1.5,
         }}
       >
-        <PanelTabsContainer sx={{ minWidth: 0 }}>
-          <PanelTabs
-            value={categories.length > 0 ? activeTab : false}
-            onChange={(_, newValue) => {
-              const nextParams = new URLSearchParams(searchParams)
-              nextParams.set('category', newValue)
-              setSearchParams(nextParams, { replace: true })
-            }}
-            variant="scrollable"
-            scrollButtons="auto"
-          >
-            {categories.map((category) => (
-              <Tab key={category} label={category} value={category} />
-            ))}
-          </PanelTabs>
-        </PanelTabsContainer>
+        {/* 上方留出浮动标签的位置：页面外层是 overflow: hidden */}
+        <Box sx={{ width: { xs: '100%', sm: 360 }, pt: 0.5 }}>
+          <SearchField
+            fullWidth
+            label={t('system.searchLabel')}
+            placeholder={t('system.searchPlaceholder')}
+            value={searchInput}
+            onChange={value => handleSearchChange(value)}
+            onClear={() => handleSearchChange('')}
+          />
+        </Box>
+        {navGroups.length > 0 && (
+          <SettingsCategoryNav
+            groups={navGroups}
+            activeCategory={isSearching ? null : activeTab}
+            onSelect={selectCategory}
+            onOpenDomain={domain => navigate(`${domain.pagePath}?settings=open`)}
+          />
+        )}
       </Box>
 
       {showOutputFilterPanel && (
@@ -446,24 +555,54 @@ export default function SettingsPage() {
       )}
 
       <Box sx={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
-        {configService && (
-          <ConfigTable
-            configKey="system"
-            configService={configService}
-            configs={displayConfigs}
-            loading={isLoading}
-            searchText={searchInput}
-            onSearchChange={handleSearchChange}
-            onRefresh={handleRefresh}
-            showSearchBar={true}
-            showToolbar={true}
-            toolbarActions={guideToolbarAction}
-            showCategoryColumn={Boolean(searchInput.trim())}
-            emptyMessage={t('system.emptyMessage')}
-            // 实例作用域返回的是成对的 `enable_X` / `X`：不按覆盖页渲染就既画不出覆盖开关、
-            // 也不会把 `enable_X` 一起提交，改完保存等于什么都没发生（见文件头注释）
-            isOverridePage={isOverrideScope}
-          />
+        {domainForActiveTab && !isSearching ? (
+          <Box
+            sx={{
+              p: 2,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 2,
+              flexWrap: 'wrap',
+              border: '1px solid',
+              borderColor: 'divider',
+              borderRadius: 1,
+              bgcolor: 'background.paper',
+            }}
+          >
+            <Typography variant="body1" sx={{ minWidth: 0, flex: 1 }}>
+              {tDomainSettings('system.moved', {
+                page: tDomainSettings(`page.${domainForActiveTab.key}`),
+              })}
+            </Typography>
+            <ActionButton
+              tone="primary"
+              onClick={() => navigate(`${domainForActiveTab.pagePath}?settings=open`)}
+            >
+              {tDomainSettings('system.go')}
+            </ActionButton>
+          </Box>
+        ) : (
+          configService && (
+            <ConfigTable
+              configKey="system"
+              worldbookBudgetConfigKey={worldbookBudgetConfigKey}
+              configService={configService}
+              configs={displayConfigs}
+              loading={isLoading}
+              searchText={searchInput}
+              onSearchChange={handleSearchChange}
+              onRefresh={handleRefresh}
+              // 搜索框提到了分类导航上方（跨分类搜索），表格自己的不再画
+              showSearchBar={false}
+              showToolbar={true}
+              toolbarActions={guideToolbarAction}
+              showCategoryColumn={Boolean(searchInput.trim())}
+              emptyMessage={t('system.emptyMessage')}
+              // 实例作用域返回的是成对的 `enable_X` / `X`：不按覆盖页渲染就既画不出覆盖开关、
+              // 也不会把 `enable_X` 一起提交，改完保存等于什么都没发生（见文件头注释）
+              isOverridePage={isOverrideScope}
+            />
+          )
         )}
       </Box>
     </Box>

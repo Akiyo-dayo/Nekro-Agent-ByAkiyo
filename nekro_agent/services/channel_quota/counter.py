@@ -13,11 +13,19 @@
 
 计数是**观测**，它的失败不该让一条消息处理失败、更不该让一个已经跑完的回合变成异常。
 这与用量账本的同一条约束一致（见 `services/usage/ledger.py` 的模块文档）。
+
+## 每小时回合数只在进程内
+
+每日回合数落在库里（`DBChannelQuotaDaily.replies`），小时这一档只在进程内记一份
+（`_hour_replies`）：它每小时清零、只用来做均摊，写库的收益抵不上每小时给每个活跃频道
+写一次。代价是重启后这个小时从 0 重新数，重启后的头一个小时均摊会偏松；每日上限读的是
+库里的那份，不受影响。
 """
 
 from __future__ import annotations
 
 import datetime
+import time
 from typing import Dict, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -35,6 +43,13 @@ FALLBACK_TIMEZONE = "Asia/Shanghai"
 # 计入「回复主链路」的那些场景。平台方把 token 计入范围切成只算回复链路时，
 # 读的是 `tokens_reply` 这一列，所以这里的集合决定了那一列的语义。
 REPLY_SCENES: frozenset[str] = frozenset({"chat", "history_plan"})
+
+# 每小时回合计数：`chat_key → (整点小时的起始秒, 回合数)`。进程内，重启即清空。
+_hour_replies: Dict[str, tuple[int, int]] = {}
+
+# 小时计数表的上限：超过就删掉所有不是当前小时的项。频道数正常远小于这个数，
+# 上限只兜「会话标识频繁变化」这类异常形态。
+MAX_HOUR_REPLY_KEYS = 4096
 
 _timezone_warned = False
 
@@ -132,9 +147,15 @@ async def record_tokens(
 
 
 async def record_reply(chat_key: str, adapter_key: str, instance_key: str) -> None:
-    """给频道的当天计数加一次回复（一个回合算一次，不是一条消息一次）"""
+    """给频道的当天计数加一次回复（一个回合算一次，不是一条消息一次）
+
+    当天计数写库（每日上限读它），当前整点小时的计数只记在进程内（每小时均摊读它）。
+    小时计数在读库之前加：库写失败时小时这一档仍然记上了，而那条 warning 已经说明了
+    每日那一档丢了数——两处口径不一致时以「不超发」为优先。
+    """
     if not chat_key:
         return
+    _bump_hour_replies(chat_key)
     try:
         day = quota_day()
         await _bump(chat_key, day, replies=1)
@@ -144,6 +165,42 @@ async def record_reply(chat_key: str, adapter_key: str, instance_key: str) -> No
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"频道额度回复计数失败（已忽略）: chat_key={chat_key} | {exc}")
+
+
+def _hour_start(at: Optional[float] = None) -> int:
+    """当前整点小时的起始秒（epoch 秒）
+
+    单独一个小函数：用例要打桩跨整点，而时钟只该在这一处读。
+    """
+    now = time.time() if at is None else at
+    return int(now - (now % 3600))
+
+
+def _bump_hour_replies(chat_key: str) -> None:
+    """给这个频道的当前小时回合数加一；小时变了就从 1 重新起"""
+    hour = _hour_start()
+    cached = _hour_replies.get(chat_key)
+    if cached is not None and cached[0] == hour:
+        _hour_replies[chat_key] = (hour, cached[1] + 1)
+        return
+    _hour_replies[chat_key] = (hour, 1)
+    if len(_hour_replies) > MAX_HOUR_REPLY_KEYS:
+        current = _hour_start()
+        for key in [key for key, value in _hour_replies.items() if value[0] != current]:
+            _hour_replies.pop(key, None)
+
+
+def hour_replies(chat_key: str) -> int:
+    """这个频道当前整点小时的回合数；没有记录、或记录属于过去的小时返回 0"""
+    cached = _hour_replies.get(chat_key)
+    if cached is None or cached[0] != _hour_start():
+        return 0
+    return cached[1]
+
+
+def reset_hour_replies() -> None:
+    """清空进程内的小时回合计数（**仅供测试**）"""
+    _hour_replies.clear()
 
 
 async def add_bonus(chat_key: str, day: str, amount: int) -> None:
@@ -173,13 +230,16 @@ async def get_daily_bulk(chat_keys: Iterable[str], day: str) -> Dict[str, DBChan
 
 __all__ = [
     "FALLBACK_TIMEZONE",
+    "MAX_HOUR_REPLY_KEYS",
     "REPLY_SCENES",
     "add_bonus",
     "get_daily",
     "get_daily_bulk",
+    "hour_replies",
     "quota_day",
     "record_reply",
     "record_tokens",
+    "reset_hour_replies",
     "reset_timezone_warning",
     "resolve_timezone",
 ]

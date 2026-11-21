@@ -29,7 +29,7 @@ fail-closed 的，控制台对它们的启 / 停 / 重启 / 删全部 403，且�
 ## 取材原则
 
 - 表驱动、显式输入、精确期望；不随机 fuzz、不 sleep、不只断言「没抛异常」。
-- 环境派生值一律**调用产品自己的函数**现算，不写默认环境下的字面量（§2.9）。
+- 环境派生值一律**调用产品自己的函数**现算，不写默认环境下的字面量。
 - 路径一律落在 `tmp_path` 下：`/opt/...` 这类字面量在 Windows 上会被 `resolve()` 变成
   `C:\opt\...`，而 `create_container` 会真的去 `mkdir`。
 """
@@ -92,7 +92,7 @@ def here(monkeypatch: pytest.MonkeyPatch, deploy_a: Path) -> Path:
 
 
 def owner_tag_of(monkeypatch: pytest.MonkeyPatch, data_dir: Path, instance_name: str = "") -> str:
-    """某套部署会**写入**的归属标签（调产品自己的函数现算，§2.9）"""
+    """某套部署会**写入**的归属标签（调产品自己的函数现算）"""
     with monkeypatch.context() as patch:
         patch.setattr(OsEnv, "INSTANCE_NAME", instance_name)
         patch.setattr(OsEnv, "DATA_DIR", str(data_dir))
@@ -554,7 +554,7 @@ class TestLegacyContainersSurviveTheUpgrade:
 
 
 # ===========================================================================
-# 接线：破坏性操作真的会走到这套判定上（§2.7）
+# 接线：破坏性操作真的会走到这套判定上
 # ===========================================================================
 
 
@@ -679,16 +679,25 @@ class TestCreateWritesOnlyTheCurrentTag:
         docker: Dict[str, Any],
         db: DBAdapterInstance,
     ) -> None:
-        """创建侧的挂载点与归属判定读的那三个常量必须是同一批
+        """创建侧的挂载点与归属判定读的常量必须是同一批
 
         两边分叉时判据会静默退化成「永远读不到挂载」，表现是存量容器全部 403 ——
-        而那正是双识别要消灭的症状。
+        而那正是双识别要消灭的症状。数据目录只挂 `uploads`、只读（协议端只需要读 NA 交给它发送的
+        文件），整个数据目录不再挂给它。
         """
         await container_manager.create_container(db, image_tag="latest", auto_pull=False)
         _name, config = docker["created"][0]
         binds = config["HostConfig"]["Binds"]
         expected = mount_points_of(monkeypatch, here, INSTANCE_KEY)
-        assert sorted(binds) == sorted(f"{source}:{destination}" for destination, source in expected.items())
+        data_dir = expected.pop(container_manager.CONTAINER_DATA_DIR)
+        assert sorted(binds) == sorted(
+            [
+                f"{data_dir / 'uploads'}:{container_manager.CONTAINER_DATA_DIR}/uploads:ro",
+                *(f"{source}:{destination}" for destination, source in expected.items()),
+            ]
+        )
+        assert not any(bind.split(":/", 1)[0] == str(data_dir) for bind in binds), "整个数据目录不该挂给 NapCat"
+        assert (data_dir / "uploads").is_dir(), "uploads 要先建好，不让 Docker 以 root 建"
 
     async def test_the_freshly_created_container_needs_no_mount_evidence(
         self,

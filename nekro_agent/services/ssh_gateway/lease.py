@@ -89,11 +89,18 @@ class SshLease:
         actor_user_id: 后台直发的账号 id；复核按 id 重查（用户名不唯一）
         triggered_by: 叫醒这一轮的账号，去重保序
         credential_ids: 拍下那一刻被覆盖的行，任务中途新登记的行不会加进来
+        duty_ids: 其中按值守判据覆盖的行（复核时不比所有者名单，改判仍是值守）；
+            后台直发恒为空
         state: `queued` / `running` / `ended`
         created_at: 拍下时刻（单调时钟）
         started_at: 转 `running` 的时刻；没生效过为空
         expires_at: 最长有效期，`created_at + SSH_GATEWAY_LEASE_MAX_SECONDS`
         end_reason: 结束原因，审计与排查用
+        created_wall: 拍下时刻的墙上时间（事后摘要里给人看）
+        task_text / final_result: 只在带值守覆盖的租约上存，事后摘要用；
+            都来自模型与容器，按不可信内容处理
+        connected_ids: 网关按这份租约放行过连接的行（`authority.authorize_connection` 放行时记）。
+            事后摘要以它判断「值守行真的连过」，不依赖审计行有没有落库
     """
 
     lease_id: str
@@ -107,13 +114,21 @@ class SshLease:
     actor: str = ""
     actor_user_id: int = 0
     triggered_by: Tuple[str, ...] = ()
+    duty_ids: FrozenSet[int] = frozenset()
     state: str = LEASE_STATE_QUEUED
     created_at: float = field(default_factory=lambda: _clock())
     started_at: Optional[float] = None
     expires_at: float = 0.0
     end_reason: str = ""
     ended_at: Optional[float] = None
+    created_wall: float = field(default_factory=time.time)
+    task_text: str = ""
+    final_result: str = ""
+    connected_ids: Set[int] = field(default_factory=set)
 
+
+# 存在租约上的任务正文与 CC 结果最多留这么长；摘要只取开头几百字，多留一点给截断提示
+NOTE_MAX_CHARS = 2000
 
 _end_callbacks: List[Callable[[SshLease], object]] = []
 _leases: Dict[str, SshLease] = {}
@@ -129,7 +144,7 @@ def lease_expired(lease: SshLease, now: Optional[float] = None) -> bool:
 
 
 def on_lease_end(callback: Callable[[SshLease], object]) -> None:
-    """登记租约结束时的回调；本轮没有订阅者，网关那一轮用它断开连接
+    """登记租约结束时的回调；网关用它断开连接，值守用它发事后摘要
 
     每个回调单独包一层：一个回调抛错不能挡住后面的回调，也不能让 `end_lease` 失败。
     回调可以返回协程，返回的协程会被排进事件循环。
@@ -167,12 +182,20 @@ def create_lease(
         return None
 
     now = _clock()
+    credential_ids = frozenset(int(item) for item in coverage.credential_ids)
+    # 值守只给聊天来源；子集之外的 id 一概不认（覆盖结果被拼错时宁可按严格复核）
+    duty_ids = (
+        frozenset(int(item) for item in getattr(coverage, "duty_ids", frozenset())) & credential_ids
+        if str(origin) == "chat"
+        else frozenset()
+    )
     lease = SshLease(
         lease_id=secrets.token_hex(8),
         workspace_id=int(workspace_id),
         task_ref=str(task_ref),
         origin=str(origin),
-        credential_ids=frozenset(int(item) for item in coverage.credential_ids),
+        credential_ids=credential_ids,
+        duty_ids=duty_ids,
         chat_key=str(chat_key),
         adapter_key=str(adapter_key),
         instance_key=str(instance_key),
@@ -183,7 +206,8 @@ def create_lease(
         expires_at=now + max(0, int(config.SSH_GATEWAY_LEASE_MAX_SECONDS)),
     )
     _leases[lease.lease_id] = lease
-    _write_audit(lease, "create")
+    # 按值守授权的行在拍下那一行审计里点名，平台方事后能一眼看出「这次不是所有者本人叫醒的」
+    _write_audit(lease, f"create duty={','.join(str(item) for item in sorted(duty_ids))}" if duty_ids else "create")
     return lease
 
 
@@ -219,6 +243,31 @@ def end_lease(lease_id: str, reason: str) -> None:
 
     for callback in list(_end_callbacks):
         _invoke_callback(callback, lease)
+
+
+def note_task_text(lease_id: str, text: str) -> None:
+    """记下委托给 CC 的任务正文；只记带值守覆盖、还没结束的租约"""
+    lease = _leases.get(str(lease_id or ""))
+    if lease is None or not lease.duty_ids or lease.state == LEASE_STATE_ENDED:
+        return
+    lease.task_text = str(text or "")[:NOTE_MAX_CHARS]
+
+
+def note_final_result(lease_id: str, text: str) -> None:
+    """记下 CC 最后一条结果；要在 `end_lease` 之前调，摘要在结束回调里读它"""
+    lease = _leases.get(str(lease_id or ""))
+    if lease is None or not lease.duty_ids or lease.state == LEASE_STATE_ENDED:
+        return
+    lease.final_result = str(text or "")[:NOTE_MAX_CHARS]
+
+
+def note_connected(lease_id: str, credential_id: int) -> None:
+    """网关按这份租约放行了一条到 `credential_id` 的连接；行数不超过租约覆盖的行"""
+    lease = _leases.get(str(lease_id or ""))
+    if lease is None or lease.state == LEASE_STATE_ENDED:
+        return
+    if int(credential_id) in lease.credential_ids:
+        lease.connected_ids.add(int(credential_id))
 
 
 def get_lease(lease_id: str) -> Optional[SshLease]:
@@ -383,6 +432,9 @@ __all__ = [
     "lease_expired",
     "leases_for_workspace",
     "mark_running",
+    "note_connected",
+    "note_final_result",
+    "note_task_text",
     "on_lease_end",
     "reset_leases",
     "running_lease",

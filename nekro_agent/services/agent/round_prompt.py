@@ -20,19 +20,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from nekro_agent.adapters.interface.schemas.platform import PlatformUser
 from nekro_agent.core.config import CoreConfig, ModelConfigGroup
+from nekro_agent.core.config import config as global_config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_chat_channel import DBChatChannel, DefaultPreset
 from nekro_agent.models.db_preset import DBPreset
+from nekro_agent.models.db_rp_preset import DBRpPreset
 from nekro_agent.schemas.agent_ctx import AgentCtx
-from nekro_agent.schemas.chat_message import ChatMessage
+from nekro_agent.schemas.chat_message import ChatMessage, ChatType
 from nekro_agent.services.affection.evaluator import schedule_affection_evaluation
 from nekro_agent.services.affection.prompt import render_affection_prompt
+from nekro_agent.services.affection.suppression import is_narrative_suppressed
 from nekro_agent.services.memory import prompt_rounds
 from nekro_agent.services.model_group_service import enforce_channel_model_group_scope
 from nekro_agent.services.ops_agent.provider import render_prompt_section as render_ops_prompt_section
@@ -41,8 +44,11 @@ from nekro_agent.services.plugin.prompt_activation import build_plugin_activatio
 from nekro_agent.services.plugin.scope import resolve_active_plugins
 from nekro_agent.services.tavern import greeting as tavern_greeting
 from nekro_agent.services.tavern import runtime as tavern_runtime
+from nekro_agent.services.tavern.rp_layout import RpLayout, build_layout
+from nekro_agent.services.tavern.rp_preset import segments_from_stored
 from nekro_agent.services.worldbook import render as wb_render
 from nekro_agent.services.worldbook import runtime as wb_runtime
+from nekro_agent.services.worldbook import variables as wb_variables
 from nekro_agent.services.worldbook.selection import Hit
 
 from .creator import OpenAIChatMessage
@@ -71,6 +77,13 @@ _SLOT_LABELS = {
 
 # 预览 / 试发时 Bot 不在线、取不到它自己的平台账号，提示词里那一处用这串占位。
 OFFLINE_BOT_ID_PLACEHOLDER = "[Bot 当前不在线，平台账号未知]"
+
+
+def _trigger_person_uid(trigger_message: Optional[ChatMessage]) -> str:
+    """触发这一轮的人的平台账号；判不出（定时任务、预览）时为空串"""
+    if trigger_message is None:
+        return ""
+    return str(getattr(trigger_message, "platform_userid", None) or getattr(trigger_message, "sender_id", "") or "")
 
 
 async def _dry_run_self_info(ctx: AgentCtx, channel: DBChatChannel) -> tuple[PlatformUser, bool]:
@@ -139,6 +152,8 @@ async def build_round_prompt(
     extra_history_lines: Optional[list[str]] = None,
     hidden_book_ids: Optional[set[int]] = None,
     mask_platform_slots: bool = False,
+    rp_preset_override: Optional[DBRpPreset] = None,
+    lean_history: int = 0,
 ) -> RoundPrompt:
     """组装这一轮发给模型的提示词
 
@@ -156,6 +171,11 @@ async def build_round_prompt(
         hidden_book_ids: 预览要遮正文的书 ID；这些书的条目正文换成固定占位，字数统计仍按原文。
         mask_platform_slots: 预览时把带平台方层的槽位文字换成「有这段、多少字」的占位。
             只允许在 `dry_run=True` 时打开：发给模型的永远是原文。
+        rp_preset_override: 预览时指定一份角色扮演预设；调用方已判过可见性。仍要求
+            酒馆运行时与高级提示词槽位都开着，否则不启用并在 `meta` 里给出原因。
+        lean_history: 首次请求被上游按内容拦下后少带内容重发时传最近消息条数（>0）：
+            不排好感评估、不发开场白、世界书只留常驻条目且不做语义检索、历史只带最后
+            这么多条，返回的 `prefill` 置 None。0 表示正常一轮。
 
     Returns:
         组装结果；`dry_run` 时 `meta` 已填好。
@@ -179,6 +199,8 @@ async def build_round_prompt(
             extra_history_lines=extra_history_lines,
             hidden_book_ids=hidden_book_ids,
             mask_platform_slots=mask_platform_slots,
+            rp_preset_override=rp_preset_override,
+            lean_history=lean_history,
         )
     finally:
         if dry_run:
@@ -200,6 +222,8 @@ async def _build_round_prompt(
     extra_history_lines: Optional[list[str]],
     hidden_book_ids: Optional[set[int]],
     mask_platform_slots: bool,
+    rp_preset_override: Optional[DBRpPreset],
+    lean_history: int,
 ) -> RoundPrompt:
     """实际组装；异常照原样抛给调用方，预览的缓存清理在 :func:`build_round_prompt` 里"""
     config = await db_chat_channel.get_effective_config()
@@ -230,6 +254,27 @@ async def _build_round_prompt(
         trigger_message,
         dry_run=dry_run,
     )
+    # 预览指定预设：仍要求酒馆运行时与高级提示词槽位都开着；不开时按没选处理，并在
+    # `meta` 里说明原因，页面才能解释「为什么没有按这份预设渲染」。
+    rp_preset_inactive_reason = ""
+    if rp_preset_override is not None:
+        if not tavern.enabled:
+            rp_preset_inactive_reason = "tavern_off"
+        elif tavern.slots is None or not tavern.slots.enabled:
+            rp_preset_inactive_reason = "slots_off"
+        else:
+            tavern.rp_preset = rp_preset_override
+        if rp_preset_inactive_reason:
+            tavern.rp_preset = None
+    elif dry_run and tavern.rp_preset is None and _configured_rp_preset_id(config) > 0:
+        # 频道自己的配置里选了预设、这一轮却没用上：预览同样要说清原因，否则管理员只看到
+        # 「选了但没效果」。正式一轮不记（那里靠运行时的 WARNING）。
+        if not tavern.enabled:
+            rp_preset_inactive_reason = "tavern_off"
+        elif tavern.slots is None or not tavern.slots.enabled:
+            rp_preset_inactive_reason = "slots_off"
+        else:
+            rp_preset_inactive_reason = "unavailable"
     # 开场白必须发在渲染历史之前：它进聊天记录之后，这一轮的历史里才看得到它，模型
     # 才能接着演。预览只判断与展开，不发也不写；闸关或解析失败时 `tavern.enabled` 为假，
     # 不碰任何记录。
@@ -242,7 +287,8 @@ async def _build_round_prompt(
             config=config,
             tavern=tavern,
         )
-    elif tavern.enabled:
+    elif tavern.enabled and lean_history <= 0:
+        # 少带内容重发时开场白已经由第一次渲染记过，不再重复。
         await tavern_greeting.maybe_greet(
             channel=db_chat_channel,
             preset=preset,
@@ -287,6 +333,9 @@ async def _build_round_prompt(
         ctx,
         activation_enabled=activation_enabled,
         call_inject=not dry_run,
+        one_time_code=one_time_code,
+        # 上一轮被拦时这一轮不注入插件的不可信内容：判据与世界书的不可信条目抑制同一个。
+        suppress_untrusted=is_narrative_suppressed(chat_key, global_config.AI_CHAT_CONTEXT_EXPIRE_SECONDS),
     )
     adapter_runtime_prompt = await ctx.adapter.render_runtime_prompt()
     runtime_prompts = [
@@ -303,32 +352,91 @@ async def _build_round_prompt(
         config=config,
     )
     # 预览不排评估：那会在后台真的写好感，而预览的承诺是「不留痕」。
-    if not dry_run:
+    # 少带内容重发同样不排：第一次渲染已经排过一次。
+    if not dry_run and lean_history <= 0:
         schedule_affection_evaluation(db_chat_channel, config)
 
     # 世界书：闸关时不查任何世界书表、也不查消息（`resolve_round` 的早退分支），
     # 因此提示词与改造前逐字相同。读路径 fail-open：求值失败只会让这一轮不注入。
     # 预览「换一个人设看看」时人设书按所选人设判，否则看到的是「新人设 + 旧人设的书」；
     # 频道摘要与好感块跟着人设的记忆分区走，预览不切换分区，页面上写明。
+    # 世界书模板读变量的来源（由插件登记，例如角色状态）：没有登记时是空提供者，与没有变量时
+    # 逐字相同；世界书关着时模板根本不求值，不问。取不到、出错、超时都回落成空提供者。
+    template_variables = None
+    if bool(getattr(config, "WORLDBOOK_ENABLED", False)):
+        template_variables = await wb_variables.provider_for_round(
+            wb_variables.RoundVariableContext(
+                one_time_code=one_time_code,
+                channel=db_chat_channel,
+                chat_key=chat_key,
+                preset_id=preset_override.id if preset_override is not None else None,
+                is_private=getattr(db_chat_channel, "chat_type", None) == ChatType.PRIVATE,
+                trigger_person_uid=_trigger_person_uid(trigger_message),
+                config=config,
+                dry_run=dry_run,
+            ),
+        )
     worldbook_round = await wb_runtime.resolve_round(
         one_time_code,
         db_chat_channel,
         config,
         preset_id_override=preset_override.id if preset_override is not None else None,
+        variables=template_variables,
+        constant_only=lean_history > 0,
     )
-    prompt_rounds.note_worldbook(one_time_code, state=worldbook_round.state, dropped=worldbook_round.dropped)
+    prompt_rounds.note_worldbook(
+        one_time_code,
+        state=worldbook_round.state,
+        dropped=worldbook_round.dropped,
+        budget=worldbook_round.budget.as_dict() if worldbook_round.budget is not None else None,
+        tokens=worldbook_round.tokens,
+    )
     # 条目正文里的宏按当轮上下文展开；闸关时展开器是恒等函数，输出逐字不变。
+    # `person_labels` 缺省为空（测试替身等没有这个字段的轮次结果按「不标」处理），
+    # 给了才在个人书条目前加一行「关于谁」。
     worldbook_prompt = wb_render.render_block(
         worldbook_round.groups.after_persona,
         one_time_code,
         in_history=False,
         expand=tavern_expand,
         hidden_book_ids=hidden_book_ids,
+        person_labels=getattr(worldbook_round, "person_labels", None),
     )
     if worldbook_prompt:
         prompt_rounds.note_worldbook_items(
             one_time_code,
-            wb_render.rendered_items(worldbook_round.groups.after_persona, expand=tavern_measure),
+            wb_render.rendered_items(
+                worldbook_round.groups.after_persona,
+                expand=tavern_measure,
+                with_reason=True,
+            ),
+        )
+
+    # 角色扮演预设：世界书块已经渲染好，按预设顺序把人设卡字段、预设段落与世界书
+    # 排成一块替换人设节。没启用时 `rp_layout` 为 `None`，下面所有参数保持原形状。
+    rp_layout: Optional[RpLayout] = None
+    if (
+        tavern.enabled
+        and tavern.slots is not None
+        and tavern.slots.enabled
+        and tavern.rp_preset is not None
+    ):
+        rp_layout = build_layout(
+            segments_from_stored(tavern.rp_preset.segments),
+            fields=_rp_card_fields(tavern),
+            worldbook_block=worldbook_prompt,
+            post_history_slot=tavern.post_history,
+            expand=tavern_expand,
+        )
+        prompt_rounds.note_tavern(
+            one_time_code,
+            rp_preset={
+                "id": int(tavern.rp_preset.id),
+                "name": tavern.rp_preset.name,
+                "segments": len(rp_layout.used),
+                "system_chars": len(rp_layout.system_block),
+                "tail_chars": len(rp_layout.tail_text),
+            },
         )
 
     # 运维工具说明：没有授权时是空串，模板里的 `{%- if %}` 不成立，渲染结果与改造前逐字一致
@@ -344,11 +452,21 @@ async def _build_round_prompt(
         chat_preset=tavern.persona_content,
         plugins_prompt=rendered_plugins.system_prompt,
         plugins_runtime_prompt=runtime_prompt,
+        plugin_depth_blocks=rendered_plugins.depth_blocks,
         plugin_activation_rules=build_plugin_activation_rules() if activation_enabled else "",
         plugin_call_priority_rules=build_plugin_call_priority_rules(),
         enable_cot=used_model_group.ENABLE_COT,
         chat_key_rules="\n".join(f"- {r}" for r in db_chat_channel.adapter.chat_key_rules),
         enable_at=db_chat_channel.adapter.config.SESSION_ENABLE_AT,
+        # 角色扮演频道（酒馆运行时开着且高级提示词槽位开着）去掉人设节的外层框。
+        # 槽位关着时人设正文只是普通设定，保留原来的框。
+        persona_roleplay=bool(tavern.enabled and tavern.slots is not None and tavern.slots.enabled),
+        # 稳定前缀顺序：按频道生效配置决定世界书 / 好感块紧跟人设，还是挪到系统提示词末尾。
+        stable_prefix_order=bool(getattr(config, "PROMPT_STABLE_PREFIX_ORDER", False)),
+        # 预设块非空时替换人设节；世界书已经包含在块里，模板不再单独输出。
+        rp_block=rp_layout.system_block if rp_layout is not None else "",
+        rp_tail=rp_layout.tail_text if rp_layout is not None else None,
+        rp_depth_blocks=list(rp_layout.depth_blocks) if rp_layout is not None else None,
     )
 
     messages = [prompt_compiler.render_system_message()]
@@ -367,6 +485,7 @@ async def _build_round_prompt(
             dry_run=dry_run,
             extra_history_lines=extra_history_lines,
             hidden_book_ids=hidden_book_ids,
+            max_messages=lean_history if lean_history > 0 else None,
         ),
     )
     # 辅助提示词非空就一定进了系统提示词（模板只在空时跳过）；这里把明细从 pending 改成 sent。
@@ -394,16 +513,52 @@ async def _build_round_prompt(
         # 页面据此提示「Bot 不在线，提示词里它的平台账号是占位」，免得管理员以为那就是真值
         meta["bot_offline"] = bot_offline
         meta["message_sources"] = message_sources
+        if rp_layout is not None and tavern.rp_preset is not None:
+            meta["rp_preset"] = {
+                "id": int(tavern.rp_preset.id),
+                "name": tavern.rp_preset.name,
+                "used": [dict(item) for item in rp_layout.used],
+                "prefill_text": rp_layout.prefill_text,
+                "prefill_sent": False,
+            }
+        if rp_preset_inactive_reason:
+            meta["rp_preset_inactive_reason"] = rp_preset_inactive_reason
     return RoundPrompt(
         messages=messages,
         config=config,
         preset=preset,
         used_model_group=used_model_group,
         runtime_prompt=runtime_prompt,
-        prefill=tavern.prefill,
+        prefill=None if lean_history > 0 else tavern.prefill,
         tavern=tavern,
         meta=meta,
     )
+
+
+def _configured_rp_preset_id(config: Any) -> int:
+    """频道生效配置里选的角色扮演预设编号；没选或值不成形时是 0"""
+    try:
+        return int(getattr(config, "PROMPT_RP_PRESET_ID", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rp_card_fields(tavern: tavern_runtime.TavernRound) -> dict[str, str]:
+    """预设排布要用的人设卡字段；没有卡时 `description` 用人设正文，其余为空
+
+    `source_fields` 是 JSON 列，历史数据或手工改库可能不是 dict；任何一种形状不对都按
+    空串处理，与运行时读卡片的其它地方同一方向。
+    """
+    fields = {"system": "", "description": "", "personality": "", "scenario": "", "mes_example": ""}
+    card = tavern.card
+    source = getattr(card, "source_fields", None) if card is not None else None
+    if isinstance(source, dict):
+        for key in fields:
+            value = source.get(key)
+            fields[key] = value if isinstance(value, str) else ""
+    elif card is None:
+        fields["description"] = tavern.persona_content
+    return fields
 
 
 def _slot_preview_texts(tavern: tavern_runtime.TavernRound, expand: Callable[[str], str]) -> dict[str, str]:
@@ -479,8 +634,10 @@ def _prefill_meta(tavern: tavern_runtime.TavernRound, group: ModelConfigGroup) -
 def _worldbook_meta_items(
     hits: Sequence[Hit],
     expand: Callable[[str], str],
+    token_counts: Optional[Mapping[int, int]] = None,
 ) -> list[dict[str, Any]]:
-    """把一组入选条目转成预览用的清单：只写引用、位置、信任与字数，不写原文"""
+    """把一组入选条目转成预览用的清单：只写引用、位置、信任、字数与 token 数，不写原文"""
+    counts = token_counts or {}
     return [
         {
             "entry_id": entry_id,
@@ -488,6 +645,7 @@ def _worldbook_meta_items(
             "position": position,
             "trusted": trusted,
             "chars": chars,
+            "tokens": counts.get(entry_id),
         }
         for entry_id, book_id, chars, position, trusted in wb_render.rendered_items(hits, expand=expand)
     ]
@@ -544,13 +702,23 @@ def _build_meta(
         "slots_preview": preview,
         "depth_prompt": {"text": tavern.depth_prompt, "depth": tavern.depth},
         "worldbook": {
-            "after_persona": _worldbook_meta_items(worldbook_round.groups.after_persona, expand),
-            "before_history": _worldbook_meta_items(worldbook_round.groups.before_history, expand),
+            "after_persona": _worldbook_meta_items(
+                worldbook_round.groups.after_persona,
+                expand,
+                worldbook_round.tokens,
+            ),
+            "before_history": _worldbook_meta_items(
+                worldbook_round.groups.before_history,
+                expand,
+                worldbook_round.tokens,
+            ),
             "at_depth": [
                 {"depth": depth, **item}
                 for depth, hits in sorted(worldbook_round.groups.at_depth.items())
-                for item in _worldbook_meta_items(hits, expand)
+                for item in _worldbook_meta_items(hits, expand, worldbook_round.tokens)
             ],
+            # 这一轮的预算是怎么算出来的；闸关或求值失败时为 None
+            "budget": worldbook_round.budget.as_dict() if worldbook_round.budget is not None else None,
         },
         "prefill": _prefill_meta(tavern, group),
         "greeting": greeting if greeting is not None else {"will_send": False, "text": ""},

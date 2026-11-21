@@ -212,7 +212,13 @@ def _fake_message_query(monkeypatch: pytest.MonkeyPatch, message_ids: tuple[str,
     monkeypatch.setattr(history_module, "supports_vision", lambda *_a, **_k: False)
 
 
-async def _render_history(monkeypatch: pytest.MonkeyPatch, *, code: str, inject_worldbook: bool = True) -> str:
+async def _render_history(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    code: str,
+    inject_worldbook: bool = True,
+    plugin_depth_blocks: list[tuple[int, str]] | None = None,
+) -> str:
     _fake_message_query(monkeypatch, ("m1", "m2", "m3"))
     rendered = await history_module.render_history_data(
         chat_key=CHAT_KEY,
@@ -221,6 +227,7 @@ async def _render_history(monkeypatch: pytest.MonkeyPatch, *, code: str, inject_
         config=_FakeConfig(),  # type: ignore[arg-type]
         model_group=_FakeConfig.MODEL_GROUPS["default"],  # type: ignore[arg-type]
         inject_worldbook=inject_worldbook,
+        plugin_depth_blocks=plugin_depth_blocks,
     )
     return str(rendered.to_dict()["content"])
 
@@ -296,6 +303,33 @@ class TestPostHistory:
 
         assert "PostHistoryInstructions" in first
         assert "PostHistoryInstructions" not in again
+
+
+class TestPluginDepthBlocks:
+    async def test_inserted_before_the_last_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        content = await _render_history(monkeypatch, code=CODE, plugin_depth_blocks=[(1, "插件状态块")])
+
+        assert content.index("[m2]") < content.index("插件状态块") < content.index("[m3]")
+
+    async def test_after_the_character_note_at_the_same_depth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        tavern_runtime._rounds[CODE] = _round(depth_prompt="备注正文", depth=1)  # noqa: SLF001
+
+        content = await _render_history(monkeypatch, code=CODE, plugin_depth_blocks=[(1, "插件状态块")])
+
+        assert content.index("备注正文") < content.index("插件状态块") < content.index("[m3]")
+
+    async def test_iteration_render_does_not_repeat_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        first = await _render_history(monkeypatch, code=CODE, plugin_depth_blocks=[(1, "插件状态块")])
+        again = await _render_history(monkeypatch, code=CODE, inject_worldbook=False, plugin_depth_blocks=[(1, "插件状态块")])
+
+        assert "插件状态块" in first
+        assert "插件状态块" not in again
+
+    async def test_no_blocks_is_byte_identical(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        baseline = await _render_history(monkeypatch, code=CODE)
+        with_empty = await _render_history(monkeypatch, code=CODE, plugin_depth_blocks=[])
+
+        assert with_empty == baseline
 
 
 class TestDepthNote:
@@ -443,7 +477,7 @@ class TestRoundDetail:
             return ""
 
         async def empty_plugins(*_args: Any, **_kwargs: Any) -> Any:
-            return SimpleNamespace(system_prompt="", runtime_prompt="")
+            return SimpleNamespace(system_prompt="", runtime_prompt="", depth_blocks=[])
 
         async def empty_plugins_resolve(**_kwargs: Any) -> list[Any]:
             return []
@@ -525,7 +559,7 @@ class TestMacroCountMatchesInjection:
             return ""
 
         async def empty_plugins(*_args: Any, **_kwargs: Any) -> Any:
-            return SimpleNamespace(system_prompt="", runtime_prompt="")
+            return SimpleNamespace(system_prompt="", runtime_prompt="", depth_blocks=[])
 
         async def empty_plugins_resolve(**_kwargs: Any) -> list[Any]:
             return []

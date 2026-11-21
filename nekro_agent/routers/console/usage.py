@@ -60,10 +60,11 @@ END_DESC = "结束时间（ISO 8601，不含）；留空表示此刻"
 
 
 class UsageMetrics(BaseModel):
-    """一组聚合出来的量。四个数值列在每一档里都是同一个口径"""
+    """一组聚合出来的量。五个数值列在每一档里都是同一个口径"""
 
     records: int = Field(description="请求条数（含失败与中断）")
     token_input: int = Field(description="输入 token 合计")
+    token_input_cached: int = Field(default=0, description="输入里命中上游缓存的 token 合计")
     token_output: int = Field(description="输出 token 合计")
     token_total: int = Field(description="上游给出的总 token 合计")
     cost: float = Field(description="按当时倍率折算的费用合计")
@@ -110,6 +111,7 @@ class UsageRecordItem(BaseModel):
     model_name: str
     stream_mode: bool
     token_input: int
+    token_input_cached: int
     token_output: int
     token_total: int
     cost: float
@@ -141,6 +143,7 @@ def _to_metrics(row: Dict[str, float]) -> UsageMetrics:
     return UsageMetrics(
         records=int(row["records"]),
         token_input=int(row["token_input"]),
+        token_input_cached=int(row["token_input_cached"]),
         token_output=int(row["token_output"]),
         token_total=int(row["token_total"]),
         cost=float(row["cost"]),
@@ -188,13 +191,14 @@ def _to_items(
                 position[key] = len(items)
             items.append(item)
             continue
-        # 合并进已有的那一行；四个数值列是同一口径，逐列相加即可
+        # 合并进已有的那一行；五个数值列是同一口径，逐列相加即可
         index = position[key]
         existing = items[index]
         items[index] = UsageBreakdownItem(
             key=key,
             records=existing.records + item.records,
             token_input=existing.token_input + item.token_input,
+            token_input_cached=existing.token_input_cached + item.token_input_cached,
             token_output=existing.token_output + item.token_output,
             token_total=existing.token_total + item.token_total,
             cost=existing.cost + item.cost,
@@ -338,6 +342,7 @@ async def list_usage_records(
                 model_name=row.model_name,
                 stream_mode=row.stream_mode,
                 token_input=row.token_input,
+                token_input_cached=row.token_input_cached,
                 token_output=row.token_output,
                 token_total=row.token_total,
                 cost=row.cost,

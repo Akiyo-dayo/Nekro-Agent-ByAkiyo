@@ -50,14 +50,20 @@
 因此在真实启动路径上可达（此前只有测试直接传占位符才走得到）。
 """
 
+import math
 from enum import Enum
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 from tortoise import Tortoise, fields
 from tortoise.backends.base.client import BaseDBAsyncClient
 from tortoise.models import Model
 
-from nekro_agent.core.config import ModelConfigGroup, is_model_group_api_key_placeholder
+from nekro_agent.core.config import (
+    MODEL_GROUP_CONTEXT_LENGTH_MAX,
+    MODEL_GROUP_TOKEN_FACTOR_MAX,
+    ModelConfigGroup,
+    is_model_group_api_key_placeholder,
+)
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.fields import EncryptedTextField
 from nekro_agent.schemas.tenant import ModelGroupOwnership
@@ -85,6 +91,26 @@ class ModelGroupVisibility(str, Enum):
 # 而默认值本身是一条**平台方从没做过的授权**，越权闸门管不到它。
 # 开放给租户必须是平台方在后台的一次显式动作。
 DEFAULT_VISIBILITY = ModelGroupVisibility.PRIVATE
+
+
+def _clamped_context_length(value: Any) -> int:
+    """库里的上下文长度读成合法值：读不出来或越界按 0（未填）/ 上限"""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(MODEL_GROUP_CONTEXT_LENGTH_MAX, number))
+
+
+def _clamped_token_factor(value: Any) -> float:
+    """库里的分词系数读成合法值：读不出来、非有限数或负数按 0（按模型名自动取）"""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number) or number < 0:
+        return 0.0
+    return min(MODEL_GROUP_TOKEN_FACTOR_MAX, number)
 
 
 class DBModelGroup(Model):
@@ -125,6 +151,9 @@ class DBModelGroup(Model):
     enable_vision = fields.BooleanField(default=False, description="启用视觉功能")
     enable_cot = fields.BooleanField(default=False, description="启用外置思维链")
     prefill_mode = fields.CharField(max_length=16, default="off", description="预填方式 off / assistant / deepseek")
+    api_format = fields.CharField(max_length=16, default="openai", description="聊天接口格式 openai / gemini")
+    context_length = fields.IntField(default=0, description="上下文长度（token）；0 表示未填，世界书预算按 32768 估")
+    token_count_factor = fields.FloatField(default=0.0, description="分词系数（相对 o200k_base）；0 表示按模型名自动取")
     token_input_rate = fields.FloatField(default=1.0, description="输入 Token 倍率")
     token_completion_rate = fields.FloatField(default=1.0, description="补全 Token 倍率")
     model_price_rate = fields.FloatField(default=1.0, description="模型价格倍率")
@@ -238,6 +267,10 @@ class DBModelGroup(Model):
             ENABLE_VISION=self.enable_vision,
             ENABLE_COT=self.enable_cot,
             PREFILL_MODE=self.prefill_mode if self.prefill_mode in ("off", "assistant", "deepseek") else "off",
+            API_FORMAT=self.api_format if self.api_format in ("openai", "gemini") else "openai",
+            # 手改库写出越界值时夹回合法区间：这一行要进运行时视图，校验失败会让整组不可用
+            CONTEXT_LENGTH=_clamped_context_length(self.context_length),
+            TOKEN_COUNT_FACTOR=_clamped_token_factor(self.token_count_factor),
             TOKEN_INPUT_RATE=self.token_input_rate,
             TOKEN_COMPLETION_RATE=self.token_completion_rate,
             MODEL_PRICE_RATE=self.model_price_rate,
@@ -260,6 +293,9 @@ class DBModelGroup(Model):
         self.enable_vision = group.ENABLE_VISION
         self.enable_cot = group.ENABLE_COT
         self.prefill_mode = group.PREFILL_MODE
+        self.api_format = group.API_FORMAT
+        self.context_length = group.CONTEXT_LENGTH
+        self.token_count_factor = group.TOKEN_COUNT_FACTOR
         self.token_input_rate = group.TOKEN_INPUT_RATE
         self.token_completion_rate = group.TOKEN_COMPLETION_RATE
         self.model_price_rate = group.MODEL_PRICE_RATE

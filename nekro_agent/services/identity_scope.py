@@ -335,6 +335,10 @@ async def resolve_domain_members(adapter_key: str, instance_key: str) -> tuple[t
     return tuple(sorted(set(members)))
 
 
+# 别名表一条 `IN (...)` 最多放多少个账号（与记忆后台服务的批量上限相同）
+_ALIAS_IN_CHUNK = 1000
+
+
 async def resolve_person_uid(domain: ScopeDomain, platform_userid: str) -> str:
     """把一个平台账号解析成它在该域里的「人」
 
@@ -352,19 +356,23 @@ async def resolve_person_uids(domain: ScopeDomain, platform_userids: Sequence[st
     别名**只跟一跳**：`person_uid` 指向的账号自己又是别名时，本函数打 WARNING 并按一跳的
     结果返回。静默追链会让一次错误合并的影响范围随时间悄悄扩大，而告警能让它被发现；
     维护"不成链"这条不变式是合并服务的职责。
+
+    后台的分组视图一次会交进来几千个账号：去重保持入参顺序、线性时间，`IN` 按
+    `_ALIAS_IN_CHUNK` 分块（每块一条查询）。
     """
-    unique_ids: List[str] = []
-    for platform_userid in platform_userids:
-        if platform_userid not in unique_ids:
-            unique_ids.append(platform_userid)
+    unique_ids: List[str] = list(dict.fromkeys(platform_userids))
     if not unique_ids:
         return {}
 
-    rows = await DBIdentityAlias.filter(domain_id=domain.domain_id, platform_userid__in=unique_ids).order_by("id")
     alias_of: Dict[str, str] = {}
-    for row in rows:
-        # 唯一约束保证一个账号只有一行；脏行下取最早那行，与本项目其他读侧取舍一致。
-        alias_of.setdefault(row.platform_userid, row.person_uid)
+    for start in range(0, len(unique_ids), _ALIAS_IN_CHUNK):
+        rows = await DBIdentityAlias.filter(
+            domain_id=domain.domain_id,
+            platform_userid__in=unique_ids[start : start + _ALIAS_IN_CHUNK],
+        ).order_by("id")
+        for row in rows:
+            # 唯一约束保证一个账号只有一行；脏行下取最早那行，与本项目其他读侧取舍一致。
+            alias_of.setdefault(row.platform_userid, row.person_uid)
 
     resolved = {platform_userid: alias_of.get(platform_userid, platform_userid) for platform_userid in unique_ids}
     await _warn_on_alias_chains(domain, alias_of)
@@ -388,11 +396,11 @@ async def _warn_on_alias_chains(domain: ScopeDomain, alias_of: Dict[str, str]) -
     # 同批里已经查到的那些目标直接复用，剩下的才补一次 `IN`
     next_hop: Dict[str, str] = {target: alias_of[target] for target in targets if target in alias_of}
     unknown = sorted(targets - alias_of.keys())
-    if unknown:
-        rows = await DBIdentityAlias.filter(domain_id=domain.domain_id, platform_userid__in=unknown).values_list(
-            "platform_userid",
-            "person_uid",
-        )
+    for start in range(0, len(unknown), _ALIAS_IN_CHUNK):
+        rows = await DBIdentityAlias.filter(
+            domain_id=domain.domain_id,
+            platform_userid__in=unknown[start : start + _ALIAS_IN_CHUNK],
+        ).values_list("platform_userid", "person_uid")
         for platform_userid, person_uid in rows:
             next_hop.setdefault(str(platform_userid), str(person_uid))
     # 指向自己的退化行不是链，别把它报成链——那会让真正的链淹没在噪声里

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
@@ -50,11 +51,13 @@ from nekro_agent.routers.presets import (
 from nekro_agent.schemas.errors import NotFoundError, PermissionDeniedError, ValidationError
 from nekro_agent.schemas.memory_admin import ChannelOption, InstanceOption, PresetOption, ScopeOptionsResponse
 from nekro_agent.schemas.worldbook import (
+    BookBudgetCheck,
     BookCreateRequest,
     BookDetail,
     BookItem,
     BookListResponse,
     BookUpdateRequest,
+    BudgetDroppedItem,
     DeleteResponse,
     EntryActionRequest,
     EntryCreateRequest,
@@ -76,6 +79,10 @@ from nekro_agent.schemas.worldbook import (
     TriggerRendered,
     TriggerTestRequest,
     TriggerTestResponse,
+    WorldbookBudgetInfo,
+    WorldbookGraphEdge,
+    WorldbookGraphNode,
+    WorldbookGraphResponse,
 )
 from nekro_agent.services.identity_scope import resolve_preset_id
 from nekro_agent.services.memory import admin_service
@@ -88,15 +95,29 @@ from nekro_agent.services.memory.instance_scope import (
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import assert_instance_accessible, get_tenant_scope
+from nekro_agent.services.worldbook import graph_view as wb_graph
+from nekro_agent.services.worldbook import purpose as wb_purpose
 from nekro_agent.services.worldbook import render, safe_regex, st_format
 from nekro_agent.services.worldbook import runtime as wb_runtime
 from nekro_agent.services.worldbook import selection as wb_selection
 from nekro_agent.services.worldbook import service as wb_service
+from nekro_agent.services.worldbook import tokens as wb_tokens
+from nekro_agent.services.worldbook import vectors as wb_vectors
+from nekro_agent.services.worldbook.budget import resolve_budget
 from nekro_agent.services.worldbook.types import WindowMessage
 
 router = APIRouter(prefix="/worldbook", tags=["Worldbook"])
 
 logger = get_sub_logger("worldbook.admin")
+
+# 书详情条目列表的分页：默认一页 50 条，最多 200 条。一本导入的大书有几万条，一次全取既慢
+# 又要把每条都分析一遍。
+ENTRY_PAGE_SIZE_DEFAULT = 50
+ENTRY_PAGE_SIZE_MAX = 200
+# 页码也夹住：任意大的整数算成 OFFSET 会让数据库报溢出。
+ENTRY_PAGE_MAX = 1_000_000
+# 搜索词里的空字符：PostgreSQL 的文本里不能有，查询会直接报错。
+_NUL = chr(0)
 
 # 触发测试取最近多少条消息当窗口。与记忆页的窗口口径一致，管理员在两边看到的是同一段
 # 对话；再长就超出「最近一轮」的直觉，再短则看不出群聊里的来回。
@@ -290,9 +311,16 @@ def _book_item(
         person_account=book.person_account,
         enabled=book.enabled,
         scan_depth=book.scan_depth,
-        budget_chars=book.budget_chars,
+        budget_tokens=book.budget_tokens,
+        inject_mode=book.inject_mode,
+        active_scene=book.active_scene,
         case_sensitive=book.case_sensitive,
         match_whole_words=book.match_whole_words,
+        scan_names=book.scan_names,
+        vector_all=book.vector_all,
+        vector_query_messages=book.vector_query_messages,
+        vector_max_entries=book.vector_max_entries,
+        vector_threshold=book.vector_threshold,
         entry_count=entry_count,
         quarantined_count=quarantined_count,
         update_time=book.update_time,
@@ -301,11 +329,18 @@ def _book_item(
     )
 
 
-def _entry_item(entry: DBWbEntry, disabled: dict[int, list[str]]) -> EntryItem:
+def _entry_item(
+    entry: DBWbEntry,
+    disabled: dict[int, list[str]],
+    summary: wb_purpose.EntrySummary | None,
+) -> EntryItem:
     """条目行转响应；`ext` 只摘出两个有名字的字段
 
     无效关键词来自导入（`ext.na_invalid_keys`），熔断关键词来自进程内的正则执行器。两者
     都是「这条条目上有几个关键词现在跑不了」，分开列出管理员才知道该改哪一个。
+
+    `summary` 是用途与疑似防盗的摘要（与运行时同一个判据）；`None` 表示这次请求的分析预算
+    用完了、还没算，页面标「分析中」，稍后再取。
     """
     invalid: list[InvalidKeyItem] = []
     ext = entry.ext if isinstance(entry.ext, dict) else {}
@@ -336,6 +371,8 @@ def _entry_item(entry: DBWbEntry, disabled: dict[int, list[str]]) -> EntryItem:
         delay=entry.delay,
         enabled=entry.enabled,
         trusted=entry.trusted,
+        vectorized=entry.vectorized,
+        ignore_budget=entry.ignore_budget,
         status=entry.status,
         quarantined_at=entry.quarantined_at,
         quarantine_reason=entry.quarantine_reason or "",
@@ -344,6 +381,11 @@ def _entry_item(entry: DBWbEntry, disabled: dict[int, list[str]]) -> EntryItem:
         update_time=entry.update_time,
         invalid_keys=invalid,
         slow_disabled_keys=disabled.get(entry.id, []),
+        purpose=summary.purpose.value if summary is not None else "normal",
+        template_note=summary.unsupported_reason if summary is not None else "",
+        suspected_trap=bool(summary.suspected_trap) if summary is not None else False,
+        trap_reason=summary.trap_reason if summary is not None else "",
+        analysis_pending=summary is None,
     )
 
 
@@ -501,6 +543,60 @@ async def list_books(
     )
 
 
+@router.get("/graph", summary="世界书图谱", response_model=WorldbookGraphResponse)
+@require_role(Role.Admin)
+async def get_worldbook_graph(
+    instance_key: str = "",
+    adapter_key: str = "",
+    book_id: Optional[int] = None,
+    q: str = "",
+    include_inactive: bool = False,
+    limit: int = wb_graph.GRAPH_LIMIT_DEFAULT,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> WorldbookGraphResponse:
+    """书、条目、绑定对象与条目间的关键词引用；只读
+
+    作用域与 `GET /worldbook/books` 同一套；`book_id` 走 `_load_readable_book`，不存在与
+    无权同为 404。`q` 与条目列表同义（标题 / 主次关键词 / 正文）；`limit` 是**条目**节点
+    的上限（50 ~ 600），书最多画 200 本、条目最多扫 5000 条。注入次数来自最近 3000 行
+    提示词明细，在这一层不额外按书过滤。
+    """
+    if _NUL in q:
+        raise ValidationError(reason="搜索词里不能有空字符")
+    scope, instance = await _resolve_book_scope(
+        _current_user,
+        instance_key=instance_key,
+        adapter_key=adapter_key,
+    )
+    book: Optional[DBWbBook] = None
+    if book_id is not None:
+        book, _read_only = await _load_readable_book(_current_user, book_id)
+    graph = await wb_graph.build_worldbook_graph(
+        _current_user,
+        scope,
+        instance_key=instance.instance_key if instance is not None else "",
+        book=book,
+        q=q[:200],
+        include_inactive=include_inactive,
+        limit=limit,
+    )
+    return WorldbookGraphResponse(
+        generated_at=datetime.now(timezone.utc),
+        nodes=[WorldbookGraphNode.model_validate(node) for node in graph.nodes],
+        edges=[WorldbookGraphEdge.model_validate(edge) for edge in graph.edges],
+        node_count=len(graph.nodes),
+        edge_count=len(graph.edges),
+        books_total=graph.books_total,
+        books_drawn=graph.books_drawn,
+        entries_total=graph.entries_total,
+        entries_drawn=graph.entries_drawn,
+        rounds_scanned=graph.rounds_scanned,
+        books_truncated=graph.books_truncated,
+        entries_truncated=graph.entries_truncated,
+        references_truncated=graph.references_truncated,
+    )
+
+
 @router.post("/books", summary="新建世界书", response_model=BookDetail)
 @require_role(Role.Admin)
 async def create_book(
@@ -532,9 +628,13 @@ async def import_new_book(
     person_account: str = Form(default=""),
     enabled: bool = Form(default=True),
     scan_depth: Optional[int] = Form(default=None),
-    budget_chars: int = Form(default=0),
+    budget_tokens: int = Form(default=0),
+    inject_mode: str = Form(default="both"),
+    active_scene: str = Form(default="both"),
     case_sensitive: bool = Form(default=False),
     match_whole_words: bool = Form(default=False),
+    rewrite_name_vars: bool = Form(default=True),
+    scan_names: bool = Form(default=True),
     instance_key: str = "",
     adapter_key: str = "",
     _current_user: DBUser = Depends(get_current_active_user),
@@ -556,9 +656,12 @@ async def import_new_book(
                 "person_account": person_account,
                 "enabled": enabled,
                 "scan_depth": scan_depth,
-                "budget_chars": budget_chars,
+                "budget_tokens": budget_tokens,
+                "inject_mode": inject_mode,
+                "active_scene": active_scene,
                 "case_sensitive": case_sensitive,
                 "match_whole_words": match_whole_words,
+                "scan_names": scan_names,
             },
         )
     except PydanticValidationError as exc:
@@ -566,13 +669,20 @@ async def import_new_book(
         # 书名为空这种普通输入错误会变成 500。
         raise ValidationError(reason=_form_errors(exc)) from exc
     owner = await _resolve_owner_for_create(_current_user, req, instance)
+    tenant_id = get_tenant_scope(_current_user)
+    tenant_key = wb_purpose.tenant_slot_key(tenant_id)
+    # 这个租户已有导入在分析就先拒掉，省得先把上传文件读进内存、解析一遍（在事件循环上）才 409。
+    # 上传本身在进到这里之前已经被框架收完，这一步省不了带宽。
+    wb_purpose.ensure_import_slot_free(tenant_key)
     parsed = await _read_upload(file)
     return await wb_service.import_new_book(
         owner,
         req,
         parsed,
-        is_platform=get_tenant_scope(_current_user) is None,
+        is_platform=tenant_id is None,
         username=_current_user.username,
+        tenant_key=tenant_key,
+        rewrite_names=rewrite_name_vars,
     )
 
 
@@ -586,6 +696,7 @@ async def get_book(
     book, read_only = await _load_readable_book(_current_user, book_id)
     counts = await wb_service.book_counts([book.id])
     labels = await wb_service.binding_labels([book])
+    vector_participating, vector_pending = await wb_vectors.participation_counts(book)
     return BookDetail(
         **_book_item(
             book,
@@ -594,6 +705,60 @@ async def get_book(
             read_only=read_only,
         ).model_dump(),
         ext_keys=sorted(book.ext) if isinstance(book.ext, dict) else [],
+        vector_participating=vector_participating,
+        vector_pending=vector_pending,
+    )
+
+
+@router.get("/books/{book_id}/budget-check", summary="世界书预算体检", response_model=BookBudgetCheck)
+@require_role(Role.Admin)
+async def get_book_budget_check(
+    book_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> BookBudgetCheck:
+    """书里启用的常驻条目按每轮预算装一遍：合计多少、只有常驻条目命中时能进几条、哪几条进不来。
+
+    只读；预算按书的归属实例算（与导入提示同一个口径）。和书详情分开一个接口，书详情页单独拉它：
+    常驻条目多的书要数一阵 token，不该拖慢书详情本身。平台方提供给租户只读的书不报（返回空结果）：
+    那本书的预算按平台方的配置算；租户要看就在自己的频道上做触发测试。每个租户（平台方算一个）同一时间
+    只算一个，正在算时回 `busy`、不排队。租户看到的预算明细里模型组名字清空（名字不算机密，这里清掉只是
+    少给一样用不上的东西；触发测试等别处照常显示）。
+    """
+    book, read_only = await _load_readable_book(_current_user, book_id)
+    if read_only:
+        return BookBudgetCheck()
+    tenant_id = get_tenant_scope(_current_user)
+    result = await wb_service.book_budget_check(book, tenant_key=wb_purpose.tenant_slot_key(tenant_id))
+    if result.busy:
+        return BookBudgetCheck(busy=True, summary="预算体检正忙（这个账号下还有一本书在算），稍后再看")
+    budget, check, truncated = result.budget, result.check, result.truncated
+    if budget is None or check is None:
+        return BookBudgetCheck()
+    budget_info = WorldbookBudgetInfo(**budget.as_dict())
+    if tenant_id is not None:
+        budget_info = budget_info.model_copy(update={"model_group": "", "fallback_model_group": ""})
+    return BookBudgetCheck(
+        budget=budget_info,
+        book_budget=check.book_budget,
+        max_entries=check.max_entries,
+        constant_count=check.constant_count,
+        constant_tokens=check.constant_tokens,
+        fit_count=check.fit_count,
+        fit_tokens=check.fit_tokens,
+        routed_out=check.routed_out,
+        dropped=[
+            BudgetDroppedItem(
+                entry_id=item.entry_id,
+                uid=item.uid,
+                title=item.title,
+                tokens=item.tokens,
+                reason=item.reason,
+                alone_over=item.alone_over,
+            )
+            for item in check.dropped
+        ],
+        truncated=truncated,
+        summary=("这本书" + check.summary()) if check.constant_count else check.summary(),
     )
 
 
@@ -609,9 +774,12 @@ async def update_book(
     await wb_service.update_book(book, req, username=_current_user.username)
     counts = await wb_service.book_counts([book.id])
     labels = await wb_service.binding_labels([book])
+    vector_participating, vector_pending = await wb_vectors.participation_counts(book)
     return BookDetail(
         **_book_item(book, counts.get(book.id, (0, 0)), labels.get(book.id, ("", "", False))).model_dump(),
         ext_keys=sorted(book.ext) if isinstance(book.ext, dict) else [],
+        vector_participating=vector_participating,
+        vector_pending=vector_pending,
     )
 
 
@@ -631,13 +799,56 @@ async def delete_book(
 @require_role(Role.Admin)
 async def list_entries(
     book_id: int,
+    page: int = 1,
+    page_size: int = ENTRY_PAGE_SIZE_DEFAULT,
+    q: str = "",
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> EntryListResponse:
-    """一本书的全部条目；权重大的在前，同权重按创建顺序。平台方提供的只读书也能看。"""
+    """一本书的一页条目；权重大的在前，同权重按创建顺序。平台方提供的只读书也能看。
+
+    分页加搜索（标题、正文、主 / 次关键词，都在数据库里匹配）。每条带的用途与疑似防盗标记来自
+    `worldbook.purpose` 的摘要（与运行时同一个判据）；分析在专用的单线程执行器里跑、每次请求有
+    预算，执行器正忙或超出预算的条目这次标「分析中」，页面过一会儿再取。参数不用 `Query(...)`：
+    用例直接调这个函数时要拿到真值。
+    """
+    if _NUL in q:
+        raise ValidationError(reason="搜索词里不能有空字符")
     book, _read_only = await _load_readable_book(_current_user, book_id)
-    entries = await wb_service.list_entries(book)
+    page = max(1, min(ENTRY_PAGE_MAX, int(page)))
+    page_size = max(1, min(ENTRY_PAGE_SIZE_MAX, int(page_size)))
+    entries, total = await wb_service.list_entries_page(book, page=page, page_size=page_size, query=q[:200])
+    summaries = await wb_purpose.listing_summaries(entries)
     disabled = _disabled_by_entry()
-    return EntryListResponse(items=[_entry_item(entry, disabled) for entry in entries])
+    return EntryListResponse(
+        items=[_entry_item(entry, disabled, summaries.get(entry.id)) for entry in entries],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/entries/{entry_id}", summary="世界书条目详情", response_model=EntryItem)
+@require_role(Role.Admin)
+async def get_entry(
+    entry_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> EntryItem:
+    """按 ID 取一条条目，返回结构与条目列表里的一项相同。
+
+    先取条目、再对它的书走 `_load_readable_book`：条目表没有归属列，可见范围永远算在
+    书上。不存在与无权同为 404，理由与 `_load_readable_book` 相同。
+    """
+    entry = await wb_service.load_entry(entry_id)
+    if entry is None:
+        raise NotFoundError(resource="世界书")
+    await _load_readable_book(_current_user, entry.book_id)
+    return await _entry_item_with_summary(entry)
+
+
+async def _entry_item_with_summary(entry: DBWbEntry) -> EntryItem:
+    """单条的响应：摘要在书详情的执行器里排队算（一条有上限，总是算完）"""
+    summary = await wb_purpose.single_summary(entry)
+    return _entry_item(entry, _disabled_by_entry(), summary)
 
 
 @router.post("/books/{book_id}/entries", summary="新建条目", response_model=EntryItem)
@@ -655,7 +866,7 @@ async def create_entry(
         is_platform=get_tenant_scope(_current_user) is None,
         username=_current_user.username,
     )
-    return _entry_item(entry, _disabled_by_entry())
+    return await _entry_item_with_summary(entry)
 
 
 @router.put("/entries/{entry_id}", summary="修改条目", response_model=EntryItem)
@@ -673,7 +884,7 @@ async def update_entry(
         is_platform=get_tenant_scope(_current_user) is None,
         username=_current_user.username,
     )
-    return _entry_item(entry, _disabled_by_entry())
+    return await _entry_item_with_summary(entry)
 
 
 @router.delete("/entries/{entry_id}", summary="删除条目", response_model=DeleteResponse)
@@ -698,7 +909,7 @@ async def entry_action(
     """四种状态动作走同一个端点；已经是目标状态时不报错。"""
     entry = await _load_visible_entry(_current_user, entry_id)
     await wb_service.apply_entry_action(entry, req.action)
-    return _entry_item(entry, _disabled_by_entry())
+    return await _entry_item_with_summary(entry)
 
 
 @router.get("/quarantine", summary="世界书隔离区", response_model=QuarantineListResponse)
@@ -735,16 +946,25 @@ async def list_quarantine(
 async def import_into_book(
     book_id: int,
     file: UploadFile = File(...),
+    rewrite_name_vars: bool = Form(default=True),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> ImportReport:
-    """追加到已有书：编号撞号的条目重编号，书级 `ext` 保持不动。"""
+    """追加到已有书：编号撞号的条目重编号，书级 `ext` 保持不动。
+
+    `rewrite_name_vars` 为假时正文里读名字的变量原样导入（导入对话框的开关）。
+    """
     book = await _load_visible_book(_current_user, book_id)
+    tenant_id = get_tenant_scope(_current_user)
+    tenant_key = wb_purpose.tenant_slot_key(tenant_id)
+    wb_purpose.ensure_import_slot_free(tenant_key)
     parsed = await _read_upload(file)
     return await wb_service.import_world(
         book,
         parsed,
-        is_platform=get_tenant_scope(_current_user) is None,
+        is_platform=tenant_id is None,
         username=_current_user.username,
+        tenant_key=tenant_key,
+        rewrite_names=rewrite_name_vars,
     )
 
 
@@ -873,12 +1093,15 @@ async def _test_window(
     rows = await DBChatMessage.filter(chat_key=channel.chat_key).order_by("-id").limit(_RECENT_WINDOW)
     # 倒序取最近 N 条再翻回升序：`scan_text` 与 `book_active_for_person` 都按 `id` 升序
     # 理解「最后几条」，直接把倒序列表传进去会让「最后 depth 条」变成「最早 depth 条」。
+    # 说话人名字与运行时同一口径（`runtime.load_window`）：群友用清洗过的昵称，Bot 自己的
+    # 留空、由 `evaluate` 换成人设名。合成消息没有说话人。
     return [
         WindowMessage(
             id=row.id,
             sender_id=row.sender_id,
             platform_userid=row.platform_userid,
             content_text=row.content_text,
+            speaker="" if row.sender_id == wb_runtime.BOT_SENDER_ID else wb_runtime.speaker_name(row.sender_nickname),
         )
         for row in reversed(rows)
     ]
@@ -921,20 +1144,32 @@ async def test_trigger(
 
     channel_config = await channel.get_effective_config()
     window = await _test_window(channel, req)
+    # 预算与运行时同一个函数、同一份生效配置（含这个频道的主模型组与分词系数）
+    await wb_tokens.ensure_loaded_async()
+    budget = resolve_budget(channel_config)
     # 与运行时同一条求值路径（`runtime.evaluate`），只是不带定时锚点、不做下一轮抑制：
     # 测试页不该改变正式状态，也不该因为上一次测试而给出不同的结论。
     evaluation = await wb_runtime.evaluate(
         channel,
         preset_id=preset_id,
         window=window,
-        max_chars=int(channel_config.WORLDBOOK_MAX_CHARS),
+        budget=budget,
         max_entries=int(config.WORLDBOOK_MAX_ENTRIES_PER_ROUND),
         use_timed_state=False,
         suppress_untrusted=False,
+        semantic=bool(getattr(channel_config, "WORLDBOOK_VECTOR_ENABLED", False)),
+        requester=(channel.adapter_key, channel.instance_key),
     )
     books = evaluation.books
     entries = evaluation.entries
-    hits = list(evaluation.hits)
+    # 按用途或模板不进主提示词的命中条目也列出来，原因放进 `dropped`：管理员要看得到
+    # 「它命中了，但因为什么没进来」，而不是以为关键词没对上。按标题分流的条目不在
+    # `evaluation.hits` 里，入选时才判出来的那些已经在了，按条目 ID 去重。
+    hit_ids = {hit.entry.id for hit in evaluation.hits}
+    hits = [
+        *evaluation.hits,
+        *(hit for hit, _reason in evaluation.routed_out if hit.entry.id not in hit_ids),
+    ]
     chosen = evaluation.chosen
     groups = evaluation.groups
     channel_count = len(window)
@@ -969,16 +1204,25 @@ async def test_trigger(
                 comment=comment_by_id.get(hit.entry.id, ""),
                 reason_kind=hit.reason.kind,
                 matched_key=hit.reason.key,
+                score=hit.reason.score,
                 position=hit.entry.position.value,
                 order=hit.entry.order,
                 chars=len(hit.entry.content),
+                tokens=chosen.tokens.get(hit.entry.id),
                 trusted=hit.entry.trusted,
+                ignored_budget=hit.entry.id in chosen.ignored_budget,
             )
             for hit in hits
         ],
         selected=[hit.entry.id for hit in chosen.selected],
         dropped=[
-            TriggerDroppedItem(entry_id=hit.entry.id, reason=reason) for hit, reason in chosen.dropped
+            TriggerDroppedItem(
+                entry_id=hit.entry.id,
+                reason=reason,
+                tokens=chosen.tokens.get(hit.entry.id),
+                ahead=_ahead_of(hit, reason, chosen.selected),
+            )
+            for hit, reason in (*chosen.dropped, *evaluation.routed_out)
         ],
         groups=TriggerGroups(
             after_persona=[hit.entry.id for hit in groups.after_persona],
@@ -989,7 +1233,24 @@ async def test_trigger(
         timed_ignored=True,
         gate_enabled=bool(channel_config.WORLDBOOK_ENABLED),
         rendered=_render_for_test(groups, hidden_books),
+        budget=WorldbookBudgetInfo(**budget.as_dict()),
+        total_tokens=chosen.total_tokens,
     )
+
+
+def _ahead_of(hit: wb_selection.Hit, reason: str, selected: tuple[wb_selection.Hit, ...]) -> list[int]:
+    """因预算被跳过的条目：在它前面入选、占掉预算的是哪几条（入选顺序与 `select_hits` 相同）
+
+    `global_tokens` 看全部入选条目，`book_tokens` 只看同一本书的；其它原因（条数上限、用途、模板）不报。
+    """
+    if reason not in ("global_tokens", "book_tokens"):
+        return []
+    key = (-hit.entry.order, hit.entry.id)
+    return [
+        item.entry.id
+        for item in selected
+        if (-item.entry.order, item.entry.id) < key and (reason == "global_tokens" or item.entry.book_id == hit.entry.book_id)
+    ]
 
 
 async def _books_invisible_to(user: DBUser, books: list[DBWbBook]) -> set[int]:

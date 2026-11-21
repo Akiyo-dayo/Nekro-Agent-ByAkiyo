@@ -1,11 +1,6 @@
 {
-  "title": "实例配额",
-  "subtitle": "按实例查看并设置每频道每日 AI 回复上限，同时看清此刻的沙盒并发占用。",
-  "layerHint": {
-    "text": "这里是租户对自己群的回复配额（自限，按回复条数）；平台方给每个群 / 私聊的每日额度在「",
-    "channelQuotaLink": "频道额度",
-    "after": "」页——两层都放行才回复。"
-  },
+  "title": "实例自限",
+  "subtitle": "按实例查看并设置每频道每日 AI 回复回合上限，同时看清此刻的沙盒并发占用。",
   "stats": {
     "globalCapacity": "全局并发容量",
     "globalActive": "并发占用",
@@ -39,7 +34,7 @@
   "usage": {
     "activeChannels": "{{count}} 个活跃频道",
     "channelsAtLimit": "{{count}} 个频道已撞上限",
-    "peakChannel": "单频道最高 {{count}} 条",
+    "peakChannel": "单频道最高 {{count}} 个回复回合",
     "queued": "排队 {{count}}",
     "rejected": "被拒 {{count}}",
     "concurrencyHint": "占用 {{active}} / 上限 {{max}}，累计放行 {{admitted}}，最长等待 {{wait}} 秒"
@@ -52,11 +47,11 @@
     "disabled": "已停用"
   },
   "dialog": {
-    "titleSingle": "设置实例配额",
-    "titleBatch": "批量设置实例配额",
+    "titleSingle": "设置实例自限",
+    "titleBatch": "批量设置实例自限",
     "batchTargets": "本次改动会逐个套用到已选的 {{count}} 个实例，某个实例失败不影响其余实例。",
     "dailyLimitLabel": "每日上限",
-    "dailyLimitHelper": "每个频道每日的 AI 回复上限，0 表示不限制；设在实例层即对该实例的所有频道生效。留空表示不改动配额。",
+    "dailyLimitHelper": "每个频道每日的 AI 回复回合上限，0 表示不限制；设在实例层即对该实例的所有频道生效。留空表示不改动配额。",
     "clearOverrideLabel": "清除覆盖，回落到继承值 {{value}}",
     "clearOverrideLabelBatch": "清除覆盖，回落到各实例各自的继承值",
     "clearOverrideHelper": "清除实例层覆盖后，配额由适配器层或全局配置决定，上面填写的每日上限会被忽略。",

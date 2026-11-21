@@ -126,11 +126,12 @@ export const instanceScopeApi = {
   savePluginInstanceConfig: async (
     pluginKey: string,
     instanceKey: string,
-    configs: Record<string, string>
+    configs: Record<string, string>,
+    base?: Record<string, unknown>
   ): Promise<ScopeActionResponse> => {
     const response = await axios.put<ScopeActionResponse>(
       `/plugins/${encode(pluginKey)}/config/${encode(instanceKey)}`,
-      { configs }
+      base ? { configs, base } : { configs }
     )
     return response.data
   },
@@ -147,11 +148,12 @@ export const instanceScopeApi = {
   saveInstanceConfig: async (
     adapterKey: string,
     instanceKey: string,
-    configs: Record<string, string>
+    configs: Record<string, string>,
+    base?: Record<string, unknown>
   ): Promise<ScopeActionResponse> => {
     const response = await axios.put<ScopeActionResponse>(
       `/config/instance/${encode(adapterKey)}/${encode(instanceKey)}`,
-      { configs }
+      base ? { configs, base } : { configs }
     )
     return response.data
   },
@@ -236,8 +238,12 @@ export function createInstanceConfigService(
     getConfigList: () => instanceScopeApi.getInstanceConfig(adapterKey, instanceKey),
     getModelGroups: unifiedConfigApi.getModelGroups,
     getModelTypes: unifiedConfigApi.getModelTypes,
-    batchUpdateConfig: async (_configKey: string, configs: Record<string, string>) => {
-      await instanceScopeApi.saveInstanceConfig(adapterKey, instanceKey, configs)
+    batchUpdateConfig: async (
+      _configKey: string,
+      configs: Record<string, string>,
+      base?: Record<string, unknown>
+    ) => {
+      await instanceScopeApi.saveInstanceConfig(adapterKey, instanceKey, configs, base)
     },
     saveConfig: async () => {
       // 实例级覆盖在 PUT 时即已落盘，无需额外的保存动作

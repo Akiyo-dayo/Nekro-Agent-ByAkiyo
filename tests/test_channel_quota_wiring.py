@@ -259,7 +259,7 @@ class TestPushHumanMessageGate:
 
     async def test_a_failing_quota_check_lets_the_message_through(self, db, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ARG002
         """判定本身出错按「没暂停」放行：额度判定不能变成「群友说一句话、Bot 报一个错」的故障点"""
-        from nekro_agent.services import channel_quota
+        from nekro_agent.services.channel_quota import service as channel_quota_service
         from nekro_agent.services.message_service import message_service
 
         await seed_channel()
@@ -269,7 +269,7 @@ class TestPushHumanMessageGate:
         async def boom(_channel: Any) -> None:
             raise RuntimeError("库抖了一下")
 
-        monkeypatch.setattr(channel_quota, "check_and_alert", boom)
+        monkeypatch.setattr(channel_quota_service, "check_and_alert", boom)
 
         await self._push()
 

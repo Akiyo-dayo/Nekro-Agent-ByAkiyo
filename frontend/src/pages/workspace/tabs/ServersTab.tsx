@@ -10,7 +10,7 @@
  * 关闭对话框即丢弃。查看动作本身由后端记审计，所以界面上写清楚这一点。
  */
 
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Box,
@@ -65,6 +65,7 @@ import {
   type SshCredentialTestResponse,
   type SshCredentialUpdate,
   type SshCredentialView,
+  type SshDutyMode,
   type SshGatewayStatusResponse,
 } from '../../../services/api/sshGateway'
 import type { WorkspaceDetail } from '../../../services/api/workspace'
@@ -119,6 +120,8 @@ const STATUS_COLORS: Record<string, 'success' | 'default' | 'warning' | 'error'>
   auth_failed: 'error',
 }
 
+const RUNBOOK_MAX_LENGTH = 8000
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
   return String(error ?? '')
@@ -133,6 +136,11 @@ function splitHostKeys(value: string): string[] {
 
 function instancePairId(adapterKey: string, instanceKey: string): string {
   return `${adapterKey}:${instanceKey}`
+}
+
+/** 后端给的是自由字符串；只认三种合法值，其余按「跟随默认」处理 */
+function normalizeDutyMode(value: string): SshDutyMode {
+  return value === 'strict' || value === 'duty' ? value : ''
 }
 
 export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }) {
@@ -159,6 +167,11 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
   const [revealLoading, setRevealLoading] = useState(false)
   const [testTarget, setTestTarget] = useState<SshCredentialView | null>(null)
   const [testResult, setTestResult] = useState<SshCredentialTestResponse | null>(null)
+  const [dutyTarget, setDutyTarget] = useState<SshCredentialView | null>(null)
+  const [dutyMode, setDutyMode] = useState<SshDutyMode>('')
+  const [runbookTarget, setRunbookTarget] = useState<SshCredentialView | null>(null)
+  const [runbookDraft, setRunbookDraft] = useState<string | null>(null)
+  const [entryToDelete, setEntryToDelete] = useState<number | null>(null)
   const [expandedAudit, setExpandedAudit] = useState<Set<number>>(new Set())
 
   const credentialsQuery = useQuery({
@@ -175,6 +188,22 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
     refetchInterval: 10_000,
     retry: false,
   })
+
+  const runbookCredentialId = runbookTarget?.id ?? 0
+  const runbookQuery = useQuery({
+    queryKey: SSH_GATEWAY_QUERY_KEYS.runbook(workspaceId, runbookCredentialId),
+    queryFn: () =>
+      sshGatewayApi.getRunbook(workspaceId, runbookCredentialId),
+    enabled: platformViewer && !!runbookTarget,
+    retry: false,
+  })
+
+  // 首次拿到数据时填进可编辑的草稿；之后保存/删除引起的刷新不覆盖用户正在改的内容
+  useEffect(() => {
+    if (runbookDraft !== null) return
+    if (!runbookQuery.data) return
+    setRunbookDraft(runbookQuery.data.runbook)
+  }, [runbookDraft, runbookQuery.data])
 
   const instanceOptionsQuery = useQuery({
     queryKey: ['console', 'instance-options'],
@@ -403,6 +432,80 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
     },
   })
 
+  const dutyModeMutation = useMutation({
+    mutationFn: (variables: { credentialId: number; dutyMode: SshDutyMode }) =>
+      sshGatewayApi.setDutyMode(
+        workspaceId,
+        variables.credentialId,
+        variables.dutyMode
+      ),
+    onSuccess: () => {
+      notification.success(t('detail.servers.duty.saved'))
+      setDutyTarget(null)
+      void queryClient.invalidateQueries({
+        queryKey: SSH_GATEWAY_QUERY_KEYS.workspaceCredentials(workspaceId),
+      })
+    },
+    onError: error => {
+      notification.error(
+        t('detail.servers.notifications.updateFailed', {
+          message: errorMessage(error),
+        })
+      )
+    },
+  })
+
+  const runbookSaveMutation = useMutation({
+    mutationFn: (variables: { credentialId: number; runbook: string }) =>
+      sshGatewayApi.updateRunbook(
+        workspaceId,
+        variables.credentialId,
+        variables.runbook
+      ),
+    onSuccess: (data, variables) => {
+      notification.success(t('detail.servers.runbook.saved'))
+      setRunbookDraft(data.runbook)
+      void queryClient.invalidateQueries({
+        queryKey: SSH_GATEWAY_QUERY_KEYS.runbook(
+          workspaceId,
+          variables.credentialId
+        ),
+      })
+    },
+    onError: error => {
+      notification.error(
+        t('detail.servers.notifications.updateFailed', {
+          message: errorMessage(error),
+        })
+      )
+    },
+  })
+
+  const runbookDeleteMutation = useMutation({
+    mutationFn: (variables: { credentialId: number; entryId: number }) =>
+      sshGatewayApi.deleteRunbookEntry(
+        workspaceId,
+        variables.credentialId,
+        variables.entryId
+      ),
+    onSuccess: (_data, variables) => {
+      setEntryToDelete(null)
+      void queryClient.invalidateQueries({
+        queryKey: SSH_GATEWAY_QUERY_KEYS.runbook(
+          workspaceId,
+          variables.credentialId
+        ),
+      })
+    },
+    onError: error => {
+      notification.error(
+        t('detail.servers.notifications.deleteFailed', {
+          message: errorMessage(error),
+        })
+      )
+    },
+  })
+
   const closeForm = () => {
     if (saveMutation.isPending) return
     setFormOpen(false)
@@ -518,6 +621,50 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
     setTestResult(null)
   }
 
+  const openDutyMode = (credential: SshCredentialView) => {
+    setDutyTarget(credential)
+    setDutyMode(normalizeDutyMode(credential.duty_mode))
+  }
+
+  const closeDutyMode = () => {
+    if (dutyModeMutation.isPending) return
+    setDutyTarget(null)
+  }
+
+  const submitDutyMode = () => {
+    if (!dutyTarget) return
+    dutyModeMutation.mutate({ credentialId: dutyTarget.id, dutyMode })
+  }
+
+  const openRunbook = (credential: SshCredentialView) => {
+    setRunbookTarget(credential)
+    setRunbookDraft(null)
+  }
+
+  const closeRunbook = () => {
+    if (runbookSaveMutation.isPending || runbookDeleteMutation.isPending) return
+    setRunbookTarget(null)
+    setRunbookDraft(null)
+    setEntryToDelete(null)
+  }
+
+  const submitRunbook = () => {
+    if (!runbookTarget || runbookDraft === null) return
+    if (runbookDraft.length > RUNBOOK_MAX_LENGTH) return
+    runbookSaveMutation.mutate({
+      credentialId: runbookTarget.id,
+      runbook: runbookDraft,
+    })
+  }
+
+  const confirmDeleteRunbookEntry = () => {
+    if (!runbookTarget || entryToDelete === null) return
+    runbookDeleteMutation.mutate({
+      credentialId: runbookTarget.id,
+      entryId: entryToDelete,
+    })
+  }
+
   const copySecret = async (value: string) => {
     const copied = await copyText(value)
     if (copied) {
@@ -578,6 +725,14 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
     !!testResult.presented_entry &&
     !!testResult.presented_fingerprint
   const acceptingHostKey = hostKeyMismatch && !!testTarget?.can_edit_connection
+
+  const defaultDutyModeLabel =
+    statusQuery.data?.default_duty_mode === 'duty'
+      ? t('detail.servers.duty.modeDuty')
+      : t('detail.servers.duty.modeStrict')
+  const runbookText = runbookDraft ?? ''
+  const runbookOverLimit = runbookText.length > RUNBOOK_MAX_LENGTH
+  const runbookEntries = runbookQuery.data?.entries ?? []
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -748,6 +903,24 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
                                   }}
                                 />
                               )}
+                            {platformViewer &&
+                              credential.owner_kind === 'platform' &&
+                              credential.effective_duty_mode === 'duty' && (
+                                <Tooltip title={t('detail.servers.duty.badgeHint')}>
+                                  <Chip
+                                    size="small"
+                                    color="warning"
+                                    label={t('detail.servers.duty.badge')}
+                                    sx={{
+                                      height: 'auto',
+                                      '& .MuiChip-label': {
+                                        whiteSpace: 'normal',
+                                        py: 0.25,
+                                      },
+                                    }}
+                                  />
+                                </Tooltip>
+                              )}
                           </Stack>
                         </TableCell>
                         <TableCell sx={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>
@@ -839,6 +1012,25 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
                                 {t('detail.servers.actions.reveal')}
                               </ActionButton>
                             )}
+                            {platformViewer &&
+                              credential.owner_kind === 'platform' && (
+                                <>
+                                  <ActionButton
+                                    size="small"
+                                    tone="ghost"
+                                    onClick={() => openDutyMode(credential)}
+                                  >
+                                    {t('detail.servers.actions.dutyMode')}
+                                  </ActionButton>
+                                  <ActionButton
+                                    size="small"
+                                    tone="ghost"
+                                    onClick={() => openRunbook(credential)}
+                                  >
+                                    {t('detail.servers.actions.runbook')}
+                                  </ActionButton>
+                                </>
+                              )}
                             <ActionButton
                               size="small"
                               tone="ghost"
@@ -1525,6 +1717,231 @@ export default function ServersTab({ workspace }: { workspace: WorkspaceDetail }
             )
           )}
         </Stack>
+      </NekroDialog>
+
+      <NekroDialog
+        open={platformViewer && !!dutyTarget}
+        onClose={closeDutyMode}
+        title={t('detail.servers.duty.title')}
+        maxWidth="xs"
+        actions={
+          <>
+            <ActionButton
+              onClick={closeDutyMode}
+              disabled={dutyModeMutation.isPending}
+            >
+              {t('detail.servers.form.cancel')}
+            </ActionButton>
+            <ActionButton
+              variant="contained"
+              onClick={submitDutyMode}
+              disabled={dutyModeMutation.isPending}
+            >
+              {t('detail.servers.form.save')}
+            </ActionButton>
+          </>
+        }
+      >
+        <Stack spacing={2} sx={{ pt: 0.5 }}>
+          <TextField
+            select
+            size="small"
+            fullWidth
+            label={t('detail.servers.duty.title')}
+            value={dutyMode}
+            onChange={event =>
+              setDutyMode(event.target.value as SshDutyMode)
+            }
+          >
+            <MenuItem value="">
+              {t('detail.servers.duty.modeInherit', {
+                mode: defaultDutyModeLabel,
+              })}
+            </MenuItem>
+            <MenuItem value="strict">
+              {t('detail.servers.duty.modeStrict')}
+            </MenuItem>
+            <MenuItem value="duty">
+              {t('detail.servers.duty.modeDuty')}
+            </MenuItem>
+          </TextField>
+          {dutyMode === 'duty' && (
+            <Alert severity="warning">
+              {t('detail.servers.duty.dutyWarning')}
+            </Alert>
+          )}
+        </Stack>
+      </NekroDialog>
+
+      <NekroDialog
+        open={platformViewer && !!runbookTarget}
+        onClose={closeRunbook}
+        title={t('detail.servers.runbook.title', {
+          alias: runbookTarget?.alias ?? '',
+        })}
+        maxWidth="md"
+        actions={
+          <>
+            <ActionButton
+              onClick={closeRunbook}
+              disabled={
+                runbookSaveMutation.isPending ||
+                runbookDeleteMutation.isPending
+              }
+            >
+              {t('detail.servers.form.cancel')}
+            </ActionButton>
+            <ActionButton
+              variant="contained"
+              onClick={submitRunbook}
+              disabled={
+                runbookSaveMutation.isPending ||
+                runbookDraft === null ||
+                runbookOverLimit
+              }
+            >
+              {t('detail.servers.form.save')}
+            </ActionButton>
+          </>
+        }
+      >
+        <Stack spacing={2} sx={{ pt: 0.5 }}>
+          <Typography variant="body2" color="text.secondary">
+            {t('detail.servers.runbook.ownerHint')}
+          </Typography>
+          <Box>
+            <TextField
+              multiline
+              minRows={8}
+              fullWidth
+              value={runbookText}
+              onChange={event => setRunbookDraft(event.target.value)}
+              disabled={runbookDraft === null || runbookSaveMutation.isPending}
+            />
+            <Typography
+              variant="caption"
+              color={runbookOverLimit ? 'error' : 'text.secondary'}
+              sx={{ display: 'block', mt: 0.5, textAlign: 'right' }}
+            >
+              {runbookText.length} / {RUNBOOK_MAX_LENGTH}
+            </Typography>
+          </Box>
+
+          <Box>
+            <Typography variant="subtitle2" fontWeight={700}>
+              {t('detail.servers.runbook.entriesTitle', {
+                count: runbookEntries.length,
+              })}
+            </Typography>
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              component="div"
+            >
+              {t('detail.servers.runbook.entriesHint')}
+            </Typography>
+
+            {runbookQuery.isLoading ? (
+              <Box sx={{ display: 'flex', justifyContent: 'center', py: 3 }}>
+                <CircularProgress size={24} />
+              </Box>
+            ) : runbookQuery.isError ? (
+              <Box sx={{ mt: 1 }}>
+                <QueryErrorState
+                  error={runbookQuery.error}
+                  onRetry={() => void runbookQuery.refetch()}
+                  compact
+                />
+              </Box>
+            ) : runbookEntries.length === 0 ? (
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ mt: 1 }}
+              >
+                {t('detail.servers.runbook.entriesEmpty')}
+              </Typography>
+            ) : (
+              <Stack spacing={1} sx={{ mt: 1 }}>
+                {runbookEntries.map(entry => (
+                  <Box
+                    key={entry.id}
+                    sx={{
+                      p: 1,
+                      bgcolor: 'action.hover',
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Stack
+                      direction="row"
+                      alignItems="flex-start"
+                      justifyContent="space-between"
+                      spacing={1}
+                    >
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          component="div"
+                        >
+                          {formatLastActiveTimeFromInput(entry.created_at, '—')}
+                        </Typography>
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                          }}
+                        >
+                          {entry.content}
+                        </Typography>
+                      </Box>
+                      <IconActionButton
+                        aria-label={t('detail.servers.runbook.deleteEntry')}
+                        onClick={() => setEntryToDelete(entry.id)}
+                        disabled={
+                          runbookDeleteMutation.isPending ||
+                          runbookSaveMutation.isPending
+                        }
+                      >
+                        <DeleteIcon fontSize="small" />
+                      </IconActionButton>
+                    </Stack>
+                  </Box>
+                ))}
+              </Stack>
+            )}
+          </Box>
+        </Stack>
+      </NekroDialog>
+
+      <NekroDialog
+        open={platformViewer && !!runbookTarget && entryToDelete !== null}
+        onClose={() => !runbookDeleteMutation.isPending && setEntryToDelete(null)}
+        title={t('detail.servers.runbook.deleteEntry')}
+        maxWidth="xs"
+        actions={
+          <>
+            <ActionButton
+              onClick={() => setEntryToDelete(null)}
+              disabled={runbookDeleteMutation.isPending}
+            >
+              {t('detail.servers.form.cancel')}
+            </ActionButton>
+            <ActionButton
+              tone="danger"
+              variant="contained"
+              onClick={confirmDeleteRunbookEntry}
+              disabled={runbookDeleteMutation.isPending}
+            >
+              {t('detail.servers.delete.confirm')}
+            </ActionButton>
+          </>
+        }
+      >
+        <Typography variant="body2">
+          {t('detail.servers.runbook.deleteConfirm')}
+        </Typography>
       </NekroDialog>
     </Box>
   )

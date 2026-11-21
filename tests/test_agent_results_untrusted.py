@@ -28,7 +28,7 @@ import functools
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 from tortoise import Tortoise
@@ -318,6 +318,27 @@ class TestMemory:
         result = memory._memory_result('{"content": "%s"}' % HOSTILE)  # noqa: SLF001
         assert_hostile_only_in_body(result)
         assert result.kind == "WorkspaceMemory"
+
+
+class TestWorldbookLookup:
+    def test_the_helper_wraps_json_untrusted(self):
+        from nekro_agent.services.worldbook import lookup
+        from plugins.builtin.worldbook_tools import main as worldbook_tools
+
+        item = lookup.LookupItem(
+            id=1,
+            book_id=1,
+            book=HOSTILE,
+            title=HOSTILE,
+            keys=(HOSTILE,),
+            content=HOSTILE,
+            truncated=False,
+            chars=len(HOSTILE),
+            tokens=1,
+        )
+        result = worldbook_tools._worldbook_result(lookup.LookupResult(items=(item,), note=""))  # noqa: SLF001
+        assert_hostile_only_in_body(result)
+        assert result.kind == "WorldInfo"
 
 
 class TestViewImage:
@@ -715,6 +736,8 @@ UNTRUSTED_AGENT_METHODS = {
     ("skill_loader/main.py", "load_skill"),
     ("video_analysis/main.py", "analyze_video"),
     ("view_image.py", "view_image"),
+    ("worldbook_tools/main.py", "read_worldbook_entries"),
+    ("worldbook_tools/main.py", "search_worldbook"),
 }
 
 # 返回值全部由宿主自己拼出来（固定文案、插件自己的配置与状态）的 `AGENT` / `BEHAVIOR` 方法，写明理由。
@@ -745,6 +768,7 @@ TRUSTED_SYSTEM_METHODS = {
     ("note.py", "set_note"): "只返回 True",
     ("plugin_activation.py", "activate_plugin"): "宿主渲染的插件提示词块；module_name 经 echo_inline",
     ("plugin_activation.py", "extend_plugin_activation"): "宿主固定文案与轮数；module_name 经 echo_inline",
+    ("state_table/inline.py", "update_state"): "宿主拼的回告（_reply）：处数是宿主数的，没收的路径经 echo_inline，原因是校验器的固定文案；不回显状态值与被拒的值",
     ("timer.py", "delete_recurring_timer"): "宿主固定文案；任务 ID 取自库里的记录，不回显参数",
     ("timer.py", "pause_recurring_timer"): "宿主固定文案；任务 ID 取自库里的记录，不回显参数",
     ("timer.py", "resume_recurring_timer"): "宿主固定文案；任务 ID 取自库里的记录，不回显参数",
@@ -902,7 +926,7 @@ class TestTrustedTextOutsideTheBlock:
         assert ("skill_loader/main.py", "load_skill") in summaries
         # 定时提醒改走不可信通道之后，`_execute_task` 不再推 SYSTEM 消息；
         # 这里换一个确实还在推 SYSTEM 的内核调用点，保证扫描范围没有缩到只剩插件
-        assert ("services/message_service.py", "push_human_message") in pushes
+        assert ("services/channel_quota/notice.py", "send_self_limit_notice_once") in pushes
         assert ("routers/chat_channel.py", "_send_message_via_webui") in pushes
         assert ("api/message.py", "push_system") in pushes
         assert ("schemas/agent_ctx.py", "push_system") in pushes
@@ -986,6 +1010,7 @@ REVIEWED_FSTRING_INTERPOLATIONS: Dict[Tuple[str, str], Dict[str, str]] = {
         "plugin_block": "宿主渲染的插件提示词块",
     },
     ("plugin_activation.py", "extend_plugin_activation"): {"final_rounds": "宿主算出的轮数"},
+    ("state_table/inline.py", "update_state"): {"MAX_INLINE_CALLS": "宿主常量（一轮最多调用几次）"},
     ("timer.py", "delete_recurring_timer"): {"job.job_id": "库里的任务 ID（不是模型传入的参数）"},
     ("timer.py", "pause_recurring_timer"): {"job.job_id": "库里的任务 ID（不是模型传入的参数）"},
     ("timer.py", "resume_recurring_timer"): {"job.job_id": "库里的任务 ID（不是模型传入的参数）"},
@@ -1001,6 +1026,10 @@ REVIEWED_RETURN_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
     },
     ("email_utils.py", "get_email_accounts"): {
         "items": "宿主拼的账户清单：每项只有显示名、引用与布尔值，或（能看地址的会话里）地址与服务商",
+    },
+    ("state_table/inline.py", "update_state"): {
+        "_reply(0, [], len(ops), cap)": "宿主拼的回告：只有宿主数出的处数与宿主算出的上限",
+        "_reply(len(kept), rejected, over, cap)": "宿主拼的回告（_reply）：处数与上限是宿主算的，没收的路径经 echo_inline，原因是校验器的固定文案（隐藏字段统一说成「模板里没有这个字段」）",
     },
     ("email_utils.py", "get_my_mail_preference"): {
         "str(e)": "服务层抛出的固定文案（「这一轮不止一个人在说话…」/「这个会话不能设置邮件偏好」），不含外部输入",
@@ -1125,9 +1154,11 @@ REVIEWED_PUSH_EXPRESSIONS: Dict[Tuple[str, str], Dict[str, str]] = {
             "（`nekro_agent/services/command/ctl.py:80`），是第三方插件接口的透传；文字由插件作者写死"
         ),
     },
-    ("services/message_service.py", "push_human_message"): {
-        "quota_msg": "仅宿主掌握的值：宿主固定文案加宿主查出来的今日回复计数与配置上限",
-        "hourly_msg": "仅宿主掌握的值：宿主固定文案加宿主查出来的本小时回复计数与配额上限",
+    ("services/channel_quota/notice.py", "send_self_limit_notice_once"): {
+        "message": (
+            "仅宿主掌握的值：`_self_limit_message` 的宿主固定文案，加宿主查出来的今日 / 本小时回复计数与上限"
+            "（原先在 `message_service.push_human_message` 里的两句，回复限制合一后搬到这里）"
+        ),
     },
     ("services/plugin/task.py", "notify_agent"): {
         "message": (
@@ -1146,6 +1177,7 @@ UNTRUSTED_RESULT_WRAPPERS = {
     "UntrustedToolResult",
     "_kb_result",
     "_memory_result",
+    "_worldbook_result",
     "_rcon_result",
     "_email_content_result",
     "_email_summary_result",
@@ -1399,6 +1431,7 @@ async def third_party(monkeypatch: pytest.MonkeyPatch):
     plugin = NekroPlugin(name="第三方", module_name="third_party_probe", description="", version="0.1.0", author="t", url="")
     untrusted_body: List[str] = [HOSTILE]
     untrusted_summary: List[str] = ["fetched 1 page"]
+    untrusted_history: List[Optional[str]] = [None]
 
     @plugin.mount_sandbox_method(SandboxMethodType.AGENT, "返回字符串")
     async def plain_agent(_ctx: Any, text: str) -> str:
@@ -1406,7 +1439,13 @@ async def third_party(monkeypatch: pytest.MonkeyPatch):
 
     @plugin.mount_sandbox_method(SandboxMethodType.AGENT, "返回不可信结果")
     async def untrusted_agent(_ctx: Any) -> UntrustedToolResult:
-        return UntrustedToolResult(kind="Fetched", body=untrusted_body[0], summary=untrusted_summary[0], attrs={"pages": 1})
+        return UntrustedToolResult(
+            kind="Fetched",
+            body=untrusted_body[0],
+            summary=untrusted_summary[0],
+            attrs={"pages": 1},
+            history_body=untrusted_history[0],
+        )
 
     monkeypatch.setitem(plugin_collector.loaded_plugins, plugin.key, plugin)
     token = issue_sandbox_call_grant(
@@ -1428,6 +1467,7 @@ async def third_party(monkeypatch: pytest.MonkeyPatch):
     call.system_messages = system_messages  # type: ignore[attr-defined]
     call.untrusted_body = untrusted_body  # type: ignore[attr-defined]
     call.untrusted_summary = untrusted_summary  # type: ignore[attr-defined]
+    call.untrusted_history = untrusted_history  # type: ignore[attr-defined]
     try:
         yield call
     finally:
@@ -1471,6 +1511,45 @@ class TestThirdPartyPluginsKeepTheOldPath:
         await third_party("untrusted_agent")
         stored = json.loads((await DBChatMessage.get(chat_key=THIRD_PARTY_CHAT_KEY)).content_data)[0]["text"]
         assert stored == "y" * MAX_TOOL_RESULT_BODY_CHARS + TRUNCATION_MARK
+
+    async def test_history_body_is_what_gets_stored_while_this_round_sees_the_full_body(
+        self, third_party, monkeypatch: pytest.MonkeyPatch
+    ):
+        """设了 `history_body`：落库、广播、之后的回放只有它；本轮交给模型的仍是完整正文"""
+        from nekro_agent.models.db_chat_message import DBChatMessage
+        from nekro_agent.services import message_service as message_service_module
+        from nekro_agent.services.agent.session_token import attach_untrusted_result, register_session_token
+        from nekro_agent.tools.untrusted_content import MAX_TOOL_RESULT_BODY_CHARS, TRUNCATION_MARK
+
+        published: List[str] = []
+
+        async def spy_publish(_chat_key: str, message: Any) -> None:
+            published.extend(segment.text for segment in message.content_data)
+
+        monkeypatch.setattr(message_service_module.message_broadcaster, "publish", spy_publish)
+        register_session_token(THIRD_PARTY_CONTAINER, "fullbody0code")
+        third_party.untrusted_history[0] = '{"entry_ids": [7]}'
+
+        await third_party("untrusted_agent")
+
+        row = await DBChatMessage.get(chat_key=THIRD_PARTY_CHAT_KEY)
+        assert json.loads(row.content_data)[0]["text"] == '{"entry_ids": [7]}'
+        assert HOSTILE not in row.content_data
+        assert published == ['{"entry_ids": [7]}']
+        render_config = SimpleNamespace(
+            AI_CONTEXT_LENGTH_PER_MESSAGE=100_000, AI_SHOW_REMOTE_URL=False, AI_INCLUDE_TOME_INDICATOR=False
+        )
+        replayed = row.parse_chat_history_prompt("cafebabecafebabe", render_config)  # type: ignore[arg-type]
+        assert '{"entry_ids": [7]}' in replayed and HOSTILE not in replayed
+        attached = attach_untrusted_result("sandbox output", THIRD_PARTY_CONTAINER, "fullbody0code")
+        assert HOSTILE in attached, "本轮这一次仍拿到完整正文"
+
+        # 落库的那一份同样有硬上限
+        await DBChatMessage.all().delete()
+        third_party.untrusted_history[0] = "h" * (MAX_TOOL_RESULT_BODY_CHARS + 10)
+        await third_party("untrusted_agent")
+        stored = json.loads((await DBChatMessage.get(chat_key=THIRD_PARTY_CHAT_KEY)).content_data)[0]["text"]
+        assert stored == "h" * MAX_TOOL_RESULT_BODY_CHARS + TRUNCATION_MARK
 
 
 # ---------------------------------------------------------------------------

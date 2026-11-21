@@ -442,3 +442,70 @@ class TestHistoryInjection:
         empty_block = render.render_block([], "code", in_history=False)
 
         assert _content(_compiler(worldbook_prompt=empty_block)) == baseline
+
+
+class TestPersonLabelInHistory:
+    """历史消息里的个人书条目带一行「关于谁」：轮次结果里的 `person_labels` 一路传到这里"""
+
+    async def test_before_history_person_entry_is_labeled(self, monkeypatch: Any) -> None:
+        from nekro_agent.services.worldbook import render
+        from nekro_agent.services.worldbook.runtime import RoundWorldbook
+
+        code = "labeled-history"
+        runtime._rounds[code] = RoundWorldbook(  # noqa: SLF001
+            state="injected",
+            groups=selection.RenderGroups(
+                before_history=[_hit(1, content="她喜欢下雨天", trusted=True, position=Position.BEFORE_HISTORY)],
+            ),
+            person_labels={1: "10001"},
+        )
+        try:
+            content = await _render_history(monkeypatch, code=code)
+        finally:
+            runtime._rounds.clear()  # noqa: SLF001
+
+        assert f"{render.PERSON_NOTE_LABEL.format(accounts='10001')}\n她喜欢下雨天" in content
+        assert content.index(
+            render.PERSON_NOTE_LABEL.format(accounts="10001"),
+        ) < content.index("Recent Messages:")
+
+    async def test_at_depth_person_entry_is_labeled(self, monkeypatch: Any) -> None:
+        from nekro_agent.services.worldbook import render
+        from nekro_agent.services.worldbook.runtime import RoundWorldbook
+
+        code = "labeled-depth"
+        runtime._rounds[code] = RoundWorldbook(  # noqa: SLF001
+            state="injected",
+            groups=selection.RenderGroups(
+                at_depth={
+                    1: [_hit(2, content="深度个人备注", trusted=False, position=Position.AT_DEPTH, depth=1)],
+                },
+            ),
+            person_labels={1: "10001"},
+        )
+        try:
+            content = await _render_history(monkeypatch, code=code)
+        finally:
+            runtime._rounds.clear()  # noqa: SLF001
+
+        assert f"{render.PERSON_NOTE_LABEL.format(accounts='10001')}\n深度个人备注" in content
+
+    async def test_without_labels_the_history_is_unchanged(self, monkeypatch: Any) -> None:
+        from nekro_agent.services.worldbook.runtime import RoundWorldbook
+
+        code = "unlabeled-history"
+        runtime._rounds.clear()  # noqa: SLF001
+        without_round = await _render_history(monkeypatch, code=code)
+        runtime._rounds[code] = RoundWorldbook(  # noqa: SLF001
+            state="injected",
+            groups=selection.RenderGroups(
+                before_history=[_hit(1, content="个人备注", trusted=True, position=Position.BEFORE_HISTORY)],
+            ),
+        )
+        try:
+            labeled = await _render_history(monkeypatch, code=code)
+        finally:
+            runtime._rounds.clear()  # noqa: SLF001
+
+        assert "[About the user with id:" not in labeled
+        assert without_round != labeled

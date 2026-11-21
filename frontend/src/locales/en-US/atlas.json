@@ -1,0 +1,72 @@
+{
+  "toolbar": {
+    "view": "View",
+    "viewEpisode": "Events",
+    "viewAtomic": "Atomic",
+    "density": "Density",
+    "densityLow": "Sparse",
+    "densityMedium": "Medium",
+    "densityHigh": "Dense",
+    "showInactive": "Show inactive"
+  },
+  "zoom": {
+    "zoomIn": "Zoom in",
+    "zoomOut": "Zoom out",
+    "fit": "Fit",
+    "hint": "Drag or scroll to pan; hold Ctrl or Command while scrolling to zoom"
+  },
+  "legend": {
+    "title": "Legend",
+    "show": "Show legend",
+    "hide": "Hide legend",
+    "count": "{{shown}} of {{total}}",
+    "countPending": "— of —",
+    "byImportance": "by importance",
+    "onlyThis": "Show only this cluster",
+    "showAll": "Show all",
+    "heavy": "Only the {{count}} most important are drawn",
+    "edges": "Lines"
+  },
+  "edges": {
+    "episode": "Event — paragraph / entity",
+    "paragraphEntity": "Paragraph — entity",
+    "paragraphPerson": "Paragraph — person",
+    "relation": "Relation",
+    "affection": "Affection (color = stage)",
+    "affectionNegative": "Wary / hostile",
+    "milestone": "Person — milestone",
+    "lastSeen": "Person — last seen channel"
+  },
+  "node": {
+    "inactive": "Inactive",
+    "quarantined": "Quarantined",
+    "frozen": "Frozen",
+    "protected": "Protected"
+  },
+  "empty": {
+    "memoryTitle": "No memories in this scope yet",
+    "memoryFiltered": "Try another channel, or clear the filters",
+    "memoryUnfiltered": "Memories will show up here once they are consolidated",
+    "affectionTitle": "No affection records in this scope yet",
+    "affectionFiltered": "Try another search term or stage",
+    "affectionUnfiltered": "Records show up here after people chat with the bot",
+    "clearFilters": "Clear filters"
+  },
+  "panel": {
+    "close": "Close",
+    "more": "More actions",
+    "expand": "Show more",
+    "collapse": "Show less",
+    "persons": "People",
+    "channel": "Channel",
+    "time": "Time",
+    "weight": "Weight",
+    "weightLine": "{{weight}} · reinforced {{count}}×",
+    "blockedHits": "Blocked hits",
+    "related": "Connected",
+    "relatedEpisode": "Events",
+    "relatedPerson": "People",
+    "relatedEntity": "Entities",
+    "relatedOther": "Other"
+  }
+}

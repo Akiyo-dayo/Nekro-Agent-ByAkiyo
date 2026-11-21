@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from nekro_agent.services.worldbook import unsupported as wb_unsupported
+
 from .card_png import PNG_SIGNATURE, PngCardInfo, card_text_from_png, read_png
 from .errors import CardFileRejected
 from .limits import (
@@ -56,19 +58,11 @@ _VARIABLE_MACRO = re.compile(
     r"\{\{\s*(?:setvar|getvar|addvar|incvar|decvar|hasvar|deletevar|setglobalvar|getglobalvar|if|else|/if)\b",
     re.IGNORECASE,
 )
-# EJS 模板块（「提示词模板」扩展的写法）。只数块数、不解析：NA 不执行模板代码。
-_EJS_BLOCK = re.compile(r"<%[\s\S]*?%>")
-# 酒馆助手脚本里写死的联网地址，只取主机名。
-_URL_HOST = re.compile(r"https?://([A-Za-z0-9.-]+)", re.IGNORECASE)
-# 不是网络请求的主机：`www.w3.org` 出现在 SVG / XML 的命名空间里；`.invalid` 是保留顶级域
-# （RFC 2606），永远解析不到，脚本作者常拿它当占位。
-_NON_NETWORK_HOSTS = frozenset({"www.w3.org"})
-_RESERVED_SUFFIX = ".invalid"
-# 检查页里最多列多少个脚本、每个脚本最多列多少个主机；超出的写「另有 N 个」。
-MAX_LISTED_SCRIPTS = 20
-MAX_LISTED_HOSTS = 8
-# 脚本名字在说明里最多显示多少字。
-_SCRIPT_NAME_CHARS = 40
+# EJS 模板块、酒馆助手脚本与卡内书里不支持的功能：判据与说明在 `worldbook.unsupported`，
+# 与世界书文件导入共用同一套。这里留几个名字给已有的调用方。
+_count_ejs_blocks = wb_unsupported.count_ejs_blocks
+MAX_LISTED_SCRIPTS = wb_unsupported.MAX_LISTED_SCRIPTS
+MAX_LISTED_HOSTS = wb_unsupported.MAX_LISTED_HOSTS
 
 
 @dataclass(frozen=True)
@@ -456,6 +450,18 @@ def parse_card_file(data: bytes) -> tuple[ParsedCard, PngCardInfo | None]:
         info = read_png(data)
         text = card_text_from_png(info)
         source_format = "png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        raise CardFileRejected(
+            "这是 JPG 图片，存不下人设卡数据；多半是网站缩略图或转存时被转码了，请找原始 PNG 或 JSON",
+        )
+    elif data.startswith((b"GIF87a", b"GIF89a")):
+        raise CardFileRejected(
+            "这是 GIF 图片，存不下人设卡数据；多半是网站缩略图或转存时被转码了，请找原始 PNG 或 JSON",
+        )
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        raise CardFileRejected(
+            "这是 WebP 图片，存不下人设卡数据；多半是网站缩略图或转存时被转码了，请找原始 PNG 或 JSON",
+        )
     elif data.startswith(b"PK\x03\x04"):
         raise CardFileRejected("暂不支持 CHARX（ZIP）格式的卡")
     else:
@@ -510,24 +516,6 @@ def detect_unsupported(data: Mapping[str, Any]) -> list[CardNote]:
             ),
         )
 
-    book = data.get("character_book")
-    if isinstance(book, dict):
-        entries = book.get("entries")
-        if isinstance(entries, list):
-            decorator_count = 0
-            for entry in entries:
-                if isinstance(entry, dict) and isinstance(entry.get("content"), str):
-                    if entry["content"].startswith("@@"):
-                        decorator_count += 1
-            if decorator_count:
-                notes.append(
-                    CardNote(
-                        "character_book",
-                        "unsupported",
-                        f"卡内知识书里有 {decorator_count} 条内容以 @@ 开头的条目，装饰器不会生效",
-                    ),
-                )
-
     assets = data.get("assets")
     if isinstance(assets, list):
         other_assets = 0
@@ -543,23 +531,6 @@ def detect_unsupported(data: Mapping[str, Any]) -> list[CardNote]:
                 ),
             )
 
-    ejs_blocks = 0
-    ejs_places = 0
-    for _, value in _iter_text_values(data):
-        found = len(_EJS_BLOCK.findall(value))
-        if found:
-            ejs_blocks += found
-            ejs_places += 1
-    if ejs_blocks:
-        notes.append(
-            CardNote(
-                "ejs",
-                "unsupported",
-                f"这张卡有 {ejs_blocks} 个 EJS 模板块（<% … %>，在 {ejs_places} 处文字里），NA 现在不执行，"
-                "会原样留在文字里；0.4.7 起支持其中一部分",
-            ),
-        )
-
     extensions = data.get("extensions")
     if isinstance(extensions, dict):
         world = extensions.get("world")
@@ -574,9 +545,17 @@ def detect_unsupported(data: Mapping[str, Any]) -> list[CardNote]:
                 ),
             )
 
-        scripts = _tavern_helper_scripts(extensions)
-        if scripts:
-            notes.append(CardNote("extensions.tavern_helper", "unsupported", _scripts_detail(scripts)))
+    # EJS 模板块、卡内书里不支持的功能（装饰器、包含组、概率……）、酒馆助手脚本：与世界书文件
+    # 导入共用 `worldbook.unsupported.unsupported_items`，同一类东西两边说同一句话。
+    book = data.get("character_book")
+    entries = book.get("entries") if isinstance(book, dict) else None
+    for item in wb_unsupported.unsupported_items(
+        entries=entries if isinstance(entries, list) else (),
+        extensions=extensions if isinstance(extensions, dict) else None,
+        texts=[value for _, value in _iter_text_values(data)],
+        card=True,
+    ):
+        notes.append(CardNote(item.field, "unsupported", item.detail))
 
     return notes
 
@@ -586,66 +565,6 @@ def _book_name(data: Mapping[str, Any]) -> str:
     book = data.get("character_book")
     name = book.get("name") if isinstance(book, dict) else None
     return name.strip() if isinstance(name, str) else ""
-
-
-def _tavern_helper_scripts(extensions: Mapping[str, Any]) -> list[tuple[str, str]]:
-    """卡里的酒馆助手脚本 `(名字, 正文)`，按出现顺序
-
-    新结构是 `extensions.tavern_helper.scripts`，里面可以有文件夹（带自己的 `scripts`）；旧版本写在
-    `extensions.TavernHelper_scripts`。两处都收。JSON 嵌套层数在解析时已经封顶，这里递归不会失控。
-    """
-    found: list[tuple[str, str]] = []
-
-    def walk(items: Any) -> None:
-        if not isinstance(items, list):
-            return
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if isinstance(content, str):
-                name = item.get("name")
-                found.append((name if isinstance(name, str) else "", content))
-            elif isinstance(item.get("scripts"), list):
-                walk(item["scripts"])
-
-    helper = extensions.get("tavern_helper")
-    if isinstance(helper, dict):
-        walk(helper.get("scripts"))
-    walk(extensions.get("TavernHelper_scripts"))
-    return found
-
-
-def _script_hosts(content: str) -> list[str]:
-    """脚本里写死的联网主机，去重保序，去掉不是网络请求的那几种"""
-    hosts: list[str] = []
-    for match in _URL_HOST.finditer(content):
-        host = match.group(1).lower().rstrip(".")
-        if not host or host in _NON_NETWORK_HOSTS or host.endswith(_RESERVED_SUFFIX) or host in hosts:
-            continue
-        hosts.append(host)
-    return hosts
-
-
-def _scripts_detail(scripts: list[tuple[str, str]]) -> str:
-    """酒馆助手脚本清单的说明：名字、字数、联网主机；写明 NA 不执行"""
-    parts: list[str] = []
-    for name, content in scripts[:MAX_LISTED_SCRIPTS]:
-        label = _strip_controls(name).strip()[:_SCRIPT_NAME_CHARS] or "未命名"
-        hosts = _script_hosts(content)
-        if hosts:
-            listed = "、".join(hosts[:MAX_LISTED_HOSTS])
-            if len(hosts) > MAX_LISTED_HOSTS:
-                listed += f" 等 {len(hosts)} 个"
-            parts.append(f"「{label}」{len(content)} 字，联网 {listed}")
-        else:
-            parts.append(f"「{label}」{len(content)} 字，没有写死的联网地址")
-    more = f"；另有 {len(scripts) - MAX_LISTED_SCRIPTS} 个未列出" if len(scripts) > MAX_LISTED_SCRIPTS else ""
-    return (
-        f"卡里有 {len(scripts)} 个酒馆助手脚本，NA 不执行（原样保存在卡片原文里，导出时还原）："
-        + "；".join(parts)
-        + more
-    )
 
 
 def pick_creator_notes(data: Mapping[str, Any]) -> str:

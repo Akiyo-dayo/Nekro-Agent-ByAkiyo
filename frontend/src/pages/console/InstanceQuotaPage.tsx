@@ -20,7 +20,6 @@ import {
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { Link as RouterLink } from 'react-router-dom'
 import BoltRoundedIcon from '@mui/icons-material/BoltRounded'
 import EditRoundedIcon from '@mui/icons-material/EditRounded'
 import HourglassEmptyRoundedIcon from '@mui/icons-material/HourglassEmptyRounded'
@@ -58,7 +57,12 @@ function limitSourceColor(theme: Theme, source: InstanceQuotaLimitSource): strin
   return theme.palette.text.secondary
 }
 
-export default function InstanceQuotaPage() {
+interface InstanceQuotaPageProps {
+  /** 嵌在「额度与用量」页壳里时，不再画自己的大标题与外层页面内边距 */
+  embedded?: boolean
+}
+
+export default function InstanceQuotaPage({ embedded = false }: InstanceQuotaPageProps) {
   const theme = useTheme()
   const notification = useNotification()
   const queryClient = useQueryClient()
@@ -245,7 +249,7 @@ export default function InstanceQuotaPage() {
   return (
     <Box
       sx={{
-        p: { xs: 1.5, sm: 2, md: 3 },
+        p: embedded ? 0 : { xs: 1.5, sm: 2, md: 3 },
         height: '100%',
         minHeight: 0,
         display: 'flex',
@@ -256,14 +260,17 @@ export default function InstanceQuotaPage() {
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
-        <Box sx={{ minWidth: 0, flex: 1 }}>
-          <Typography variant="h6" fontWeight={700}>
-            {t('title')}
-          </Typography>
-          <Typography variant="caption" color="text.secondary">
-            {t('subtitle')}
-          </Typography>
-        </Box>
+        {!embedded && (
+          <Box sx={{ minWidth: 0, flex: 1 }}>
+            <Typography variant="h6" fontWeight={700}>
+              {t('title')}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {t('subtitle')}
+            </Typography>
+          </Box>
+        )}
+        {embedded && <Box sx={{ flex: 1 }} />}
         {activeSelection.length > 0 && (
           <Typography variant="caption" color="text.secondary">
             {t('list.selected', { count: activeSelection.length })}
@@ -287,14 +294,6 @@ export default function InstanceQuotaPage() {
           {t('actions.batchEdit')}
         </ActionButton>
       </Box>
-
-      {/* 两层配额的分工只在这里讲一次：这一页是租户对自己群的自限（回复条数），
-          平台方给每个群的每日额度在「频道额度」页，两层都放行才回复 */}
-      <Alert severity="info">
-        {t('layerHint.text')}
-        <RouterLink to="/console/channel-quota">{t('layerHint.channelQuotaLink')}</RouterLink>
-        {t('layerHint.after')}
-      </Alert>
 
       {/* 失败时这一排整块不画。三张卡片各自 `?? 0`，403 之下会稳定地显示
           「全局并发上限 0 / 运行中 0 / 排队 0」——那是三句假话，而且是**看起来很像真的**

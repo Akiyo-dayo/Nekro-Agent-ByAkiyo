@@ -74,6 +74,7 @@ import IconActionButton from '../../components/common/IconActionButton'
 import InstanceScopeBanner from '../../components/common/InstanceScopeBanner'
 import PresetSwitchConfirmDialog from '../../components/common/PresetSwitchConfirmDialog'
 import PresetAvatar from '../../components/common/PresetAvatar'
+import DomainSettingsButton from '../../components/settings/DomainSettingsButton'
 import { useIdentity } from '../../hooks/useIdentity'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 
@@ -2144,6 +2145,7 @@ export default function PresetsPage() {
         />
       </Box>
         <Box className="flex gap-2">
+          <DomainSettingsButton domain="presets" />
           {/* 「刷新共享状态」按的是部署级社区账号的发布清单（`POST /presets/refresh-shared-status`，
               平台方专属），租户点它必然 403，所以整颗按钮对租户身份不出现。 */}
           {!isTenantScoped && (

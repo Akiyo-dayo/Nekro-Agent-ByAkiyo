@@ -86,10 +86,95 @@ def test_settings_json_write_does_not_follow_a_link(world) -> None:
         WorkspaceCredential(base_url="http://relay", auth_token="relay-token", relayed=True),
         "测试",
         allow_platform_secrets=False,
+        home=WorkspaceService.claude_home(1),
     )
     _untouched(world)
     payload = json.loads((world.ws / "settings.json").read_text(encoding="utf-8"))
     assert payload["providers"]["anthropic"]["auth_token"] == "relay-token"
+
+
+# 新布局的 home 在工作区目录之外，上级只有 NA 写得到；home 里面的条目照样是容器写得到的
+
+
+def test_user_level_settings_in_the_new_home_do_not_follow_a_link(world) -> None:
+    home = WorkspaceService.ensure_claude_home(WorkspaceService.claude_home(1))
+    assert home.legacy is False
+    _link(home.path / "settings.json", world.secret, is_dir=False)
+    from nekro_agent.core.cc_model_presets import CCModelPresetItem
+
+    preset = CCModelPresetItem(
+        id=1,
+        name="p",
+        base_url="http://upstream",
+        auth_token="",
+        api_timeout_ms="180000",
+        model_type="manual",
+        anthropic_model="m",
+        small_fast_model="",
+        extra_env={},
+        is_default=True,
+    )
+    WorkspaceService._write_settings_files(  # noqa: SLF001
+        world.ws,
+        preset,
+        WorkspaceCredential(base_url="http://relay", auth_token="relay-token", relayed=True),
+        "测试",
+        allow_platform_secrets=False,
+        home=home,
+    )
+    _untouched(world)
+    assert not (home.path / "settings.json").is_symlink()
+    assert "relay-token" in (home.path / "settings.json").read_text(encoding="utf-8")
+
+    # 没有预设时删掉的也只是链接本身
+    (home.path / "settings.json").unlink()
+    _link(home.path / "settings.json", world.secret, is_dir=False)
+    WorkspaceService._write_settings_files(  # noqa: SLF001
+        world.ws,
+        None,
+        WorkspaceCredential(base_url="http://relay", auth_token="relay-token", relayed=True),
+        "测试",
+        allow_platform_secrets=False,
+        home=home,
+    )
+    assert not (home.path / "settings.json").exists()
+    _untouched(world)
+
+
+def test_gateway_files_in_the_new_home_replace_a_linked_nk_ssh_dir(world) -> None:
+    from nekro_agent.services.ssh_gateway import container_files
+
+    home = WorkspaceService.ensure_claude_home(WorkspaceService.claude_home(1))
+    _link(home.path / "nk-ssh", world.outside, is_dir=True)
+    container_files._write_nk_ssh_files_on_host(1, {"config": "cfg", "id_gateway": "KEY"})  # noqa: SLF001
+    _untouched(world)
+    assert not (home.path / "nk-ssh").is_symlink()
+    assert (home.path / "nk-ssh" / "id_gateway").read_text(encoding="utf-8") == "KEY"
+
+    # 里面的文件换成链接：删的时候只删链接本身
+    (home.path / "nk-ssh" / "config").unlink()
+    _link(home.path / "nk-ssh" / "config", world.secret, is_dir=False)
+    container_files._remove_nk_ssh_files_on_host(1)  # noqa: SLF001
+    _untouched(world)
+    assert not (home.path / "nk-ssh").exists()
+
+
+def test_skills_in_the_new_home_replace_a_linked_skills_dir(world) -> None:
+    fake_skill = world.outside / "stolen"
+    fake_skill.mkdir()
+    (fake_skill / "SKILL.md").write_text("---\nname: stolen\n---\nplatform", encoding="utf-8")
+    home = WorkspaceService.ensure_claude_home(WorkspaceService.claude_home(1))
+    _link(home.path / "skills", world.outside, is_dir=True)
+
+    assert WorkspaceService.list_dynamic_skills(1) == []
+    assert WorkspaceService.read_dynamic_skill(1, "stolen") is None
+    assert WorkspaceService.delete_dynamic_skill(1, "stolen") is False
+
+    WorkspaceService.write_dynamic_skill(1, "mine", "---\nname: mine\n---\n")
+    assert not (home.path / "skills").is_symlink()
+    assert (home.path / "skills" / "mine" / "SKILL.md").is_file()
+    assert (fake_skill / "SKILL.md").is_file()
+    assert sorted(p.name for p in world.outside.iterdir()) == ["nekro-agent.yaml", "stolen"]
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +295,14 @@ def test_dynamic_skill_helpers_do_not_follow_a_linked_claude_home(world) -> None
     assert (fake_skill / "SKILL.md").is_file()
 
 
-def test_dynamic_skill_write_refuses_a_linked_skill_dir(world) -> None:
+@pytest.mark.parametrize("legacy_layout", [False, True], ids=["home-outside-workspace", "legacy-claude-home"])
+def test_dynamic_skill_write_refuses_a_linked_skill_dir(world, legacy_layout: bool) -> None:
+    if legacy_layout:
+        (world.ws / ".claude_home").mkdir()
     WorkspaceService.write_dynamic_skill(1, "mine", "---\nname: mine\n---\n")
-    _link(world.ws / ".claude_home" / "skills" / "other", world.outside, is_dir=True)
+    home = WorkspaceService.claude_home(1)
+    assert home.legacy is legacy_layout
+    _link(home.path / "skills" / "other", world.outside, is_dir=True)
     with pytest.raises(ValueError):
         WorkspaceService.write_dynamic_skill(1, "other", "x")
     with pytest.raises(ValueError):

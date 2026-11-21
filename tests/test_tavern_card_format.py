@@ -184,6 +184,23 @@ class TestRejections:
         with pytest.raises(CardFileRejected, match="CHARX"):
             parse_card_file(b"PK\x03\x04rest")
 
+    @pytest.mark.parametrize(
+        ("data", "name"),
+        [
+            (b"\xff\xd8\xff\xe0" + b"\x00" * 32, "JPG"),
+            (b"GIF89a" + b"\x00" * 32, "GIF"),
+            (b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 32, "WebP"),
+        ],
+    )
+    def test_pictures_that_cannot_hold_card_data_are_named(self, data: bytes, name: str) -> None:
+        with pytest.raises(CardFileRejected) as caught:
+            parse_card_file(data)
+
+        message = str(caught.value)
+        assert message.startswith(f"这是 {name} 图片")
+        assert "存不下人设卡数据" in message
+        assert "原始 PNG 或 JSON" in message
+
     def test_json_that_is_not_a_card(self) -> None:
         with pytest.raises(CardFileRejected, match="不是酒馆人设卡"):
             parse_card_file(b'{"hello": "world"}')
@@ -322,7 +339,17 @@ class TestUnsupported:
         assert "3 个 EJS 模板块" in notes[0].detail
         assert "在 2 处" in notes[0].detail
         assert "不执行" in notes[0].detail
-        assert "0.4.7" in notes[0].detail
+        # 卡内书条目里的模板按安全子集求值，其它字段里的原样留着：两件事都要说清楚。
+        assert "安全子集" in notes[0].detail
+        assert "原样留在文字里" in notes[0].detail
+
+    def test_ejs_block_count_is_linear_on_unclosed_tags(self) -> None:
+        import time
+
+        started = time.monotonic()
+        assert card_format._count_ejs_blocks("<%" * 300_000) == 0  # noqa: SLF001
+        assert card_format._count_ejs_blocks("a<%b%>c<%d%><%") == 2  # noqa: SLF001
+        assert time.monotonic() - started < 2
 
     def test_tavern_helper_scripts_are_listed_with_hosts(self) -> None:
         data = {
@@ -353,8 +380,11 @@ class TestUnsupported:
         assert "联网 cdn.example.test、api.example.test" in detail
         assert "www.w3.org" not in detail
         assert ".invalid" not in detail
-        assert "「里面的」14 字，没有写死的联网地址" in detail
+        assert "「里面的」14 字，交互程序，没有写死的联网地址" in detail
         assert "「旧版」1 字" in detail
+        # 第一个脚本从网址 import 代码：归「远端代码或改世界书」；三个脚本按类别计数写在开头。
+        assert "「加载器」" in detail and "远端代码或改世界书，联网" in detail
+        assert "（交互程序 2 个、远端代码或改世界书 1 个）" in detail
 
     def test_tavern_helper_list_is_capped(self) -> None:
         hosts = " ".join(f"https://h{index}.example.test/" for index in range(card_format.MAX_LISTED_HOSTS + 2))

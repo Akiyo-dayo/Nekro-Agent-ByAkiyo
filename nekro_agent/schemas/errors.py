@@ -21,7 +21,7 @@
     raise ConfigNotFoundError(key="USE_MODEL_GROUP")
 """
 
-from typing import Any, ClassVar, Dict, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 from .i18n import I18nDict, SupportedLang, i18n_text
 
@@ -138,6 +138,52 @@ class ConcurrentWriteConflictError(AppError):
 
     def __init__(self, operation: str, **kwargs: Any):
         super().__init__(operation=operation, **kwargs)
+
+
+class RemoteWorldbookBusyError(AppError):
+    """同一个租户已有一个远程世界书在下载：直接拒绝，不排队"""
+
+    http_status: ClassVar[int] = 409
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="已有一本远程世界书正在下载，等它完成后再试",
+        en_US="Another remote worldbook is still downloading; try again when it finishes",
+    )
+
+
+class RemoteWorldbookImportedError(AppError):
+    """这个来源已经导成了一本书；要换成新版本得明确要求替换"""
+
+    http_status: ClassVar[int] = 409
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="这个来源已经导入成《{book_name}》；要换成新版本，请先检查更新，再选「更新到新版本」",
+        en_US='This source is already imported as "{book_name}"; check for updates and choose to update instead',
+    )
+
+    def __init__(self, book_name: str, **kwargs: Any):
+        super().__init__(book_name=book_name, **kwargs)
+
+
+class RemoteWorldbookDownloadError(AppError):
+    """远程世界书下载或转换失败；`reason` 逐个地址写明原因（只写主机名）"""
+
+    http_status: ClassVar[int] = 422
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="{reason}",
+        en_US="{reason}",
+    )
+
+    def __init__(self, reason: str, **kwargs: Any):
+        super().__init__(reason=reason, **kwargs)
+
+
+class WorldbookAnalysisBusyError(AppError):
+    """同一个租户已有一个世界书导入（或卡片检查）在分析：直接拒绝，不排队"""
+
+    http_status: ClassVar[int] = 409
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="已有一个导入或卡片检查正在分析，等它完成后再试",
+        en_US="Another import or card check is still being analysed; try again when it finishes",
+    )
 
 
 class OperationFailedError(AppError):
@@ -320,6 +366,22 @@ class ConfigInvalidError(AppError):
 
     def __init__(self, key: str, reason: str, **kwargs: Any):
         super().__init__(key=key, reason=reason, **kwargs)
+
+
+class ConfigStaleWriteError(AppError):
+    """保存的配置项在读取之后被别处改过：整批没有写入（见 `services/config_write_guard.py`）
+
+    `data["keys"]` 列出是哪几项，前端据此刷新这几项、保留其余改动。
+    """
+
+    http_status: ClassVar[int] = 409
+    i18n_message: ClassVar[I18nDict] = i18n_text(
+        zh_CN="这些配置项在你打开页面之后被别处改过，这次保存没有生效：{keys}。请刷新后在最新值上重新修改",
+        en_US="These settings were changed elsewhere after you opened the page, so nothing was saved: {keys}. Reload and make your change on the current values",
+    )
+
+    def __init__(self, keys: List[str], **kwargs: Any):
+        super().__init__(data={"keys": list(keys)}, keys=", ".join(keys), **kwargs)
 
 
 class ModelGroupNotFoundError(AppError):

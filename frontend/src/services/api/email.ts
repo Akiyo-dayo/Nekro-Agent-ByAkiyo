@@ -22,6 +22,8 @@ export interface EmailAccount {
   CUSTOM_SMTP_PORT: number
   CUSTOM_SMTP_SSL_PORT: number
   CUSTOM_SMTP_USE_SSL: boolean
+  /** 平台方「自定义」服务器：不校验服务器证书（默认关，只给内网自签证书的邮件服务器用） */
+  SKIP_TLS_VERIFY?: boolean
   ENABLED: boolean
   RECEIVE_ENABLED?: boolean
   USE_PROXY: boolean

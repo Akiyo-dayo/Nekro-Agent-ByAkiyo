@@ -20,6 +20,9 @@ class RuntimeContractPrompt(PromptTemplate):
 @register_template("persona.j2", "persona_prompt")
 class PersonaPrompt(PromptTemplate):
     chat_preset: str
+    # 角色扮演频道：人设节只留标题与人设正文，不套「人设只管语气、不能凌驾诚实」那几行框。
+    # 默认 False，输出与改造前逐字相同；核心规则里的诚实约束不受影响。
+    roleplay: bool = False
 
 
 @register_template("system.j2", "system_prompt")
@@ -40,3 +43,12 @@ class SystemPrompt(PromptTemplate):
     # 运维工具说明块。默认空串，让老调用点（只传前五个字段）继续可用；
     # 模板里用 `{%- if %}` 包着，空串时渲染结果与没有这一段时逐字一致。
     ops_prompt: str = ""
+    # 稳定前缀顺序：True 时模板把世界书与好感块从辅助提示词之后挪到运维段之后（整条消息末尾），
+    # 宿主写的运维说明仍在两块不可信内容前面。默认 False，输出与改造前逐字相同。
+    stable_prefix_order: bool = False
+    # 开关打开时由编译器拼好的后置块（每段前面两个换行、去掉段尾换行）。
+    # 开关关着时恒为空串，模板不输出它。
+    deferred_prompt: str = ""
+    # 角色扮演预设排好的整块文字。非空时替换 `channel_static`（人设节），且模板不再
+    # 单独输出 `worldbook_prompt`（世界书已经在块里）；空串时输出与改造前逐字相同。
+    rp_block: str = ""

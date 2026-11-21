@@ -182,7 +182,8 @@ export default function ChannelQuotaDetailDialog({
               <Typography variant="subtitle2" fontWeight={700} gutterBottom>
                 {t('detail.dailyTitle')}
               </Typography>
-              <Table size="small" sx={UNIFIED_TABLE_STYLES.getTableBase(false, true)}>
+              <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+              <Table size="small" sx={{ minWidth: 480 }}>
                 <TableHead>
                   <TableRow>
                     <TableCell>{t('detail.columns.day')}</TableCell>
@@ -206,6 +207,7 @@ export default function ChannelQuotaDetailDialog({
                   ))}
                 </TableBody>
               </Table>
+              </Box>
             </Box>
 
             <Box>
@@ -220,7 +222,8 @@ export default function ChannelQuotaDetailDialog({
                   {t('detail.noScene')}
                 </Typography>
               ) : (
-                <Table size="small" sx={UNIFIED_TABLE_STYLES.getTableBase(false, true)}>
+                <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+                <Table size="small">
                   <TableHead>
                     <TableRow>
                       <TableCell>{t('detail.columns.scene')}</TableCell>
@@ -240,6 +243,7 @@ export default function ChannelQuotaDetailDialog({
                     ))}
                   </TableBody>
                 </Table>
+                </Box>
               )}
             </Box>
 

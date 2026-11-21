@@ -15,7 +15,7 @@
 上限**，不是功能限制：取得足够宽，真实的酒馆世界书（几 MB、几千条、每条上百个关键词、单条
 几万字）碰不到。导入时任何一条超了就整份拒绝并说明是哪一条、哪个字段，**不截断**——截掉
 半条设定比导入失败更糟，管理员往往要到出了怪回复才发现少了字。每轮注入的预算另有配置项
-`WORLDBOOK_MAX_CHARS`，比它还长的条目照样导入，只在导入报告里提示。
+（按 token 计，见 `budget` 模块），比它还长的条目照样导入，只在导入报告里提示。
 
 - `MAX_KEYS` / `MAX_KEY_LENGTH`：主 / 次关键词各自的条数与单条长度。关键词是每轮逐条跑的，
   上限挡的是「一条条目塞几万个关键词」这种把每轮拖慢的输入；匹配耗时按 3000 条 × 每条 100 个
@@ -32,11 +32,12 @@
 - `TIMED_MAX`：sticky / cooldown / delay 的条数上限（按消息条数计）。
 - `ORDER_MIN` / `ORDER_MAX`：排序权重的合法区间，宽到够用，又能挡住「用 10 位数当权重」
   这类把排序变成事故的输入。
-- `DEFAULT_MAX_CHARS` / `DEFAULT_MAX_ENTRIES_PER_ROUND`：每轮注入的默认预算，只作为
-  `runtime` 读配置时的兜底（配置对象上取不到这一项时用它们）。真正的预算来自配置项
-  （`WORLDBOOK_MAX_CHARS` / `WORLDBOOK_MAX_ENTRIES_PER_ROUND`），触发测试读的是这个频道
-  的生效配置——测试页必须与正式那一轮用同一份预算，否则管理员看到的「被预算截掉」会
-  在改配置之后与实际情况不符。
+- `DEFAULT_MAX_ENTRIES_PER_ROUND`：每轮条数上限的兜底，只在 `runtime` 读配置取不到这一项时用。
+  真正的条数上限来自配置项 `WORLDBOOK_MAX_ENTRIES_PER_ROUND`；token 预算由 `budget.resolve_budget`
+  按这个频道的生效配置算，触发测试与正式那一轮用同一个函数——测试页必须与正式那一轮用同一份
+  预算，否则管理员看到的「被预算截掉」会在改配置之后与实际情况不符。
+- `MAX_BOOK_BUDGET_TOKENS`：书级每轮预算的上限，与全局 token 上限（`WORLDBOOK_BUDGET_CAP_TOKENS`
+  的 65536）同一个数：书的预算比全局还大没有意义。
 """
 
 from __future__ import annotations
@@ -64,10 +65,10 @@ ORDER_MAX = 100_000
 DEFAULT_BOOK_SCAN_DEPTH = 4
 DEFAULT_PERSON_BOOK_SCAN_DEPTH = 10
 
-# 每轮注入的默认预算，只用作 `runtime` 读配置时的兜底（配置对象上取不到这一项时）。
-# 真正的预算来自 `WORLDBOOK_MAX_CHARS` / `WORLDBOOK_MAX_ENTRIES_PER_ROUND` 两项配置。
-DEFAULT_MAX_CHARS = 3000
+# 每轮条数上限的兜底，只用作 `runtime` 读配置时取不到 `WORLDBOOK_MAX_ENTRIES_PER_ROUND` 的情形。
 DEFAULT_MAX_ENTRIES_PER_ROUND = 32
+# 书级每轮 token 预算的上限（0 表示不单独限制）
+MAX_BOOK_BUDGET_TOKENS = 65536
 
 
 class ScopeKind(StrEnum):
@@ -110,9 +111,36 @@ class QuarantineReason(StrEnum):
     AUTO_BLOCKED = "auto_blocked"
 
 
+class InjectMode(StrEnum):
+    """书的注入方式：关键词命中就注入、留给模型自己查，或两样都行"""
+
+    PUSH = "push"
+    LOOKUP = "lookup"
+    BOTH = "both"
+
+
+class ActiveScene(StrEnum):
+    """书的生效场景：所有频道、只在私聊，或只在群聊"""
+
+    BOTH = "both"
+    PRIVATE = "private"
+    GROUP = "group"
+
+
 def _clamp(value: int, low: int, high: int) -> int:
     """把整数夹进闭区间；导入与保存都走它，边界只有一个来源"""
     return max(low, min(high, value))
+
+
+def _clamp_float(value: Any, low: float, high: float) -> float:
+    """把浮点设置夹进闭区间；读坏了（非数字、NaN）按下限走"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return low
+    if number != number:  # NaN
+        return low
+    return max(low, min(high, number))
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -133,15 +161,22 @@ class MatchBook:
 
     `scan_depth` / `case_sensitive` / `match_whole_words` 是书的默认值，条目的空覆盖
     由 `entry_to_match` 在这里补齐，引擎里不再出现「条目没设就回头看书的」这种分支。
+    `scan_names` 只有书级（与酒馆的 `include_names` 一样没有条目级），同样抄到条目上。
     """
 
     id: int
     scope_kind: ScopeKind
     person_account: str
     scan_depth: int
-    budget_chars: int
+    budget_tokens: int
     case_sensitive: bool
     match_whole_words: bool
+    scan_names: bool = False
+    # 语义触发（向量激活）：只有检索路径读它们，关键词匹配不碰。
+    vector_all: bool = False
+    vector_query_messages: int = 2
+    vector_max_entries: int = 5
+    vector_threshold: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -155,6 +190,10 @@ class MatchEntry:
         sticky / cooldown / delay: 0 表示不用（列上的 NULL 与 0 在这里是同一件事）。
         invalid_keys: 导入时被判为无效正则的关键词原文。它们仍留在 `keys` 里以便导出
             不丢，但匹配时一律跳过，否则一条坏正则会每轮都抛错。
+        scan_names: 从书上抄来的「扫描时带上说话人名字」。
+        ignore_budget: 条目上存的「忽略预算」原值。**只有宿主条目（`trusted`）才生效**，
+            判据在 `selection.select_hits`；租户条目上的标记照存、不起作用，否则租户能绕过
+            平台方给的预算上限。
     """
 
     id: int
@@ -176,20 +215,28 @@ class MatchEntry:
     delay: int
     trusted: bool
     invalid_keys: frozenset[str]
+    scan_names: bool = False
+    ignore_budget: bool = False
+    vectorized: bool = False
 
 
 @dataclass(frozen=True)
 class WindowMessage:
     """扫描窗口里的一条消息
 
-    刻意不带昵称：昵称由群友自己改，拿它触发条目等于让任何人改个名就能召唤设定。
-    只带引擎真正要用的四列，免得「窗口」慢慢变成一个能读到整行消息的后门。
+    `speaker` 是说话人名字，**只在书打开了「扫描时带上说话人名字」时才拼进扫描文本**
+    （`matcher.scan_text`）。群友的名字来自他自己能改的昵称，已按 `{{user}}` 那套清洗过
+    （去换行、标签、零宽，限 24 字）；Bot 自己的消息用这一轮生效的人设名。默认关的理由在
+    `matcher` 模块文档：打开以后，群友改个名就能触发这本书里写着那个名字的条目。
+
+    其余只带引擎真正要用的四列，免得「窗口」慢慢变成一个能读到整行消息的后门。
     """
 
     id: int
     sender_id: str
     platform_userid: str
     content_text: str
+    speaker: str = ""
 
 
 def book_to_match(book: Any) -> MatchBook:
@@ -207,9 +254,18 @@ def book_to_match(book: Any) -> MatchBook:
         scope_kind=scope_kind,
         person_account=str(getattr(book, "person_account", "") or ""),
         scan_depth=_clamp(scan_depth, SCAN_DEPTH_MIN, SCAN_DEPTH_MAX),
-        budget_chars=max(0, _as_int(getattr(book, "budget_chars", 0), 0)),
+        budget_tokens=_clamp(_as_int(getattr(book, "budget_tokens", 0), 0), 0, MAX_BOOK_BUDGET_TOKENS),
         case_sensitive=bool(getattr(book, "case_sensitive", False)),
         match_whole_words=bool(getattr(book, "match_whole_words", False)),
+        scan_names=bool(getattr(book, "scan_names", False)),
+        vector_all=bool(getattr(book, "vector_all", False)),
+        vector_query_messages=_clamp(
+            _as_int(getattr(book, "vector_query_messages", 2), 2),
+            1,
+            10,
+        ),
+        vector_max_entries=_clamp(_as_int(getattr(book, "vector_max_entries", 5), 5), 1, 20),
+        vector_threshold=_clamp_float(getattr(book, "vector_threshold", 0.25), 0.0, 1.0),
     )
 
 
@@ -291,4 +347,7 @@ def entry_to_match(entry: Any, book: MatchBook) -> MatchEntry:
         delay=_timed(getattr(entry, "delay", None)),
         trusted=bool(getattr(entry, "trusted", False)),
         invalid_keys=_invalid_keys(entry),
+        scan_names=book.scan_names,
+        ignore_budget=bool(getattr(entry, "ignore_budget", False)),
+        vectorized=bool(getattr(entry, "vectorized", False)),
     )

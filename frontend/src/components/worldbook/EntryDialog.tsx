@@ -35,6 +35,7 @@ import {
   WORLDBOOK_SCAN_DEPTH_MAX,
   WORLDBOOK_SCAN_DEPTH_MIN,
   WORLDBOOK_SELECTIVE_LOGICS,
+  WORLDBOOK_STATE_ONLY_PURPOSES,
   WORLDBOOK_TIMED_MAX,
   worldbookApi,
   type WorldbookBookDetail,
@@ -67,6 +68,8 @@ interface EntryFormState {
   delay: string
   enabled: boolean
   trusted: boolean
+  vectorized: boolean
+  ignoreBudget: boolean
 }
 
 const DEFAULT_ENTRY_FORM: EntryFormState = {
@@ -88,6 +91,8 @@ const DEFAULT_ENTRY_FORM: EntryFormState = {
   delay: '',
   enabled: true,
   trusted: false,
+  vectorized: false,
+  ignoreBudget: false,
 }
 
 function triStateFromNullable(value: boolean | null): TriState {
@@ -120,6 +125,8 @@ function entryFormFromEntry(entry: WorldbookEntryItem): EntryFormState {
     delay: entry.delay === null ? '' : String(entry.delay),
     enabled: entry.enabled,
     trusted: entry.trusted,
+    vectorized: entry.vectorized,
+    ignoreBudget: entry.ignore_budget,
   }
 }
 
@@ -286,6 +293,10 @@ export default function EntryDialog({ open, book, entry, onClose, onSaved }: Ent
       delayError
   )
 
+  // 「忽略预算」只对宿主条目生效：新建时服务端按创建者身份定（平台方建的一律是宿主内容），
+  // 编辑时看这一行现在的值。租户写的条目一律不是宿主条目。
+  const effectiveTrusted = entry ? form.trusted : isPlatformOwner
+
   const mutation = useMutation({
     mutationFn: async () => {
       if (entry) {
@@ -329,6 +340,8 @@ export default function EntryDialog({ open, book, entry, onClose, onSaved }: Ent
       cooldown: parseOptionalInteger(form.cooldown),
       delay: parseOptionalInteger(form.delay),
       enabled: form.enabled,
+      vectorized: form.vectorized,
+      ignore_budget: form.ignoreBudget,
       // 不带 `trusted`：新建条目的信任级别由服务端按创建者身份定（平台方 = 宿主内容），
       // 请求里带了也会被忽略
     }
@@ -369,6 +382,8 @@ export default function EntryDialog({ open, book, entry, onClose, onSaved }: Ent
     if (delay !== entry.delay) body.delay = delay
 
     if (form.enabled !== entry.enabled) body.enabled = form.enabled
+    if (form.vectorized !== entry.vectorized) body.vectorized = form.vectorized
+    if (form.ignoreBudget !== entry.ignore_budget) body.ignore_budget = form.ignoreBudget
     if (isPlatformOwner && form.trusted !== entry.trusted) body.trusted = form.trusted
 
     return body
@@ -445,6 +460,21 @@ export default function EntryDialog({ open, book, entry, onClose, onSaved }: Ent
         )}
         {entry && entry.status === 'quarantined' && (
           <Alert severity="warning">{t('entryDialog.quarantinedWarning')}</Alert>
+        )}
+        {entry && WORLDBOOK_STATE_ONLY_PURPOSES.includes(entry.purpose) && (
+          <Alert severity="info">
+            {t('detail.purposeHint.stateOnly', {
+              kind: t(`detail.purposeKind.${entry.purpose}`, { defaultValue: entry.purpose }),
+            })}
+          </Alert>
+        )}
+        {entry && entry.purpose === 'unsupported_template' && (
+          <Alert severity="warning">
+            {t('detail.purposeHint.unsupported', { reason: entry.template_note })}
+          </Alert>
+        )}
+        {entry && entry.suspected_trap && (
+          <Alert severity="error">{t('detail.trapHint', { reason: entry.trap_reason })}</Alert>
         )}
 
         <TextField
@@ -598,13 +628,37 @@ export default function EntryDialog({ open, book, entry, onClose, onSaved }: Ent
             control={
               <Switch
                 checked={form.constant}
-                onChange={event => update({ constant: event.target.checked })}
+                onChange={event =>
+                  update(
+                    event.target.checked
+                      ? { constant: true, vectorized: false }
+                      : { constant: false }
+                  )
+                }
               />
             }
             label={t('entryDialog.constant')}
           />
           <Typography variant="caption" color="text.secondary" display="block">
             {t('entryDialog.constantHelper')}
+          </Typography>
+        </Box>
+
+        <Box>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={form.vectorized}
+                disabled={form.constant}
+                onChange={event => update({ vectorized: event.target.checked })}
+              />
+            }
+            label={t('entryDialog.vectorized')}
+          />
+          <Typography variant="caption" color="text.secondary" display="block">
+            {form.constant
+              ? t('entryDialog.vectorizedConstant')
+              : t('entryDialog.vectorizedHelper')}
           </Typography>
         </Box>
 
@@ -722,6 +776,26 @@ export default function EntryDialog({ open, book, entry, onClose, onSaved }: Ent
           }
           label={t('entryDialog.enabled')}
         />
+
+        <Box>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={form.ignoreBudget}
+                onChange={event => update({ ignoreBudget: event.target.checked })}
+              />
+            }
+            label={t('entryDialog.ignoreBudget')}
+          />
+          <Typography variant="caption" color="text.secondary" display="block">
+            {t('entryDialog.ignoreBudgetHelper')}
+          </Typography>
+          {form.ignoreBudget && !effectiveTrusted && (
+            <Typography variant="caption" color="warning.main" display="block">
+              {t('entryDialog.ignoreBudgetNotHost')}
+            </Typography>
+          )}
+        </Box>
 
         {isPlatformOwner ? (
           <Box>

@@ -88,6 +88,8 @@ export default function ConsoleHomePage() {
         gap: 2,
         overflow: 'auto',
         boxSizing: 'border-box',
+        // 定高滚动列：子项按内容定高，不被压扁（见 SCROLL_COLUMN_STYLES）
+        '& > *': { flexShrink: 0 },
       }}
     >
       <Box

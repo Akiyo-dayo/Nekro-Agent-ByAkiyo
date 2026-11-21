@@ -164,6 +164,124 @@ class TestRenderBlock:
         assert items == [(6, 1, len("租户\u200b正文"), "before_history", False)]
 
 
+class TestPersonNoteLabel:
+    """个人书条目前那一行「关于谁」：只标账号，不标昵称"""
+
+    def test_person_book_entry_is_labeled(self) -> None:
+        block = render.render_block(
+            [_hit(1, content="她喜欢下雨天", book_id=7)],
+            CODE,
+            in_history=False,
+            person_labels={7: "10001"},
+        )
+
+        assert render.PERSON_NOTE_LABEL == "[About the user with id:{accounts}]"
+        assert f"{render.PERSON_NOTE_LABEL.format(accounts='10001')}\n她喜欢下雨天" in block
+
+    def test_normal_book_entry_is_not_labeled(self) -> None:
+        block = render.render_block(
+            [_hit(1, content="域设定正文", book_id=7), _hit(2, content="普通书正文", book_id=8)],
+            CODE,
+            in_history=False,
+            person_labels={7: "10001"},
+        )
+
+        assert block.count("[About the user with id:") == 1
+        assert "普通书正文" in block
+
+    def test_two_person_books_are_labeled_separately(self) -> None:
+        """两本书的条目按 `id` 交错时，每条各标各的"""
+        hits = [
+            _hit(1, content="甲的设定", trusted=True, book_id=11, order=100),
+            _hit(2, content="乙的设定", trusted=True, book_id=12, order=100),
+            _hit(3, content="甲又说", trusted=True, book_id=11, order=100),
+        ]
+        block = render.render_block(
+            hits,
+            CODE,
+            in_history=False,
+            person_labels={11: "id_a", 12: "id_b"},
+        )
+
+        assert block.index("[About the user with id:id_a]\n甲的设定") < block.index("[About the user with id:id_b]\n乙的设定")
+        assert block.index("[About the user with id:id_b]\n乙的设定") < block.index("[About the user with id:id_a]\n甲又说")
+
+    def test_label_line_goes_through_tenant_sanitize_and_defang(self) -> None:
+        # 标注行跟着正文一起过清洗：账号串里的零宽字符同样被去掉、整段照样包进不可信块
+        block = render.render_block(
+            [_hit(1, content="正文", book_id=3)],
+            CODE,
+            in_history=False,
+            person_labels={3: "10001\u200b"},
+        )
+
+        assert "[About the user with id:10001]" in block
+        assert "\u200b" not in block
+        assert f"<{CODE} | {render.WORLD_INFO_KIND} source:tenant trust:untrusted>" in block
+        assert block.count(f"<{CODE} | /{render.WORLD_INFO_KIND}>") == 1
+
+    def test_label_is_expanded_after_the_content_macro(self) -> None:
+        """宏展开只作用于原正文：先展开、再加标注行"""
+        block = render.render_block(
+            [_hit(1, content="{{char}} 的设定", trusted=True, book_id=5)],
+            CODE,
+            in_history=False,
+            expand=lambda text: text.replace("{{char}}", "某角色"),
+            person_labels={5: "10001"},
+        )
+
+        assert "某角色 的设定" in block
+        assert "[About the user with id:10001]" in block
+        assert block.index("[About the user with id:10001]") < block.index("某角色 的设定")
+
+    def test_hidden_book_entry_is_not_labeled(self) -> None:
+        block = render.render_block(
+            [_hit(1, content="不该显示的正文", book_id=9)],
+            CODE,
+            in_history=False,
+            hidden_book_ids={9},
+            person_labels={9: "10001"},
+        )
+
+        assert block.count(render.HIDDEN_BODY) == 1
+        assert "[About the user with id:" not in block
+
+    def test_none_person_labels_is_byte_identical(self) -> None:
+        hits = [_hit(1, content="宿主正文", trusted=True), _hit(2, content="租户正文")]
+        baseline = render.render_block(hits, CODE, in_history=True)
+        empty = render.render_block(hits, CODE, in_history=True, person_labels={})
+        none = render.render_block(hits, CODE, in_history=True, person_labels=None)
+
+        assert baseline == empty == none
+
+    def test_host_group_label(self) -> None:
+        """宿主组（平台方为个人写的书）同样带标注"""
+        block = render.render_block(
+            [_hit(1, content="平台写的个人备注", trusted=True, book_id=4)],
+            CODE,
+            in_history=False,
+            person_labels={4: "10001 / id:10002"},
+        )
+
+        assert "[About the user with id:10001 / id:10002]\n平台写的个人备注" in block
+        assert block.startswith(render.HOST_HEADER)
+
+    def test_chars_count_does_not_include_the_label(self) -> None:
+        items = render.rendered_items([_hit(1, content="正文", trusted=False, book_id=6)])
+
+        assert items == [(1, 6, len("正文"), "before_history", False)]
+
+    def test_insert_at_depth_passes_the_labels(self) -> None:
+        merged = render.insert_at_depth(
+            ["m1"],
+            {0: [_hit(1, content="个人备注", book_id=7)]},
+            CODE,
+            person_labels={7: "10001"},
+        )
+
+        assert "[About the user with id:10001]\n个人备注" in merged[-1]
+
+
 class TestInsertAtDepth:
     """深度注入的落点：`d = 0` 在末尾，`d > n` 在最前，同下标深度大的在前"""
 
@@ -263,7 +381,7 @@ async def _book(
         instance_key=instance_key,
         enabled=True,
         scan_depth=4,
-        budget_chars=0,
+        budget_tokens=0,
     )
 
 
@@ -336,7 +454,7 @@ class TestWorldbookDetail:
 
     async def test_dropped_items_are_listed_but_not_counted(self, db: None) -> None:
         prompt_rounds.begin(CODE, _Channel())
-        prompt_rounds.note_worldbook(CODE, state="none", dropped=[(9, 2, 40, "global_chars")])
+        prompt_rounds.note_worldbook(CODE, state="none", dropped=[(9, 2, 40, 31, "global_tokens")])
         prompt_rounds.note_worldbook_items(CODE, [(1, 2, 10, "before_history", True)])
         prompt_rounds.finish(CODE, "ok")
         await prompt_rounds.drain()
@@ -344,8 +462,23 @@ class TestWorldbookDetail:
         row = await DBMemPromptRound.get()
         types = [(item["type"], item["id"]) for item in row.worldbook_items]
         assert types == [("worldbook", 1), ("worldbook_dropped", 9)]
+        assert row.worldbook_items[1]["tokens"] == 31 and row.worldbook_items[1]["reason"] == "global_tokens"
         # 被跳过的那条不算进注入字数。
         assert row.worldbook_chars == 10
+
+    async def test_tokens_and_the_budget_are_recorded(self, db: None) -> None:
+        """入选条目记 token 数（预算口径），这一轮的预算与算法整份进 `worldbook_budget`"""
+        budget = {"model_group": "default", "context_length": 32768, "budget": 7168, "percent": 25, "cap_tokens": 0}
+        prompt_rounds.begin(CODE, _Channel())
+        prompt_rounds.note_worldbook(CODE, state="injected", budget=budget, tokens={1: 7})
+        prompt_rounds.note_worldbook_items(CODE, [(1, 2, 10, "after_persona", False)])
+        prompt_rounds.finish(CODE, "ok")
+        await prompt_rounds.drain()
+
+        row = await DBMemPromptRound.get()
+        assert row.worldbook_items[0]["tokens"] == 7
+        assert row.worldbook_items[0]["chars"] == 10
+        assert row.worldbook_budget == budget
 
     async def test_injected_but_nothing_rendered_is_written_as_none(self, db: None) -> None:
         # 求值说 `injected`，但这一轮一条都没真正渲染出来（历史早退、系统提示词那一组为空）：
@@ -418,7 +551,7 @@ class TestWorldbookAutoQuarantine:
         entry = await _entry(book)
 
         prompt_rounds.begin(CODE, _Channel())
-        prompt_rounds.note_worldbook(CODE, state="none", dropped=[(entry.id, book.id, 40, "global_chars")])
+        prompt_rounds.note_worldbook(CODE, state="none", dropped=[(entry.id, book.id, 40, 31, "global_tokens")])
         prompt_rounds.note_memory(CODE, state="empty")
         prompt_rounds.finish(CODE, "blocked")
         await prompt_rounds.drain()
@@ -705,7 +838,7 @@ class TestBlockedRoundSuppression:
 def _wb_config() -> Any:
     from types import SimpleNamespace
 
-    return SimpleNamespace(WORLDBOOK_ENABLED=True, WORLDBOOK_MAX_CHARS=3000)
+    return SimpleNamespace(WORLDBOOK_ENABLED=True, WORLDBOOK_BUDGET_PERCENT=100, WORLDBOOK_BUDGET_CAP_TOKENS=0)
 
 
 def _fake_channel() -> Any:

@@ -95,6 +95,38 @@ class SshCredentialView(BaseModel):
     owner_whitelisted: Optional[bool] = None
     can_reveal: bool = False
     can_edit_connection: bool = False
+    # 值守模式：只对平台方视图里的平台方行填；租户视图与用户行一律为空
+    duty_mode: str = Field(default="", description="行上设的模式：strict / duty / 空（跟随默认）")
+    effective_duty_mode: str = Field(default="", description="此刻生效的模式：strict / duty")
+
+
+class SshDutyModeUpdate(BaseModel):
+    """改一台平台方服务器的模式；空串表示跟随 `SSH_GATEWAY_DEFAULT_DUTY_MODE`"""
+
+    duty_mode: str = Field(default="", max_length=16)
+
+
+class SshRunbookUpdate(BaseModel):
+    """改所有者写的运维手册"""
+
+    runbook: str = Field(default="", max_length=8000)
+
+
+class SshRunbookEntryView(BaseModel):
+    """Bot 追加的一条经验"""
+
+    id: int
+    content: str
+    task_ref: str = ""
+    created_at: Optional[str] = None
+
+
+class SshRunbookView(BaseModel):
+    """一台平台方服务器的运维手册：所有者写的与 Bot 追加的经验（新的在前）"""
+
+    credential_id: int
+    runbook: str = ""
+    entries: List[SshRunbookEntryView] = Field(default_factory=list)
 
 
 class SshBoundInstance(BaseModel):
@@ -194,6 +226,16 @@ class SshGatewayStatusResponse(BaseModel):
     connections: int = Field(default=0, description="当前容器侧连接数")
     channels: int = Field(default=0, description="当前通道数")
     running_leases: int = Field(default=0, description="当前生效中的租约数")
+    # 值守模式（只有平台方看得到这个接口）
+    default_duty_mode: str = Field(default="strict", description="平台方服务器的默认模式：strict / duty")
+    duty_instances: List[str] = Field(
+        default_factory=list,
+        description="能触发值守的平台方实例（适配器:实例）；空且未关闭表示所有平台方实例",
+    )
+    duty_instances_closed: bool = Field(
+        default=False,
+        description="名单被摘空、值守对所有实例关闭（名单里只剩占位）",
+    )
 
 
 class ImportReportEntry(BaseModel):

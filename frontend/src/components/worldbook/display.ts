@@ -34,6 +34,20 @@ export function worldbookBindingMissingText(scopeKind: string, t: TFunction): st
   }
 }
 
+/**
+ * 命中了但没有注入的原因
+ *
+ * 条数上限之后的条目不分析；缓存里已经知道要分流的，后端把两个原因用 `|` 连在一起
+ * （如 `max_entries|template_unsupported`），这里逐个翻译再连起来。
+ */
+export function worldbookDropReasonText(reason: string, prefix: string, t: TFunction): string {
+  return reason
+    .split('|')
+    .filter(Boolean)
+    .map(part => t(`${prefix}.${part}`, { defaultValue: part }))
+    .join(t('common.reasonSeparator'))
+}
+
 /** 位置的名字；深度位置带上深度 */
 export function worldbookPositionText(
   position: string,

@@ -59,10 +59,10 @@ from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import ChatMessageSegmentType, ChatMessageSegmentVideo
 from nekro_agent.tools.common_util import (
     UnsafeDownloadUrlError,
-    assert_connected_peer_safe,
     assert_download_url_safe,
 )
 from nekro_agent.tools.path_convertor import LocalFileRefused, is_url_path, open_regular_file_within
+from nekro_agent.tools.tenant_egress import download_http_transport
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 logger = get_sub_logger("adapter.onebot_v11")
@@ -545,12 +545,6 @@ def _total_size(response: httpx.Response) -> int:
     return int(declared) if response.status_code == 200 and declared.isdigit() else 0
 
 
-def _peer_ip(response: httpx.Response) -> Optional[str]:
-    stream = response.extensions.get("network_stream")
-    address = stream.get_extra_info("server_addr") if stream is not None else None
-    return address[0] if address else None
-
-
 @dataclass
 class VideoStream:
     """转发结果：`body` 是字节流（上游或本机文件），`closer` 负责收尾，可以重复调用"""
@@ -570,11 +564,14 @@ class VideoStream:
 async def _open_upstream(url: str, range_header: Optional[str]) -> Tuple[httpx.AsyncClient, httpx.Response]:
     """逐跳校验地打开上游
 
-    与插件同一套出站校验。`trust_env=False`：走代理时对端是代理，`assert_connected_peer_safe` 就没有意义了。
+    与插件同一套出站校验：每一跳先预检，建连接那一步由 `download_http_transport` 再解析一次、按同一判据校验、
+    直接连校验过的地址并核对对端（两次解析之间改口也连不进内网）。环境代理由传输层处理（经 HTTP(S) 代理时
+    `CONNECT` 校验过的地址），所以客户端自己 `trust_env=False`。
     """
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(READ_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS),
         follow_redirects=False,
+        transport=download_http_transport(),
         trust_env=False,
     )
     headers = {"Accept-Encoding": "identity"}
@@ -585,11 +582,6 @@ async def _open_upstream(url: str, range_header: Optional[str]) -> Tuple[httpx.A
         for _ in range(MAX_PROXY_REDIRECTS + 1):
             await assert_download_url_safe(current)
             response = await client.send(client.build_request("GET", current, headers=headers), stream=True)
-            try:
-                assert_connected_peer_safe(_peer_ip(response))
-            except UnsafeDownloadUrlError:
-                await response.aclose()
-                raise
             if response.status_code not in _REDIRECT_STATUS:
                 return client, response
             location = response.headers.get("location")

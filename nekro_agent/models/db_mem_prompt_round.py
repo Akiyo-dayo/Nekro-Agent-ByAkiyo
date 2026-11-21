@@ -51,9 +51,17 @@ class DBMemPromptRound(Model):
         default="disabled",
         description="世界书状态 injected / none / disabled / suppressed / error",
     )
-    worldbook_items = fields.JSONField(default=list, description="世界书条目引用与字数")
+    worldbook_items = fields.JSONField(default=list, description="世界书条目引用、字数与 token 数")
     worldbook_chars = fields.IntField(default=0, description="世界书正文总字数")
+    worldbook_budget = fields.JSONField(
+        default=dict,
+        description="这一轮的世界书预算与算法：模型组、上下文长度、百分比、上限、分词系数、最终预算（token）",
+    )
     tavern_items = fields.JSONField(default=dict, description="人设卡与高级槽位的本轮状态与字数")
+    state_items = fields.JSONField(
+        default=dict,
+        description="角色状态的本轮状态：块的 token 数与字数、截掉的组、上次更新的结果（只记计数与名字，不记值）",
+    )
     started_at = fields.DatetimeField(description="本轮开始时间")
     finished_at = fields.DatetimeField(description="本轮结束时间")
 

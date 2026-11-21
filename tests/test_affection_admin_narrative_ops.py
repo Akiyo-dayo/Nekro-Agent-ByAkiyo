@@ -41,7 +41,7 @@ from nekro_agent.routers.affection import (
     get_affection_list,
     reset_affection,
 )
-from nekro_agent.schemas.errors import NotFoundError
+from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.schemas.tenant import TenantRole
 from nekro_agent.services.affection.evaluator import reset_evaluation_throttle
 from nekro_agent.services.affection.key import AffectionKey
@@ -620,3 +620,124 @@ class TestListShowsWhichPresetEachRowBelongsTo:
         record = await seed(key_of(INSTANCE_A, PERSON_A, alpha.id))
         item = await reset_affection(record_id=record.id, instance_key=INSTANCE_A, _current_user=admin_a())
         assert (item.preset_name, item.in_use_channels) == ("人设甲", 1)
+
+
+# ---------------------------------------------------------------------------
+# 列表：按人精确筛（人物卡用）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("db")
+class TestListPersonFilter:
+    async def _list(self, *, person: Optional[str], instance_key: str = INSTANCE_A, user: Optional[DBUser] = None) -> Any:
+        return await get_affection_list(
+            page=1,
+            page_size=50,
+            search="",
+            person=person if person is not None else "",
+            stage=None,
+            sort_by="score_desc",
+            instance_key=instance_key,
+            _current_user=user or admin_a(),
+        )
+
+    async def test_main_account_hits_only_that_person(self) -> None:
+        alpha = await make_preset("人设甲")
+        beta = await make_preset("人设乙")
+        await seed(key_of(INSTANCE_A, PERSON_A, alpha.id))
+        await seed(key_of(INSTANCE_A, PERSON_A, beta.id))
+        await seed(key_of(INSTANCE_A, OTHER_PERSON_A))
+
+        listing = await self._list(person=PERSON_A)
+
+        assert listing.total == 2
+        assert {item.platform_userid for item in listing.items} == {PERSON_A}
+        assert {item.preset_id for item in listing.items} == {alpha.id, beta.id}
+
+    async def test_alias_resolves_to_the_main_account(self) -> None:
+        record = await seed(key_of(INSTANCE_A, PERSON_A))
+        await merge_accounts(
+            ScopeDomain.of_instance(ADAPTER, INSTANCE_A),
+            person_uid=PERSON_A,
+            alias_platform_userid=PERSON_A_ALT,
+        )
+
+        listing = await self._list(person=PERSON_A_ALT)
+
+        assert [item.id for item in listing.items] == [record.id]
+        assert listing.items[0].platform_userid == PERSON_A
+
+    async def test_same_account_in_another_instance_stays_out(self) -> None:
+        own = await seed(key_of(INSTANCE_A, PERSON_A))
+        await seed(key_of(INSTANCE_B, PERSON_A))
+
+        listing = await self._list(person=PERSON_A, user=make_user(None))
+
+        assert [item.id for item in listing.items] == [own.id]
+
+    async def test_platform_global_view_does_not_expand_aliases(self) -> None:
+        record = await seed(key_of(INSTANCE_A, PERSON_A))
+        await merge_accounts(
+            ScopeDomain.of_instance(ADAPTER, INSTANCE_A),
+            person_uid=PERSON_A,
+            alias_platform_userid=PERSON_A_ALT,
+        )
+
+        by_main = await self._list(person=PERSON_A, instance_key="", user=make_user(None))
+        by_alias = await self._list(person=PERSON_A_ALT, instance_key="", user=make_user(None))
+
+        assert [item.id for item in by_main.items] == [record.id]
+        assert by_alias.total == 0
+
+    async def test_tenant_without_instance_still_rejected(self) -> None:
+        await seed(key_of(INSTANCE_A, PERSON_A))
+
+        with pytest.raises(ValidationError):
+            await self._list(person=PERSON_A, instance_key="")
+
+    async def test_empty_person_is_the_same_request_as_no_person(self) -> None:
+        await seed(key_of(INSTANCE_A, PERSON_A))
+        await seed(key_of(INSTANCE_A, OTHER_PERSON_A))
+
+        without_person = await get_affection_list(
+            page=1,
+            page_size=50,
+            search="",
+            stage=None,
+            sort_by="score_desc",
+            instance_key=INSTANCE_A,
+            _current_user=admin_a(),
+        )
+        with_empty_person = await self._list(person="")
+
+        assert [item.id for item in with_empty_person.items] == [item.id for item in without_person.items]
+        assert with_empty_person.total == without_person.total
+
+    async def test_person_and_search_are_combined_with_and(self) -> None:
+        alpha = await make_preset("人设甲")
+        await seed(key_of(INSTANCE_A, PERSON_A, alpha.id), reason="一起看海")
+        await seed(key_of(INSTANCE_A, OTHER_PERSON_A, alpha.id), reason="一起看海")
+
+        matching = await get_affection_list(
+            page=1,
+            page_size=50,
+            search=PERSON_A,
+            person=PERSON_A,
+            stage=None,
+            sort_by="score_desc",
+            instance_key=INSTANCE_A,
+            _current_user=admin_a(),
+        )
+        mismatching = await get_affection_list(
+            page=1,
+            page_size=50,
+            search=OTHER_PERSON_A,
+            person=PERSON_A,
+            stage=None,
+            sort_by="score_desc",
+            instance_key=INSTANCE_A,
+            _current_user=admin_a(),
+        )
+
+        assert {item.platform_userid for item in matching.items} == {PERSON_A}
+        assert mismatching.total == 0

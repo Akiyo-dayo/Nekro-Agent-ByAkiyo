@@ -306,6 +306,14 @@ async def refresh_runtime_view(persist: bool = True) -> Dict[str, ModelConfigGro
     """
     rows = await DBModelGroup.all().order_by("id")
     view: Dict[str, ModelConfigGroup] = {row.name: row.to_config_group() for row in rows}
+    # 运行时视图（`ModelConfigGroup`）上没有归属；租户出站要知道一个组（或它的旧副本）归不归租户，
+    # 在这里一并登记（只增不减，判不出来按租户，见 `tenant_egress.is_tenant_owned_group`）
+    from nekro_agent.tools.tenant_egress import register_model_groups
+
+    register_model_groups(
+        tenant=[(row.name, view[row.name]) for row in rows if not row.is_platform_owned],
+        platform=[(row.name, view[row.name]) for row in rows if row.is_platform_owned],
+    )
     config.MODEL_GROUPS = view
     # 「库里解不开、YAML 原值暂由落盘钩子原样写回」的记账按视图的真值修剪：组被删了、库里的 Key 已可用
     # 或被后台显式换成新 Key（视图里 Key 非空），库已接管，旧的 YAML 原值不再钉着（A4）
@@ -579,6 +587,30 @@ async def bootstrap_model_groups() -> None:
     protect_yaml = bool(report.unreadable) or (bool(diverged) and backup_path is None)
     view = await refresh_runtime_view(persist=not protect_yaml)
     logger.info(f"模型组运行时视图就绪，共 {len(view)} 组")
+    for name, group in view.items():
+        warn_if_context_too_small(name, group.CONTEXT_LENGTH)
+
+
+def warn_if_context_too_small(name: str, context_length: int) -> bool:
+    """上下文长度填了、但不超过世界书的回复预留：用这一组时世界书每轮预算只剩 1 token，记一条 WARNING
+
+    不拦：这么小的上下文本身是合法配置（小模型、只做短问答），只是世界书实际上注入不了任何条目。
+    模型组页面上同一条件也有提示。返回是否记了警告。
+    """
+    from nekro_agent.services.worldbook.budget import OUTPUT_RESERVE_TOKENS, is_small_context
+
+    try:
+        small = is_small_context(context_length)
+    except (TypeError, ValueError):
+        return False
+    if not small:
+        return False
+    logger.warning(
+        f"模型组 {name!r} 的上下文长度只填了 {context_length}，不超过世界书的回复预留 {OUTPUT_RESERVE_TOKENS}："
+        "用这一组时世界书每轮预算只有 1 token，实际上注入不了任何条目。上下文长度填的是 token 数，"
+        "不确定就留空（按 32768 算）",
+    )
+    return True
 
 
 # ============================================================
@@ -661,6 +693,7 @@ async def create_group(
     await row.save()
     await refresh_runtime_view()
     logger.info(f"新建模型组 {normalized}（归属 {row.ownership}，租户 {row.owner_tenant_id}）")
+    warn_if_context_too_small(normalized, row.context_length)
     return row
 
 
@@ -693,6 +726,7 @@ async def update_group(
     await row.save()
     await refresh_runtime_view()
     logger.info(f"更新模型组 {row.name}")
+    warn_if_context_too_small(row.name, row.context_length)
     return row
 
 
@@ -836,6 +870,7 @@ async def upsert_platform_group(name: str, group: ModelConfigGroup) -> DBModelGr
     row.apply_config_group(group)
     await row.save()
     await refresh_runtime_view()
+    warn_if_context_too_small(row.name, row.context_length)
     return row
 
 

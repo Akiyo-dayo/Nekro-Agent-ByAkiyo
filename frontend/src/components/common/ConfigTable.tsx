@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, ReactNode } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react'
 import {
   Box,
   Paper,
@@ -28,6 +28,7 @@ import {
   Stack,
   Tooltip,
   Alert,
+  Slider,
   SxProps,
   Theme,
 } from '@mui/material'
@@ -47,7 +48,7 @@ import {
 } from '@mui/icons-material'
 import { unstable_usePrompt as usePrompt, useBeforeUnload, useNavigate } from 'react-router-dom'
 import type { BlockerFunction } from 'react-router-dom'
-import { UNIFIED_TABLE_STYLES, CHIP_VARIANTS } from '../../theme/variants'
+import { UNIFIED_TABLE_STYLES, CHIP_VARIANTS, MONO_CAPTION_STYLES } from '../../theme/variants'
 import ActionButton from './ActionButton'
 import IconActionButton from './IconActionButton'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
@@ -55,19 +56,58 @@ import { useNotification } from '../../hooks/useNotification'
 import { restartApi } from '../../services/api/restart'
 import { useRestartCapability } from '../../hooks/useRestartCapability'
 import { unifiedConfigApi } from '../../services/api/unified-config'
+import { ApiError } from '../../services/api/axios'
 import { ThemedTooltip } from './ThemedTooltip'
 import { presetsApi, Preset } from '../../services/api/presets'
+import { rpPresetsApi, type RpPresetSummary } from '../../services/api/rpPresets'
 import { TENANT_QUERY_KEYS, tenantApi } from '../../services/api/tenant'
 import { useIdentity } from '../../hooks/useIdentity'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { I18nDict, getLocalizedText } from '../../services/api/types'
+import WorldbookBudgetPreview from '../worldbook/WorldbookBudgetPreview'
 
 const Button = ActionButton
 const IconButton = IconActionButton
 
 const HtmlTooltip = ThemedTooltip
+
+/**
+ * 紧凑模式（功能页「设置」抽屉）的表格版式
+ *
+ * 抽屉只有六七百像素宽：固定布局、按比例分列，表头不折行；单元格顶端对齐，
+ * 标题 + 说明 + 键名这一列多行时，左侧开关与右侧取值仍和标题对齐。
+ * 非紧凑模式不走这里。
+ */
+const COMPACT_TABLE_SX: SxProps<Theme> = {
+  tableLayout: 'fixed',
+  width: '100%',
+  // 手机上抽屉占满屏：值列再窄就放不下输入框，宁可整表横向滚一点
+  minWidth: { xs: 440, sm: 0 },
+  '& .MuiTableCell-head': {
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    px: 1.5,
+    py: 1.25,
+  },
+  '& .MuiTableCell-body': {
+    px: 1.5,
+    py: 1.5,
+    verticalAlign: 'top',
+  },
+}
+
+/** 紧凑模式里标题下方的说明：完整显示到三行，再长的悬停看全文 */
+const COMPACT_DESCRIPTION_SX: SxProps<Theme> = {
+  display: '-webkit-box',
+  WebkitLineClamp: 3,
+  WebkitBoxOrient: 'vertical',
+  overflow: 'hidden',
+  lineHeight: 1.6,
+  wordBreak: 'break-word',
+}
 
 export interface ConfigItem {
   key: string
@@ -113,9 +153,17 @@ export interface ConfigItem {
   ref_presets?: boolean
   ref_presets_no_default?: boolean
   ref_presets_multiple?: boolean
+  /** 从已导入的角色扮演（酒馆对话补全）预设里选一个；值是预设 ID，0 表示不使用 */
+  ref_rp_presets?: boolean
   is_hidden?: boolean
   required?: boolean
   model_type?: string
+  minimum?: number
+  maximum?: number
+  /** 这个整数项用滑块编辑 */
+  slider?: boolean
+  /** 0 表示「不设上限」 */
+  zero_means_unlimited?: boolean
   sub_item_name?: string
   enable_toggle?: string
   overridable?: boolean
@@ -155,6 +203,12 @@ export interface ModelGroupConfig {
   ENABLE_COT?: boolean
   /** 预填方式；后端默认 off，只有声明支持的服务才该改 */
   PREFILL_MODE?: 'off' | 'assistant' | 'deepseek'
+  /** 聊天接口格式；后端默认 openai（OpenAI 兼容），gemini 走原生 REST */
+  API_FORMAT?: 'openai' | 'gemini'
+  /** 模型上下文窗口（token）；0 = 未填 */
+  CONTEXT_LENGTH?: number
+  /** 分词系数（相对 o200k_base）；0 = 按模型名自动取 */
+  TOKEN_COUNT_FACTOR?: number
 }
 
 export interface ModelTypeOption {
@@ -169,9 +223,26 @@ export interface ConfigService {
   getConfigList: (configKey: string) => Promise<ConfigItem[]>
   getModelGroups?: () => Promise<Record<string, ModelGroupConfig>>
   getModelTypes?: () => Promise<ModelTypeOption[]>
-  batchUpdateConfig: (configKey: string, configs: Record<string, string>) => Promise<void>
+  /**
+   * `base`：每个改动项在页面读取时的值（读接口返回的 `value` 原样）。服务端拿它比对现值，
+   * 打开页面之后被别处改过的项整批拒绝（`ConfigStaleWriteError`），不会把别处的改动盖回去
+   */
+  batchUpdateConfig: (
+    configKey: string,
+    configs: Record<string, string>,
+    base?: Record<string, unknown>
+  ) => Promise<void>
   saveConfig: (configKey: string) => Promise<void>
   reloadConfig: (configKey: string) => Promise<void>
+}
+
+/** 过期写回被拒时，服务端在 `data.keys` 里列出是哪几项 */
+function readStaleKeys(data: unknown): string[] {
+  if (typeof data !== 'object' || data === null) {
+    return []
+  }
+  const keys = (data as { keys?: unknown }).keys
+  return Array.isArray(keys) ? keys.filter((key): key is string => typeof key === 'string') : []
 }
 
 interface ExpandedRowsState {
@@ -432,6 +503,7 @@ function renderNestedConfigRows(
   handleConfigChange: (key: string, value: string) => void,
   isOverridePage: boolean,
   isSmall: boolean,
+  compact: boolean,
   expandedRows: ExpandedRowsState,
   setExpandedRows: React.Dispatch<React.SetStateAction<ExpandedRowsState>>,
   t: TFunction,
@@ -454,6 +526,7 @@ function renderNestedConfigRows(
     borderLeft: level > 0 ? `2px solid` : 'none',
     borderLeftColor: level > 0 ? 'divider' : 'transparent',
   }
+  const baseColSpan = isOverridePage ? (compact ? 3 : 5) : compact ? 2 : 4
 
   if (config.type === 'list' && !config.is_complex) {
     const listValue = Array.isArray(currentValue) ? currentValue : []
@@ -481,16 +554,20 @@ function renderNestedConfigRows(
               </IconButton>
             </Box>
           </TableCell>
-          <TableCell />
-          <TableCell>
-            <Chip
-              label={elementType}
-              size="small"
-              color={getTypeColor(elementType)}
-              variant="outlined"
-              sx={CHIP_VARIANTS.base(isSmall)}
-            />
-          </TableCell>
+          {!compact && (
+            <>
+              <TableCell />
+              <TableCell>
+                <Chip
+                  label={elementType}
+                  size="small"
+                  color={getTypeColor(elementType)}
+                  variant="outlined"
+                  sx={CHIP_VARIANTS.base(isSmall)}
+                />
+              </TableCell>
+            </>
+          )}
           <TableCell>
             {renderSimpleListInput(
               item,
@@ -508,7 +585,7 @@ function renderNestedConfigRows(
     })
     rows.push(
       <TableRow key={`${config.key}-add`} sx={{ ...UNIFIED_TABLE_STYLES.nestedRow }}>
-        <TableCell sx={tableCellStyle} colSpan={isOverridePage ? 5 : 4}>
+        <TableCell sx={tableCellStyle} colSpan={baseColSpan}>
           <Button
             variant="text"
             size="small"
@@ -538,7 +615,7 @@ function renderNestedConfigRows(
             key={`${config.key}[${index}]-header`}
             sx={{ ...UNIFIED_TABLE_STYLES.nestedRow }}
           >
-            <TableCell sx={tableCellStyle} colSpan={isOverridePage ? 5 : 4}>
+            <TableCell sx={tableCellStyle} colSpan={baseColSpan}>
               <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                 <Typography
                   variant="body2"
@@ -630,16 +707,20 @@ function renderNestedConfigRows(
                     </Typography>
                   </Box>
                 </TableCell>
-                <TableCell />
-                <TableCell>
-                  <Chip
-                    label={fieldSchema.type}
-                    size="small"
-                    color={getTypeColor(fieldSchema.type)}
-                    variant="outlined"
-                    sx={CHIP_VARIANTS.base(isSmall)}
-                  />
-                </TableCell>
+                {!compact && (
+                  <>
+                    <TableCell />
+                    <TableCell>
+                      <Chip
+                        label={fieldSchema.type}
+                        size="small"
+                        color={getTypeColor(fieldSchema.type)}
+                        variant="outlined"
+                        sx={CHIP_VARIANTS.base(isSmall)}
+                      />
+                    </TableCell>
+                  </>
+                )}
                 <TableCell>
                   {renderFieldInput(
                     fieldValue,
@@ -691,16 +772,20 @@ function renderNestedConfigRows(
                         </IconButton>
                       </Box>
                     </TableCell>
-                    <TableCell />
-                    <TableCell>
-                      <Chip
-                        label={fieldElementType}
-                        size="small"
-                        color={getTypeColor(fieldElementType)}
-                        variant="outlined"
-                        sx={CHIP_VARIANTS.base(isSmall)}
-                      />
-                    </TableCell>
+                    {!compact && (
+                      <>
+                        <TableCell />
+                        <TableCell>
+                          <Chip
+                            label={fieldElementType}
+                            size="small"
+                            color={getTypeColor(fieldElementType)}
+                            variant="outlined"
+                            sx={CHIP_VARIANTS.base(isSmall)}
+                          />
+                        </TableCell>
+                      </>
+                    )}
                     <TableCell>
                       {renderSimpleListInput(
                         listItem,
@@ -724,7 +809,7 @@ function renderNestedConfigRows(
                 <TableRow key={`${subKey}-add`} sx={{ ...UNIFIED_TABLE_STYLES.nestedRow }}>
                   <TableCell
                     sx={{ ...tableCellStyle, pl: 6 + level * 2 }}
-                    colSpan={isOverridePage ? 5 : 4}
+                    colSpan={baseColSpan}
                   >
                     <Button
                       variant="text"
@@ -752,7 +837,7 @@ function renderNestedConfigRows(
       })
       rows.push(
         <TableRow key={`${config.key}-add-complex`} sx={{ ...UNIFIED_TABLE_STYLES.nestedRow }}>
-          <TableCell sx={tableCellStyle} colSpan={isOverridePage ? 5 : 4}>
+          <TableCell sx={tableCellStyle} colSpan={baseColSpan}>
             <Button
               variant="text"
               size="small"
@@ -808,16 +893,20 @@ function renderNestedConfigRows(
               </IconButton>
             </Box>
           </TableCell>
-          <TableCell />
-          <TableCell>
-            <Chip
-              label={valueType}
-              size="small"
-              color={getTypeColor(valueType)}
-              variant="outlined"
-              sx={CHIP_VARIANTS.base(isSmall)}
-            />
-          </TableCell>
+          {!compact && (
+            <>
+              <TableCell />
+              <TableCell>
+                <Chip
+                  label={valueType}
+                  size="small"
+                  color={getTypeColor(valueType)}
+                  variant="outlined"
+                  sx={CHIP_VARIANTS.base(isSmall)}
+                />
+              </TableCell>
+            </>
+          )}
           <TableCell>
             {renderSimpleListInput(
               value,
@@ -834,7 +923,7 @@ function renderNestedConfigRows(
     })
     rows.push(
       <TableRow key={`${config.key}-add-dict`} sx={{ ...UNIFIED_TABLE_STYLES.nestedRow }}>
-        <TableCell sx={tableCellStyle} colSpan={isOverridePage ? 5 : 4}>
+        <TableCell sx={tableCellStyle} colSpan={baseColSpan}>
           <TextField
             size="small"
             placeholder={t('configTable.newItemPlaceholder')}
@@ -860,6 +949,11 @@ function renderNestedConfigRows(
   return rows
 }
 
+export interface ConfigTableEditorState {
+  dirtyKeys: string[]
+  save: () => Promise<void>
+}
+
 export interface ConfigTableProps {
   configKey: string
   configService: ConfigService
@@ -875,7 +969,22 @@ export interface ConfigTableProps {
   infoBox?: ReactNode
   isOverridePage?: boolean
   showCategoryColumn?: boolean
+  /** 抽屉里的紧凑版：隐藏「属性」「类型」两列，说明文字放到标题下一行 */
+  compact?: boolean
+  /** 只渲染这些键；不传则渲染全部。用于把一张配置表拆成常用 / 高级小组 */
+  visibleKeys?: string[]
+  /** 把未保存键与保存入口交给外层，供抽屉底部的统一保存条使用 */
+  onEditorStateChange?: (state: ConfigTableEditorState) => void
+  /** 是否注册路由离开拦截；抽屉内多张表由抽屉自己拦一次，这里传 false */
+  navigationPrompt?: boolean
   toolbarActions?: ReactNode
+  /**
+   * 世界书预算换算用的配置键
+   *
+   * 与 `configKey` 通常相同；实例覆盖页传的是 `instance_override_*`，而配置表本身
+   * 仍以 `system` 读实例覆盖接口，两者不能互相顶替。
+   */
+  worldbookBudgetConfigKey?: string
 }
 
 interface ConfirmDialogProps {
@@ -911,6 +1020,40 @@ const ConfirmDialog = ({
   )
 }
 
+/**
+ * 导航拦截单独做成子组件：抽屉里同时挂多张紧凑表，每张都调 `usePrompt` 会
+ * 注册多个 blocker；只有需要拦截的表格才挂这个组件。
+ */
+function ConfigTableNavigationPrompt({
+  hasUnsavedChanges,
+  message,
+}: {
+  hasUnsavedChanges: boolean
+  message: string
+}) {
+  const blocker = useCallback<BlockerFunction>(
+    ({ currentLocation, nextLocation }) => {
+      if (!hasUnsavedChanges) {
+        return false
+      }
+
+      if (currentLocation.pathname !== nextLocation.pathname) {
+        return true
+      }
+
+      const currentCategory = new URLSearchParams(currentLocation.search).get('category')
+      const nextCategory = new URLSearchParams(nextLocation.search).get('category')
+
+      return currentCategory !== nextCategory
+    },
+    [hasUnsavedChanges]
+  )
+
+  usePrompt({ when: blocker, message })
+
+  return null
+}
+
 export default function ConfigTable({
   configKey,
   configService,
@@ -926,7 +1069,12 @@ export default function ConfigTable({
   infoBox,
   isOverridePage = false,
   showCategoryColumn = false,
+  compact = false,
+  visibleKeys,
+  onEditorStateChange,
+  navigationPrompt = true,
   toolbarActions,
+  worldbookBudgetConfigKey,
 }: ConfigTableProps) {
   const navigate = useNavigate()
   const notification = useNotification()
@@ -1004,6 +1152,8 @@ export default function ConfigTable({
 
   const [editingValues, setEditingValues] = useState<Record<string, string>>({})
   const [dirtyKeys, setDirtyKeys] = useState<Set<string>>(new Set())
+  // 保存撞上过期写回时，没过期的那些改动：刷新出最新的配置之后原样带回来
+  const carriedEditsRef = useRef<Record<string, string> | null>(null)
   /** 等待确认的顶层布尔开关；确认之前 editingValues 不动，取消就是什么都不发生 */
   const [pendingOpenConfirm, setPendingOpenConfirm] = useState<{
     key: string
@@ -1043,6 +1193,16 @@ export default function ConfigTable({
   const [emailSendAccounts, setEmailSendAccounts] = useState<EmailSendAccountOption[]>([])
 
   const [presets, setPresets] = useState<Preset[]>([])
+  /**
+   * 角色扮演预设下拉的数据
+   *
+   * 与上面的人设清单分开取：这个接口失败只该让这一项退回普通数字输入，不能连带
+   * 把人设下拉或整张配置表打进错误态。
+   */
+  const [rpPresets, setRpPresets] = useState<RpPresetSummary[]>([])
+  const [rpPresetsError, setRpPresetsError] = useState<string | null>(null)
+  const [rpPresetsLoading, setRpPresetsLoading] = useState(false)
+  const [rpPresetsLoaded, setRpPresetsLoaded] = useState(false)
   const [expandedRows, setExpandedRows] = useState<ExpandedRowsState>({})
   const [restartDialogOpen, setRestartDialogOpen] = useState(false)
   const [isRestarting, setIsRestarting] = useState(false)
@@ -1069,27 +1229,6 @@ export default function ConfigTable({
       event.returnValue = ''
     }, [hasUnsavedChanges])
   )
-
-  usePrompt({
-    when: useCallback<BlockerFunction>(
-      ({ currentLocation, nextLocation }) => {
-        if (!hasUnsavedChanges) {
-          return false
-        }
-
-        if (currentLocation.pathname !== nextLocation.pathname) {
-          return true
-        }
-
-        const currentCategory = new URLSearchParams(currentLocation.search).get('category')
-        const nextCategory = new URLSearchParams(nextLocation.search).get('category')
-
-        return currentCategory !== nextCategory
-      },
-      [hasUnsavedChanges]
-    ),
-    message: t('configTable.unsavedChangesConfirm'),
-  })
 
   useEffect(() => {
     if (!onSearchChange) {
@@ -1128,6 +1267,46 @@ export default function ConfigTable({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [configService, currentInstanceKey, isScopeReady])
 
+  // 只有当前页真的出现 `ref_rp_presets` 的配置项才去拉预设清单：大多数配置页没有这一项
+  const needsRpPresets = useMemo(
+    () => Boolean(configs?.some(item => item.ref_rp_presets)),
+    [configs]
+  )
+
+  useEffect(() => {
+    if (!isScopeReady || !needsRpPresets) {
+      return
+    }
+    let cancelled = false
+    setRpPresetsLoading(true)
+    setRpPresetsLoaded(false)
+    setRpPresetsError(null)
+    rpPresetsApi
+      .list({ instance_key: currentInstanceKey ?? undefined })
+      .then(response => {
+        if (cancelled) return
+        setRpPresets(response.items)
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return
+        // 这里刻意不弹通知：同页其它配置还能正常改，只在值控件下面说明这一项为什么退化
+        setRpPresets([])
+        setRpPresetsError(
+          error instanceof Error && error.message
+            ? error.message
+            : t('configTable.rpPresetsLoadFailed')
+        )
+      })
+      .finally(() => {
+        if (cancelled) return
+        setRpPresetsLoading(false)
+        setRpPresetsLoaded(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [currentInstanceKey, isScopeReady, needsRpPresets, t])
+
   const modelTypeMap = useMemo(
     () => Object.fromEntries(modelTypes.map(mt => [mt.value, mt])),
     [modelTypes]
@@ -1159,9 +1338,17 @@ export default function ConfigTable({
     return map
   }, [configs, editingValues])
 
+  // 抽屉把同一份配置拆成多张表：只渲染给定键，不传则维持原来的全量行为
+  const visibleKeySet = useMemo(
+    () => (visibleKeys ? new Set(visibleKeys) : null),
+    [visibleKeys]
+  )
+
   const checkRequiredFields = useCallback(() => {
     const emptyFields = configs
       .filter(config => {
+        // 抽屉只渲染当前域/当前分组；不要用别的分类里的必填项挡住这一次保存
+        if (visibleKeySet && !visibleKeySet.has(config.key)) return false
         if (!config.required) return false
         if (config.enable_toggle && enableStateMap.get(config.enable_toggle) === false) {
           return false
@@ -1178,7 +1365,7 @@ export default function ConfigTable({
       return false
     }
     return true
-  }, [configs, editingValues, enableStateMap, getConfigTitle])
+  }, [configs, editingValues, enableStateMap, getConfigTitle, visibleKeySet])
 
   const handleSaveAllChanges = useCallback(
     async (force: boolean = false) => {
@@ -1189,7 +1376,15 @@ export default function ConfigTable({
         const changedConfigs = Object.fromEntries(
           Array.from(dirtyKeys).map(key => [key, editingValues[key]])
         )
-        await configService.batchUpdateConfig(configKey, changedConfigs)
+        // 读取时的值一起带上：打开页面之后被别处改过的项（比如删实例时从名单里摘掉的），
+        // 服务端整批拒绝，不会把别处的改动盖回去
+        const loadedValues = new Map(configs.map(config => [config.key, config.value]))
+        const base = Object.fromEntries(
+          Array.from(dirtyKeys)
+            .filter(key => loadedValues.has(key))
+            .map(key => [key, loadedValues.get(key)])
+        )
+        await configService.batchUpdateConfig(configKey, changedConfigs, base)
         await configService.saveConfig(configKey)
         notification.success(t('configTable.saveSuccess'))
         setDirtyKeys(new Set())
@@ -1218,6 +1413,28 @@ export default function ConfigTable({
           setRestartDialogOpen(true)
         }
       } catch (error) {
+        if (error instanceof ApiError && error.isType('ConfigStaleWriteError')) {
+          // 过期的项丢掉这次的编辑、刷新成最新值，在最新值上重新改；其余改动刷新后原样带回来，可以再存一次
+          const staleKeys = readStaleKeys(error.data)
+          const staleSet = new Set(staleKeys)
+          carriedEditsRef.current = Object.fromEntries(
+            Array.from(dirtyKeys)
+              .filter(key => !staleSet.has(key))
+              .map(key => [key, editingValues[key]])
+          )
+          const titles = staleKeys.map(key => {
+            const config = configs.find(item => item.key === key)
+            return config ? getConfigTitle(config) || key : key
+          })
+          notification.error(
+            t('configTable.staleWrite', {
+              keys: titles.join(t('configTable.staleWriteSeparator')),
+            })
+          )
+          setSaveWarningOpen(false)
+          onRefresh?.()
+          return
+        }
         const errorMessage = error instanceof Error ? error.message : t('messages.saveFailed')
         notification.error(errorMessage)
       }
@@ -1231,9 +1448,22 @@ export default function ConfigTable({
       notification,
       onRefresh,
       configs,
+      getConfigTitle,
       t,
     ]
   )
+
+  // 抽屉底部要显示「n 项未保存」并统一触发保存：只有传了这个回调才建立这条接线，
+  // 其余页面（系统设置、适配器、频道覆盖、插件配置）完全不受影响。
+  useEffect(() => {
+    if (!onEditorStateChange) {
+      return
+    }
+    onEditorStateChange({
+      dirtyKeys: Array.from(dirtyKeys),
+      save: () => handleSaveAllChanges(false),
+    })
+  }, [dirtyKeys, handleSaveAllChanges, onEditorStateChange])
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1294,7 +1524,9 @@ export default function ConfigTable({
       return []
     }
 
-    let processedConfigs = configs.filter(config => !config.is_hidden)
+    let processedConfigs = configs.filter(
+      config => !config.is_hidden && (!visibleKeySet || visibleKeySet.has(config.key))
+    )
 
     if (isOverridePage) {
       processedConfigs = processedConfigs.filter(config => !config.key.startsWith('enable_'))
@@ -1321,7 +1553,7 @@ export default function ConfigTable({
     }
 
     return processedConfigs
-  }, [configs, effectiveSearchText, isOverridePage, enableStateMap, getConfigTitle, getConfigDescription])
+  }, [configs, effectiveSearchText, isOverridePage, enableStateMap, getConfigTitle, getConfigDescription, visibleKeySet])
 
   useEffect(() => {
     if (configs) {
@@ -1335,8 +1567,20 @@ export default function ConfigTable({
               : String(config.value)
           initialValues[config.key] = value
         })
+      // 上一次保存撞上过期写回：没过期的那些改动带回来（过期的那几项已经换成最新值）
+      const carried = carriedEditsRef.current
+      carriedEditsRef.current = null
+      const carriedKeys: string[] = []
+      if (carried) {
+        for (const [key, value] of Object.entries(carried)) {
+          if (key in initialValues) {
+            initialValues[key] = value
+            carriedKeys.push(key)
+          }
+        }
+      }
       setEditingValues(initialValues)
-      setDirtyKeys(new Set())
+      setDirtyKeys(new Set(carriedKeys))
     }
   }, [configs])
 
@@ -1365,6 +1609,20 @@ export default function ConfigTable({
         setEmailSendAccounts([])
       })
   }, [])
+
+  /** 取一个配置项当前显示的值（编辑中的优先）；贴给预算预览用 */
+  const configNumericValue = (item: ConfigItem, fallback: number): number => {
+    const raw = editingValues[item.key] ?? item.value
+    const parsed = typeof raw === 'number' ? raw : Number(raw)
+    return Number.isFinite(parsed) ? parsed : fallback
+  }
+
+  const worldbookPercentConfig = configs.find(
+    config => config.key === 'WORLDBOOK_BUDGET_PERCENT'
+  )
+  const worldbookCapConfig = configs.find(
+    config => config.key === 'WORLDBOOK_BUDGET_CAP_TOKENS'
+  )
 
   const renderConfigInput = (config: ConfigItem, disabled: boolean = false) => {
     const isEditing = Object.prototype.hasOwnProperty.call(editingValues, config.key)
@@ -1653,6 +1911,65 @@ export default function ConfigTable({
       )
     }
 
+    if (config.ref_rp_presets) {
+      // 值是预设 ID；0 表示「不使用」。后端默认值就是 0，空串也按 0 显示。
+      const numericValue = rawValue === '' ? '0' : rawValue
+      const isNone = numericValue === '0'
+      const selected = rpPresets.find(preset => String(preset.id) === numericValue)
+      const isInvalid = Boolean(
+        !isNone && !selected && rpPresetsLoaded && rpPresetsError === null
+      )
+
+      // 清单取不到时退回普通数字输入，并只在下方说明这一项为什么退化
+      if (rpPresetsError) {
+        return (
+          <TextField
+            type="number"
+            value={rawValue}
+            onChange={e => handleConfigChange(config.key, e.target.value)}
+            size="small"
+            fullWidth
+            placeholder={config.placeholder}
+            disabled={disabled}
+            error
+            helperText={t('configTable.rpPresetsLoadFailedWithReason', {
+              reason: rpPresetsError,
+            })}
+          />
+        )
+      }
+
+      return (
+        <TextField
+          select
+          value={numericValue}
+          onChange={e => handleConfigChange(config.key, e.target.value)}
+          size="small"
+          fullWidth
+          error={isInvalid}
+          helperText={isInvalid ? t('configTable.rpPresetMissing') : undefined}
+          placeholder={config.placeholder || t('configTable.selectRpPreset')}
+          disabled={disabled || rpPresetsLoading}
+        >
+          <MenuItem value="0">
+            <em>{t('configTable.rpPresetNone')}</em>
+          </MenuItem>
+          {rpPresets.map(preset => (
+            <MenuItem key={preset.id} value={String(preset.id)}>
+              {preset.owner_instance_key === ''
+                ? `${preset.name} ${t('configTable.rpPresetGlobalSuffix')}`
+                : preset.name}
+            </MenuItem>
+          ))}
+          {isInvalid ? (
+            <MenuItem value={numericValue}>
+              {t('configTable.rpPresetMissingValue', { id: numericValue })}
+            </MenuItem>
+          ) : null}
+        </TextField>
+      )
+    }
+
     if (config.enum) {
       return (
         <TextField
@@ -1775,7 +2092,56 @@ export default function ConfigTable({
           />
         )
       case 'int':
-      case 'float':
+      case 'float': {
+        const minimum = config.minimum
+        const maximum = config.maximum
+        if (config.slider === true && minimum !== undefined && maximum !== undefined) {
+          const numericValue = Number(rawValue)
+          const sliderValue = Number.isFinite(numericValue)
+            ? Math.min(Math.max(numericValue, minimum), maximum)
+            : minimum
+          const unlimited =
+            config.zero_means_unlimited === true &&
+            rawValue.trim() !== '' &&
+            Number(rawValue) === 0
+          // 百分比 1 ~ 100 一格一格拖；token 上限跨到 65536，按 256 一格更快，两端仍然到得了
+          const step = maximum >= 10_000 ? 256 : 1
+          return (
+            <Box sx={{ width: '100%', display: 'flex', alignItems: 'center', gap: 1.5 }}>
+              <Slider
+                value={sliderValue}
+                min={minimum}
+                max={maximum}
+                step={step}
+                onChange={(_event, value) =>
+                  handleConfigChange(
+                    config.key,
+                    String(Array.isArray(value) ? value[0] : value)
+                  )
+                }
+                valueLabelDisplay="auto"
+                disabled={disabled}
+                aria-label={getConfigTitle(config)}
+                sx={{ flex: 1, minWidth: 120 }}
+              />
+              <TextField
+                type="number"
+                value={rawValue}
+                onChange={e => handleConfigChange(config.key, e.target.value)}
+                size="small"
+                placeholder={config.placeholder}
+                disabled={disabled}
+                inputProps={{ min: minimum, max: maximum, step: 1 }}
+                sx={{ width: 112, flexShrink: 0 }}
+              />
+              {unlimited && (
+                <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
+                  {t('configTable.noCap')}
+                </Typography>
+              )}
+            </Box>
+          )
+        }
         return (
           <TextField
             type="number"
@@ -1787,6 +2153,7 @@ export default function ConfigTable({
             disabled={disabled}
           />
         )
+      }
       default:
         return (
           <TextField
@@ -1833,7 +2200,14 @@ export default function ConfigTable({
   }
 
   return (
-    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+    <Box
+      sx={{
+        height: compact ? 'auto' : '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 1.5,
+      }}
+    >
       <Stack direction="column" spacing={2} sx={{ flexShrink: 0 }}>
         {title && (
           <Typography variant="h5" component="h2" sx={{ fontWeight: 600 }}>
@@ -1905,7 +2279,7 @@ export default function ConfigTable({
       <Paper
         elevation={3}
         sx={{
-          flex: 1,
+          flex: compact ? 'none' : 1,
           display: 'flex',
           flexDirection: 'column',
           minHeight: 0,
@@ -1914,39 +2288,67 @@ export default function ConfigTable({
         }}
       >
         <TableContainer sx={{ flex: 1, overflow: 'auto', ...UNIFIED_TABLE_STYLES.scrollbar }}>
-          <Table stickyHeader size={isSmall ? 'small' : 'medium'}>
+          <Table
+            stickyHeader
+            size={isSmall ? 'small' : 'medium'}
+            sx={compact ? COMPACT_TABLE_SX : undefined}
+          >
             <TableHead>
               <TableRow sx={UNIFIED_TABLE_STYLES.header}>
                 {isOverridePage && (
-                  <TableCell sx={{ width: '10%', minWidth: 80 }}>
-                    {t('configTable.headerEnableOverride')}
+                  <TableCell
+                    sx={
+                      compact
+                        ? { width: { xs: 64, sm: 96 }, textAlign: 'center' }
+                        : { width: '10%', minWidth: 80 }
+                    }
+                  >
+                    {compact ? (
+                      // 抽屉里这一列很窄：表头用短名，完整说法放进提示
+                      <Tooltip title={t('configTable.headerEnableOverride')} arrow>
+                        <span>{t('configTable.headerOverrideShort')}</span>
+                      </Tooltip>
+                    ) : (
+                      t('configTable.headerEnableOverride')
+                    )}
                   </TableCell>
                 )}
-                <TableCell sx={{ width: '20%', minWidth: 200 }}>
+                <TableCell
+                  sx={compact ? { width: { xs: '46%', sm: '54%' } } : { width: '20%', minWidth: 200 }}
+                >
                   {t('configTable.headerConfigItem')}
                 </TableCell>
-                <TableCell sx={{ width: '5%', minWidth: 80 }}>
-                  {t('configTable.headerAttribute')}
-                </TableCell>
+                {!compact && (
+                  <TableCell sx={{ width: '5%', minWidth: 80 }}>
+                    {t('configTable.headerAttribute')}
+                  </TableCell>
+                )}
                 {showCategoryColumn && (
                   <TableCell sx={{ width: '10%', minWidth: 120 }}>
                     {t('configTable.headerCategory')}
                   </TableCell>
                 )}
-                <TableCell sx={{ width: '5%', minWidth: 80 }}>
-                  {t('configTable.headerType')}
-                </TableCell>
+                {!compact && (
+                  <TableCell sx={{ width: '5%', minWidth: 80 }}>
+                    {t('configTable.headerType')}
+                  </TableCell>
+                )}
                 <TableCell
-                  sx={{
-                    width: showCategoryColumn
-                      ? isOverridePage
-                        ? '35%'
-                        : '40%'
-                      : isOverridePage
-                        ? '45%'
-                        : '50%',
-                    minWidth: 300,
-                  }}
+                  sx={
+                    compact
+                      ? // 固定布局下值列不给宽度，吃掉开关列与配置项列剩下的部分
+                        undefined
+                      : {
+                          width: showCategoryColumn
+                            ? isOverridePage
+                              ? '35%'
+                              : '40%'
+                            : isOverridePage
+                              ? '45%'
+                              : '50%',
+                          minWidth: 300,
+                        }
+                  }
                 >
                   {t('configTable.headerValue')}
                 </TableCell>
@@ -1960,6 +2362,8 @@ export default function ConfigTable({
                     : true
                 // 平台方专属项对租户只读：服务端本来就拒，页面不给一个点了必然 403 的输入框
                 const platformLocked = !isPlatformOwner && Boolean(config.platform_only)
+                // 抽屉的实例层：没有 `overridable` 的项只能改全局，输入框灰显并标「仅全局可改」
+                const compactGlobalOnly = compact && isOverridePage && !config.overridable
 
                 const mainRow = (
                   <TableRow
@@ -1977,11 +2381,17 @@ export default function ConfigTable({
                     }}
                   >
                     {isOverridePage && (
-                      <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                      <TableCell
+                        sx={
+                          compact
+                            ? ([UNIFIED_TABLE_STYLES.cell, { textAlign: 'center' }] as SxProps<Theme>)
+                            : UNIFIED_TABLE_STYLES.cell
+                        }
+                      >
                         {config.enable_toggle ? (
                           <Switch
                             checked={isEnabled}
-                            disabled={platformLocked}
+                            disabled={platformLocked || compactGlobalOnly}
                             onChange={e => {
                               handleConfigChange(
                                 config.enable_toggle as string,
@@ -2023,7 +2433,7 @@ export default function ConfigTable({
                           >
                             {getConfigTitle(config)}
                           </Typography>
-                          {getConfigDescription(config) && (
+                          {!compact && getConfigDescription(config) && (
                             <HtmlTooltip
                               title={
                                 <div
@@ -2048,46 +2458,101 @@ export default function ConfigTable({
                             </HtmlTooltip>
                           )}
                         </Box>
+                        {compact && getConfigDescription(config) && (
+                          // 说明放在标题下方，最多三行；更长的悬停看全文
+                          <HtmlTooltip
+                            title={
+                              <div
+                                dangerouslySetInnerHTML={{
+                                  __html: getConfigDescription(config) || '',
+                                }}
+                              />
+                            }
+                            placement="bottom-start"
+                          >
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              component="div"
+                              sx={COMPACT_DESCRIPTION_SX}
+                              dangerouslySetInnerHTML={{
+                                __html: getConfigDescription(config) || '',
+                              }}
+                            />
+                          </HtmlTooltip>
+                        )}
+                        {compact && isOverridePage && !config.overridable && (
+                          <Typography variant="caption" color="text.secondary">
+                            {t('configTable.globalOnly')}
+                          </Typography>
+                        )}
+                        {compact && isOverridePage && config.overridable && !isEnabled && (
+                          <Typography variant="caption" color="text.secondary">
+                            {t('configTable.inheritedFromGlobal')}
+                          </Typography>
+                        )}
+                        {compact &&
+                          !isOverridePage &&
+                          config.overridable &&
+                          configKey === 'system' && (
+                            <Typography variant="caption" color="text.secondary">
+                              {t('configTable.overridableHint')}
+                            </Typography>
+                          )}
+                        {compact &&
+                          config.tenant_may_only_lower &&
+                          !isPlatformOwner && (
+                            <Typography variant="caption" color="text.secondary">
+                              {t('configTable.tenantMayOnlyLower')}
+                            </Typography>
+                          )}
+                        {compact && platformLocked && (
+                          <Typography variant="caption" color="text.secondary">
+                            {t('configTable.platformOnly')}
+                          </Typography>
+                        )}
                         <Typography
                           variant="caption"
                           color="text.secondary"
-                          sx={{ fontFamily: 'monospace' }}
+                          sx={compact ? MONO_CAPTION_STYLES : { fontFamily: 'monospace' }}
                         >
                           {config.key}
                         </Typography>
                       </Stack>
                     </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      <Stack spacing={1} direction="row" alignItems="center" flexWrap="wrap">
-                        {config.overridable && configKey === 'system' && (
-                          <Chip
-                            label={t('configTable.overridable')}
-                            size="small"
-                            color="info"
-                            variant="outlined"
-                            sx={{ ...CHIP_VARIANTS.base(isSmall) }}
-                          />
-                        )}
-                        {config.platform_only && (
-                          <Chip
-                            label={t('configTable.platformOnly')}
-                            size="small"
-                            color="warning"
-                            variant="outlined"
-                            sx={{ ...CHIP_VARIANTS.base(isSmall) }}
-                          />
-                        )}
-                        {config.tenant_may_only_lower && !isPlatformOwner && (
-                          <Chip
-                            label={t('configTable.tenantMayOnlyLower')}
-                            size="small"
-                            color="default"
-                            variant="outlined"
-                            sx={{ ...CHIP_VARIANTS.base(isSmall) }}
-                          />
-                        )}
-                      </Stack>
-                    </TableCell>
+                    {!compact && (
+                      <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                        <Stack spacing={1} direction="row" alignItems="center" flexWrap="wrap">
+                          {config.overridable && configKey === 'system' && (
+                            <Chip
+                              label={t('configTable.overridable')}
+                              size="small"
+                              color="info"
+                              variant="outlined"
+                              sx={{ ...CHIP_VARIANTS.base(isSmall) }}
+                            />
+                          )}
+                          {config.platform_only && (
+                            <Chip
+                              label={t('configTable.platformOnly')}
+                              size="small"
+                              color="warning"
+                              variant="outlined"
+                              sx={{ ...CHIP_VARIANTS.base(isSmall) }}
+                            />
+                          )}
+                          {config.tenant_may_only_lower && !isPlatformOwner && (
+                            <Chip
+                              label={t('configTable.tenantMayOnlyLower')}
+                              size="small"
+                              color="default"
+                              variant="outlined"
+                              sx={{ ...CHIP_VARIANTS.base(isSmall) }}
+                            />
+                          )}
+                        </Stack>
+                      </TableCell>
+                    )}
                     {showCategoryColumn && (
                       <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                         {getConfigCategory(config) ? (
@@ -2103,30 +2568,37 @@ export default function ConfigTable({
                         )}
                       </TableCell>
                     )}
+                    {!compact && (
+                      <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                        <Chip
+                          label={
+                            config.ref_presets_multiple
+                              ? 'presets'
+                              : config.ref_presets
+                                ? 'preset'
+                                : config.type
+                          }
+                          size="small"
+                          color={getTypeColor(
+                            config.ref_presets_multiple
+                              ? 'presets'
+                              : config.ref_presets
+                                ? 'preset'
+                                : config.type,
+                            config.is_complex
+                          )}
+                          variant="outlined"
+                          sx={CHIP_VARIANTS.base(isSmall)}
+                        />
+                      </TableCell>
+                    )}
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      <Chip
-                        label={
-                          config.ref_presets_multiple
-                            ? 'presets'
-                            : config.ref_presets
-                              ? 'preset'
-                              : config.type
-                        }
-                        size="small"
-                        color={getTypeColor(
-                          config.ref_presets_multiple
-                            ? 'presets'
-                            : config.ref_presets
-                              ? 'preset'
-                              : config.type,
-                          config.is_complex
-                        )}
-                        variant="outlined"
-                        sx={CHIP_VARIANTS.base(isSmall)}
-                      />
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      {renderConfigInput(config, (isOverridePage ? !isEnabled : false) || platformLocked)}
+                      {renderConfigInput(
+                        config,
+                        (isOverridePage ? !isEnabled : false) ||
+                          platformLocked ||
+                          compactGlobalOnly
+                      )}
                     </TableCell>
                   </TableRow>
                 )
@@ -2140,6 +2612,7 @@ export default function ConfigTable({
                         handleConfigChange,
                         isOverridePage,
                         isSmall,
+                        compact,
                         expandedRows,
                         setExpandedRows,
                         t,
@@ -2148,7 +2621,32 @@ export default function ConfigTable({
                       )
                     : []
 
-                return [mainRow, ...nestedRows]
+                const worldbookPreviewRow =
+                  config.key === 'WORLDBOOK_BUDGET_CAP_TOKENS' &&
+                  worldbookPercentConfig !== undefined &&
+                  worldbookCapConfig !== undefined ? (
+                    <TableRow key={`${config.key}:budget-preview`}>
+                      <TableCell
+                        colSpan={
+                          (isOverridePage ? (compact ? 3 : 5) : compact ? 2 : 4) +
+                          (showCategoryColumn ? 1 : 0)
+                        }
+                        sx={UNIFIED_TABLE_STYLES.cell}
+                      >
+                        <WorldbookBudgetPreview
+                          configKey={worldbookBudgetConfigKey ?? configKey}
+                          percent={configNumericValue(worldbookPercentConfig, 25)}
+                          capTokens={configNumericValue(worldbookCapConfig, 0)}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null
+
+                return [
+                  mainRow,
+                  ...(worldbookPreviewRow ? [worldbookPreviewRow] : []),
+                  ...nestedRows,
+                ]
               })}
             </TableBody>
           </Table>
@@ -2277,6 +2775,13 @@ export default function ConfigTable({
           )}
         </DialogActions>
       </Dialog>
+
+      {navigationPrompt && (
+        <ConfigTableNavigationPrompt
+          hasUnsavedChanges={hasUnsavedChanges}
+          message={t('configTable.unsavedChangesConfirm')}
+        />
+      )}
     </Box>
   )
 }

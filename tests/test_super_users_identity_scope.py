@@ -684,7 +684,7 @@ class TestQuotaWhitelistCommand:
 class TestQuotaThroughTheMessageEntry:
     """从消息入口走到底：今日配额已用完的频道里，冒用白名单号码的消息照样被配额拦下
 
-    频道每日上限 1、今天已经回过 1 条；发送者 20202 在白名单里（纯号码 = QQ 号），超级用户豁免关掉。
+    频道每日上限 1、今天已经回过 1 个回合；发送者 20202 在白名单里（纯号码 = QQ 号），超级用户豁免关掉。
     """
 
     WHITELISTED = "20202"
@@ -719,7 +719,7 @@ class TestQuotaThroughTheMessageEntry:
                 from nekro_agent.adapters.interface.schemas.platform import PlatformSendResponse
 
                 notices.append(request.segments[0].content)
-                return PlatformSendResponse(success=True, message_id="1")
+                return PlatformSendResponse(success=True, message_id="1", recorded=True)
 
         async def _adapter_for_chat(_chat_key: str) -> Any:
             return _Adapter()
@@ -730,15 +730,12 @@ class TestQuotaThroughTheMessageEntry:
         return SimpleNamespace(service=message_service, scheduled=scheduled, notices=notices)
 
     async def push(self, entry: Any, instance_key: str) -> None:
+        from nekro_agent.models.db_channel_quota import DBChannelQuotaDaily
         from nekro_agent.schemas.chat_message import ChatMessage
+        from nekro_agent.services.channel_quota.counter import quota_day
 
         chat_key = await add_channel(instance_key)
-        await DBChatMessage.create(
-            message_id="r1", sender_id=-1, sender_name="bot", sender_nickname="bot", adapter_key=ONEBOT,
-            instance_key=instance_key, platform_userid="-1", is_tome=0, is_recalled=False, chat_key=chat_key,
-            chat_type="group", content_text="今天已经回过一条", content_data="[]", raw_cq_code="", ext_data="{}",
-            send_timestamp=int(datetime.datetime.now().timestamp()),
-        )
+        await DBChannelQuotaDaily.create(chat_key=chat_key, day=quota_day(), replies=1)
         message = ChatMessage(
             message_id="m1", sender_id=self.WHITELISTED, sender_name="x", sender_nickname="x", adapter_key=ONEBOT,
             instance_key=instance_key, platform_userid=self.WHITELISTED, is_tome=1, is_recalled=False,

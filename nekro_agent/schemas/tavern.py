@@ -70,7 +70,9 @@ class CleanupRuleInspect(BaseModel):
     """一条清理规则的导入预览
 
     `index` 是它在卡片里的序号，管理员按序号决定启不启用；`disabled_reason` 为空表示
-    默认启用。
+    默认启用。`output_mode` 是启用后怎么替换（`replace` / `text` 只留正文 / `drop` 整段删掉），
+    `html_kind` 是替换文字带 HTML 时属于哪一类（`display` / `external` / `interactive` / `remote`，
+    不带 HTML 为空串）。
     """
 
     index: int
@@ -79,6 +81,8 @@ class CleanupRuleInspect(BaseModel):
     replace: str = ""
     enabled: bool = True
     disabled_reason: str = ""
+    output_mode: str = "replace"
+    html_kind: str = ""
 
 
 class CardBookInspect(BaseModel):
@@ -95,11 +99,122 @@ class CardBookInspect(BaseModel):
     notes: dict[str, int] = Field(default_factory=dict)
 
 
+class RemoteBookSource(BaseModel):
+    """卡片脚本要下载的一本世界书（从酒馆助手脚本的文字里静态认出来的）
+
+    `key` 是这个来源的标识（文件名的摘要），下载、检查更新、手动上传都按它找；服务端每次
+    从人设存着的卡片原文重新认，不接受前端传地址。`urls` 是主地址在前、镜像在后，
+    `version_hint` 是地址里写的分支或版本（`main`、`v0.2.2`），没有为空；真正的版本下载后
+    从文件里读。
+    """
+
+    key: str
+    file_name: str
+    urls: list[str] = Field(default_factory=list)
+    scripts: list[str] = Field(default_factory=list)
+    version_hint: str = ""
+
+
+class RemoteBookImported(BaseModel):
+    """这个来源已经导成了哪本书"""
+
+    book_id: int
+    book_name: str = ""
+    version: str = ""
+    downloaded_at: Optional[datetime] = None
+    # 实际下载成功的那个地址的主机名；手动上传时为空
+    host: str = ""
+    manual: bool = False
+    entries: int = 0
+
+
+class RemoteBookView(RemoteBookSource):
+    """人设页上的一项：来源，加上已经导入的书（没导入为空）"""
+
+    imported: Optional[RemoteBookImported] = None
+
+
+class RemoteBooksResponse(BaseModel):
+    """人设的远程世界书列表；`proxy_available` 表示后台配了系统默认代理，可以勾选走代理"""
+
+    preset_id: int
+    proxy_available: bool = False
+    sources: list[RemoteBookView] = Field(default_factory=list)
+
+
+class RemoteBookDownloadRequest(BaseModel):
+    """下载并导入；`replace` 为真时替换已经导入的那本书的全部条目（检查更新后「更新到新版本」）"""
+
+    use_proxy: bool = False
+    replace: bool = False
+
+
+class RemoteBookCheckRequest(BaseModel):
+    """检查更新：下载一遍，只比较、不导入"""
+
+    use_proxy: bool = False
+
+
+class RemoteBookImportResult(BaseModel):
+    """下载（或手动上传）并导入的结果；`replaced` 表示替换了已有那本书的条目"""
+
+    book_id: int
+    book_name: str = ""
+    version: str = ""
+    host: str = ""
+    manual: bool = False
+    replaced: bool = False
+    report: ImportReport
+
+
+class RemoteBookCheckResult(BaseModel):
+    """检查更新的结果
+
+    `status`：`same` 内容与已导入的一字不差；`newer` 版本号不同；`changed` 版本号相同（或都没有）
+    但内容变了；`not_imported` 还没导入过（只报远端版本）。
+    """
+
+    status: Literal["same", "newer", "changed", "not_imported"]
+    local_version: str = ""
+    remote_version: str = ""
+    host: str = ""
+
+
+class CardVerdict(BaseModel):
+    """检查报告最上面的一句结论
+
+    `level` 是机读档位：`full` 可完整使用、`partial` 能用但少了附加功能、`state` 玩法靠变量
+    推进、要打开角色状态。`text` 是直接显示给管理员的中文结论。
+    """
+
+    level: Literal["full", "partial", "state"]
+    text: str
+
+
+class StateTemplateReport(BaseModel):
+    """导入卡片时角色状态模板的情况（角色状态插件没登记时整段为空）
+
+    `status`：`preview` 检查页按卡内书推了一遍（不落库）；`generated` 导入后生成了模板；`exists` 这个人设已经有
+    模板，没动；`inactive` 插件在导入目标上没开（启用后首次生效时会按书生成）；`no_initvar` 卡里没有可用的
+    `[initvar]` 条目；`failed` 推不出来（原因只写类别）。`private_paths` 是自动标了私密的字段路径（最多 50 条），
+    只在后台导入对话框里显示。
+    """
+
+    status: Literal["preview", "generated", "exists", "inactive", "no_initvar", "failed"]
+    fields: int = 0
+    private_paths: list[str] = Field(default_factory=list)
+    hidden: int = 0
+    entries: int = 0
+    note: str = ""
+
+
 class CardInspectReport(BaseModel):
     """上传后的检查报告；只解析，不落库"""
 
     spec: str
     source_format: str
+    # 报告最上面的一句结论；旧响应没有这个字段时按「可完整使用」的空文案处理
+    verdict: CardVerdict = Field(default_factory=lambda: CardVerdict(level="full", text=""))
     name: str = ""
     nickname: str = ""
     creator: str = ""
@@ -121,6 +236,10 @@ class CardInspectReport(BaseModel):
     unsupported: list[CardNoteItem] = Field(default_factory=list)
     notes: list[CardNoteItem] = Field(default_factory=list)
     target: TargetGates = Field(default_factory=TargetGates)
+    # 卡片脚本要下载的世界书；导入之后在人设页（或导入结果里）下载
+    remote_books: list[RemoteBookSource] = Field(default_factory=list)
+    # 角色状态模板的预览（见 `StateTemplateReport`）
+    state_template: Optional[StateTemplateReport] = None
 
 
 class CardImportOptions(BaseModel):
@@ -129,12 +248,15 @@ class CardImportOptions(BaseModel):
     `rule_enabled` 只能关掉默认启用的规则，或打开停用原因是 `html_output` /
     `disabled_in_card` 的规则；索引是规则在卡片里的位置。其余停用原因（安全、
     语义不符）即便请求里写了 `true` 也不会被打开，原因写进结果的 `notes`。
+    `rewrite_name_vars` 为假时卡内知识书里读名字的变量原样导入（卡片检查页照常显示会换哪些）。
     """
 
     include_system_prompt: bool = True
     include_post_history: bool = True
     include_depth_prompt: bool = True
     include_book: bool = True
+    # 把卡内书里「输出用户 / 角色名字」的变量换成 {{user}} / {{char}}；导入对话框里可以关掉
+    rewrite_name_vars: bool = True
     rule_enabled: dict[int, bool] = Field(default_factory=dict)
     greeting_pick: Literal["first", "random"] = "first"
     # 「打开并导入」：导入后把目标实例的高级提示词槽位打开（实例级覆盖，写审计）；
@@ -158,6 +280,10 @@ class CardImportResult(BaseModel):
     advanced_slots: Literal["not_requested", "not_needed", "already_enabled", "enabled", "failed"] = "not_requested"
     advanced_slots_error: str = ""
     advanced_slots_off_channels: list[SlotsOffChannel] = Field(default_factory=list)
+    # 卡片脚本要下载的世界书（同检查报告）；导入结果页按这个人设给出「下载并导入」
+    remote_books: list[RemoteBookSource] = Field(default_factory=list)
+    # 角色状态模板生成的结果（见 `StateTemplateReport`）
+    state_template: Optional[StateTemplateReport] = None
 
 
 class PresetCardResponse(BaseModel):
@@ -230,11 +356,13 @@ class TavernPreviewRequest(BaseModel):
     """提示词预览：看某个人设在这个频道里会拼出什么
 
     `sample_text` 的长度在路由里判：pydantic 的长度错误是 422、英文路径，而这里要的是
-    400 与一句中文原因。`preset_id` 为空表示用频道当前人设。
+    400 与一句中文原因。`preset_id` 为空表示用频道当前人设；`rp_preset_id` 为空表示用
+    频道当前配置选的角色扮演预设，非空则预览这一份（仍要求槽位与运行时都开着）。
     """
 
     chat_key: str
     preset_id: Optional[int] = None
+    rp_preset_id: Optional[int] = None
     sample_text: Optional[str] = None
 
 
@@ -338,10 +466,19 @@ __all__ = [
     "CardInspectReport",
     "CardNoteItem",
     "CardReassembleResponse",
+    "CardVerdict",
     "CleanupRuleInspect",
     "DepthPromptInspect",
     "PresetCardResponse",
     "PresetCardUpdateRequest",
+    "RemoteBookCheckRequest",
+    "RemoteBookCheckResult",
+    "RemoteBookDownloadRequest",
+    "RemoteBookImportResult",
+    "RemoteBookImported",
+    "RemoteBookSource",
+    "RemoteBookView",
+    "RemoteBooksResponse",
     "TargetGates",
     "TavernAuditItem",
     "TavernAuditResponse",

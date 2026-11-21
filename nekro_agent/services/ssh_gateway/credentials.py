@@ -675,6 +675,14 @@ class SshCredentialService:
             host_keys.append(SshHostKeyView(entry=text, fingerprint=fingerprint))
 
         can_manage = scope is None or row.created_via != C.CREATED_VIA_CHAT
+        duty_mode = ""
+        effective_mode = ""
+        if scope is None and row.owner_kind == C.OWNER_PLATFORM:
+            # 值守模式只给平台方看（租户本来就看不到平台方行，这里再挡一层）
+            from nekro_agent.services.ssh_gateway.authz import effective_duty_mode
+
+            duty_mode = str(row.duty_mode or "")
+            effective_mode = effective_duty_mode(row)
         owner_whitelisted: Optional[bool] = None
         if row.owner_kind == C.OWNER_USER:
             owner_whitelisted = matches_super_users(
@@ -717,6 +725,8 @@ class SshCredentialService:
             owner_whitelisted=owner_whitelisted,
             can_reveal=can_manage,
             can_edit_connection=can_manage,
+            duty_mode=duty_mode,
+            effective_duty_mode=effective_mode,
         )
 
     async def _write_audit(

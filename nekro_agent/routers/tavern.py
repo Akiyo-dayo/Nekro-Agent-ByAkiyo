@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import secrets
 import time
 from typing import Any, Optional
@@ -34,8 +35,9 @@ from nekro_agent.models.db_chat_channel import DBChatChannel
 from nekro_agent.models.db_config_audit import DBConfigChangeAudit
 from nekro_agent.models.db_llm_usage import DBLLMUsageRecord
 from nekro_agent.models.db_model_group import DBModelGroup
-from nekro_agent.models.db_preset import DBPreset
+from nekro_agent.models.db_preset import GLOBAL_PRESET_OWNER, DBPreset
 from nekro_agent.models.db_preset_card import DBPresetCard
+from nekro_agent.models.db_rp_preset import DBRpPreset
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.models.db_wb_book import DBWbBook
 from nekro_agent.routers.chat_channel import assert_channel_accessible
@@ -54,6 +56,12 @@ from nekro_agent.schemas.tavern import (
     CardReassembleResponse,
     PresetCardResponse,
     PresetCardUpdateRequest,
+    RemoteBookCheckRequest,
+    RemoteBookCheckResult,
+    RemoteBookDownloadRequest,
+    RemoteBookImportResult,
+    RemoteBookSource,
+    RemoteBooksResponse,
     SlotsOffChannel,
     TargetGates,
     TavernAuditItem,
@@ -83,6 +91,7 @@ from nekro_agent.services.tavern import cleanup_runtime as cleanup_runtime_servi
 from nekro_agent.services.tavern import exporter as exporter_service
 from nekro_agent.services.tavern import importer as importer_service
 from nekro_agent.services.tavern import preview as preview_service
+from nekro_agent.services.tavern import remote_books as remote_books_service
 from nekro_agent.services.tavern import trial as trial_service
 from nekro_agent.services.tavern.assemble import assemble_content, content_sha256
 from nekro_agent.services.tavern.card_format import CardFileRejected
@@ -102,7 +111,9 @@ from nekro_agent.services.user.tenant_perm import (
     get_tenant_scope,
     instance_refs_filter,
 )
+from nekro_agent.services.worldbook import purpose as worldbook_purpose
 from nekro_agent.services.worldbook import service as worldbook_service
+from nekro_agent.services.worldbook import tokens as worldbook_tokens
 
 router = APIRouter(prefix="/tavern", tags=["Tavern"])
 logger = get_sub_logger("tavern.admin")
@@ -363,13 +374,21 @@ async def _enable_slots_after_import(
 
 
 def _strip_original(rules: Any) -> list[dict[str, Any]]:
-    """返回给前端的规则不带 `original`：那是导出还原用的底稿，可能很大"""
+    """返回给前端的规则不带 `original`：那是导出还原用的底稿，可能很大
+
+    另外补两个给页面看的值：`output_mode`（旧数据没有这个键，按 `replace` 补上）与 `html_kind`
+    （替换文字带 HTML 时它属于哪一类，见 `worldbook.unsupported.classify_code`；不带 HTML 为空串）。
+    `html_kind` 是现算的，保存时传回来也不会存。
+    """
     if not isinstance(rules, list):
         return []
     result: list[dict[str, Any]] = []
     for rule in rules:
         if isinstance(rule, dict):
-            result.append({key: value for key, value in rule.items() if key != "original"})
+            item = {key: value for key, value in rule.items() if key != "original"}
+            item["output_mode"] = cleanup.output_mode_of(rule)
+            item["html_kind"] = cleanup.html_kind_of(rule)
+            result.append(item)
     return result
 
 
@@ -472,6 +491,7 @@ def _restore_rule_originals(
                 "enabled": bool(rule.get("enabled")),
                 "disabled_reason": rule.get("disabled_reason") if isinstance(rule.get("disabled_reason"), str) else "",
                 "original": original if isinstance(original, dict) else None,
+                "output_mode": cleanup.output_mode_of(rule),
             },
         )
     return result
@@ -570,19 +590,26 @@ async def inspect_card_endpoint(
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> CardInspectReport:
     """只解析上传的卡片，返回导入报告与拼装预览"""
+    tenant_key = worldbook_purpose.tenant_slot_key(get_tenant_scope(_current_user))
+    # 这个租户已有卡片检查在分析就先拒掉，省得先把上传文件读进内存、解析一遍才 409
+    # （上传本身在进到这里之前已经被框架收完，这一步省不了带宽）
+    worldbook_purpose.ensure_inspect_slot_free(tenant_key)
     data = await _read_upload(file)
     _scope, instance = await _scope_with_instance(_current_user, instance_key, adapter_key)
-    budget_chars = (
-        worldbook_service.import_budget_chars(instance.adapter_key, instance.instance_key)
+    await worldbook_tokens.ensure_loaded_async()
+    budget = (
+        worldbook_service.import_budget(instance.adapter_key, instance.instance_key)
         if instance is not None
-        else worldbook_service.import_budget_chars("", "")
+        else worldbook_service.import_budget("", "")
     )
     try:
         return await importer_service.inspect_card(
             data,
             template=config.TAVERN_CARD_TEMPLATE,
             target=await _import_gates(instance),
-            budget_chars=budget_chars,
+            budget=budget,
+            tenant_key=tenant_key,
+            owner_instance_key=instance.instance_key if instance is not None else "",
         )
     except CardFileRejected as exc:
         raise ValidationError(reason=str(exc)) from exc
@@ -613,6 +640,10 @@ async def import_card_endpoint(
         if adapter_key and instance.adapter_key != adapter_key:
             # 同一个 instance_key 可能在别的适配器下也有实例；导入要写归属，必须落对行。
             instance = await assert_instance_accessible(_current_user, scope, adapter_key=adapter_key)
+    tenant_key = worldbook_purpose.tenant_slot_key(get_tenant_scope(_current_user))
+    # 这个租户已有导入在分析就先拒掉，省得先读上传文件、解析、处理头像（都在事件循环上）才 409
+    # （上传本身在进到这里之前已经被框架收完，这一步省不了带宽）
+    worldbook_purpose.ensure_import_slot_free(tenant_key)
     data = await _read_upload(file)
     book_owner = (instance.adapter_key, instance.instance_key) if instance is not None else ("", "")
     try:
@@ -623,6 +654,7 @@ async def import_card_endpoint(
             book_owner=book_owner,
             username=_current_user.username,
             template=config.TAVERN_CARD_TEMPLATE,
+            tenant_key=tenant_key,
         )
     except CardFileRejected as exc:
         raise ValidationError(reason=str(exc)) from exc
@@ -746,6 +778,160 @@ async def export_preset_card(
     return Response(content=payload, media_type=media_type, headers={"Content-Disposition": disposition})
 
 
+# ---------------------------------------------------------------------------
+# 卡片脚本要下载的世界书（见 `services/tavern/remote_books.py`）
+# ---------------------------------------------------------------------------
+
+_REMOTE_KEY = re.compile(r"[0-9a-f]{16}")
+
+
+async def _remote_book_target(
+    user: DBUser,
+    preset_id: int,
+    instance_key: str,
+    adapter_key: str,
+    *,
+    write: bool,
+) -> tuple[DBPreset, tuple[str, str]]:
+    """取人设并定书的归属，与世界书页建人设书同一套判据（`routers/worldbook._resolve_owner_for_create`）
+
+    读：人设可见即可。写：租户要对人设有写权限（全局人设 403）；平台方选了实例时人设对该实例可见即可，
+    没选实例时只能给全局人设导（归属为空），实例自己的人设要先选实例。
+    """
+    scope, instance = await _scope_with_instance(user, instance_key, adapter_key)
+    if write and get_tenant_scope(user) is not None:
+        preset = await get_writable_preset(preset_id, scope)
+    else:
+        preset = await get_visible_preset(preset_id, scope)
+        if write and instance is None and preset.owner_instance_key != GLOBAL_PRESET_OWNER:
+            raise ValidationError(reason="这个人设属于某个实例，请先选择实例")
+    owner = (instance.adapter_key, instance.instance_key) if instance is not None else ("", "")
+    return preset, owner
+
+
+async def _remote_book_source(preset_id: int, key: str) -> RemoteBookSource:
+    """按 `key` 从人设的卡片原文里重新认出来源；认不出就 404（不接受前端传来的地址）"""
+    source = await remote_books_service.find_source(preset_id, key) if _REMOTE_KEY.fullmatch(key) else None
+    if source is None:
+        raise NotFoundError(resource="远程世界书来源")
+    return source
+
+
+@router.get("/presets/{preset_id}/remote-books", summary="人设的卡片脚本要下载的世界书")
+@require_role(Role.Admin)
+async def list_remote_books(
+    preset_id: int,
+    instance_key: str = "",
+    adapter_key: str = "",
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> RemoteBooksResponse:
+    """认出的来源，加上这个作用域下已经导入的书；系统默认代理只对平台方显示"""
+    preset, owner = await _remote_book_target(_current_user, preset_id, instance_key, adapter_key, write=False)
+    return RemoteBooksResponse(
+        preset_id=preset.id,
+        proxy_available=get_tenant_scope(_current_user) is None and remote_books_service.proxy_available(),
+        sources=await remote_books_service.list_view(preset, owner),
+    )
+
+
+def _reject_tenant_proxy(user: DBUser, use_proxy: bool) -> None:
+    """系统默认代理是平台方的出口，租户不能借它出网"""
+    if use_proxy and get_tenant_scope(user) is not None:
+        raise ValidationError(reason="系统默认代理只有平台方能用")
+
+
+@router.post("/presets/{preset_id}/remote-books/{key}/download", summary="下载并导入卡片脚本要的世界书")
+@require_role(Role.Admin)
+async def download_remote_book(
+    preset_id: int,
+    key: str,
+    req: RemoteBookDownloadRequest,
+    instance_key: str = "",
+    adapter_key: str = "",
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> RemoteBookImportResult:
+    """由 NA 代为下载（下载守卫；平台方可选走系统默认代理），转换后作为这个人设的参考资料导入"""
+    _reject_tenant_proxy(_current_user, req.use_proxy)
+    preset, owner = await _remote_book_target(_current_user, preset_id, instance_key, adapter_key, write=True)
+    source = await _remote_book_source(preset.id, key)
+    tenant_id = get_tenant_scope(_current_user)
+    tenant_key = worldbook_purpose.tenant_slot_key(tenant_id)
+    # 导入分析的名额被占就先拒掉，省得下载完才 409
+    worldbook_purpose.ensure_import_slot_free(tenant_key)
+    result = await remote_books_service.download_and_import(
+        preset=preset,
+        source=source,
+        owner=owner,
+        use_proxy=req.use_proxy,
+        replace=req.replace,
+        username=_current_user.username,
+        is_platform=tenant_id is None,
+        tenant_key=tenant_key,
+    )
+    logger.info(
+        f"远程世界书已{'更新' if result.replaced else '导入'}：人设 {preset.id}，书 {result.book_id}，"
+        f"来自 {result.host}，{result.report.created} 条"
+    )
+    return result
+
+
+@router.post("/presets/{preset_id}/remote-books/{key}/check", summary="检查卡片脚本要的世界书有没有更新")
+@require_role(Role.Admin)
+async def check_remote_book(
+    preset_id: int,
+    key: str,
+    req: RemoteBookCheckRequest,
+    instance_key: str = "",
+    adapter_key: str = "",
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> RemoteBookCheckResult:
+    """再下载一遍，只和已经导入的那本比较，不导入"""
+    _reject_tenant_proxy(_current_user, req.use_proxy)
+    preset, owner = await _remote_book_target(_current_user, preset_id, instance_key, adapter_key, write=True)
+    source = await _remote_book_source(preset.id, key)
+    tenant_id = get_tenant_scope(_current_user)
+    tenant_key = worldbook_purpose.tenant_slot_key(tenant_id)
+    worldbook_purpose.ensure_import_slot_free(tenant_key)
+    return await remote_books_service.check_update(
+        preset=preset,
+        source=source,
+        owner=owner,
+        use_proxy=req.use_proxy,
+        is_platform=tenant_id is None,
+        tenant_key=tenant_key,
+    )
+
+
+@router.post("/presets/{preset_id}/remote-books/{key}/upload", summary="手动上传卡片脚本要的世界书")
+@require_role(Role.Admin)
+async def upload_remote_book(
+    preset_id: int,
+    key: str,
+    file: UploadFile = File(...),
+    replace: bool = Form(False),
+    instance_key: str = Query(""),
+    adapter_key: str = Query(""),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> RemoteBookImportResult:
+    """下载不下来时，管理员自己拿到文件上传；与下载同一条导入路径"""
+    preset, owner = await _remote_book_target(_current_user, preset_id, instance_key, adapter_key, write=True)
+    source = await _remote_book_source(preset.id, key)
+    tenant_id = get_tenant_scope(_current_user)
+    tenant_key = worldbook_purpose.tenant_slot_key(tenant_id)
+    worldbook_purpose.ensure_import_slot_free(tenant_key)
+    data = await _read_upload(file)
+    return await remote_books_service.import_upload(
+        preset=preset,
+        source=source,
+        owner=owner,
+        data=data,
+        replace=replace,
+        username=_current_user.username,
+        is_platform=tenant_id is None,
+        tenant_key=tenant_key,
+    )
+
+
 async def _select_trial_group(
     user: DBUser,
     channel: DBChatChannel,
@@ -811,6 +997,14 @@ async def preview_prompt(
         # 换人设只看，不切换：可见性按频道所属实例判，与设置人设的入口同一口径。
         preset_override = await get_visible_preset(req.preset_id, channel.instance_key)
 
+    rp_preset_override: Optional[DBRpPreset] = None
+    if req.rp_preset_id is not None:
+        # 与运行时同一口径：全局的或属于这个实例的才看得见；看不见按不存在处理。
+        row = await DBRpPreset.filter(id=req.rp_preset_id).first()
+        if row is None or row.owner_instance_key not in ("", channel.instance_key):
+            raise NotFoundError(resource="角色扮演预设")
+        rp_preset_override = row
+
     tenant_scope = get_tenant_scope(_current_user) is not None
     hidden_book_ids: set[int] = set()
     if tenant_scope:
@@ -840,6 +1034,7 @@ async def preview_prompt(
         extra_history_lines=extra_history_lines,
         hidden_book_ids=hidden_book_ids,
         mask_platform_slots=tenant_scope,
+        rp_preset_override=rp_preset_override,
     )
     return preview_service.build_preview_response(prompt, token)
 

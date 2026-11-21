@@ -392,7 +392,8 @@ class TestContainerFiles:
 
         monkeypatch.setattr(container_files, "fix_permissions_in_container", fix)
         await container_files.write_nk_ssh_files(workspace, listen_address=CONTROLLER, private_key="PRIVATE")
-        directory = Path(manager_module.WORKSPACE_ROOT_DIR) / str(workspace.id) / ".claude_home" / "nk-ssh"
+        # 新工作区的 home 在工作区目录之外
+        directory = Path(manager_module.WORKSPACE_ROOT_DIR) / ".nk-homes" / str(workspace.id) / "claude" / "nk-ssh"
         assert (directory / "config").read_text(encoding="utf-8").startswith("# 由 NekroAgent 生成")
         assert (directory / "known_hosts").read_text(encoding="utf-8") == "nk-gateway ssh-ed25519 AAAAGW test\n"
         assert (directory / "id_gateway").read_text(encoding="utf-8") == "PRIVATE"

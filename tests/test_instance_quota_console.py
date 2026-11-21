@@ -24,8 +24,6 @@ from nekro_agent.core.config import config
 from nekro_agent.core.core_utils import ConfigManager
 from nekro_agent.core.os_env import OsEnv
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
-from nekro_agent.models.db_chat_channel import DBChatChannel
-from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.routers.config import _assert_config_key_accessible
 from nekro_agent.routers.console.quota import (
@@ -369,7 +367,7 @@ class TestBatchUpdate:
 class TestQuotaUsage:
     """配额判定发生在频道粒度，实例视角的指标要如实反映这一点"""
 
-    async def test_usage_counts_bot_replies_per_channel(self, db):
+    async def test_usage_counts_reply_rounds_per_channel(self, db):
         await _seed_channel_replies(
             {
                 f"{ADAPTER}-{OWN_INSTANCE}-group_1": 5,
@@ -391,45 +389,20 @@ class TestQuotaUsage:
 
 
 async def _seed_channel_replies(counts: Dict[str, int]) -> None:
-    """按频道写入若干条 Bot 回复，外加一条系统消息与一条用户消息作干扰项
+    """按频道写入当天的回复回合数
 
-    配额只计 Bot 发出的、非 SYSTEM 的消息，这两条干扰项确保过滤条件确实生效。
+    数据源是 `DBChannelQuotaDaily.replies`：一个回合只记一次，不再按 Bot 消息条数统计。
     """
-    import time
+    from nekro_agent.models.db_channel_quota import DBChannelQuotaDaily
+    from nekro_agent.services.channel_quota.counter import quota_day
 
-    now = int(time.time())
+    day = quota_day()
     for chat_key, count in counts.items():
         instance_key = chat_key.split("-")[1]
-        await DBChatChannel.create(
+        await DBChannelQuotaDaily.create(
+            chat_key=chat_key,
             adapter_key=ADAPTER,
             instance_key=instance_key,
-            channel_id=chat_key.rsplit("-", maxsplit=1)[-1],
-            chat_key=chat_key,
-            channel_type="group",
-            data="{}",
+            day=day,
+            replies=count,
         )
-        for index in range(count):
-            await _create_message(chat_key, instance_key, sender_id="-1", sender_name="Bot", index=index, now=now)
-        await _create_message(chat_key, instance_key, sender_id="-1", sender_name="SYSTEM", index=900, now=now)
-        await _create_message(chat_key, instance_key, sender_id="1001", sender_name="User", index=901, now=now)
-
-
-async def _create_message(chat_key: str, instance_key: str, *, sender_id: str, sender_name: str, index: int, now: int):
-    await DBChatMessage.create(
-        sender_id=sender_id,
-        sender_name=sender_name,
-        sender_nickname=sender_name,
-        is_tome=0,
-        is_recalled=False,
-        adapter_key=ADAPTER,
-        instance_key=instance_key,
-        message_id=f"{chat_key}-{index}",
-        chat_key=chat_key,
-        chat_type="group",
-        platform_userid=sender_id,
-        content_text="hi",
-        content_data="[]",
-        raw_cq_code="",
-        ext_data="{}",
-        send_timestamp=now,
-    )

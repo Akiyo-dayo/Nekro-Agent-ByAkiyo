@@ -2,6 +2,68 @@
   "title": "Affection",
   "subtitle": "How the bot feels about each person, isolated per instance",
   "scopeBanner": "Only affection under this instance is listed and editable; other instances stay invisible",
+  "view": {
+    "list": "List",
+    "graph": "Graph"
+  },
+  "graph": {
+    "clusters": {
+      "preset": "Presets",
+      "person": "People",
+      "milestone": "Milestones",
+      "channel": "Chats"
+    },
+    "kind": {
+      "preset": "Preset",
+      "person": "Person",
+      "milestone": "Milestone",
+      "channel": "Chat"
+    },
+    "toolbar": {
+      "zoom": "Zoom",
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "viewStar": "Star view",
+      "viewClusters": "By kind",
+      "densityLow": "Sparse",
+      "densityMedium": "Balanced",
+      "densityHigh": "Dense"
+    },
+    "focus": {
+      "title": "Focus",
+      "hint": "Presets sit in the middle with people around them; thicker lines mean higher scores, the colour is the closeness, and dashed lines mean wary or hostile. Click a person to see their affection, call name, milestones and when they were last seen. Drag or scroll to pan; hold Ctrl or Command while scrolling to zoom."
+    },
+    "stats": {
+      "preset": "Presets {{count}}",
+      "person": "People {{count}}",
+      "milestone": "Milestones {{count}}",
+      "channel": "Chats {{count}}"
+    },
+    "truncated": "Showing the {{drawn}} most recently updated of {{total}}; search or filter by closeness to narrow it down",
+    "skippedMerged": "{{count}} more belong to merged secondary accounts and are not drawn",
+    "empty": "No affection records for the current scope and filters yet.",
+    "notFound": "This instance does not exist or is outside what you can manage.",
+    "panel": {
+      "title": "Details",
+      "close": "Close",
+      "none": "—",
+      "callName": "Called",
+      "callNameLine": "Called: {{name}}",
+      "lastSeen": "Last seen",
+      "lastChannel": "Last seen in",
+      "records": "Affection per preset",
+      "stageScore": "{{stage}} · {{score}}",
+      "recordMeta": "Last interaction {{time}} · {{count}} rounds",
+      "openDetail": "Full details",
+      "milestones": "Milestones ({{count}})",
+      "milestoneHidden": "(text not available)",
+      "eventTime": "Time",
+      "person": "Belongs to",
+      "seenHere": "People last seen here",
+      "personCount": "People",
+      "inUseChannels": "Chats using it"
+    }
+  },
   "filters": {
     "searchPlaceholder": "Search nickname or user id",
     "clearSearch": "Clear search",
@@ -22,12 +84,14 @@
     "feeling": "In the bot's eyes",
     "feelingEmpty": "No impression yet",
     "interactions": "Chats",
+    "interactionsInline": "{{count}} chat(s)",
     "actions": "Actions",
     "mergedInto": "Merged into {{person}}; this row is dormant, editing it has no effect",
     "inUse": "In use · {{count}} channel(s)",
     "notInUse": "No channel uses it",
     "showOtherPresets": "{{count}} more preset(s) for this person",
-    "hideOtherPresets": "Hide other presets"
+    "hideOtherPresets": "Hide other presets",
+    "instanceTooltip": "Instance {{instance}}"
   },
   "empty": {
     "title": "Nobody remembered yet",
@@ -47,6 +111,13 @@
   },
   "detail": {
     "title": "This relationship",
+    "keyFacts": "Key facts",
+    "facts": {
+      "domain": "Domain",
+      "preset": "Preset",
+      "interactions": "Chats",
+      "inUse": "Channels"
+    },
     "loadFailed": "This affection record is not visible or no longer exists (it may have been reset, or it belongs to another instance)",
     "timeline": "What happened",
     "timelineEmpty": "Nothing recorded yet",

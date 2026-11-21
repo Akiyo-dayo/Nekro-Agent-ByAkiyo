@@ -48,6 +48,7 @@ from nekro_agent.services.ssh_gateway.lease import (
     create_lease,
     find_lease,
     leases_for_workspace,
+    on_lease_end,
     reset_leases,
 )
 from nekro_agent.services.ssh_gateway.secrets import encrypt_secret
@@ -423,6 +424,33 @@ class TestDelegateTaskStream:
             assert _StreamClient.states == [LEASE_STATE_RUNNING], "第一条正文到达时租约才生效"
         assert ctls, "任务照样把终态交给上层"
         await generator.aclose()
+
+    async def test_duty_lease_keeps_task_text_and_result_before_it_ends(
+        self,
+        db,
+        monkeypatch: pytest.MonkeyPatch,
+        lease_and_handle: Any,
+    ) -> None:  # noqa: ARG002
+        """带值守覆盖的租约：任务正文与 CC 最后一条结果在租约结束之前记下（结束回调读得到）"""
+        workspace, handle, lease_id = await lease_and_handle("success")
+        lease = find_lease(workspace.id, TASK_REF)
+        assert lease is not None
+        lease.duty_ids = frozenset(lease.credential_ids)
+        seen_at_end: List[str] = []
+        on_lease_end(lambda ended: seen_at_end.append(ended.final_result))
+        _StreamClient.mode = "success"
+        _StreamClient.states = []
+        _StreamClient.task_ref = TASK_REF
+        _StreamClient.workspace_id = workspace.id
+        _install_task_stubs(monkeypatch)
+
+        ctls = [ctl async for ctl in cc._cc_delegate_task(handle, workspace.id, "做点事", ssh_lease_id=lease_id)]  # noqa: SLF001
+
+        success = [ctl for ctl in ctls if ctl.signal.value == "success"]
+        assert success and isinstance(success[0].data, str)
+        assert lease.task_text == "做点事"
+        assert lease.final_result == success[0].data
+        assert seen_at_end == [success[0].data], "结束回调里已经能读到结果"
 
     async def test_task_without_lease_id_does_not_claim_a_leftover_lease(
         self,

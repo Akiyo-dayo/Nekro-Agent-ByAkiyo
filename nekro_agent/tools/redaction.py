@@ -45,6 +45,9 @@ _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"\b[A-Za-z]:\\[^\s'\",)]+")
 # 凭据形态。分成三条而不是一条大正则，是为了各自能给出可读的替换标记
 _BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}")
 _SK_PREFIXED_RE = re.compile(r"\b(?:sk|xai|gsk|hf|ghp|glpat)-[A-Za-z0-9._\-]{8,}")
+# Google API Key（Gemini 原生接口用，正规的是 AIza 加 35 位；放宽到 30 位以上，粘错一两位的也遮）。
+# 前面不加 `\b`：转义后的 `\n` 会把下一段 Key 黏在字母 `n` 后面
+_GOOGLE_KEY_RE = re.compile(r"AIza[0-9A-Za-z_\-]{30,}")
 _KV_SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|apikey|access[_-]?token|token|secret|password|authorization)"
     r"(\s*[=:]\s*)([\"']?)([^\s\"',&;]{4,})\3",
@@ -89,6 +92,7 @@ def redact_credentials(value: str, literal_secrets: Iterable[str] = ()) -> str:
             value = value.replace(secret, REDACTED_CREDENTIAL)
     value = _BEARER_RE.sub(lambda m: f"{m.group(1)} {REDACTED_CREDENTIAL}", value)
     value = _SK_PREFIXED_RE.sub(REDACTED_CREDENTIAL, value)
+    value = _GOOGLE_KEY_RE.sub(REDACTED_CREDENTIAL, value)
     return _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED_CREDENTIAL}", value)
 
 

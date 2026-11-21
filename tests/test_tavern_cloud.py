@@ -1048,3 +1048,47 @@ class TestShareDownloadRoundTrip:
 
         assert _strip_modification_date(after) == _strip_modification_date(before)
         assert downloaded.content == preset.content
+
+
+class TestDownloadWhileImportBusy:
+    """同一个租户的导入正在分析时下载云端卡片：回 409，不退回只建人设"""
+
+    async def _download(self, world: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Any:
+        envelope = build_envelope(
+            _v3_card(),
+            content="信封正文",
+            prefill="",
+            macros_enabled=True,
+            greeting_pick="first",
+            prev_ext_data=None,
+        )
+        _serve_detail(monkeypatch, _detail(ext_data=envelope, content="云端正文"))
+        return await presets_market.download_preset(REMOTE_ID, instance_key="t1a", _current_user=world["tenant"])
+
+    async def test_refused_up_front(self, world: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+        from nekro_agent.schemas.errors import WorldbookAnalysisBusyError
+        from nekro_agent.services.user.tenant_perm import get_tenant_scope
+        from nekro_agent.services.worldbook import purpose as wb_purpose
+
+        key = wb_purpose.tenant_slot_key(get_tenant_scope(world["tenant"]))
+        wb_purpose._import_running.add(key)
+        try:
+            with pytest.raises(WorldbookAnalysisBusyError):
+                await self._download(world, monkeypatch)
+        finally:
+            wb_purpose._import_running.discard(key)
+        assert not await DBPreset.filter(remote_id=REMOTE_ID).exists()
+
+    async def test_busy_during_the_import_is_not_swallowed(
+        self, world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from nekro_agent.schemas.errors import WorldbookAnalysisBusyError
+
+        async def busy(*_args: Any, **_kwargs: Any) -> Any:
+            raise WorldbookAnalysisBusyError()
+
+        # 提前检查放过了（两个请求同时到），真正占名额时才发现忙
+        monkeypatch.setattr(importer.wb_purpose, "run_import_analysis", busy)
+        with pytest.raises(WorldbookAnalysisBusyError):
+            await self._download(world, monkeypatch)
+        assert not await DBPreset.filter(remote_id=REMOTE_ID).exists()

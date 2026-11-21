@@ -21,6 +21,9 @@ from nekro_agent.services.tavern.cleanup import (
     HTML_OUTPUT,
     INVALID_REGEX,
     NOT_AI_OUTPUT,
+    OUTPUT_DROP,
+    OUTPUT_REPLACE,
+    OUTPUT_TEXT,
     PROMPT_ONLY,
     UNSAFE_REGEX,
     CompiledRule,
@@ -88,8 +91,31 @@ class TestDisabledReasons:
     def test_unsafe_regex(self) -> None:
         assert rule_from_st_script(_script(findRegex="/(a+)+/"))["disabled_reason"] == UNSAFE_REGEX
 
-    def test_html_output(self) -> None:
-        assert rule_from_st_script(_script(replaceString="<b>状态</b>"))["disabled_reason"] == HTML_OUTPUT
+    def test_html_output_is_enabled_as_text_only(self) -> None:
+        # 输出 HTML 的规则不再停用：启用并只留正文（QQ 显示不了网页）
+        rule = rule_from_st_script(_script(replaceString="<b>状态</b>$1"))
+
+        assert rule["enabled"] is True
+        assert rule["disabled_reason"] == ""
+        assert rule["output_mode"] == OUTPUT_TEXT
+
+    def test_html_output_with_an_image_is_dropped(self) -> None:
+        rule = rule_from_st_script(_script(replaceString='<IMG src="https://img.example.test/$1.png">'))
+
+        assert rule["enabled"] is True
+        assert rule["output_mode"] == OUTPUT_DROP
+
+    def test_html_output_that_could_not_be_saved_stays_disabled(self) -> None:
+        # 启用以后过不了保存校验（去除串超过 20 个）的，照旧停用，免得规则表存不回去
+        rule = rule_from_st_script(_script(replaceString="<b>状态</b>", trimStrings=["x"] * 21))
+
+        assert rule["enabled"] is False
+        assert rule["disabled_reason"] == HTML_OUTPUT
+        # 处理方式照样给默认值：管理员改好去除串再打开时，不会先按 4000 字的「按替换文字」上限报错
+        assert rule["output_mode"] == OUTPUT_TEXT
+
+    def test_plain_rule_keeps_replace_mode(self) -> None:
+        assert rule_from_st_script(_script())["output_mode"] == OUTPUT_REPLACE
 
     def test_default_enabled_status_bar_rule(self) -> None:
         rule = rule_from_st_script(_script())

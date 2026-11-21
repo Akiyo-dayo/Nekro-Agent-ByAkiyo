@@ -4,6 +4,7 @@
   "scopeBanner": "作用域跟随顶栏实例；平台方不选实例时看全部",
   "tabs": {
     "books": "书",
+    "graph": "图谱",
     "quarantine": "隔离区",
     "test": "触发测试"
   },
@@ -18,7 +19,8 @@
     "hostContent": "宿主",
     "reference": "参考",
     "globalPreset": "全局人设",
-    "empty": "（空）"
+    "empty": "（空）",
+    "reasonSeparator": "；"
   },
   "scope": {
     "domain": "域",
@@ -39,10 +41,14 @@
   "roundDetail": {
     "title": "世界书",
     "chars": "共 {{chars}} 字",
+    "tokenValue": "{{tokens}} token",
+    "charSuffix": "{{chars}} 字",
     "suppressedHint": "被拦的下一轮不注入租户写的条目，宿主条目照常",
     "injectedTitle": "注入的条目",
-    "droppedTitle": "被预算跳过",
+    "droppedTitle": "命中了但没有注入",
+    "lookupTitle": "模型查询",
     "empty": "这一轮没有世界书条目",
+    "semanticHit": "语义 · {{score}}",
     "state": {
       "injected": "已注入",
       "none": "未命中",
@@ -56,9 +62,17 @@
       "atDepth": "深度"
     },
     "dropReason": {
+      "global_tokens": "超过本轮总 token 上限",
+      "book_tokens": "超过这本书的 token 上限",
       "global_chars": "超过本轮总字数上限",
       "book_chars": "超过这本书的字数上限",
-      "max_entries": "超过每轮条数上限"
+      "max_entries": "超过每轮条数上限",
+      "state_only": "仅在开启角色状态时使用",
+      "template_unsupported": "含不支持的模板",
+      "template_trap": "疑似防盗（变量读不到时才出现的大段文字）",
+      "template_error": "模板求值出错",
+      "template_empty": "模板算完为空",
+      "template_budget": "本轮模板求值预算用完"
     },
     "status": {
       "active": "正常",
@@ -70,12 +84,14 @@
       "unknown": "未知"
     },
     "columns": {
+      "id": "编号",
       "book": "书名",
       "title": "标题",
       "position": "位置",
       "trust": "类别",
       "status": "当前状态",
       "chars": "字数",
+      "tokens": "Token / 字数",
       "renders": "渲染次数",
       "reason": "原因",
       "actions": "操作"
@@ -118,17 +134,27 @@
       "enabledOff": "停用",
       "search": "关键词",
       "searchPlaceholder": "搜书名与描述",
-      "clear": "清空筛选"
+      "more": "更多筛选",
+      "moreWithCount": "更多筛选 ({{count}})",
+      "clear": "清空",
+      "done": "完成"
     },
     "columns": {
       "name": "名称",
       "scope": "作用域",
+      "effectiveScope": "生效范围",
       "instance": "实例",
       "entries": "条目",
       "enabled": "启用",
+      "status": "状态",
       "updatedAt": "更新时间"
     },
     "quarantinedCount": "其中 {{count}} 条隔离中",
+    "toggleStatus": "切换启用状态",
+    "enable": "启用",
+    "disable": "停用",
+    "enabledOn": "已启用",
+    "enabledOff": "已停用",
     "emptyTitle": "还没有世界书",
     "emptyHint": "新建一本，或导入酒馆世界书 JSON"
   },
@@ -185,24 +211,50 @@
       "position": "位置",
       "order": "顺序",
       "chars": "字数",
+      "tokens": "Token",
       "trust": "类别",
       "result": "结果"
     },
     "reasonConstant": "常驻",
     "reasonKey": "关键词「{{key}}」",
+    "reasonSemantic": "语义命中 · {{score}}",
     "selected": "入选",
-    "dropped": "被预算跳过：{{reason}}",
+    "ignoredBudget": "忽略预算",
+    "tokenWithChars": "{{tokens}} ({{chars}} 字)",
+    "dropped": "没有注入：{{reason}}",
+    "ahead": "前面占掉预算的：{{titles}}",
+    "aheadMore": "前面占掉预算的：{{titles}} 等 {{count}} 条",
     "notSelected": "未入选",
     "dropReason": {
+      "global_tokens": "全局 token 上限",
+      "book_tokens": "本书 token 上限",
       "global_chars": "全局字数上限",
       "book_chars": "本书字数上限",
-      "max_entries": "每轮条数上限"
+      "max_entries": "每轮条数上限",
+      "state_only": "仅在开启角色状态时使用",
+      "template_unsupported": "含不支持的模板",
+      "template_trap": "疑似防盗",
+      "template_error": "模板求值出错",
+      "template_empty": "模板算完为空",
+      "template_budget": "本轮模板预算用完"
     },
     "renderedTitle": "渲染结果",
     "renderedAfterPersona": "人设之后",
     "renderedBeforeHistory": "聊天记录之前",
     "renderedAtDepth": "深度 {{depth}}",
     "renderedCaption": "令牌用占位串 SESSION_TOKEN 代替；你看不到的书正文换成占位文字（平台方给全局人设建的书对你只读可见，正文照常显示）"
+  },
+  "budgetExplain": {
+    "line": "预算 {{budget}} token（约 {{approx}} 字）= min( {{percent}}% × ({{contextLength}} − {{outputReserve}}), {{cap}} )；模型组 {{modelGroup}}，分词系数 {{factor}}（{{source}}）",
+    "total": "本轮入选合计 {{total}} token",
+    "fallback": "备用模型组 {{modelGroup}} 的上下文只有 {{contextLength}}，换到它重试时世界书可能放不下",
+    "cap": "上限 {{cap}}",
+    "hardCap": "硬上限 {{cap}}",
+    "source": {
+      "group": "来源：模型组上填的",
+      "modelName": "来源：按模型名 {{family}}",
+      "default": "来源：默认"
+    }
   },
   "bookForm": {
     "createTitle": "新建世界书",
@@ -237,12 +289,44 @@
     "scanDepthHelper": "留空时默认 4",
     "scanDepthHelperPerson": "留空时默认 10",
     "scanDepthHelperEdit": "扫描最近几条消息（1 ~ 50）",
-    "budget": "本书每轮字数上限",
-    "budgetInvalid": "本书每轮字数上限需在 0 ~ 100000 之间",
+    "budget": "本书每轮 token 上限",
+    "budgetInvalid": "本书每轮 token 上限需在 0 ~ 65536 之间",
     "budgetHelper": "0 = 不单独限制",
+    "injectMode": {
+      "label": "注入方式",
+      "both": "推送和查询",
+      "push": "只推送",
+      "lookup": "只能查",
+      "helper": "只能查：常驻条目照常注入，关键词命中的不再自动注入，模型需要时自己查。几百条的百科类大书建议选它。"
+    },
+    "activeScene": {
+      "label": "生效场景",
+      "both": "私聊和群聊",
+      "private": "只在私聊",
+      "group": "只在群聊",
+      "helper": "围绕一对一写的书（人设里大量把对方称作用户的）建议只挂私聊。"
+    },
     "caseSensitive": "区分大小写",
     "matchWholeWords": "整词匹配",
     "matchWholeWordsHelper": "只对英文、数字关键词生效；中文关键词总是按包含匹配",
+    "scanNames": "扫描时带上说话人名字",
+    "scanNamesHelper": "开着时每条消息前带上说话人名字再匹配关键词：Bot 自己的消息用人设名，群友用昵称。写着人设名的条目只要 Bot 最近说过话就会命中；代价是群友改个昵称也能触发这本书里写着那个名字的条目。",
+    "scanNamesStDefault": "与酒馆新装默认一致。",
+    "semantic": {
+      "label": "语义触发",
+      "vectorAll": "全部条目都参与",
+      "vectorAllHelper": "除了关键词，最近的对话和条目内容意思相近时也会带出它。常驻条目每轮都在，不需要参与。",
+      "advanced": "调节",
+      "queryMessages": "取最近几条消息",
+      "queryMessagesHelper": "只数非空消息，范围 1 ~ 10，默认 2",
+      "queryMessagesInvalid": "取最近几条消息需在 1 ~ 10 之间",
+      "maxEntries": "每轮最多几条",
+      "maxEntriesHelper": "本书每轮最多由语义带出几条，范围 1 ~ 20，默认 5",
+      "maxEntriesInvalid": "每轮最多几条需在 1 ~ 20 之间",
+      "threshold": "相似度下限",
+      "thresholdHelper": "低于这个相似度不算命中，范围 0 ~ 1，默认 0.25",
+      "thresholdInvalid": "相似度下限需在 0 ~ 1 之间"
+    },
     "createSuccess": "世界书已创建",
     "updateSuccess": "设置已保存"
   },
@@ -255,6 +339,7 @@
     "noFile": "请选择文件",
     "fileSummary": "{{name}}（{{size}}）",
     "macroHint": "支持酒馆（SillyTavern）世界书 JSON；不支持的字段原样保存，导出时还原；{{example}} 等宏原样保留，不会替换",
+    "rewriteNameVars": "把读名字的变量换成 {{userMacro}} / {{charMacro}}",
     "reportTitle": "导入报告",
     "created": "导入 {{count}} 条",
     "notesTitle": "变动类别",
@@ -267,7 +352,14 @@
       "position_downgraded": "位置降级",
       "renumbered": "重新编号",
       "bad_value": "值不合法",
-      "over_budget": "正文超过每轮注入上限"
+      "over_budget": "正文超过每轮注入上限",
+      "name_var": "名字变量换成了宏",
+      "state_only": "仅在开启角色状态时使用（不进主提示词）",
+      "unsupported_template": "含不支持的模板（不注入）",
+      "suspected_trap": "疑似防盗条目",
+      "template_not_analyzed": "模板太多，导入时未逐条分析（运行时命中再分析）",
+      "budget_check": "预算体检",
+      "unsupported": "不生效清单（不支持的功能与模板）"
     },
     "detailsTitle": "明细",
     "detailColumns": {
@@ -292,17 +384,22 @@
     "deleteSuccess": "已删除这本书",
     "exportFailed": "导出失败",
     "entriesTitle": "条目",
+    "semanticParticipating": "语义触发 {{count}} 条",
+    "semanticPending": "向量生成中 {{count}} 条",
     "searchPlaceholder": "搜索标题、关键词或正文",
     "entriesEmpty": "这本书还没有条目",
+    "searchEmpty": "没有匹配的条目",
     "columns": {
       "title": "标题",
       "keys": "关键词",
       "position": "位置",
+      "positionOrder": "位置 · 顺序",
       "order": "顺序",
       "status": "状态",
       "trust": "类别",
       "actions": "操作"
     },
+    "moreActions": "更多操作",
     "keywordsMore": "等 {{count}} 个",
     "secondary": "{{logic}}，次关键词 {{count}} 个",
     "status": {
@@ -313,6 +410,25 @@
     "autoQuarantined": "被拦 {{count}} 次后自动隔离",
     "invalidKeys": "无效关键词：{{key}}（{{reason}}）",
     "slowKeys": "已停用（太慢）：{{key}}",
+    "purpose": {
+      "stateOnly": "仅在开启角色状态时使用",
+      "unsupported": "含不支持的模板",
+      "plot": "剧情专用"
+    },
+    "purposeKind": {
+      "mvu_update": "变量更新规则",
+      "initvar": "变量初值",
+      "state_render": "状态渲染"
+    },
+    "purposeHint": {
+      "stateOnly": "用途是「{{kind}}」，给以后的角色状态功能用，不进主提示词",
+      "unsupported": "模板里有 NA 不认的写法（{{reason}}），这一条整条不注入",
+      "plot": "标题带 [mvu_plot]：剧情用的设定，照常注入"
+    },
+    "trap": "疑似防盗",
+    "analysisPending": "分析中",
+    "analysisPendingHint": "这条的模板还没分析完，用途与防盗标记稍后自动更新",
+    "trapHint": "{{reason}}。这类文字是针对不执行模板的客户端埋的诱饵，NA 不会把它注入",
     "actions": {
       "view": "查看",
       "edit": "编辑",
@@ -330,7 +446,10 @@
     },
     "entryDeleteTitle": "删除条目",
     "entryDeleteDescription": "删除后不可恢复",
-    "entryDeleteSuccess": "已删除"
+    "entryDeleteSuccess": "已删除",
+    "budgetCheck": {
+      "truncated": "常驻条目太多，只看了编号最小的一批"
+    }
   },
   "entryDialog": {
     "createTitle": "新建条目",
@@ -358,6 +477,9 @@
     "regexSafety": "保存时服务端还会做安全检查（不许反向引用、嵌套重复等），不通过会逐个列出原因",
     "constant": "常驻",
     "constantHelper": "不看关键词，书生效就注入",
+    "vectorized": "参与语义触发",
+    "vectorizedHelper": "除了关键词，最近的对话和这条内容意思相近时也会带出它",
+    "vectorizedConstant": "常驻条目每轮都在，不需要",
     "content": "正文",
     "contentRequired": "正文不能为空",
     "contentTooLong": "正文不能超过 {{max}} 字",
@@ -395,11 +517,87 @@
     "trustedHelper": "不勾时这条按参考资料放进不可信块；改租户写的条目不会自动变成宿主内容",
     "trustedCreateHelper": "平台方新建的条目一律按宿主内容注入；要改成参考资料，建好后在编辑里取消勾选",
     "tenantTrustedHint": "你写的条目按参考资料注入（放进不可信块）",
+    "ignoreBudget": "忽略预算",
+    "ignoreBudgetHelper": "命中后不受全局与这本书的预算限制；仍受每轮条数上限，占用的 token 照样计入，后面的条目余量相应变少。只对平台方写的宿主条目生效。",
+    "ignoreBudgetNotHost": "这条不是宿主条目，开关不会生效",
     "personBookWarning": "这本书绑在某个人身上：这个人出现在最近的消息里时，这些条目会进提示词，全群都会受影响。",
     "invalidKeysWarning": "无效关键词：{{keys}}",
     "slowKeysWarning": "已停用（太慢）：{{keys}}",
     "quarantinedWarning": "这条在隔离中，改完仍需在隔离区或条目表里放回",
     "saveSuccess": "条目已保存"
+  },
+  "graph": {
+    "allBooks": "全部书",
+    "searchPlaceholder": "搜标题、关键词或正文",
+    "clearSearch": "清空搜索",
+    "bookPickerError": "书列表没取到，仍可按当前作用域看图",
+    "entryNotFound": "这一条不存在或已删除",
+    "entryWrongBook": "这一条不属于当前这本书",
+    "clusters": {
+      "book": "书",
+      "entry": "条目",
+      "person": "人",
+      "binding": "绑定"
+    },
+    "edges": {
+      "bookEntry": "包含",
+      "bookBinding": "绑定",
+      "keyReference": "关键词引用（推导）"
+    },
+    "legend": {
+      "booksTruncated": "书太多，只画了最近更新的 {{drawn}} 本，共 {{total}} 本。",
+      "entriesTruncated": "只画了最近注入最多的 {{drawn}} 条，共 {{total}} 条。",
+      "referencesTruncated": "引用关系没算完，部分「谁提到谁」没画。"
+    },
+    "empty": {
+      "noBooks": "还没有世界书",
+      "noBooksHint": "先建一本书，或在顶栏选一个实例",
+      "noEntries": "没有符合条件的条目",
+      "noEntriesHint": "当前范围里还没有可画的条目",
+      "filteredHint": "换个关键词、换本书，或把停用 / 隔离的条目也显示出来",
+      "clearFilters": "清空筛选",
+      "notFound": "没有找到这本书",
+      "notFoundHint": "书可能已删除，或不在当前作用域里"
+    },
+    "kind": {
+      "book": "书",
+      "entry": "条目",
+      "preset": "人设",
+      "channel": "频道",
+      "person": "人"
+    },
+    "bindingType": {
+      "preset": "人设",
+      "channel": "频道",
+      "person": "人"
+    },
+    "panel": {
+      "none": "无",
+      "boundTo": "绑定：{{target}}",
+      "entryCount": "条目 {{count}}",
+      "constantCount": "常驻 {{count}}",
+      "quarantinedCount": "隔离 {{count}}",
+      "injectMode": "注入方式",
+      "activeScene": "生效场景",
+      "vectorAll": "全部条目参与语义触发",
+      "openBook": "打开这本书",
+      "book": "所属书",
+      "injectionSummary": "最近 {{rounds}} 轮里：注入 {{injected}} 次、被预算挤掉 {{dropped}} 次、被模型查过 {{lookups}} 次",
+      "starved": "最近只被预算挤掉，一次都没进去过，可以调高预算或给它开『忽略预算』",
+      "starvedShort": "最近只被预算挤掉，一次都没注入过",
+      "preview": "正文预览",
+      "mentions": "它提到的",
+      "mentionedBy": "提到它的",
+      "openEntry": "在书里打开这一条",
+      "bindingType": "类型",
+      "boundBooks": "绑着的书（{{count}}）"
+    },
+    "flags": {
+      "constant": "常驻",
+      "vectorized": "参与语义触发",
+      "ignoreBudget": "忽略预算",
+      "trusted": "可信（宿主内容）"
+    }
   },
   "readOnly": {
     "chip": "平台方提供（只读）",

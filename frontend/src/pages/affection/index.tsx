@@ -13,7 +13,7 @@
  * 每个改动对话框都写明改的是哪个人设那一份——否则重置很容易落在一行没人用的旧人设上。
  */
 
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Alert,
   Box,
@@ -21,7 +21,12 @@ import {
   Chip,
   CircularProgress,
   Divider,
+  Drawer,
   Link,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
   Stack,
   SxProps,
   Table,
@@ -34,17 +39,19 @@ import {
   Typography,
   useTheme,
 } from '@mui/material'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import AutoFixHighRoundedIcon from '@mui/icons-material/AutoFixHighRounded'
 import CleaningServicesRoundedIcon from '@mui/icons-material/CleaningServicesRounded'
+import CloseRoundedIcon from '@mui/icons-material/CloseRounded'
 import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded'
 import EditNoteRoundedIcon from '@mui/icons-material/EditNoteRounded'
 import FavoriteRoundedIcon from '@mui/icons-material/FavoriteRounded'
+import MoreHorizRoundedIcon from '@mui/icons-material/MoreHorizRounded'
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
 import RestartAltRoundedIcon from '@mui/icons-material/RestartAltRounded'
-import TimelineRoundedIcon from '@mui/icons-material/TimelineRounded'
+import AssignmentIndRoundedIcon from '@mui/icons-material/AssignmentIndRounded'
 import ActionButton from '../../components/common/ActionButton'
 import FilterSelect from '../../components/common/FilterSelect'
 import IconActionButton from '../../components/common/IconActionButton'
@@ -53,8 +60,15 @@ import NekroDialog from '../../components/common/NekroDialog'
 import PaginationStyled from '../../components/common/PaginationStyled'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import SearchField from '../../components/common/SearchField'
+import StatusChip from '../../components/common/StatusChip'
+import DomainSettingsButton from '../../components/settings/DomainSettingsButton'
+import SegmentedControl from '../../components/common/SegmentedControl'
+import AffectionGraphView from '../../components/affection/AffectionGraphView'
+import { affectionStageColor } from '../../components/affection/affectionAtlasConfig'
 import { SimpleTooltip } from '../../components/common/ThemedTooltip'
+import { formatFullTime } from '../../utils/listTime'
 import PersonNotesSection from '../../components/worldbook/PersonNotesSection'
+import PersonMemorySection from '../../components/person/PersonMemorySection'
 import { useDeepLinkInstance, withDeepLinkInstance } from '../../hooks/useDeepLinkInstance'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 import { useNotification } from '../../hooks/useNotification'
@@ -67,6 +81,8 @@ import {
   type AffectionSortBy,
   type AffectionStageValue,
 } from '../../services/api/affection'
+import { stateTableApi } from '../../services/api/stateTable'
+import { statePath } from '../../router/routes'
 import { isNotFoundError } from '../../services/api/axios'
 
 const PAGE_SIZE = 20
@@ -79,36 +95,112 @@ const EVENT_TEXT_MAX = 160
 // 称呼的上限同样由服务端定（`store.MAX_CALL_NAME_LENGTH`），这里只做即时提示
 const CALL_NAME_MAX = 24
 
+const VIEW_STORAGE_KEY = 'affection.view'
+
+function readStoredView(): 'list' | 'graph' {
+  try {
+    return localStorage.getItem(VIEW_STORAGE_KEY) === 'graph' ? 'graph' : 'list'
+  } catch {
+    return 'list'
+  }
+}
+
+function writeStoredView(view: 'list' | 'graph') {
+  try {
+    localStorage.setItem(VIEW_STORAGE_KEY, view)
+  } catch {
+    // 隐私模式或存储被禁用时只是不记住，不影响页面
+  }
+}
+
 /**
  * 里程碑状态标签
  *
  * `active` 不画标签：一屏里绝大多数都是正常的，给每一条都挂一个「正常」只是噪音。
- * 其余几种都是「这条已经不在检索里了」，隔离给警告色，其余给灰或红。
+ * 其余几种都是「这条已经不在检索里了」；隔离、已删除、已清理、硬删除各按全站状态语气走。
  */
 function MilestoneStatusChip({ status }: { status: AffectionMilestoneStatus }) {
-  const theme = useTheme()
   const { t } = useTranslation('affection')
   if (status === 'active') return null
-  const color =
+  const tone =
     status === 'quarantined'
-      ? theme.palette.warning.main
+      ? 'quarantined'
       : status === 'deleted'
-        ? theme.palette.error.main
-        : theme.palette.text.disabled
-  return (
-    <Chip
-      size="small"
-      label={t(`detail.milestonesStatus.${status}`)}
-      sx={CHIP_VARIANTS.getCustomColorChip(color, true)}
-    />
-  )
+        ? 'inactive'
+        : status === 'hard_deleted'
+          ? 'failed'
+          : 'disabled'
+  return <StatusChip tone={tone} label={t(`detail.milestonesStatus.${status}`)} />
 }
 
-function formatDateTime(value: string | null, fallback: string): string {
-  if (!value) return fallback
-  const timestamp = new Date(value).getTime()
-  if (Number.isNaN(timestamp)) return fallback
-  return new Date(timestamp).toLocaleString()
+/** 非确认类动作（调分、编辑印象）也走右侧抽屉，页面里只给确认类交互留 Dialog */
+function ActionDrawer({
+  open,
+  title,
+  onClose,
+  closeLabel,
+  footer,
+  children,
+}: {
+  open: boolean
+  title: string
+  onClose: () => void
+  closeLabel: string
+  footer: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <Drawer
+      anchor="right"
+      open={open}
+      onClose={onClose}
+      PaperProps={{
+        sx: { width: { xs: '100%', sm: 520 }, maxWidth: '100%', bgcolor: 'background.paper' },
+      }}
+    >
+      <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <Box
+          sx={{
+            position: 'sticky',
+            top: 0,
+            zIndex: 2,
+            px: 2,
+            py: 1.5,
+            bgcolor: 'background.paper',
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+          }}
+        >
+          <Stack direction="row" alignItems="center" spacing={1.5}>
+            <Typography variant="h6" fontWeight={700} sx={{ minWidth: 0 }}>
+              {title}
+            </Typography>
+            <Box sx={{ flex: 1 }} />
+            <IconActionButton onClick={onClose} aria-label={closeLabel}>
+              <CloseRoundedIcon />
+            </IconActionButton>
+          </Stack>
+        </Box>
+        <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 2, py: 2 }}>{children}</Box>
+        <Box
+          sx={{
+            position: 'sticky',
+            bottom: 0,
+            zIndex: 2,
+            px: 2,
+            py: 1.5,
+            bgcolor: 'background.paper',
+            borderTop: '1px solid',
+            borderColor: 'divider',
+          }}
+        >
+          <Stack direction="row" spacing={1} justifyContent="flex-end">
+            {footer}
+          </Stack>
+        </Box>
+      </Box>
+    </Drawer>
+  )
 }
 
 /**
@@ -145,8 +237,10 @@ export default function AffectionPage() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const { t } = useTranslation('affection')
+  const { t: tState } = useTranslation('state')
   const { t: tCommon } = useTranslation('common')
-  const { currentInstanceKey, isScopeReady } = useInstanceScope()
+  const { currentInstanceKey, currentInstance, instances, isScopeSwitchable, isScopeReady } =
+    useInstanceScope()
   // 跳进来的链接带着 `instance` 时先切到那一份所在的实例（规则见 hook 的注释）
   useDeepLinkInstance()
 
@@ -177,6 +271,9 @@ export default function AffectionPage() {
     useState<AffectionMilestoneItem | null>(null)
   // 展开了「其他人设」的人，键与 `groupByPerson` 的分组键相同
   const [expandedPeople, setExpandedPeople] = useState<Set<string>>(() => new Set())
+  // 行尾「⋯」只开一个菜单：记住锚点和那一行
+  const [rowMenuAnchor, setRowMenuAnchor] = useState<HTMLElement | null>(null)
+  const [rowMenuTarget, setRowMenuTarget] = useState<AffectionItem | null>(null)
 
   // 地址栏里的 `record` 就是「这一份正开着」：进页面、刷新、前进后退都靠它恢复
   useEffect(() => {
@@ -227,12 +324,25 @@ export default function AffectionPage() {
    *
    * 阶段的语义由服务端的阈值表决定，前端只负责把"越亲近越暖"这件事画出来。
    */
-  const stageColor = (stage: AffectionStageValue): string => {
-    if (stage === 'trusted' || stage === 'close') return theme.palette.error.main
-    if (stage === 'friendly' || stage === 'acquainted') return theme.palette.success.main
-    if (stage === 'wary') return theme.palette.warning.main
-    if (stage === 'hostile') return theme.palette.text.disabled
-    return theme.palette.info.main
+  const stageColor = useCallback(
+    (stage: AffectionStageValue): string => affectionStageColor(theme, stage),
+    [theme]
+  )
+
+  // 列表 / 关系图（地址栏 `view`，列表时不写）：默认仍是列表；记住上一次的选择，
+  // 地址里显式给了 `view` 时以地址为准。关系图下排序与分页没有意义，搜索与阶段筛选照用。
+  const [storedView, setStoredView] = useState<'list' | 'graph'>(readStoredView)
+  const viewParam = searchParams.get('view')
+  const view: 'list' | 'graph' =
+    viewParam === 'graph' ? 'graph' : viewParam === 'list' ? 'list' : storedView
+  const setView = (next: 'list' | 'graph') => {
+    if (next === view) return
+    writeStoredView(next)
+    setStoredView(next)
+    const params = new URLSearchParams(searchParams)
+    if (next === 'graph') params.set('view', 'graph')
+    else params.delete('view')
+    setSearchParams(params, { replace: true })
   }
 
   const listQuery = useQuery({
@@ -250,11 +360,14 @@ export default function AffectionPage() {
     retry: false,
   })
 
+  // 概览的计数跟着搜索走：换了关键词先留住上一份，避免数字闪成 0 再跳回来。
+  // 阶段筛选不带 —— 概览本身就是按阶段分组的。
   const summaryQuery = useQuery({
-    queryKey: ['affection', 'summary', scopeParam],
-    queryFn: () => affectionApi.getSummary(scopeParam),
+    queryKey: ['affection', 'summary', scopeParam, search.trim()],
+    queryFn: () => affectionApi.getSummary(scopeParam, search.trim() || undefined),
     enabled: isScopeReady,
     retry: false,
+    placeholderData: keepPreviousData,
   })
 
   const detailQuery = useQuery({
@@ -263,6 +376,52 @@ export default function AffectionPage() {
     enabled: isScopeReady && detailId !== null,
     retry: false,
   })
+
+  /**
+   * 「角色状态档案」入口
+   *
+   * 状态插件按 (人设, 账号, 域) 存个人档案，好感这一行恰好带着这三项，所以先拿它换一个
+   * 档案编号。查不到（插件没启用、这个人还没写过状态）就是没有入口，不弹错误 ——
+   * 一条本来就不存在的数据不该在打开好感详情时刷一个红条。
+   */
+  // 与角色状态页同一个口径：只有一个实例（顶栏没有切换器）时就用那一个
+  const stateInstance =
+    currentInstance ?? (!isScopeSwitchable && instances.length === 1 ? instances[0] : null)
+  const stateScope = useMemo(
+    () =>
+      stateInstance?.instance_key && stateInstance.adapter_key
+        ? { adapter_key: stateInstance.adapter_key, instance_key: stateInstance.instance_key }
+        : null,
+    [stateInstance?.instance_key, stateInstance?.adapter_key]
+  )
+
+  const affectionItem = detailQuery.data?.item
+  const personLookupQuery = useQuery({
+    queryKey: [
+      'state-table',
+      'person-lookup',
+      stateScope?.adapter_key,
+      stateScope?.instance_key,
+      affectionItem?.preset_id,
+      affectionItem?.platform_userid,
+      affectionItem?.domain_group_id,
+    ],
+    queryFn: () =>
+      stateTableApi.lookupPerson(stateScope!, {
+        preset_id: affectionItem!.preset_id,
+        uid: affectionItem!.platform_userid,
+        domain_group_id: affectionItem!.domain_group_id,
+      }),
+    enabled:
+      isScopeReady &&
+      stateScope !== null &&
+      detailId !== null &&
+      affectionItem !== undefined,
+    retry: false,
+  })
+
+  // 404 与其它错误都落到 null：这一块只在真查到档案时才出现，不另报错
+  const stateProfileId = personLookupQuery.data?.id ?? null
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ['affection'] })
@@ -389,15 +548,20 @@ export default function AffectionPage() {
   const total = listQuery.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
-  // 阶段清单由服务端下发（阈值表是服务端的唯一事实来源），前端不复制一份枚举
+  // 阶段清单由服务端下发（阈值表是服务端的唯一事实来源），前端不复制一份枚举。
+  // 计数来自摘要接口：阶段筛选本身就是工具条上的一组选项，不再单独占一行 Chip。
   const availableStages = listQuery.data?.stages
-  const stageOptions = useMemo(
-    () => [
-      { value: 'all', label: t('filters.allStages') },
-      ...(availableStages ?? []).map(stage => ({ value: stage.value, label: stage.label })),
-    ],
-    [availableStages, t]
-  )
+  const stageOptions = useMemo(() => {
+    const counts = new Map<string, number>()
+    summaryQuery.data?.stage_counts.forEach(stage => counts.set(stage.value, stage.count))
+    return [
+      { value: 'all', label: `${t('filters.allStages')} ${summaryQuery.data?.total ?? total}` },
+      ...(availableStages ?? []).map(stage => ({
+        value: stage.value,
+        label: `${stage.label} ${counts.get(stage.value) ?? 0}`,
+      })),
+    ]
+  }, [availableStages, summaryQuery.data, t, total])
 
   const sortOptions = useMemo(
     () => SORT_OPTIONS.map(value => ({ value, label: t(`sort.${value}`) })),
@@ -408,6 +572,11 @@ export default function AffectionPage() {
     setAdjustTarget(item)
     setAdjustScore(String(item.score))
     setAdjustReason('')
+  }
+
+  const closeRowMenu = () => {
+    setRowMenuAnchor(null)
+    setRowMenuTarget(null)
   }
 
   const parsedAdjustScore = Number(adjustScore)
@@ -426,6 +595,7 @@ export default function AffectionPage() {
         boxSizing: 'border-box',
       }}
     >
+      {/* 标题行：标题 · 视图切换 …… 刷新 · 设置；筛选单独一行，阶段多时不会把标题挤折行 */}
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
         <Box sx={{ minWidth: 0, flexShrink: 0 }}>
           <Typography variant="h6" fontWeight={700}>
@@ -435,6 +605,33 @@ export default function AffectionPage() {
             {t('subtitle')}
           </Typography>
         </Box>
+        <SegmentedControl
+          value={view}
+          options={[
+            { value: 'list', label: t('view.list') },
+            { value: 'graph', label: t('view.graph') },
+          ]}
+          onChange={setView}
+        />
+        <Box sx={{ flex: 1 }} />
+        <SimpleTooltip title={tCommon('actions.refresh')}>
+          <span>
+            <IconActionButton
+              aria-label={tCommon('actions.refresh')}
+              onClick={() =>
+                void (view === 'graph'
+                  ? queryClient.invalidateQueries({ queryKey: ['affection', 'graph'] })
+                  : listQuery.refetch())
+              }
+            >
+              <RefreshRoundedIcon />
+            </IconActionButton>
+          </span>
+        </SimpleTooltip>
+        <DomainSettingsButton domain="affection" />
+      </Box>
+
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
         <SearchField
           value={search}
           onChange={value => {
@@ -449,54 +646,33 @@ export default function AffectionPage() {
           placeholder={t('filters.searchPlaceholder')}
           sx={{ flex: 1, minWidth: 200, maxWidth: 320 }}
         />
-        <FilterSelect
-          label={t('filters.stage')}
-          value={stageFilter}
-          options={stageOptions}
-          onChange={value => {
-            setStageFilter(value as AffectionStageValue | 'all')
-            setPage(1)
-          }}
-          fullWidth={false}
-          sx={{ minWidth: 150 }}
-        />
-        <FilterSelect
-          label={t('filters.sort')}
-          value={sortBy}
-          options={sortOptions}
-          onChange={value => setSortBy(value as AffectionSortBy)}
-          fullWidth={false}
-          sx={{ minWidth: 160 }}
-        />
-        <ActionButton
-          tone="ghost"
-          size="small"
-          startIcon={<RefreshRoundedIcon />}
-          onClick={() => void listQuery.refetch()}
-          sx={{ ml: 'auto' }}
-        >
-          {tCommon('actions.refresh')}
-        </ActionButton>
+        {/* 分段控件不能折行（折开后圆角与分隔线全乱）：阶段多时在自己的格子里横向滚动 */}
+        <Box sx={{ minWidth: 0, maxWidth: '100%', overflowX: 'auto', flexShrink: 1 }}>
+          <SegmentedControl
+            value={stageFilter}
+            options={stageOptions}
+            onChange={value => {
+              setStageFilter(value as AffectionStageValue | 'all')
+              setPage(1)
+            }}
+            sx={{ flexWrap: 'nowrap', whiteSpace: 'nowrap' }}
+          />
+        </Box>
+        {view === 'list' && (
+          <FilterSelect
+            label={t('filters.sort')}
+            value={sortBy}
+            options={sortOptions}
+            onChange={value => setSortBy(value as AffectionSortBy)}
+            fullWidth={false}
+            sx={{ width: 160, flexShrink: 0, ml: { sm: 'auto' } }}
+          />
+        )}
       </Box>
 
       <InstanceScopeBanner description={t('scopeBanner')} />
 
-      {summaryQuery.data && summaryQuery.data.total > 0 && (
-        <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', gap: 1 }}>
-          {summaryQuery.data.stage_counts
-            .filter(stage => stage.count > 0)
-            .map(stage => (
-              <Chip
-                key={stage.value}
-                size="small"
-                label={`${stage.label} · ${stage.count}`}
-                sx={CHIP_VARIANTS.getCustomColorChip(stageColor(stage.value), true)}
-              />
-            ))}
-        </Stack>
-      )}
-
-      {listQuery.isError && (
+      {view === 'list' && listQuery.isError && (
         <Alert
           severity="error"
           variant="outlined"
@@ -510,6 +686,18 @@ export default function AffectionPage() {
         </Alert>
       )}
 
+      {view === 'graph' ? (
+        <AffectionGraphView
+          scopeParam={scopeParam}
+          adapterKey={stateInstance?.adapter_key}
+          isScopeReady={isScopeReady}
+          search={search}
+          stage={stageFilter === 'all' ? undefined : stageFilter}
+          stageColor={stageColor}
+          onOpenDetail={openDetail}
+        />
+      ) : (
+        <>
       <Box sx={UNIFIED_TABLE_STYLES.tableContentContainer as SxProps<Theme>}>
         <Box sx={UNIFIED_TABLE_STYLES.tableViewport as SxProps<Theme>}>
           {/* isPending 而不是 isLoading：作用域未就绪时查询被 enabled 关着，
@@ -557,9 +745,6 @@ export default function AffectionPage() {
                   <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
                     {t('columns.feeling')}
                   </TableCell>
-                  <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>} align="right">
-                    {t('columns.interactions')}
-                  </TableCell>
                   <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>} align="center">
                     {t('columns.actions')}
                   </TableCell>
@@ -578,29 +763,61 @@ export default function AffectionPage() {
                           <TableRow
                             key={item.id}
                             hover
+                            onClick={() => openDetail(item.id)}
                             sx={
                               [
                                 UNIFIED_TABLE_STYLES.row,
+                                { cursor: 'pointer' },
                                 nested ? { bgcolor: theme.palette.action.hover } : {},
                               ] as SxProps<Theme>
                             }
                           >
                             <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                               <Box sx={{ pl: nested ? 2 : 0 }}>
-                                <Typography variant="body2" fontWeight={600} noWrap>
-                                  {item.nickname || item.platform_userid}
-                                </Typography>
-                                <Typography variant="caption" color="text.secondary" noWrap>
-                                  {item.platform_userid}
-                                  {item.instance_key ? ` · ${item.instance_key}` : ''}
-                                </Typography>
+                                <SimpleTooltip
+                                  title={[
+                                    item.platform_userid,
+                                    item.instance_key
+                                      ? t('columns.instanceTooltip', {
+                                          instance: item.instance_key,
+                                        })
+                                      : '',
+                                  ]
+                                    .filter(Boolean)
+                                    .join(' · ')}
+                                >
+                                  <span>
+                                    <Stack
+                                      direction="row"
+                                      spacing={0.75}
+                                      alignItems="center"
+                                      sx={{ minWidth: 0 }}
+                                    >
+                                      <Typography
+                                        variant="body2"
+                                        fontWeight={600}
+                                        noWrap
+                                        sx={{ minWidth: 0 }}
+                                      >
+                                        {item.nickname || item.platform_userid}
+                                      </Typography>
+                                      {item.call_name && (
+                                        <Chip
+                                          size="small"
+                                          label={item.call_name}
+                                          sx={CHIP_VARIANTS.base(true)}
+                                        />
+                                      )}
+                                    </Stack>
+                                  </span>
+                                </SimpleTooltip>
                                 {/* 被合并掉的副号那一行是**休眠**数据：Bot 读的是主账号那一行，
                                     在这里调分数不会有任何效果。不标出来的话管理员会对着一个
                                     「改了也不动」的行反复调整。 */}
                                 {item.merged_into && (
                                   <Typography
                                     variant="caption"
-                                    color="warning.main"
+                                    color="text.secondary"
                                     noWrap
                                     display="block"
                                   >
@@ -613,7 +830,10 @@ export default function AffectionPage() {
                                     type="button"
                                     variant="caption"
                                     underline="hover"
-                                    onClick={() => togglePerson(groupKey)}
+                                    onClick={event => {
+                                      event.stopPropagation()
+                                      togglePerson(groupKey)
+                                    }}
                                     sx={{ display: 'block', mt: 0.25 }}
                                   >
                                     {expanded
@@ -624,70 +844,91 @@ export default function AffectionPage() {
                               </Box>
                             </TableCell>
                             <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                              <Typography variant="body2" noWrap>
-                                {item.preset_name}
-                              </Typography>
-                              {item.in_use_channels > 0 ? (
+                              <Stack
+                                direction="row"
+                                spacing={0.75}
+                                alignItems="center"
+                                sx={{ flexWrap: 'wrap' }}
+                              >
+                                <Typography variant="body2" noWrap>
+                                  {item.preset_name}
+                                </Typography>
+                                {item.in_use_channels > 0 ? (
+                                  <Chip
+                                    size="small"
+                                    label={t('columns.inUse', { count: item.in_use_channels })}
+                                    sx={CHIP_VARIANTS.getCustomColorChip(
+                                      theme.palette.success.main,
+                                      true
+                                    )}
+                                  />
+                                ) : (
+                                  <Typography variant="caption" color="text.disabled" noWrap>
+                                    {t('columns.notInUse')}
+                                  </Typography>
+                                )}
+                              </Stack>
+                            </TableCell>
+                            <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                              <Stack
+                                direction="row"
+                                spacing={1}
+                                alignItems="center"
+                                justifyContent="space-between"
+                              >
                                 <Chip
                                   size="small"
-                                  label={t('columns.inUse', { count: item.in_use_channels })}
+                                  label={item.stage_label}
                                   sx={CHIP_VARIANTS.getCustomColorChip(
-                                    theme.palette.success.main,
+                                    affectionStageColor(theme, item.stage),
                                     true
                                   )}
                                 />
-                              ) : (
-                                <Typography variant="caption" color="text.secondary">
-                                  {t('columns.notInUse')}
+                                <Typography
+                                  variant="body2"
+                                  fontWeight={700}
+                                  sx={{
+                                    fontVariantNumeric: 'tabular-nums',
+                                    textAlign: 'right',
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  {item.score}
                                 </Typography>
-                              )}
-                            </TableCell>
-                            <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                              <Chip
-                                size="small"
-                                label={item.stage_label}
-                                sx={CHIP_VARIANTS.getCustomColorChip(stageColor(item.stage), true)}
-                              />
+                              </Stack>
                               <Typography
                                 variant="caption"
                                 color="text.secondary"
                                 sx={{ display: 'block', mt: 0.25 }}
                               >
-                                {item.score}
+                                {t('columns.interactionsInline', {
+                                  count: item.interaction_count,
+                                })}
                               </Typography>
                             </TableCell>
                             <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                              <Typography variant="body2">
-                                {item.state_text || t('columns.feelingEmpty')}
+                              <Typography
+                                variant="body2"
+                                sx={{
+                                  display: '-webkit-box',
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: 'vertical',
+                                  overflow: 'hidden',
+                                }}
+                              >
+                                {item.state_text ||
+                                  item.last_event_text ||
+                                  t('columns.feelingEmpty')}
                               </Typography>
-                              {item.last_event_text && (
-                                <Typography variant="caption" color="text.secondary">
-                                  {item.last_event_text}
-                                </Typography>
-                              )}
-                            </TableCell>
-                            <TableCell
-                              sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}
-                              align="right"
-                            >
-                              {item.interaction_count}
                             </TableCell>
                             <TableCell
                               sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}
                               align="center"
                             >
-                              <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'center' }}>
-                                <SimpleTooltip title={t('actions.detail')}>
-                                  <span>
-                                    <IconActionButton
-                                      size="small"
-                                      tone="primary"
-                                      onClick={() => openDetail(item.id)}
-                                    >
-                                      <TimelineRoundedIcon fontSize="small" />
-                                    </IconActionButton>
-                                  </span>
-                                </SimpleTooltip>
+                              <Box
+                                onClick={event => event.stopPropagation()}
+                                sx={{ display: 'flex', gap: 0.5, justifyContent: 'center' }}
+                              >
                                 <SimpleTooltip title={t('actions.adjust')}>
                                   <span>
                                     <IconActionButton
@@ -699,37 +940,18 @@ export default function AffectionPage() {
                                     </IconActionButton>
                                   </span>
                                 </SimpleTooltip>
-                                <SimpleTooltip title={t('actions.editNarrative')}>
+                                <SimpleTooltip title={tCommon('actions.more')}>
                                   <span>
                                     <IconActionButton
                                       size="small"
                                       tone="subtle"
-                                      onClick={() => openEdit(item)}
+                                      aria-label={tCommon('actions.more')}
+                                      onClick={event => {
+                                        setRowMenuAnchor(event.currentTarget)
+                                        setRowMenuTarget(item)
+                                      }}
                                     >
-                                      <EditNoteRoundedIcon fontSize="small" />
-                                    </IconActionButton>
-                                  </span>
-                                </SimpleTooltip>
-                                <SimpleTooltip title={t('actions.clearNarrative')}>
-                                  <span>
-                                    <IconActionButton
-                                      size="small"
-                                      tone="subtle"
-                                      disabled={!item.state_text && !item.last_event_text}
-                                      onClick={() => setClearTarget(item)}
-                                    >
-                                      <CleaningServicesRoundedIcon fontSize="small" />
-                                    </IconActionButton>
-                                  </span>
-                                </SimpleTooltip>
-                                <SimpleTooltip title={t('actions.reset')}>
-                                  <span>
-                                    <IconActionButton
-                                      size="small"
-                                      tone="danger"
-                                      onClick={() => setResetTarget(item)}
-                                    >
-                                      <RestartAltRoundedIcon fontSize="small" />
+                                      <MoreHorizRoundedIcon fontSize="small" />
                                     </IconActionButton>
                                   </span>
                                 </SimpleTooltip>
@@ -754,20 +976,131 @@ export default function AffectionPage() {
         loading={listQuery.isFetching}
         alwaysShow={false}
       />
+        </>
+      )}
 
-      <NekroDialog
+      <Menu
+        anchorEl={rowMenuAnchor}
+        open={rowMenuAnchor !== null}
+        onClose={closeRowMenu}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        <MenuItem
+          disabled={!rowMenuTarget}
+          onClick={() => {
+            if (!rowMenuTarget) return
+            closeRowMenu()
+            openEdit(rowMenuTarget)
+          }}
+        >
+          <ListItemIcon>
+            <EditNoteRoundedIcon fontSize="small" />
+          </ListItemIcon>
+          <ListItemText>{t('actions.editNarrative')}</ListItemText>
+        </MenuItem>
+        <MenuItem
+          disabled={
+            !rowMenuTarget || (!rowMenuTarget.state_text && !rowMenuTarget.last_event_text)
+          }
+          onClick={() => {
+            if (!rowMenuTarget) return
+            closeRowMenu()
+            setClearTarget(rowMenuTarget)
+          }}
+        >
+          <ListItemIcon>
+            <CleaningServicesRoundedIcon fontSize="small" />
+          </ListItemIcon>
+          <ListItemText>{t('actions.clearNarrative')}</ListItemText>
+        </MenuItem>
+        <Divider />
+        <MenuItem
+          disabled={!rowMenuTarget}
+          sx={{ color: 'error.main' }}
+          onClick={() => {
+            if (!rowMenuTarget) return
+            closeRowMenu()
+            setResetTarget(rowMenuTarget)
+          }}
+        >
+          <ListItemIcon>
+            <RestartAltRoundedIcon fontSize="small" sx={{ color: 'error.main' }} />
+          </ListItemIcon>
+          <ListItemText>{t('actions.reset')}</ListItemText>
+        </MenuItem>
+      </Menu>
+
+      <Drawer
+        anchor="right"
         open={detailId !== null}
         onClose={closeDetail}
-        title={t('detail.title')}
-        titleStartIcon={<FavoriteRoundedIcon fontSize="small" />}
-        // 里程碑与备注两张卡要并排放，`sm`（600px）里每列只剩二百来像素，按钮会折成好几行
-        maxWidth="md"
-        actions={
-          <ActionButton tone="ghost" onClick={closeDetail}>
-            {tCommon('actions.close')}
-          </ActionButton>
-        }
+        PaperProps={{
+          sx: { width: { xs: '100%', sm: 520 }, maxWidth: '100%', bgcolor: 'background.paper' },
+        }}
       >
+        <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          <Box
+            sx={{
+              position: 'sticky',
+              top: 0,
+              zIndex: 2,
+              px: 2,
+              py: 1.5,
+              bgcolor: 'background.paper',
+              borderBottom: '1px solid',
+              borderColor: 'divider',
+            }}
+          >
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <FavoriteRoundedIcon fontSize="small" color="primary" />
+              <Typography variant="h6" fontWeight={700}>
+                {t('detail.title')}
+              </Typography>
+              <Box sx={{ flex: 1 }} />
+              <IconActionButton onClick={closeDetail} aria-label={tCommon('actions.close')}>
+                <CloseRoundedIcon />
+              </IconActionButton>
+            </Stack>
+            {detailQuery.data && (
+              <Box sx={{ mt: 1 }}>
+                <Typography variant="subtitle1" fontWeight={700}>
+                  {detailQuery.data.item.nickname || detailQuery.data.item.platform_userid}
+                </Typography>
+                {/* 人物详情是唯一允许常显账号的地方：昵称优先，账号与实例放在标题下 */}
+                <Typography variant="caption" color="text.secondary" display="block">
+                  {detailQuery.data.item.platform_userid}
+                  {detailQuery.data.item.instance_key
+                    ? ` · ${detailQuery.data.item.instance_key}`
+                    : ''}
+                </Typography>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  alignItems="center"
+                  sx={{ mt: 0.5, flexWrap: 'wrap' }}
+                >
+                  <Chip
+                    size="small"
+                    label={detailQuery.data.item.stage_label}
+                    sx={CHIP_VARIANTS.getCustomColorChip(
+                      affectionStageColor(theme, detailQuery.data.item.stage),
+                      true
+                    )}
+                  />
+                  <Typography variant="body2" fontWeight={700}>
+                    {detailQuery.data.item.score}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {t('detail.callNameLine', {
+                      name: detailQuery.data.item.call_name || '—',
+                    })}
+                  </Typography>
+                </Stack>
+              </Box>
+            )}
+          </Box>
+          <Box sx={{ flex: 1, minHeight: 0, overflow: 'auto', px: 2, py: 2 }}>
         {detailQuery.isError ? (
           isNotFoundError(detailQuery.error) ? (
             // 深链接（`?record=`）指向别人实例的那一份、或已被删掉时是 404：
@@ -789,60 +1122,97 @@ export default function AffectionPage() {
           </Box>
         ) : (
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
-            <Box>
-              <Typography variant="subtitle1" fontWeight={700}>
-                {detailQuery.data.item.nickname || detailQuery.data.item.platform_userid}
-              </Typography>
-              <Typography variant="caption" color="text.secondary" display="block">
-                {detailQuery.data.item.platform_userid}
-                {detailQuery.data.item.instance_key
-                  ? ` · ${detailQuery.data.item.instance_key}`
-                  : ''}
-                {' · '}
-                {detailQuery.data.item.stage_label} ({detailQuery.data.item.score})
-              </Typography>
-              <Typography variant="caption" color="text.secondary" display="block">
-                {t('detail.callNameLine', {
-                  name: detailQuery.data.item.call_name || '—',
-                })}
-              </Typography>
-            </Box>
-            <Typography variant="body2">
-              {detailQuery.data.item.state_text || t('columns.feelingEmpty')}
-            </Typography>
-
-            {/* 「这份好感属于：域 X / 人设 甲」
-                没有这一段，「为什么他在这个群 80 分那个群 0 分」没人解释得清 ——
+            {/* 关键事实：两列小网格。「属于哪个域 / 哪个人设」必须在这里 ——
+                没有它，「为什么他在这个群 80 分那个群 0 分」没人解释得清：
                 两个群绑着不同人设时那就是**两份**好感，不是数据丢了。
-                标签由后端算（`identity_admin.domain_label`），前端不复算一份措辞。 */}
-            <Alert severity="info" variant="outlined" icon={false}>
-              <Typography variant="caption" component="div">
-                {t('detail.scopeLine', {
-                  domain: detailQuery.data.scope.domain_label,
-                  preset: detailQuery.data.scope.preset_name,
-                })}
+                域标签由后端算（`identity_admin.domain_label`），前端不复算一份措辞。 */}
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
+                {t('detail.keyFacts')}
               </Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  columnGap: 2,
+                  rowGap: 1,
+                }}
+              >
+                {[
+                  {
+                    key: 'domain',
+                    value: detailQuery.data.scope.domain_label,
+                  },
+                  {
+                    key: 'preset',
+                    value: detailQuery.data.scope.preset_name,
+                  },
+                  {
+                    key: 'interactions',
+                    value: t('columns.interactionsInline', {
+                      count: detailQuery.data.item.interaction_count,
+                    }),
+                  },
+                  {
+                    key: 'inUse',
+                    value:
+                      detailQuery.data.item.in_use_channels > 0
+                        ? t('columns.inUse', { count: detailQuery.data.item.in_use_channels })
+                        : t('columns.notInUse'),
+                  },
+                ].map(fact => (
+                  <Box key={fact.key} sx={{ minWidth: 0 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      {t(`detail.facts.${fact.key}`)}
+                    </Typography>
+                    <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>
+                      {fact.value || '—'}
+                    </Typography>
+                  </Box>
+                ))}
+              </Box>
               {!detailQuery.data.scope.preset_exists && (
-                <Typography variant="caption" component="div" color="warning.main">
+                <Typography variant="caption" display="block" color="warning.main" sx={{ mt: 1 }}>
                   {t('detail.presetDeleted')}
                 </Typography>
               )}
               {detailQuery.data.scope.alias_accounts.length > 0 && (
-                <Typography variant="caption" component="div" color="text.secondary">
+                <Typography variant="caption" display="block" color="text.secondary" sx={{ mt: 1 }}>
                   {t('detail.mergedAccounts', {
                     accounts: detailQuery.data.scope.alias_accounts.join('、'),
                   })}
                 </Typography>
               )}
-            </Alert>
+            </Box>
 
-            {/* 这两块说的是同一件事的两面，所以并排放，各自第一句先交代「它是什么」：
+            <Box>
+              <Typography variant="caption" color="text.secondary" display="block">
+                {t('columns.feeling')}
+              </Typography>
+              <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {detailQuery.data.item.state_text || t('columns.feelingEmpty')}
+              </Typography>
+            </Box>
+
+            {/* 好感详情里不叠第二个人物卡抽屉：只把其中「记忆」那一段插进来，
+                与人物卡共用同一个组件，口径不会漂。 */}
+            {stateScope && (
+              <PersonMemorySection
+                account={detailQuery.data.item.platform_userid}
+                adapterKey={stateScope.adapter_key}
+                instanceKey={stateScope.instance_key}
+                onNavigate={closeDetail}
+              />
+            )}
+
+            {/* 这两块说的是同一件事的两面，各自第一句先交代「它是什么」：
                 里程碑是 Bot 自己写进长期记忆的，备注是管理员写进世界书的 ——
-                不写明的话，两边看起来都只是「关于这个人的一段字」。 */}
+                不写明的话，两边看起来都只是「关于这个人的一段字」。
+                抽屉只有 520 宽，并排会把两张卡挤成两条窄缝，所以上下排。 */}
             <Box
               sx={{
                 display: 'grid',
-                gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                gridTemplateColumns: '1fr',
                 gap: 1.5,
                 alignItems: 'start',
               }}
@@ -899,7 +1269,7 @@ export default function AffectionPage() {
                           >
                             <MilestoneStatusChip status={milestone.status} />
                             <Typography variant="caption" color="text.secondary">
-                              {formatDateTime(milestone.event_time, '—')}
+                              {formatFullTime(milestone.event_time)}
                             </Typography>
                             {!isGone && (
                               <ActionButton
@@ -976,7 +1346,7 @@ export default function AffectionPage() {
                         <Typography variant="body2" color="text.secondary" fontStyle="italic">
                           {t('detail.reasonDeleted', {
                             operator: event.deleted_by || '—',
-                            time: formatDateTime(event.deleted_at, '—'),
+                            time: formatFullTime(event.deleted_at),
                           })}
                         </Typography>
                       ) : (
@@ -985,7 +1355,7 @@ export default function AffectionPage() {
                         </Typography>
                       )}
                       <Typography variant="caption" color="text.secondary">
-                        {formatDateTime(event.create_time, '—')}
+                        {formatFullTime(event.create_time)}
                         {' · '}
                         {t(`detail.source.${event.source}`)}
                         {/* 时间线是按「人」取的并集，合并过的人身上会同时出现好几个号干的事。
@@ -1018,14 +1388,45 @@ export default function AffectionPage() {
             )}
           </Box>
         )}
-      </NekroDialog>
+          </Box>
+          <Box
+            sx={{
+              position: 'sticky',
+              bottom: 0,
+              zIndex: 2,
+              px: 2,
+              py: 1.5,
+              bgcolor: 'background.paper',
+              borderTop: '1px solid',
+              borderColor: 'divider',
+            }}
+          >
+            <Stack direction="row" spacing={1} justifyContent="flex-end">
+              {/* 只有查到了档案编号才给入口：没有档案时按钮点了也是一页空的 */}
+              {stateProfileId !== null && (
+                <ActionButton
+                  tone="secondary"
+                  size="small"
+                  startIcon={<AssignmentIndRoundedIcon />}
+                  onClick={() => navigate(statePath('people', { person: String(stateProfileId) }))}
+                >
+                  {tState('affection.openPerson')}
+                </ActionButton>
+              )}
+              <ActionButton tone="ghost" onClick={closeDetail}>
+                {tCommon('actions.close')}
+              </ActionButton>
+            </Stack>
+          </Box>
+        </Box>
+      </Drawer>
 
-      <NekroDialog
+      <ActionDrawer
         open={adjustTarget !== null}
         onClose={() => setAdjustTarget(null)}
         title={t('adjustDialog.title')}
-        maxWidth="xs"
-        actions={
+        closeLabel={tCommon('actions.close')}
+        footer={
           <>
             <ActionButton tone="ghost" onClick={() => setAdjustTarget(null)}>
               {tCommon('actions.cancel')}
@@ -1071,7 +1472,7 @@ export default function AffectionPage() {
             onChange={event => setAdjustReason(event.target.value)}
           />
         </Box>
-      </NekroDialog>
+      </ActionDrawer>
 
       <NekroDialog
         open={resetTarget !== null}
@@ -1138,12 +1539,12 @@ export default function AffectionPage() {
         </Box>
       </NekroDialog>
 
-      <NekroDialog
+      <ActionDrawer
         open={editTarget !== null}
         onClose={() => setEditTarget(null)}
         title={t('editDialog.title')}
-        maxWidth="sm"
-        actions={
+        closeLabel={tCommon('actions.close')}
+        footer={
           <>
             <ActionButton tone="ghost" onClick={() => setEditTarget(null)}>
               {tCommon('actions.cancel')}
@@ -1207,7 +1608,7 @@ export default function AffectionPage() {
             onChange={event => setEditEventText(event.target.value)}
           />
         </Box>
-      </NekroDialog>
+      </ActionDrawer>
 
       <NekroDialog
         open={deleteReasonEventId !== null}

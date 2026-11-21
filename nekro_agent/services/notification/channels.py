@@ -169,7 +169,19 @@ class WebhookChannel:
 
         try:
             # follow_redirects=False：跟随重定向会让上面的公网 IP 校验形同虚设
-            async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False) as client:
+            if self.tenant_writable:
+                # 租户填的地址：上面那次校验与连接各解析一次，中间可以被 DNS 重绑。改成解析一次、
+                # 直连校验过的地址（`tools/tenant_egress.py`）
+                from nekro_agent.tools.tenant_egress import tenant_http_client
+
+                client_cm = tenant_http_client(
+                    subject="通知地址",
+                    timeout=WEBHOOK_TIMEOUT_SECONDS,
+                    follow_redirects=False,
+                )
+            else:
+                client_cm = httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT_SECONDS, follow_redirects=False)
+            async with client_cm as client:
                 response = await client.post(self.url, json=payload)
         except httpx.HTTPError as e:
             logger.warning(f"Webhook 通知发送失败: {e}")

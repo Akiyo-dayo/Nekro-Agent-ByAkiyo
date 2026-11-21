@@ -35,6 +35,7 @@ from nekro_agent.tools.common_util import (
     assert_tenant_connected_peer_safe,
     assert_tenant_endpoint_url_safe,
 )
+from nekro_agent.tools.tenant_egress import TenantEgressRejected, tenant_http_client
 
 from .schemas import McpServerConfig, McpServerType
 
@@ -165,7 +166,8 @@ def _find_unsafe_url_error(exc: BaseException) -> Optional[BaseException]:
 
     mcp SDK 会把传输层的异常包几层；`anyio` 的 `ExceptionGroup` 更是把并发任务里的异常
     收进 `.exceptions`。这里整条链都翻一遍，否则被拦的连接会被报成 `transport_error`，
-    前端就没法显示「目标地址不允许」。
+    前端就没法显示「目标地址不允许」。建连接那一步（`tenant_egress`）拒掉的 `TenantEgressRejected` 也算：
+    它的文案与请求钩子拒掉时同一句、不带地址，也不挂异常链。
     """
     seen: set[int] = set()
     stack: List[BaseException] = [exc]
@@ -174,7 +176,7 @@ def _find_unsafe_url_error(exc: BaseException) -> Optional[BaseException]:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, UnsafeDownloadUrlError):
+        if isinstance(current, (UnsafeDownloadUrlError, TenantEgressRejected)):
             return current
         for nested in getattr(current, "exceptions", ()) or ():
             if isinstance(nested, BaseException):
@@ -213,13 +215,16 @@ def _public_only_client_factory(default_timeout: float) -> Any:
         # 形参名必须是 `headers` / `timeout` / `auth`：SDK 是按关键字调用的
         # （`streamablehttp_client` 与 `sse_client` 都写 `httpx_client_factory(headers=..., timeout=..., auth=...)`），
         # 改个名字不是风格问题，而是 `TypeError: unexpected keyword argument`。
-        return httpx.AsyncClient(
+        # 建连接那一步走 `tools/tenant_egress.py`：解析一次、拒内网、直连校验过的地址。
+        # 两个钩子照留：请求钩子让被拒的地址在发请求前就报 `url_not_allowed`，响应钩子核对实际对端兜底。
+        # 不走代理（`trust_env=False`）照旧：走代理时对端是代理，`_peer_ip` 判的就不是目标
+        return tenant_http_client(
+            trust_env=False,
+            subject="MCP 服务器地址",
             headers=headers,
             timeout=timeout or httpx.Timeout(default_timeout),
             auth=auth,
             follow_redirects=False,
-            # 与视频预览同理：走代理时对端是代理，`_peer_ip` 判的就不是目标
-            trust_env=False,
             event_hooks={"request": [_guard_request], "response": [_guard_response]},
         )
 

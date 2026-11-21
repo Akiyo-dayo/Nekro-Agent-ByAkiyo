@@ -6,7 +6,8 @@ import ServerDataTable, {
   type ServerDataTableColumn,
 } from '../../components/common/ServerDataTable'
 import QueryErrorState from '../../components/common/QueryErrorState'
-import { formatDateTime } from '../../components/memory/format'
+import { SimpleTooltip } from '../../components/common/ThemedTooltip'
+import { formatFullTime, formatListTime } from '../../utils/listTime'
 import { isNotFoundError } from '../../services/api/axios'
 import { tavernApi, type TavernAuditItem } from '../../services/api/tavern'
 import type { WorldbookScopeParams } from '../../services/api/worldbook'
@@ -24,6 +25,7 @@ const PAGE_SIZE = 20
 
 const FIELD_LABEL_KEYS: Record<string, string> = {
   PROMPT_ADVANCED_SLOTS_ENABLED: 'lab.audit.field.advancedSlots',
+  PROMPT_STABLE_PREFIX_ORDER: 'lab.audit.field.stablePrefixOrder',
   PROMPT_POST_HISTORY: 'lab.audit.field.postHistory',
   PROMPT_AUXILIARY: 'lab.audit.field.auxiliary',
   PROMPT_PREFILL: 'lab.audit.field.prefill',
@@ -89,7 +91,11 @@ export default function AuditTab({ scope }: { scope: WorldbookScopeParams }) {
       header: t('lab.audit.columns.time'),
       width: 170,
       render: row => (
-        <Typography variant="body2">{formatDateTime(row.created_at)}</Typography>
+        <SimpleTooltip title={formatFullTime(row.created_at)}>
+          <span>
+            <Typography variant="body2">{formatListTime(row.created_at)}</Typography>
+          </span>
+        </SimpleTooltip>
       ),
     },
     {

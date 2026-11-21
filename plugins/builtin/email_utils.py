@@ -105,6 +105,7 @@ from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND, require_s
 from nekro_agent.services.resource_scope import resolve_session_owner
 from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
 from nekro_agent.tools.path_convertor import convert_filename_to_sandbox_upload_path, sanitize_chat_key_for_path
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 from nekro_agent.tools.untrusted_content import UntrustedToolResult, echo_inline, sanitize_block_text
 
 # 创建插件实例
@@ -852,6 +853,8 @@ async def summarize_recent_emails(
                     base_url=model_group_config.BASE_URL,
                     api_key=model_group_config.API_KEY,
                     stream_mode=False,
+                    api_format=model_group_config.API_FORMAT,
+                    tenant_egress=is_tenant_owned_group(model_group_config),
                 )
         except Exception as e:
             logger.error(f"调用模型生成摘要失败: {e}")

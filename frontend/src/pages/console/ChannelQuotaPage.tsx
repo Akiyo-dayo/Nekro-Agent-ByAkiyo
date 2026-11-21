@@ -5,11 +5,11 @@
  * 数据来自 `nekro_agent/routers/console/channel_quota.py`，作用域由后端按当前身份收敛：
  * 平台方看全部，租户只看自己名下实例上的频道，越权一律 404。
  *
- * ## 与「配额」页的关系
+ * ## 与「实例自限」标签的关系
  *
- * 这一页是平台方的承诺层；`/console/quota` 是租户对自己群的自限（回复条数）。
- * 两层各管各的，**两层都放行才回复**。页头那段说明是唯一把这件事讲给用户听的地方，
- * 两个页面互相不知道对方存在的话，用户会以为改了一处就够了。
+ * 这一页是平台额度（平台方给每个群 / 私聊的承诺），`/console/quota` 是租户在它以内
+ * 自己再调低的自限（按回复回合数）。两层各管各的，**两层都放行才回复**。这条说明已经
+ * 挪到「额度与用量」页壳的页头副标题，本页不再单独解释一遍。
  *
  * ## 失败不画 0
  *
@@ -19,7 +19,6 @@
 
 import { useMemo, useState } from 'react'
 import {
-  Alert,
   Box,
   Card,
   CardContent,
@@ -42,7 +41,6 @@ import {
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { Link as RouterLink } from 'react-router-dom'
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
 import ActionButton from '../../components/common/ActionButton'
 import QueryErrorState from '../../components/common/QueryErrorState'
@@ -247,7 +245,12 @@ function GlobalPolicyCard() {
   )
 }
 
-export default function ChannelQuotaPage() {
+interface ChannelQuotaPageProps {
+  /** 嵌在「额度与用量」页壳里时，不再画自己的大标题与外层页面内边距 */
+  embedded?: boolean
+}
+
+export default function ChannelQuotaPage({ embedded = false }: ChannelQuotaPageProps) {
   const theme = useTheme()
   const { t } = useTranslation('console-channel-quota')
   const notification = useNotification()
@@ -303,23 +306,24 @@ export default function ChannelQuotaPage() {
   })
 
   return (
-    <Box sx={{ p: { xs: 1.5, sm: 2, md: 3 }, display: 'flex', flexDirection: 'column', gap: 2 }}>
-      <Box>
-        <Typography variant="h6" fontWeight={700}>
-          {t('title')}
-        </Typography>
-        <Typography variant="caption" color="text.secondary">
-          {t('subtitle')}
-        </Typography>
-      </Box>
-
-      <Alert severity="info">
-        {t('intro.text')}
-        <RouterLink to="/console/quota">{t('intro.quotaLink')}</RouterLink>
-        {t('intro.after')}
-        {' '}
-        {t('intro.settingsHint')}
-      </Alert>
+    <Box
+      sx={{
+        p: embedded ? 0 : { xs: 1.5, sm: 2, md: 3 },
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+      }}
+    >
+      {!embedded && (
+        <Box>
+          <Typography variant="h6" fontWeight={700}>
+            {t('title')}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {t('subtitle')}
+          </Typography>
+        </Box>
+      )}
 
       {isPlatformOwner && <GlobalPolicyCard />}
 
@@ -441,7 +445,7 @@ export default function ChannelQuotaPage() {
             </Box>
           ) : (
             <>
-              <Box sx={{ overflowX: 'auto' }}>
+              <Box sx={UNIFIED_TABLE_STYLES.embedded}>
                 <Table size="small" stickyHeader sx={UNIFIED_TABLE_STYLES.getTableBase(false, true)}>
                   <TableHead>
                     <TableRow>

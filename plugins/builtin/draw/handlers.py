@@ -16,6 +16,7 @@ from nekro_agent.services.agent.creator import ContentSegment, OpenAIChatMessage
 from nekro_agent.services.plugin.scope_guard import CHANNEL_NOT_FOUND, require_same_tenant_chat_key
 from nekro_agent.tools.path_convertor import convert_to_host_path
 from nekro_agent.tools.sandbox_shared_files import read_host_file_bytes
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group, tenant_http_client
 
 from .models import ImageReference, MultiImageDrawRequest
 from .plugin import config, plugin
@@ -24,6 +25,15 @@ from .utils import extract_image_from_content
 # 保存上次成功的模式
 last_successful_mode: Optional[str] = None
 OPENAI_IMAGE_PLACEHOLDER = "data:image/webp;base64, XXX"
+
+
+def _draw_client(model_group: Any, **client_kwargs: Any) -> AsyncClient:
+    """绘图请求的客户端：租户建的模型组按租户出站连（`tools/tenant_egress.py`：解析一次、拒内网、
+    直连校验过的地址），平台方的组照旧。代理语义照旧：这里本来就不用组上的代理，只认环境变量
+    """
+    if is_tenant_owned_group(model_group):
+        return tenant_http_client(subject="绘图模型组接口地址", **client_kwargs)
+    return AsyncClient(**client_kwargs)
 
 
 def _use_gpt_image_native() -> bool:
@@ -403,7 +413,7 @@ async def generate_image_api(
     if negative_prompt.replace(" ", "") != "":
         json_data["negative_prompt"] = negative_prompt
 
-    async with AsyncClient() as client:
+    async with _draw_client(model_group) as client:
         response = await client.post(
             f"{model_group.BASE_URL}/images/generations",
             headers={
@@ -440,7 +450,7 @@ async def generate_openai_image_api(
         "Authorization": f"Bearer {model_group.API_KEY}",
     }
 
-    async with AsyncClient() as client:
+    async with _draw_client(model_group) as client:
         if source_image_data != OPENAI_IMAGE_PLACEHOLDER:
             mime_type, image_bytes = _decode_data_uri(source_image_data)
             extension = _extension_from_mime(mime_type)
@@ -506,7 +516,7 @@ async def generate_openai_multi_image_api(
         extension = _extension_from_mime(mime_type)
         files.append(("image", (f"reference_{index}.{extension}", image_bytes, mime_type)))
 
-    async with AsyncClient() as client:
+    async with _draw_client(model_group) as client:
         response = await client.post(
             f"{model_group.BASE_URL}/images/edits",
             headers={
@@ -637,7 +647,10 @@ async def generate_chat_response_with_image_support(
 
         try:
             # 使用上下文管理器创建异步客户端，配置超时时间
-            async with AsyncClient(timeout=Timeout(read=max_wait_time, write=max_wait_time, connect=10, pool=10)) as client:
+            async with _draw_client(
+                model_group,
+                timeout=Timeout(read=max_wait_time, write=max_wait_time, connect=10, pool=10),
+            ) as client:
                 # 使用 await 异步发送 POST 请求
                 response = await client.post(URL, json=payload, headers=GOOGLE_AUTH_HEADERS)
                 
@@ -678,7 +691,10 @@ async def generate_chat_response_with_image_support(
         collected_content = ""
         collected_image_data: Optional[str] = None
 
-        async with AsyncClient(timeout=Timeout(read=max_wait_time, write=max_wait_time, connect=10, pool=10)) as client:
+        async with _draw_client(
+            model_group,
+            timeout=Timeout(read=max_wait_time, write=max_wait_time, connect=10, pool=10),
+        ) as client:
             if stream_mode:
                 # 流式请求
                 async with client.stream(

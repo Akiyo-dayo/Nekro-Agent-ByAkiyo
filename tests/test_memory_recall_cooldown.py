@@ -34,7 +34,8 @@ CHAT_KEY = "onebot_v11-cooldown-group_1"
 PRESET_ID = 7
 
 
-def _memory(pid: int, *, similarity: float = 0.5, weight: float = 1.0) -> RetrievedMemory:
+# 默认相似度落在闸开注入的下限（0.55）之上、问句的冷却旁路（0.7）之下：冷却用例只看冷却本身。
+def _memory(pid: int, *, similarity: float = 0.6, weight: float = 1.0) -> RetrievedMemory:
     return RetrievedMemory(
         target_id=pid,
         source_type="paragraph",

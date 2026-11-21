@@ -33,12 +33,17 @@ from nekro_agent.schemas.ssh_gateway import (
     SshCredentialTestResponse,
     SshCredentialUpdate,
     SshCredentialView,
+    SshDutyModeUpdate,
     SshGatewayStatusResponse,
     SshHostKeyAcceptRequest,
     SshHostKeyView,
+    SshRunbookEntryView,
+    SshRunbookUpdate,
+    SshRunbookView,
 )
 from nekro_agent.services.ssh_gateway import audit_queue, row_state
 from nekro_agent.services.ssh_gateway import constants as C
+from nekro_agent.services.ssh_gateway import runbook as runbook_service
 from nekro_agent.services.ssh_gateway.authority import TargetSpec
 from nekro_agent.services.ssh_gateway.credentials import (
     ChatRegisteredEditForbiddenError,
@@ -53,6 +58,7 @@ from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
 from nekro_agent.services.user.tenant_perm import accessible_instance_refs, get_tenant_scope
 from nekro_agent.services.workspace.tenant_scope import assert_workspace_accessible
+from nekro_agent.tools.untrusted_content import sanitize_block_text
 
 router = APIRouter(tags=["SSH Gateway"])
 workspace_router = APIRouter(prefix="/workspaces")
@@ -205,6 +211,103 @@ async def enable_ssh_credential(
         credential_id,
         enable=True,
     )
+
+
+# ==== 值守模式与运维手册：只给平台方（`Role.Super` 且全局作用域），只对平台方行 ====
+
+
+async def _load_platform_row(user: DBUser, workspace_id: int, credential_id: int) -> DBWsSshCredential:
+    """平台方后台账号取一条平台方行；租户与用户行一律当作不存在"""
+    await assert_workspace_accessible(user, workspace_id)
+    row, scope = await ssh_credential_service._load_visible(user, workspace_id, credential_id)  # noqa: SLF001
+    if scope is not None or row.owner_kind != C.OWNER_PLATFORM:
+        raise ValidationError(reason="只有平台方服务器有值守模式与运维手册")
+    return row
+
+
+def _runbook_view(row: DBWsSshCredential, entries: List[object]) -> SshRunbookView:
+    return SshRunbookView(
+        credential_id=int(row.id),
+        runbook=str(row.runbook or ""),
+        entries=[
+            SshRunbookEntryView(
+                id=int(getattr(entry, "id")),
+                # Bot 写的，给平台方看之前剥不可见字符：藏在 Tag 字符里的话审的人看不见、删不掉
+                content=sanitize_block_text(str(getattr(entry, "content", "") or ""), 4 * C.RUNBOOK_ENTRY_MAX_CHARS),
+                task_ref=str(getattr(entry, "task_ref", "") or ""),
+                created_at=(
+                    getattr(entry, "created_at").isoformat() if getattr(entry, "created_at", None) is not None else None
+                ),
+            )
+            for entry in entries
+        ],
+    )
+
+
+@workspace_router.put(
+    "/{workspace_id}/ssh-credentials/{credential_id}/duty-mode",
+    summary="改平台方服务器的值守模式",
+    response_model=SshCredentialView,
+)
+@require_role(Role.Super)
+async def update_ssh_credential_duty_mode(
+    workspace_id: int,
+    credential_id: int,
+    body: SshDutyModeUpdate,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> SshCredentialView:
+    row = await _load_platform_row(_current_user, workspace_id, credential_id)
+    await runbook_service.set_duty_mode(row, body.duty_mode, actor=str(_current_user.username or ""))
+    return await ssh_credential_service.get_credential(_current_user, workspace_id, credential_id)
+
+
+@workspace_router.get(
+    "/{workspace_id}/ssh-credentials/{credential_id}/runbook",
+    summary="查看平台方服务器的运维手册",
+    response_model=SshRunbookView,
+)
+@require_role(Role.Super)
+async def get_ssh_credential_runbook(
+    workspace_id: int,
+    credential_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> SshRunbookView:
+    row = await _load_platform_row(_current_user, workspace_id, credential_id)
+    return _runbook_view(row, list(await runbook_service.list_entries(int(row.id))))
+
+
+@workspace_router.put(
+    "/{workspace_id}/ssh-credentials/{credential_id}/runbook",
+    summary="修改平台方服务器的运维手册",
+    response_model=SshRunbookView,
+)
+@require_role(Role.Super)
+async def update_ssh_credential_runbook(
+    workspace_id: int,
+    credential_id: int,
+    body: SshRunbookUpdate,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> SshRunbookView:
+    row = await _load_platform_row(_current_user, workspace_id, credential_id)
+    row = await runbook_service.set_runbook(row, body.runbook, actor=str(_current_user.username or ""))
+    return _runbook_view(row, list(await runbook_service.list_entries(int(row.id))))
+
+
+@workspace_router.delete(
+    "/{workspace_id}/ssh-credentials/{credential_id}/runbook/entries/{entry_id}",
+    summary="删除一条 Bot 追加的运维经验",
+    response_model=SshRunbookView,
+)
+@require_role(Role.Super)
+async def delete_ssh_credential_runbook_entry(
+    workspace_id: int,
+    credential_id: int,
+    entry_id: int,
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> SshRunbookView:
+    row = await _load_platform_row(_current_user, workspace_id, credential_id)
+    await runbook_service.delete_entry(row, entry_id, actor=str(_current_user.username or ""))
+    return _runbook_view(row, list(await runbook_service.list_entries(int(row.id))))
 
 
 @workspace_router.get(
@@ -524,8 +627,18 @@ async def import_ssh_gateway_resources(
 async def get_ssh_gateway_status(
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> SshGatewayStatusResponse:
-    """平台方专属：状态里只有运行数字，不含凭据或目标地址"""
-    return SshGatewayStatusResponse(**supervisor.status())
+    """平台方专属：状态里只有运行数字与值守的默认模式 / 实例名单，不含凭据或目标地址"""
+    from nekro_agent.core.config import config as app_config
+    from nekro_agent.services.ssh_gateway.duty_instances import duty_list_view
+
+    duty_instances, duty_closed = duty_list_view()
+    default_mode = str(app_config.SSH_GATEWAY_DEFAULT_DUTY_MODE or "").strip()
+    return SshGatewayStatusResponse(
+        **supervisor.status(),
+        default_duty_mode=C.DUTY_MODE_DUTY if default_mode == C.DUTY_MODE_DUTY else C.DUTY_MODE_STRICT,
+        duty_instances=duty_instances,
+        duty_instances_closed=duty_closed,
+    )
 
 
 router.include_router(workspace_router)

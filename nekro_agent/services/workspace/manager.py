@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import shutil
+import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
@@ -26,15 +28,78 @@ if TYPE_CHECKING:
 
 logger = get_sub_logger("workspace_manager")
 
-# 挂进容器当 `~/.claude/` 的宿主目录（CC 会话历史、技能、用户级设置都在这里）
+# 挂进容器当 `~/.claude/` 的宿主目录（CC 会话历史、技能、用户级设置、`.claude.json` 都在这里），
+# 两种布局（见 `ClaudeHome`）：
+# - 新：`{工作区根}/.nk-homes/<id>/claude`，在工作区目录之外，只以挂载点 `~/.claude` 出现在容器里；
+# - 旧：`{工作区}/.claude_home`，同时也在 `/workspace` 挂载里，容器能对它改名、换成链接。
+# 旧布局在建容器时迁到新位置（`WorkspaceService.migrate_claude_home`）
 CLAUDE_HOME_DIRNAME = ".claude_home"
-# CC 格式的设置文件名。NA 写的是**用户级**那一份：宿主 `{ws}/.claude_home/settings.json`，
+HOMES_DIRNAME = ".nk-homes"
+CLAUDE_HOME_SUBDIR = "claude"
+# CC 格式的设置文件名。NA 写的是**用户级**那一份：home 里的 `settings.json`，
 # 容器里 `~/.claude/settings.json`——CC 每次启动都读，不受工作目录影响
 CLAUDE_SETTINGS_FILENAME = "settings.json"
+# 容器里跑 CC 的用户：cc-sandbox 镜像里的 `appuser`，uid / gid 都是 1000。镜像入口脚本 `chown` 工作区
+# 用的是它，nk-ssh 收权限脚本里私钥的属主也是这个数；NA 没有对应的配置项，跟镜像保持一致。
+# NA 在 CC home 里建的目录、写的文件都交给它（`WorkspaceService.give_to_container`）
+CONTAINER_USER_UID = 1000
+CONTAINER_USER_GID = 1000
 # 早先 NA 把这份设置写在 `{ws}/.claude/settings.json`（容器里 `/workspace/.claude/`），
 # 而 CC 的工作目录是 `/workspace/default`，项目级设置只从工作目录下的 `.claude/` 读，所以那份
 # 文件从来没生效过；里面却可能留着以前写出去的凭据。写设置与启动复核都会把它删掉
 LEGACY_CLAUDE_SETTINGS_PARTS: Tuple[str, str] = (".claude", "settings.json")
+
+
+@dataclass(frozen=True)
+class ClaudeHome:
+    """一个工作区的 CC home 在宿主上的位置：`safe_fs` 的可信根 `base` 加上它下面的 `parts`
+
+    新布局 `base` 是工作区根、`parts` 是 `(.nk-homes, <id>, claude)`：`.nk-homes` 与 `<id>` 是 NA
+    自己的目录（0700，不挂进任何容器），只有最后一级 `claude` 挂进容器，在容器里对它改名会得到
+    EBUSY。旧布局 `base` 是工作区目录、`parts` 是 `(.claude_home,)`，整个都在容器写得到的地方。
+    两种布局下 home 里面的条目都是容器写得到的，读写一律走 `safe_fs`。
+    """
+
+    base: Path
+    parts: Tuple[str, ...]
+    legacy: bool
+    # 哪个工作区的：旧布局的 home 不见了（刚迁走）时按它重新定位
+    workspace_id: int
+
+    @property
+    def path(self) -> Path:
+        """字面路径（不 `resolve()`）"""
+        return self.base.joinpath(*self.parts)
+
+    def sub(self, *names: str) -> Tuple[str, ...]:
+        """home 里某个条目相对 `base` 的路径分量"""
+        return (*self.parts, *names)
+
+
+class StaleHomeError(RuntimeError):
+    """新建工作区时同号残留的 CC home 清不掉，创建已撤销"""
+
+
+# 每个工作区一把线程锁：动 CC home 位置的操作（迁移、把旧 home 挪出工作区）与往 home 里写东西
+# （用户级设置、技能、nk-ssh）互斥。迁移在线程里跑，写的一方有的在事件循环里（热更新、撤销凭据、
+# 动态技能），各自算好 home 之后才动手：没有这把锁，迁移可能正好落在「算好旧位置」与「写进去」之间。
+# 持有期间只做几个文件系统调用，不 await；可重入（迁移里会再调挪旧 home 的那一步）
+_home_locks: Dict[int, threading.RLock] = {}
+_home_locks_guard = threading.Lock()
+
+
+def home_lock(workspace_id: int) -> threading.RLock:
+    with _home_locks_guard:
+        lock = _home_locks.get(int(workspace_id))
+        if lock is None:
+            lock = threading.RLock()
+            _home_locks[int(workspace_id)] = lock
+        return lock
+
+
+# NA 改不了属主（不是 root，也不是 uid 1000）时只提醒一次，免得每写一个文件记一条
+_chown_refusal_reported = False
+
 
 # 每 workspace 一把 asyncio.Lock，避免 MCP read-modify-write 并发覆盖
 _mcp_locks: Dict[int, asyncio.Lock] = {}
@@ -269,6 +334,271 @@ class WorkspaceService:
     @staticmethod
     def get_workspace_dir(workspace_id: int) -> Path:
         return Path(WORKSPACE_ROOT_DIR) / str(workspace_id)
+
+    # ── CC home（容器里的 ~/.claude）────────────────────────────────────────
+    #
+    # 新布局在工作区根下的 `.nk-homes/<id>/claude`：与回收目录 `.nk-trash/<id>` 一样在工作区
+    # 目录之外、容器写不到它的上级，而且与工作区目录在同一个文件系统上，迁移是一次 `renameat`。
+
+    @staticmethod
+    def new_claude_home(workspace_id: int) -> ClaudeHome:
+        # 工作区根按 `get_workspace_dir` 的上级算（与回收目录 `_open_trash_dir` 同一口径）
+        return ClaudeHome(
+            base=WorkspaceService.get_workspace_dir(workspace_id).parent,
+            parts=(HOMES_DIRNAME, str(int(workspace_id)), CLAUDE_HOME_SUBDIR),
+            legacy=False,
+            workspace_id=int(workspace_id),
+        )
+
+    @staticmethod
+    def legacy_claude_home(workspace_id: int) -> ClaudeHome:
+        return ClaudeHome(
+            base=WorkspaceService.get_workspace_dir(workspace_id),
+            parts=(CLAUDE_HOME_DIRNAME,),
+            legacy=True,
+            workspace_id=int(workspace_id),
+        )
+
+    @staticmethod
+    def claude_home(workspace_id: int) -> ClaudeHome:
+        """这个工作区现在的 home。宿主侧读写 home、算挂载源、核对挂载的地方一律经它定位
+
+        - 新位置已经是目录：用新的；
+        - 还没迁、工作区目录里有 `.claude_home`：用旧的——**不论它是不是普通目录**。升级时还在跑
+          的容器挂的是旧路径，重启沿用这份挂载，迁移只在建容器时做（`migrate_claude_home`）。旧的
+          被容器换成了链接时也得按旧布局来：写的一方不跟随链接（写设置时删掉链接重建，写 nk-ssh
+          时不写），重启前的修复与核对也落在旧路径上——换成「新位置」的话，旧路径上的链接没人修，
+          重启时 Docker 会顺着它把宿主别处挂进容器；
+        - 都没有（新工作区，或者旧的被容器整个删掉了）：新的。
+        """
+        new = WorkspaceService.new_claude_home(workspace_id)
+        if safe_fs.kind(new.base, new.parts) == "dir":
+            return new
+        legacy = WorkspaceService.legacy_claude_home(workspace_id)
+        if safe_fs.kind(legacy.base, legacy.parts) is not None:
+            return legacy
+        return new
+
+    @staticmethod
+    def migrate_claude_home(workspace_id: int) -> ClaudeHome:
+        """把旧布局的 `.claude_home` 挪到工作区之外，返回迁移之后用的 home
+
+        只能在这个工作区没有任何容器在跑、拿着工作区锁的时候调（建容器清场之后）：这时没有谁能
+        动工作区目录，旧 `.claude_home` 的判断与改名之间没有竞争。NA 自己在别处往 home 里写的
+        （热更新、撤销凭据、动态技能）靠 `home_lock` 排开。
+        - 新位置已经是目录：已经迁过。旧的若还在（退回旧版本又升级回来、没跑回滚脚本），整个挪出
+          工作区（`retire_legacy_home`）；
+        - 旧的是普通目录：基于目录句柄 `renameat` 整个挪过去（同一文件系统，原子，没有大小上限，
+          会话历史、技能、`.claude.json`、nk-ssh 钥匙原样带走）；改名失败（例如工作区目录单独挂在
+          另一个文件系统上）就照旧按旧布局启动，记 ERROR，不让启动失败；
+        - 旧的是链接或别的东西：不挪（那头不是 NA 的东西），新位置建空目录，记 ERROR；
+        - 都没有：建新位置。
+        """
+        with home_lock(workspace_id):
+            return WorkspaceService._migrate_claude_home_locked(workspace_id)
+
+    @staticmethod
+    def _migrate_claude_home_locked(workspace_id: int) -> ClaudeHome:
+        new = WorkspaceService.new_claude_home(workspace_id)
+        legacy = WorkspaceService.legacy_claude_home(workspace_id)
+        new_kind = safe_fs.kind(new.base, new.parts)
+        legacy_kind = safe_fs.kind(legacy.base, legacy.parts)
+        if new_kind == "dir":
+            if legacy_kind is not None:
+                WorkspaceService.retire_legacy_home(workspace_id)
+            WorkspaceService.ensure_claude_home(new)
+            return new
+        if new_kind is not None:
+            # `.nk-homes/<id>/claude` 是 NA 自己的路径，不是目录只能是残留：删掉条目本身
+            with safe_fs.open_dir(new.base, new.parts[:-1]) as parent:
+                parent.remove_tree(new.parts[-1])
+        if legacy_kind == "dir":
+            for depth in range(1, len(new.parts)):
+                safe_fs.ensure_dir(new.base, new.parts[:depth], mode=0o700, replace_links=True)
+                safe_fs.chmod(new.base, new.parts[:depth], 0o700)
+            try:
+                with safe_fs.open_dir(legacy.base, legacy.parts[:-1]) as source, safe_fs.open_dir(
+                    new.base,
+                    new.parts[:-1],
+                ) as target:
+                    source.rename_to(legacy.parts[-1], target, new.parts[-1])
+            except OSError as e:
+                logger.error(
+                    f"工作区 {workspace_id} 的 {CLAUDE_HOME_DIRNAME} 没能挪到工作区之外（{type(e).__name__}: {e}），"
+                    f"这次照旧按旧位置启动。手动迁移：停掉这个工作区的容器后把 {legacy.path} 挪到 {new.path}",
+                )
+                return legacy
+            if safe_fs.kind(new.base, new.parts) != "dir":
+                # 不该发生（容器停着，挪的是核对过的目录）：挪过来的不是目录就删掉，建空的
+                logger.error(f"工作区 {workspace_id} 挪到新位置的 CC home 不是目录，已删掉并新建空目录")
+                with safe_fs.open_dir(new.base, new.parts[:-1]) as parent:
+                    parent.remove_tree(new.parts[-1])
+            WorkspaceService.ensure_claude_home(new)
+            logger.info(f"工作区 {workspace_id} 的 CC home 已迁到工作区目录之外: {new.path}")
+            return new
+        if legacy_kind is not None:
+            logger.error(
+                f"工作区 {workspace_id} 的 {CLAUDE_HOME_DIRNAME} 不是普通目录（{legacy_kind}，容器可能想把宿主目录挂进来），"
+                "不迁移、不碰它，在工作区之外新建空的 CC home；原来的会话与技能如果被挪走了，在工作区目录里找",
+            )
+        WorkspaceService.ensure_claude_home(new)
+        return new
+
+    @staticmethod
+    def retire_legacy_home(workspace_id: int) -> Optional[Path]:
+        """新位置已经在用、工作区目录里还有一份旧 `.claude_home`：整个挪出工作区，返回挪到了哪里
+
+        这份旧 home 不再挂进容器当 `~/.claude`，NA 也不再往里写（定位一律落到新位置），可它还在
+        `/workspace` 里，容器读得到。退回旧版本又升级回来（没跑回滚脚本）时就是这样：旧版本往里写过
+        `settings.json`（`direct` 模式下带平台 Key）和 `nk-ssh/id_gateway`，之后撤销凭据只重写新
+        home，这一份没人管。所以挪到 `.nk-homes/<id>/legacy-<时间>`（0700，不挂进任何容器），日志写出
+        路径，确认没用了由管理员删；删工作区时随 `.nk-homes/<id>` 一起删。
+
+        只在没有容器把旧 home 挂成 `~/.claude` 的时候调：建容器（迁移里）、重启（停下来之后）、NA
+        启动复核（核对挂载之后）。
+        - 新位置不是目录（还是旧布局）、旧的不在：什么都不做；
+        - 旧的是链接或文件：不挪（不是 NA 写的：NA 写 home 不跟随链接），记 WARNING；
+        - 改名失败：退一步删掉里面 NA 写的那几样（`settings.json`、`nk-ssh`），记 ERROR。
+        """
+        with home_lock(workspace_id):
+            new = WorkspaceService.new_claude_home(workspace_id)
+            legacy = WorkspaceService.legacy_claude_home(workspace_id)
+            if safe_fs.kind(new.base, new.parts) != "dir":
+                return None
+            legacy_kind = safe_fs.kind(legacy.base, legacy.parts)
+            if legacy_kind is None:
+                return None
+            if legacy_kind != "dir":
+                logger.warning(
+                    f"工作区 {workspace_id} 已经在用工作区之外的 CC home，工作区目录里的 {CLAUDE_HOME_DIRNAME} "
+                    f"是 {legacy_kind}（不是 NA 写的），不碰它",
+                )
+                return None
+            holder = new.parts[:-1]
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            try:
+                for depth in range(1, len(holder) + 1):
+                    safe_fs.ensure_dir(new.base, holder[:depth], mode=0o700, replace_links=True)
+                    safe_fs.chmod(new.base, holder[:depth], 0o700)
+                with safe_fs.open_dir(legacy.base) as source, safe_fs.open_dir(new.base, holder) as target:
+                    name = f"legacy-{stamp}"
+                    suffix = 1
+                    while target.kind(name) is not None:
+                        suffix += 1
+                        name = f"legacy-{stamp}-{suffix}"
+                    source.rename_to(CLAUDE_HOME_DIRNAME, target, name)
+            except OSError as e:
+                scrubbed = WorkspaceService._scrub_legacy_home(legacy)
+                logger.error(
+                    f"工作区 {workspace_id} 工作区目录里旧的 {CLAUDE_HOME_DIRNAME} 没能挪出工作区（{type(e).__name__}: {e}），"
+                    f"删掉了里面 NA 写过的 {scrubbed or '（没有）'}；剩下的还在 {legacy.path}，请停掉容器后手动处理",
+                )
+                return None
+            try:
+                safe_fs.chmod(new.base, (*holder, name), 0o700)
+            except OSError as e:
+                logger.warning(f"收紧挪出来的旧 CC home 的权限失败（它在 0700 的目录里，宿主上别的用户照样进不去）: {e}")
+            moved = new.base.joinpath(*holder, name)
+            logger.warning(
+                f"工作区 {workspace_id} 已经在用工作区之外的 CC home，工作区目录里还有一份旧的 {CLAUDE_HOME_DIRNAME}"
+                f"（退回旧版本又升级回来时会有，里面可能有旧版本写下的凭据），已挪出工作区: {moved}；确认没用了可以删掉",
+            )
+            return moved
+
+    @staticmethod
+    def _scrub_legacy_home(legacy: ClaudeHome) -> List[str]:
+        """旧 home 挪不走时的退路：删掉里面 NA 写的 `settings.json` 与 `nk-ssh`，返回删了哪些"""
+        from nekro_agent.services.ssh_gateway.container_files import NK_SSH_DIRNAME
+
+        removed: List[str] = []
+        try:
+            with safe_fs.open_dir(legacy.base, legacy.parts) as home:
+                if home.kind(CLAUDE_SETTINGS_FILENAME) not in (None, "dir") and home.unlink(CLAUDE_SETTINGS_FILENAME):
+                    removed.append(CLAUDE_SETTINGS_FILENAME)
+                if home.kind(NK_SSH_DIRNAME) is not None and home.remove_tree(NK_SSH_DIRNAME):
+                    removed.append(NK_SSH_DIRNAME)
+        except (FileNotFoundError, safe_fs.UnsafePathError) as e:
+            logger.error(f"清理工作区 {legacy.workspace_id} 旧 {CLAUDE_HOME_DIRNAME} 里 NA 写过的文件也失败了: {e}")
+        return removed
+
+    @staticmethod
+    def discard_stale_home(workspace_id: int) -> List[str]:
+        """新建工作区时调：同号的 home 若已经存在（数据库重置、导入导出之后 ID 被复用），清掉
+
+        那是上一个用这个编号的工作区的 CC 会话历史、`.claude.json`、网关私钥，不能被新工作区接手。
+        工作区之外的 `.nk-homes/<id>` 与工作区目录里旧布局的 `.claude_home` 都清；删不完（条目太多）
+        的整体挪进回收目录，下次初始化再清。返回清掉了哪些（给日志）。
+        """
+        removed = WorkspaceService._remove_home_entries(workspace_id)
+        if removed:
+            logger.warning(f"新建的工作区 {workspace_id} 的编号以前用过，清掉了上一个工作区留下的 CC home: {removed}")
+        return removed
+
+    @staticmethod
+    def _remove_home_entries(workspace_id: int) -> List[str]:
+        """删掉这个编号的两种 home：工作区之外的 `.nk-homes/<id>`、工作区目录里旧布局的 `.claude_home`
+
+        逐级不跟随链接，旧 `.claude_home` 是链接只删链接本身；删不完（条目太多）的整体挪进回收
+        目录。返回删了（或挪走了）哪些。
+        """
+        removed: List[str] = []
+        root = WorkspaceService.get_workspace_dir(workspace_id).parent
+        legacy = WorkspaceService.legacy_claude_home(workspace_id)
+        targets = (
+            (root, (HOMES_DIRNAME,), str(int(workspace_id))),
+            (legacy.base, (), CLAUDE_HOME_DIRNAME),
+        )
+        with home_lock(workspace_id):
+            for base, parent_parts, name in targets:
+                if safe_fs.kind(base, (*parent_parts, name)) is None:
+                    continue
+                with safe_fs.open_dir(base, parent_parts) as parent, WorkspaceService._open_trash_dir(
+                    workspace_id,
+                    create=True,
+                ) as trash:
+                    parent.remove_tree_or_discard(name, trash)
+                removed.append(str(base.joinpath(*parent_parts, name)))
+        return removed
+
+    @staticmethod
+    async def claim_fresh_home(workspace: DBWorkspace) -> None:
+        """新建的工作区记录一落库就调：清掉同号残留的 CC home；清不掉就删掉这条记录、抛 `StaleHomeError`
+
+        宁可让这次创建失败、让管理员看见报错，也不让新工作区接手上一个同号工作区的会话历史与网关
+        私钥。编号在落库之前不知道，所以清扫只能排在 `create` 之后、别的初始化之前。
+        """
+        try:
+            await asyncio.to_thread(WorkspaceService.discard_stale_home, workspace.id)
+        except Exception as e:
+            logger.error(f"新建工作区 {workspace.id} 时清不掉同号残留的 CC home，撤销创建: {type(e).__name__}: {e}")
+            try:
+                await workspace.delete()
+            except Exception as drop_error:  # noqa: BLE001 - 原来的异常更要紧，这条记录留给管理员删
+                logger.error(f"撤销创建工作区 {workspace.id} 也失败了，请手动删除它: {drop_error}")
+            raise StaleHomeError(
+                f"编号 {workspace.id} 上一个工作区留下的 CC home 清不掉，工作区没有创建，请重试: {type(e).__name__}",
+            ) from e
+
+    @staticmethod
+    def remove_workspace_home(workspace_id: int) -> List[str]:
+        """删工作区时调（库里删除已经提交之后）：删掉它的 CC home（两种布局都删）
+
+        工作区目录本身照旧不删（那是用户的工作产物，见删除接口的判定表），但旧布局的
+        `.claude_home` 虽然在工作区目录里也一起删：home 里是 CC 的会话历史、`.claude.json`、网关
+        私钥，留着只会在编号被复用时被下一个工作区接手。删不完的挪进回收目录再清一遍，回收目录
+        清空了也删掉；清不完的留到下次（同号工作区下次初始化时）。返回删了哪些。
+        """
+        removed = WorkspaceService._remove_home_entries(workspace_id)
+        try:
+            with WorkspaceService._open_trash_dir(workspace_id, create=False) as trash:
+                trash.purge_trash()
+            with safe_fs.open_dir(WorkspaceService.get_workspace_dir(workspace_id).parent, (".nk-trash",)) as trash_root:
+                trash_root.rmdir(str(int(workspace_id)))  # 清空了才删得掉
+        except FileNotFoundError:
+            pass
+        if removed:
+            logger.info(f"工作区 {workspace_id} 的 CC home 已删除: {removed}")
+        return removed
 
     # ── CLAUDE.md 模板 ───────────────────────────────────────────────────────
     _CLAUDE_MD_TEMPLATE = """\
@@ -518,7 +848,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         """从预设取出写进 settings.json 的模型名与超时
 
         `model_type == "preset"` 时刻意留空模型名：那一档由用户级 CC 设置
-        （`.claude_home/settings.json`）的 `model` 字段决定；写进来就会变成 `ANTHROPIC_MODEL`
+        （CC home 里的 `settings.json`）的 `model` 字段决定；写进来就会变成 `ANTHROPIC_MODEL`
         环境变量，优先级高于设置文件，反而把预设档位覆盖掉。
         """
         model = ""
@@ -540,6 +870,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         label: str,
         *,
         allow_platform_secrets: bool,
+        home: ClaudeHome,
     ) -> bool:
         """把 cc-sandbox 的 settings.json 与 CC 的用户级设置落盘
 
@@ -548,8 +879,11 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
         - `{ws}/settings.json`：cc-sandbox 自己的格式，它每次拉起 `claude` 前只从这里取
           地址、令牌、手动档模型名、超时四项，翻成环境变量；
-        - `{ws}/.claude_home/settings.json`（容器里 `~/.claude/settings.json`）：CC 自己的
+        - home 里的 `settings.json`（容器里 `~/.claude/settings.json`）：CC 自己的
           格式，preset 档位的 `model`、`extra_env`、手动档的小模型与别名映射都只在这里。
+          `home` 由调用方按工作区算好（`WorkspaceService.claude_home`）。算好之后旧布局的 home
+          被迁走了（迁移在线程里跑）的话，按迁移之后的位置写，不在工作区目录里把旧的建回来
+          （见 `ensure_claude_home`）；迁移与这里的写入由 `home_lock` 排开。
           写在用户级而不是项目目录（`/workspace/default/.claude/`），是因为 CC 在工作区里做
           git 操作时会把项目目录下的文件连同中继令牌一起提交出去。
 
@@ -582,45 +916,121 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
         WorkspaceService.remove_legacy_claude_settings(ws_dir)
 
-        try:
-            WorkspaceService.ensure_claude_home(ws_dir)
-            if not cc_preset:
-                # 没有预设就没有 NA 要下发的内容；留着上一份等于留着上一份里的凭据
-                with safe_fs.open_dir(ws_dir, CLAUDE_HOME_DIRNAME) as claude_home:
-                    if claude_home.kind(CLAUDE_SETTINGS_FILENAME) not in (None, "dir"):
-                        claude_home.unlink(CLAUDE_SETTINGS_FILENAME)
-                return False
+        claude_payload: Optional[Dict[str, Any]] = None
+        if cc_preset:
             claude_payload = build_claude_settings_payload(
                 cc_preset,
                 credential,
                 allow_platform_secrets=allow_platform_secrets,
             )
-            _write_workspace_json(ws_dir, f"{CLAUDE_HOME_DIRNAME}/{CLAUDE_SETTINGS_FILENAME}", claude_payload)
-        except (safe_fs.UnsafePathError, IsADirectoryError) as e:
-            # 刚重建完 `.claude_home` 又被换掉（容器还在跑），或者 settings.json 被换成了目录
-            logger.warning(f"{label} 工作区 {ws_dir.name} 的 .claude_home 路径被容器改动过，CC 用户级设置没有写入: {e}")
+        try:
+            with home_lock(home.workspace_id):
+                home = WorkspaceService.ensure_claude_home(home)
+                if claude_payload is None:
+                    # 没有预设就没有 NA 要下发的内容；留着上一份等于留着上一份里的凭据
+                    with safe_fs.open_dir(home.base, home.parts) as claude_home:
+                        if claude_home.kind(CLAUDE_SETTINGS_FILENAME) not in (None, "dir"):
+                            claude_home.unlink(CLAUDE_SETTINGS_FILENAME)
+                    return False
+                _write_workspace_json(home.base, "/".join(home.sub(CLAUDE_SETTINGS_FILENAME)), claude_payload)
+                with safe_fs.open_dir(home.base, home.parts) as claude_home:
+                    WorkspaceService.give_to_container(claude_home, CLAUDE_SETTINGS_FILENAME)
+        except (safe_fs.UnsafePathError, IsADirectoryError, FileNotFoundError) as e:
+            # 旧布局下刚修好的 `.claude_home` 又被换掉或删掉（容器还在跑），或者 settings.json 被换成了目录
+            logger.warning(f"{label} 工作区 {ws_dir.name} 的 CC home 路径被容器改动过，CC 用户级设置没有写入: {e}")
             return False
-        logger.debug(f"{label} CC 用户级设置: {ws_dir / CLAUDE_HOME_DIRNAME / CLAUDE_SETTINGS_FILENAME}")
+        logger.debug(f"{label} CC 用户级设置: {home.path / CLAUDE_SETTINGS_FILENAME}")
         return claude_settings_carries_platform_secret(claude_payload)
 
     @staticmethod
-    def ensure_claude_home(ws_dir: Path) -> Path:
-        """建好挂进容器当 `~/.claude/` 的目录，并让容器里的 appuser 可写
+    def ensure_claude_home(home: ClaudeHome) -> ClaudeHome:
+        """建好挂进容器当 `~/.claude/` 的目录，并让容器里的 appuser 可写；返回实际用的那个 home
 
-        bind mount 跨越用户边界时宿主上的属主可能对不上，所以照旧放开成 0777。
+        bind mount 跨越用户边界时宿主上的属主可能对不上，所以 home 本身照旧放开成 0777。
+        调用方之后一律用返回值：传进来的旧布局 home 可能已经不是这个工作区现在的 home 了。
 
-        这个目录整个归 NA 管，容器却能把它换成符号链接（工作区目录以读写挂进容器）：
-        按路径 `chmod` 会把链接指向的宿主目录改成 0777，建容器时按路径算挂载源还会把
-        链接指向的目录挂进容器。所以不跟随链接地建、先打开再 `fchmod`；它是链接或文件时删掉
-        条目本身重建成目录（`replace_links=True`）。建法与 `init_workspace_dir` 里那两行相同；
-        建容器时这一步在算挂载源之前，那时旧容器已经停了，没人能再把它换回去。
+        - 旧布局：**只修，不从无到有建**。`.claude_home` 在容器写得到的工作区目录里，容器能把它
+          换成符号链接——按路径 `chmod` 会把链接指向的宿主目录改成 0777，建容器时按路径算挂载源
+          还会把链接指向的目录挂进容器。所以不跟随链接地看、先打开再 `fchmod`；它是链接或文件时
+          删掉条目本身重建成目录。新位置已经是目录（调用方算好 home 之后迁移跑完了）、或者旧的已经
+          不在了（刚被迁走，或者被容器删掉了）时改用新位置：在工作区目录里把旧的建回来的话，NA
+          接着写进去的 `settings.json`（可能带平台 Key）、nk-ssh 私钥就留在 `/workspace` 里，新布局
+          下再没人管它。
+        - 新布局：`.nk-homes/<id>` 是 NA 自己的目录，收成 0700（不挂进任何容器，宿主上别的用户
+          也读不到会话历史）；只有最后一级 `claude` 是 0777，并交给容器用户（`give_to_container`：
+          它不在 `/workspace` 里，镜像入口脚本的 `chown` 管不到）。迁进来的老 home 里面的东西不动。
+
+        与迁移并发时由调用方拿着 `home_lock`（迁移本身也拿着它）。
         """
-        previous = safe_fs.kind(ws_dir, (CLAUDE_HOME_DIRNAME,))
-        safe_fs.ensure_dir(ws_dir, (CLAUDE_HOME_DIRNAME,), replace_links=True)
-        safe_fs.chmod(ws_dir, (CLAUDE_HOME_DIRNAME,), 0o777)
-        if previous not in (None, "dir"):
-            logger.warning(f"工作区 {ws_dir.name} 的 {CLAUDE_HOME_DIRNAME} 不是普通目录（{previous}，可能是容器换的），已删掉重建")
-        return ws_dir / CLAUDE_HOME_DIRNAME
+        if home.legacy:
+            new = WorkspaceService.new_claude_home(home.workspace_id)
+            previous = None if safe_fs.kind(new.base, new.parts) == "dir" else safe_fs.kind(home.base, home.parts)
+            if previous is None:
+                return WorkspaceService.ensure_claude_home(new)
+            if previous == "dir":
+                try:
+                    safe_fs.chmod(home.base, home.parts, 0o777)
+                    return home
+                except FileNotFoundError:
+                    return WorkspaceService.ensure_claude_home(new)
+                except safe_fs.UnsafePathError:
+                    previous = "link"  # 看过之后又被换成了链接：照下面修
+            safe_fs.ensure_dir(home.base, home.parts, replace_links=True)
+            safe_fs.chmod(home.base, home.parts, 0o777)
+            WorkspaceService._give_home_to_container(home)
+            logger.warning(f"{home.base} 下的 {CLAUDE_HOME_DIRNAME} 不是普通目录（{previous}，可能是容器换的），已删掉重建")
+            return home
+        for depth in range(1, len(home.parts)):
+            safe_fs.ensure_dir(home.base, home.parts[:depth], mode=0o700, replace_links=True)
+            safe_fs.chmod(home.base, home.parts[:depth], 0o700)
+        safe_fs.ensure_dir(home.base, home.parts, replace_links=True)
+        safe_fs.chmod(home.base, home.parts, 0o777)
+        WorkspaceService._give_home_to_container(home)
+        return home
+
+    @staticmethod
+    def _give_home_to_container(home: ClaudeHome) -> None:
+        """home 目录本身交给容器用户（只这一级；里面的东西各由写它的地方交）"""
+        try:
+            with safe_fs.open_dir(home.base, home.parts[:-1]) as parent:
+                WorkspaceService.give_to_container(parent, home.parts[-1])
+        except (FileNotFoundError, safe_fs.UnsafePathError) as e:
+            logger.warning(f"工作区 {home.workspace_id} 的 CC home 没能交给容器用户: {e}")
+
+    @staticmethod
+    def give_to_container(directory: safe_fs.DirHandle, name: str, *, tree: bool = False) -> None:
+        """把 NA 在 CC home 里建的、写的条目交给容器里的用户（uid / gid 1000），不跟随链接
+
+        新布局的 home 不在 `/workspace` 里，镜像入口脚本只 `chown` 工作区，碰不到 `~/.claude`。NA
+        （Docker 部署里是 root）建出来的 `skills/`、写出来的 `settings.json` 就都属 root，容器里的
+        appuser 在 root 的 0755 `skills/` 下建不了 `skills/dynamic`，新建的工作区因此启动不起来。所以 NA
+        每建一个目录、写一个文件，都在写完之后交给容器用户；旧布局一样处理（那里本来靠入口脚本
+        `chown -R`，只在工作区对 appuser 不可写时才做）。权限位不动：home 本身 0777，私钥照旧 0600。
+
+        - `tree`：连同里面的条目一起（技能目录是整棵复制进来的）；链接不改、不进去；
+        - 不支持改属主的平台（Windows）什么都不做；
+        - NA 不是 root、改不了属主时记一次 WARNING，之后不再提醒（容器里的 appuser 可能写不进这些
+          目录）；条目被容器删掉或换掉、条目太多，记一条 WARNING，不影响调用方。
+        """
+        global _chown_refusal_reported
+        if not safe_fs.CHOWN_SUPPORTED:
+            return
+        try:
+            if tree:
+                directory.chown_tree(name, CONTAINER_USER_UID, CONTAINER_USER_GID)
+            else:
+                directory.chown(name, CONTAINER_USER_UID, CONTAINER_USER_GID)
+        except PermissionError as e:
+            if not _chown_refusal_reported:
+                _chown_refusal_reported = True
+                logger.warning(
+                    f"NA 改不了 CC home 里条目的属主（{e}）：NA 要以 root 运行（或者就是 uid {CONTAINER_USER_UID}），"
+                    f"否则容器里的 appuser 可能写不进 NA 建的目录（例如 skills/）。这条只提醒一次",
+                )
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"把 {directory.path / name} 交给容器用户失败: {type(e).__name__}: {e}")
 
     @staticmethod
     def remove_legacy_claude_settings(ws_dir: Path) -> bool:
@@ -662,7 +1072,15 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         因此写入新文件后下一条消息即可使用新的模型配置。
 
         **不轮换中继令牌**：这条路径不重启容器，轮换会让容器里正在跑的那一轮 LLM 调用当场 401。
+
+        先重读这一行：调用方手里的可能是早先查出来的对象（预设同步一次查出所有工作区再逐个写）。
+        工作区已经删了或正在删的不写——删除会在库里提交之后删掉它的 CC home，这时再写就会把
+        `.nk-homes/<id>/claude/settings.json` 建回来，成了没人管的孤儿（工作区目录本身删除时保留，
+        挡不住这一步）。
         """
+        current = await DBWorkspace.get_or_none(id=workspace.id)
+        if current is None or current.status == "deleting":
+            return
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
         if not ws_dir.is_dir():
             return  # 工作区目录尚未初始化，容器首次启动时 init_workspace_dir 会完整写入
@@ -679,6 +1097,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             credential,
             "热更新",
             allow_platform_secrets=await platform_credentials_allowed(workspace),
+            home=WorkspaceService.claude_home(workspace.id),
         ):
             await mark_platform_secret_delivered(workspace)
 
@@ -1004,7 +1423,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         controller_address: str = "",
         host_address: str = "",
     ) -> None:
-        """初始化 workspace 目录，写入 settings.json / .mcp.json / .claude_home/settings.json / skills/（幂等）
+        """初始化 workspace 目录，写入 settings.json / .mcp.json / CC home 里的 settings.json 与 skills/（幂等）
 
         Args:
             workspace: 工作区记录
@@ -1046,6 +1465,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         )
 
         allow_platform_secrets = await platform_credentials_allowed(workspace)
+        home = await asyncio.to_thread(WorkspaceService.claude_home, workspace.id)
         if await asyncio.to_thread(
             WorkspaceService._write_settings_files,
             ws_dir,
@@ -1053,6 +1473,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             credential,
             "写入",
             allow_platform_secrets=allow_platform_secrets,
+            home=home,
         ):
             await mark_platform_secret_delivered(workspace)
 
@@ -1070,11 +1491,9 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             # 创建工作区知识库目录，供知识库源文件和规范化全文使用
             WorkspaceService.ensure_kb_dirs(workspace.id)
 
-            # 创建 .claude_home 目录（挂载到容器内 ~/.claude/，持久化 Claude Code 会话历史）。
-            # 它还会被当作 bind 源挂进下一个容器：是链接就删掉链接重建，绝不顺着它挂宿主别处
-            safe_fs.ensure_dir(ws_dir, (".claude_home",), replace_links=True)
-            # 确保容器内的 appuser 有写入权限（bind mount 跨越用户边界时宿主机 owner 可能不匹配）
-            safe_fs.chmod(ws_dir, (".claude_home",), 0o777)
+            # CC home（挂载到容器内 ~/.claude/，持久化 Claude Code 会话历史）。它还会被当作
+            # bind 源挂进下一个容器：旧布局下是链接就删掉链接重建，绝不顺着它挂宿主别处
+            WorkspaceService.ensure_claude_home(home)
 
         await asyncio.to_thread(_ensure_dirs)
 
@@ -1225,7 +1644,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
     @staticmethod
     async def sync_skills(workspace: DBWorkspace) -> None:
-        """将 metadata['skills'] 中选中的技能同步到沙盒 .claude_home/skills/。
+        """将 metadata['skills'] 中选中的技能同步到 CC home 的 skills/（容器里 ~/.claude/skills/）。
 
         Claude Code only recognizes flat skill directories under ~/.claude/skills/<skill-name>/SKILL.md.
         Workspace-local dynamic skills are also stored in this same directory. A skill without
@@ -1246,7 +1665,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
         scope = await workspace_skill_scope(workspace)
 
-        # `.claude_home` 是 0777、整个挂进容器：`skills` 乃至 `.claude_home` 都可能被换成链接，
+        # CC home 是 0777、整个挂进容器：`skills` 都可能被换成链接（旧布局下 `.claude_home` 本身也会），
         # 指到技能库或宿主别处。逐级不跟随地打开，删用 `remove_tree`（链接只删链接本身）。
         # 这是启动路径：删不完的挪进工作区之外的回收目录，不让启动失败（见 `_discard_tree`）。
         # 整段文件系统操作放进线程，调用方拿着工作区的锁，事件循环不跟着卡住
@@ -1665,7 +2084,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
 
     @staticmethod
     def get_workspace_skills_dir(workspace_id: int) -> Path:
-        return WorkspaceService.get_workspace_dir(workspace_id) / ".claude_home" / "skills"
+        return WorkspaceService.claude_home(workspace_id).path / "skills"
 
     @staticmethod
     def _valid_skill_dir_name(dir_name: str) -> bool:
@@ -1739,6 +2158,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
                 raise ValueError(f"技能 '{dir_name}' 不是普通目录（可能被换成了链接），请在沙盒里删掉后重试")
             with skills.subdir(dir_name, create=True) as skill_dir:
                 skill_dir.write_text("SKILL.md", content)
+            WorkspaceService.give_to_container(skills, dir_name, tree=True)
 
     @staticmethod
     def list_dynamic_skill_tree(workspace_id: int, dir_name: str, *, max_depth: int = 5) -> Optional[List[Dict[str, Any]]]:
@@ -1855,6 +2275,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             finally:
                 for handle in reversed(opened):
                     handle.close()
+            WorkspaceService.give_to_container(skills, dir_name, tree=True)
 
     @staticmethod
     def delete_dynamic_skill(workspace_id: int, dir_name: str) -> bool:
@@ -1894,7 +2315,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
         不可能写到平台方目录里，不依赖调用点记得判一次。
 
         ⚠️ 落点判定只管「写到哪儿去」，**不管「从哪儿读」**：源目录是容器可写的。
-        所以源一侧逐级不跟随链接地打开（`.claude_home`、`skills`、技能目录本身被换成链接都不认），
+        所以源一侧逐级不跟随链接地打开（旧布局的 `.claude_home`、`skills`、技能目录本身被换成链接都不认），
         内含链接的直接拒绝晋升；真正复制时用 `copy_tree_out`，判完之后才冒出来的链接也只会被跳过，
         不会把链接指向的宿主文件带进技能库。
         """
@@ -2174,7 +2595,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
     ) -> None:
         """在**技能库**（宿主侧、容器碰不到）的 skill 目录下写入 .skill-origin.json 来源追溯文件。
 
-        工作区里的 skill 目录在容器可写的 `.claude_home` 下，不走这里，见 `_sync_skill_into`。
+        工作区里的 skill 目录在容器可写的 CC home 下，不走这里，见 `_sync_skill_into`。
         """
         origin_path = skill_dir / ".skill-origin.json"
         origin_path.write_text(
@@ -2189,20 +2610,32 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
             encoding="utf-8",
         )
 
-    # ── 工作区里的 skill 目录（`.claude_home/skills`，容器可写） ─────────────────
-    # 下面这组函数都从工作区根出发逐级不跟随链接地打开，`.claude_home`、`skills`、技能目录、
-    # 技能目录里的文件，任何一级是链接都不跟：读当作不存在，删只删链接本身，写之前删掉链接重建。
+    # ── 工作区里的 skill 目录（CC home 下的 `skills`，容器可写） ─────────────────
+    # 下面这组函数都从 home 所在的根（`WorkspaceService.claude_home`）出发逐级不跟随链接地打开，
+    # home、`skills`、技能目录、技能目录里的文件，任何一级是链接都不跟：读当作不存在，删只删链接
+    # 本身，写之前删掉链接重建。
 
     _SKILL_FILE_MAX_BYTES = 1024 * 1024
 
     @staticmethod
     def _open_workspace_skills(workspace_id: int, *, create: bool = False) -> Optional[safe_fs.DirHandle]:
-        """打开 `.claude_home/skills`；`create` 时途中缺的建出来、被换成链接的删掉重建"""
-        base = WorkspaceService.get_workspace_dir(workspace_id)
+        """打开 home 下的 `skills`；`create` 时途中缺的建出来、被换成链接的删掉重建
+
+        `create` 时定位、修 home、打开 `skills` 拿着 `home_lock` 一口气做完（迁移在线程里跑）；home
+        本身只由 `ensure_claude_home` 修，这里不顺手建（旧布局的 home 不见了就落到新位置）。拿到的
+        是目录句柄，之后 home 再被迁走，写入也跟着句柄落在挪过去的目录里。
+        """
         if create:
-            return safe_fs.open_dir(base, (".claude_home", "skills"), create=True, replace_links=True)
+            with home_lock(workspace_id):
+                home = WorkspaceService.ensure_claude_home(WorkspaceService.claude_home(workspace_id))
+                with safe_fs.open_dir(home.base, home.parts) as claude_home:
+                    skills = claude_home.subdir("skills", create=True, replace_links=True)
+                    # 容器里的 CC 要在 `skills/` 下建自己的目录（`skills/dynamic`），它得属容器用户
+                    WorkspaceService.give_to_container(claude_home, "skills")
+                    return skills
+        home = WorkspaceService.claude_home(workspace_id)
         try:
-            return safe_fs.open_dir(base, (".claude_home", "skills"))
+            return safe_fs.open_dir(home.base, home.sub("skills"))
         except (FileNotFoundError, safe_fs.UnsafePathError):
             return None
 
@@ -2256,7 +2689,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
     def _discard_tree(directory: safe_fs.DirHandle, name: str, trash: Optional[safe_fs.DirHandle]) -> None:
         """删一个条目；给了 `trash`（启动路径）时删不完就整体挪进回收目录（`_open_trash_dir`）
 
-        `.claude_home` 里的东西是容器自己的：它造一棵上百万条目的目录，删不完也不该让工作区
+        CC home 里的东西是容器自己的：它造一棵上百万条目的目录，删不完也不该让工作区
         启动失败。挪走之后这个名字就空出来了，下一次 `init_workspace_dir` 再清回收目录。
         """
         if trash is None:
@@ -2295,6 +2728,7 @@ CC 通过 Skills 与任务领域的最佳实践保持一致。**每次任务开�
                 ".skill-origin.json",
                 WorkspaceService._skill_origin_payload(origin=category, source_skill_id=skill_id),
             )
+        WorkspaceService.give_to_container(skills, target_name, tree=True)
         return True
 
     @staticmethod

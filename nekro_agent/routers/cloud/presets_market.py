@@ -13,7 +13,7 @@ from nekro_agent.routers.presets import (
     resolve_instance_scope,
     visible_presets,
 )
-from nekro_agent.schemas.errors import CloudServiceError, ConflictError
+from nekro_agent.schemas.errors import CloudServiceError, ConflictError, WorldbookAnalysisBusyError
 from nekro_agent.schemas.tavern import CardImportOptions
 from nekro_agent.services.tavern.card_format import CardFileRejected, parse_card_object
 from nekro_agent.services.tavern.cloud import parse_envelope
@@ -25,6 +25,7 @@ from nekro_agent.services.user.tenant_perm import (
     get_tenant_scope,
     require_platform_owner,
 )
+from nekro_agent.services.worldbook.purpose import ensure_import_slot_free, tenant_slot_key
 from nekro_agent.systems.cloud.api.preset import get_preset, list_presets, list_user_presets
 
 router = APIRouter(prefix="/cloud/presets-market", tags=["Cloud Presets Market"])
@@ -254,6 +255,9 @@ async def download_preset(
     并在 `note` 里说明。
     """
     scope = await resolve_instance_scope(_current_user, instance_key)
+    tenant_key = tenant_slot_key(get_tenant_scope(_current_user))
+    # 这个租户已有一个导入在分析：先拒掉，别去云端取了一遍再 409
+    ensure_import_slot_free(tenant_key)
     if await visible_presets(scope).filter(remote_id=remote_id).exists():
         raise ConflictError(resource="人设")
 
@@ -287,6 +291,7 @@ async def download_preset(
             username=_current_user.username,
             template=config.TAVERN_CARD_TEMPLATE,
             avatar=preset_data.avatar,
+            tenant_key=tenant_key,
             content_override=envelope.content,
             extra=CardExtras(
                 prefill=envelope.prefill,
@@ -308,6 +313,10 @@ async def download_preset(
         logger.warning(f"云端人设的酒馆卡数据无法还原: remote_id={preset_data.id}, reason={exc}")
         await _create_plain_preset(preset_data, scope, content=envelope.content)
         return PresetDownloadResponse(ok=True, note=CARD_RESTORE_FAILED_NOTE)
+    except WorldbookAnalysisBusyError:
+        # 同一个租户的另一个导入正在分析：照实回 409，不能退回只建人设——那样会留下一条没有书、
+        # 没有卡片附带内容、却带着云端编号的人设，重试还会撞「已存在」。
+        raise
     except Exception as exc:  # noqa: BLE001 - 还原失败就退回只建人设，原因不把卡片原文带进日志
         logger.warning(f"云端人设的酒馆卡数据无法还原: remote_id={preset_data.id}, reason={type(exc).__name__}")
         await _create_plain_preset(preset_data, scope, content=envelope.content)

@@ -111,7 +111,7 @@ def _group_children_with_visibility(source: str, key: str) -> Set[str]:
     """**菜单组**上标了 `visibility: '<key>'` 时，它名下那些子项的 path
 
     ⚠️ `_pages_with_visibility` 只认「自己带 path」的格子，而菜单组带的是 `key:` ——
-    于是 `chatManagement` / `plugins` / `workspace` 这三组整组藏起来时，
+    于是 `chatManagement` / `roleplay` / `plugins` / `workspace` 这几组整组藏起来时，
     两份清单的对齐用例**一格都检查不到**。组上标一次、子项不标是本文件允许的写法
     （`navigation.tsx` 明写「组上标一次比逐格标少一份漏登记的机会」），所以对齐判据
     必须自己把组展开。
@@ -1162,10 +1162,15 @@ class TestGroupLevelHidingIsAlignedToo:
             "组上标一次是允许的写法，但那只管画不画，地址栏照样进得去"
         )
 
-    def test_the_group_parser_finds_the_three_groups(self, navigation_source: str) -> None:
-        """§2.11 对照组的一半：解析器不是恒返回空集合"""
+    def test_the_group_parser_finds_the_tenant_admin_groups(self, navigation_source: str) -> None:
+        """§2.11 对照组的一半：解析器不是恒返回空集合
+
+        P3 把 `/presets`、`/memory`、`/worldbook`、`/affection`、`/state`、`/prompt-lab`
+        收进了新的「角色」组；这一组同样整组标了 `tenantAdminOnly`，也必须被解析出来。
+        """
         children = _group_children_with_visibility(navigation_source, "tenantAdminOnly")
         assert {"/chat-channel/management", "/plugins/management", "/workspace/skills"} <= children
+        assert {"/presets", "/memory", "/worldbook", "/affection", "/state", "/prompt-lab"} <= children
 
     def test_the_group_criterion_can_see_a_missing_registration(
         self,

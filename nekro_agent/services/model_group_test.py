@@ -236,8 +236,8 @@ async def assert_test_target_allowed(
 
     平台组对租户**不复检**，这不是漏掉了，而是必须如此：
     - 该地址由平台方设定，租户无法控制目标，测试不给租户任何新的出站能力；
-    - `UnsafeDownloadUrlError` 的文案里带主机名与解析出的 IP，对租户抛出去
-      等于把平台方的内网拓扑（以及被当作敏感信息的 BASE_URL）直接念给他听；
+    - 复检的报错已不带主机名与地址（统一成一句），但「拒与不拒」本身仍分得出来：对租户复检，
+      等于告诉他平台方的组指向不指向内网；
     - 平台方用 `http://127.0.0.1:11434/v1` 接本地推理是主流用法，本就豁免该校验。
     """
     if not credential_visible:
@@ -369,6 +369,7 @@ async def run_model_group_test(
     credential_visible: bool,
     group_name: str = "",
     tenant_id: Optional[int] = None,
+    tenant_egress: Optional[bool] = None,
 ) -> ModelGroupTestOutcome:
     """发起一次连通性测试并返回归一化结论
 
@@ -385,9 +386,13 @@ async def run_model_group_test(
             通常不相等。用显示名落账有两个后果——同一个组在用量页上裂成两行，
             而且 `visible_model_group_names` 按 `DBModelGroup.name` 反查不到它，
             于是租户自己的组在自己的账单里被掩成「(未公开的模型组)」。
+        tenant_egress: 被测的地址是不是租户的（组归租户，或租户在 inline 测试里自己填的）；是的话连接按
+            租户出站建（`tools/tenant_egress.py`）。不给时按组判（`is_tenant_owned_group`）；本仓库的三个入口
+            都显式给（按库里那一行，或 inline 测试按当前用户），静态用例钉着。
         tenant_id: 点这次测试的人所属的租户（平台方为 `None`）。这一跳没有会话也没有实例，
             不声明的话账落成 `tenant_id IS NULL`，租户在自己的用量页上**看不到自己刚烧的钱**。
     """
+    from nekro_agent.services import embedding_health
     from nekro_agent.services.agent.openai import (
         gen_openai_chat_response,
         gen_openai_embeddings,
@@ -398,6 +403,12 @@ async def run_model_group_test(
         return build_failure_outcome(ModelTestErrorCode.UNSUPPORTED_MODEL_TYPE, model_name=group.CHAT_MODEL)
     if not group.BASE_URL.strip() or not group.API_KEY.strip():
         return build_failure_outcome(ModelTestErrorCode.NOT_CONFIGURED, model_name=group.CHAT_MODEL)
+    if tenant_egress is None:
+        from nekro_agent.tools.tenant_egress import is_tenant_owned_group
+
+        # 组对象（地址、密钥、代理）与组名都看，任一判出是租户的就按租户：只看组名的话，平台方的名字配上
+        # 租户的连接参数（或反过来）就能把租户的地址按平台方连
+        tenant_egress = is_tenant_owned_group(group) or (bool(group_name) and is_tenant_owned_group(group_name))
 
     started = time.perf_counter()
     try:
@@ -412,7 +423,15 @@ async def run_model_group_test(
                     group,
                 ),
             ):
-                embedding = await gen_openai_embeddings(**build_openai_embedding_test_params(group))
+                # 测的可能是表单里还没保存的草稿（新 Key、新地址）：它的成败不代表这个组在用的那份配置，
+                # 不计入嵌入健康状态，免得一次草稿测试把正在告警的组「测好了」或者反过来。
+                # 一次性客户端：内联测试的地址直接来自请求体，进按地址缓存的连接池的话，换着填主机名就能把
+                # 平台方的客户端挤出缓存
+                with embedding_health.untracked():
+                    embedding = await gen_openai_embeddings(
+                        **build_openai_embedding_test_params(group, tenant_egress=tenant_egress),
+                        pooled_client=False,
+                    )
             if not embedding:
                 raise ValueError("嵌入接口未返回向量")
             return ModelGroupTestOutcome(
@@ -435,8 +454,9 @@ async def run_model_group_test(
         ):
             result = await gen_openai_chat_response(
                 messages=build_model_test_messages(use_system=False),
-                **build_openai_model_test_params(group, False),
+                **build_openai_model_test_params(group, False, tenant_egress=tenant_egress),
                 max_wait_time=CHAT_TEST_MAX_WAIT_SECONDS,
+                pooled_client=False,  # 同上：不进按地址缓存的连接池
             )
         if not result.response_content:
             raise ValueError("模型未返回有效内容")

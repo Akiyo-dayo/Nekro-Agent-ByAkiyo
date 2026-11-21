@@ -1,46 +1,39 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
   Chip,
   CircularProgress,
+  Divider,
+  Menu,
+  MenuItem,
   Stack,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableRow,
   Typography,
   useTheme,
 } from '@mui/material'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
-import { Navigate, useNavigate, useParams } from 'react-router-dom'
+import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import AddIcon from '@mui/icons-material/Add'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack'
-import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
-import DownloadIcon from '@mui/icons-material/Download'
-import EditIcon from '@mui/icons-material/Edit'
-import LockOutlinedIcon from '@mui/icons-material/LockOutlined'
-import PauseIcon from '@mui/icons-material/Pause'
-import PlayArrowIcon from '@mui/icons-material/PlayArrow'
-import RestoreIcon from '@mui/icons-material/Restore'
-import SettingsIcon from '@mui/icons-material/Settings'
-import UploadFileIcon from '@mui/icons-material/UploadFile'
-import VisibilityOutlinedIcon from '@mui/icons-material/VisibilityOutlined'
+import MoreHorizRoundedIcon from '@mui/icons-material/MoreHorizRounded'
 import WarningAmberRoundedIcon from '@mui/icons-material/WarningAmberRounded'
 import ActionButton from '../../components/common/ActionButton'
 import IconActionButton from '../../components/common/IconActionButton'
 import NekroDialog from '../../components/common/NekroDialog'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import SearchField from '../../components/common/SearchField'
+import StatusChip from '../../components/common/StatusChip'
+import ServerDataTable, {
+  type ServerDataTableColumn,
+} from '../../components/common/ServerDataTable'
 import { ThemedTooltip } from '../../components/common/ThemedTooltip'
 import {
   WorldbookEnabledChip,
   WorldbookReadOnlyChip,
   WorldbookScopeChip,
   WorldbookStatusChip,
-  WorldbookTrustChip,
+  WorldbookTrustIcon,
 } from '../../components/worldbook/chips'
 import {
   worldbookBindingMissingText,
@@ -58,18 +51,28 @@ import { useNotification } from '../../hooks/useNotification'
 import { worldbookPath } from '../../router/routes'
 import { isNotFoundError } from '../../services/api/axios'
 import {
+  WORLDBOOK_STATE_ONLY_PURPOSES,
   worldbookApi,
+  type BookBudgetCheck,
   type WorldbookEntryAction,
   type WorldbookEntryItem,
   type WorldbookScopeParams,
 } from '../../services/api/worldbook'
-import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
+import { CHIP_VARIANTS } from '../../theme/variants'
+
+/** 一本书的条目动辄上百条，按 20 条翻页太碎；这张表每页 50 条 */
+const ENTRY_PAGE_SIZE = 50
+
+// 搜索框停手多久再发请求
+const SEARCH_DEBOUNCE_MS = 400
+// 有条目标着「分析中」时隔多久再取一次：后端每次请求只分析一部分，下次接着算
+const PENDING_REFETCH_MS = 3000
 
 /**
  * 书详情
  *
- * 条目一次取全：一本书的条目通常只有几十条，本地过滤比再写一套服务端筛选更直接。
- * 只有书的增删改与条目动作走接口，改完统一 invalidate 以 `worldbook` 开头的查询。
+ * 条目分页、搜索都在服务端做：导入的卡片书可能有几百上千条大条目，一次取全连同用途分析
+ * 会拖慢请求。书的增删改与条目动作改完统一 invalidate 以 `worldbook` 开头的查询。
  */
 
 export default function BookDetailPage() {
@@ -87,6 +90,8 @@ export default function BookDetailPage() {
     Number.isInteger(parsedBookId) && parsedBookId > 0 ? parsedBookId : null
 
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [page, setPage] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [entryDialogOpen, setEntryDialogOpen] = useState(false)
   const [entryTarget, setEntryTarget] = useState<WorldbookEntryItem | null>(null)
@@ -94,6 +99,26 @@ export default function BookDetailPage() {
   const [deleteBookOpen, setDeleteBookOpen] = useState(false)
   const [deleteEntry, setDeleteEntryTarget] = useState<WorldbookEntryItem | null>(null)
   const [viewEntry, setViewEntry] = useState<WorldbookEntryItem | null>(null)
+  const [headerMenuAnchor, setHeaderMenuAnchor] = useState<HTMLElement | null>(null)
+  const [entryMenu, setEntryMenu] = useState<{
+    anchor: HTMLElement
+    entry: WorldbookEntryItem
+  } | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+  // 同一条地址参数只处理一次：通知对象每次渲染都是新的，不能靠依赖数组防重复
+  const handledLinkedEntryRef = useRef<number | null>(null)
+  const handledLinkedErrorRef = useRef<number | null>(null)
+
+  const parsedEntryId = Number(searchParams.get('entry'))
+  const linkedEntryId =
+    Number.isInteger(parsedEntryId) && parsedEntryId > 0 ? parsedEntryId : null
+
+  const closeLinkedEntry = useCallback(() => {
+    if (!searchParams.has('entry')) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('entry')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
 
   const scope: WorldbookScopeParams = useMemo(
     () => ({
@@ -110,12 +135,88 @@ export default function BookDetailPage() {
     retry: false,
   })
 
-  const entriesQuery = useQuery({
-    queryKey: ['worldbook', 'entries', bookId],
-    queryFn: () => worldbookApi.listEntries(bookId as number),
-    enabled: bookId !== null && isScopeReady,
+  // 图谱里「在书里打开这一条」带 `?entry=` 回来：先按 ID 取这一条，再打开书里原有的对话框。
+  // 查询等书本身加载完再发，只读开放的平台方书也能用（服务端按书判可见性）。
+  const linkedEntryQuery = useQuery({
+    queryKey: ['worldbook', 'linked-entry', linkedEntryId],
+    queryFn: () => worldbookApi.getEntry(linkedEntryId as number),
+    enabled: linkedEntryId !== null && isScopeReady && Boolean(bookQuery.data),
     retry: false,
   })
+
+  useEffect(() => {
+    if (linkedEntryId === null) {
+      handledLinkedEntryRef.current = null
+      handledLinkedErrorRef.current = null
+      return
+    }
+    if (!linkedEntryQuery.data || handledLinkedEntryRef.current === linkedEntryId) return
+    const entry = linkedEntryQuery.data
+    if (entry.book_id !== bookId) {
+      handledLinkedEntryRef.current = linkedEntryId
+      notification.error(t('graph.entryWrongBook'))
+      closeLinkedEntry()
+      return
+    }
+    handledLinkedEntryRef.current = linkedEntryId
+    if (bookQuery.data?.read_only) {
+      setViewEntry(entry)
+    } else {
+      setEntryTarget(entry)
+      setEntryDialogOpen(true)
+    }
+  }, [bookId, bookQuery.data?.read_only, closeLinkedEntry, linkedEntryId, linkedEntryQuery.data, notification, t])
+
+  useEffect(() => {
+    if (linkedEntryId === null || !linkedEntryQuery.isError) return
+    if (handledLinkedErrorRef.current === linkedEntryId) return
+    handledLinkedErrorRef.current = linkedEntryId
+    notification.error(
+      isNotFoundError(linkedEntryQuery.error)
+        ? t('graph.entryNotFound')
+        : tCommon('messages.operationFailed')
+    )
+    closeLinkedEntry()
+  }, [closeLinkedEntry, linkedEntryId, linkedEntryQuery.error, linkedEntryQuery.isError, notification, t, tCommon])
+
+  // 预算体检单独拉：常驻条目多的书要数一阵 token，不能拖慢书详情本身；失败就当没有结果
+  const budgetQuery = useQuery({
+    queryKey: ['worldbook', 'budget-check', bookId],
+    queryFn: () => worldbookApi.getBookBudgetCheck(bookId as number),
+    enabled: bookId !== null && isScopeReady && Boolean(bookQuery.data),
+    retry: false,
+  })
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(search.trim())
+      setPage(0)
+    }, SEARCH_DEBOUNCE_MS)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  const entriesQuery = useQuery({
+    queryKey: ['worldbook', 'entries', bookId, page, debouncedSearch],
+    queryFn: () =>
+      worldbookApi.listEntries(bookId as number, {
+        page: page + 1,
+        page_size: ENTRY_PAGE_SIZE,
+        q: debouncedSearch || undefined,
+      }),
+    enabled: bookId !== null && isScopeReady,
+    retry: false,
+    placeholderData: keepPreviousData,
+    refetchInterval: query =>
+      query.state.data?.items.some(item => item.analysis_pending) ? PENDING_REFETCH_MS : false,
+  })
+
+  // 删掉最后一页的最后一条后，页码可能越过末页：退回到末页
+  const entryTotal = entriesQuery.data?.total
+  useEffect(() => {
+    if (entryTotal === undefined) return
+    const lastPage = Math.max(0, Math.ceil(entryTotal / ENTRY_PAGE_SIZE) - 1)
+    if (page > lastPage) setPage(lastPage)
+  }, [entryTotal, page])
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ['worldbook'] })
@@ -183,22 +284,7 @@ export default function BookDetailPage() {
 
   const book = bookQuery.data
 
-  const filteredEntries = useMemo(() => {
-    const entries = entriesQuery.data?.items ?? []
-    const needle = search.trim().toLowerCase()
-    if (!needle) return entries
-    return entries.filter(entry => {
-      const haystack = [
-        entry.comment,
-        ...entry.keys,
-        ...entry.secondary_keys,
-        entry.content,
-      ]
-        .join('\n')
-        .toLowerCase()
-      return haystack.includes(needle)
-    })
-  }, [entriesQuery.data?.items, search])
+  const entries = entriesQuery.data?.items ?? []
 
   if (bookId === null) {
     return <Navigate to={worldbookPath()} replace />
@@ -257,11 +343,80 @@ export default function BookDetailPage() {
       : entry.selective_logic
   }
 
+  // 运行时按用途路由的结果（后端现算）：管理员要一眼看出哪些条目不会进主提示词、为什么
+  const renderPurposeChips = (entry: WorldbookEntryItem) => {
+    const chips: JSX.Element[] = []
+    if (entry.analysis_pending) {
+      chips.push(
+        <ThemedTooltip key="pending" title={t('detail.analysisPendingHint')}>
+          <Chip
+            size="small"
+            label={t('detail.analysisPending')}
+            sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.text.secondary, true)}
+          />
+        </ThemedTooltip>
+      )
+      return chips
+    }
+    if (WORLDBOOK_STATE_ONLY_PURPOSES.includes(entry.purpose)) {
+      chips.push(
+        <ThemedTooltip
+          key="purpose"
+          title={t('detail.purposeHint.stateOnly', {
+            kind: t(`detail.purposeKind.${entry.purpose}`, { defaultValue: entry.purpose }),
+          })}
+        >
+          <Chip
+            size="small"
+            label={t('detail.purpose.stateOnly')}
+            sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.text.secondary, true)}
+          />
+        </ThemedTooltip>
+      )
+    } else if (entry.purpose === 'unsupported_template') {
+      chips.push(
+        <ThemedTooltip
+          key="purpose"
+          title={t('detail.purposeHint.unsupported', { reason: entry.template_note })}
+        >
+          <Chip
+            size="small"
+            label={t('detail.purpose.unsupported')}
+            sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.warning.main, true)}
+          />
+        </ThemedTooltip>
+      )
+    } else if (entry.purpose === 'mvu_plot') {
+      chips.push(
+        <ThemedTooltip key="purpose" title={t('detail.purposeHint.plot')}>
+          <Chip
+            size="small"
+            label={t('detail.purpose.plot')}
+            sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.info.main, true)}
+          />
+        </ThemedTooltip>
+      )
+    }
+    if (entry.suspected_trap) {
+      chips.push(
+        <ThemedTooltip key="trap" title={t('detail.trapHint', { reason: entry.trap_reason })}>
+          <Chip
+            size="small"
+            label={t('detail.trap')}
+            sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.error.main, true)}
+          />
+        </ThemedTooltip>
+      )
+    }
+    return chips
+  }
+
   const renderTitle = (entry: WorldbookEntryItem) => {
     const title = entry.comment || truncateText(entry.content, 40) || `#${entry.id}`
     const hasWarnings =
       entry.invalid_keys.length > 0 || entry.slow_disabled_keys.length > 0
-    if (!hasWarnings) {
+    const chips = renderPurposeChips(entry)
+    if (!hasWarnings && chips.length === 0) {
       return <Typography variant="body2">{title}</Typography>
     }
     const lines = [
@@ -271,11 +426,14 @@ export default function BookDetailPage() {
       ...entry.slow_disabled_keys.map(key => t('detail.slowKeys', { key })),
     ]
     return (
-      <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center' }}>
+      <Stack direction="row" spacing={0.5} sx={{ alignItems: 'center', flexWrap: 'wrap', rowGap: 0.5 }}>
         <Typography variant="body2">{title}</Typography>
-        <ThemedTooltip title={lines.join('\n')}>
-          <WarningAmberRoundedIcon color="warning" sx={{ fontSize: 16 }} />
-        </ThemedTooltip>
+        {hasWarnings && (
+          <ThemedTooltip title={lines.join('\n')}>
+            <WarningAmberRoundedIcon color="warning" sx={{ fontSize: 16 }} />
+          </ThemedTooltip>
+        )}
+        {chips}
       </Stack>
     )
   }
@@ -310,11 +468,100 @@ export default function BookDetailPage() {
     )
   }
 
+  /**
+   * 预算体检的提醒
+   *
+   * 只在书上真有常驻条目、且后端给出了体检结果时出现：没有结果（预算读不到、只读书）
+   * 说明不了任何事，宁可不显示。
+   */
+  const renderBudgetCheck = (check: BookBudgetCheck | undefined) => {
+    if (check?.busy) {
+      // 同一个账号下另一本书的体检还没算完：后端不排队，直接说一声
+      return (
+        <Alert severity="info">
+          <Typography variant="body2">{check.summary}</Typography>
+        </Alert>
+      )
+    }
+    if (!check || check.budget === null || check.constant_count <= 0) return null
+    // `summary` 已经分开点名了「单条就超预算」与「只有常驻条目命中时进不来」的条目，这里不再另列一遍
+    return (
+      <Alert severity={check.dropped.length > 0 ? 'warning' : 'info'}>
+        <Typography variant="body2">{check.summary}</Typography>
+        {check.truncated ? (
+          <Typography variant="caption" display="block" sx={{ mt: 0.5 }}>
+            {t('detail.budgetCheck.truncated')}
+          </Typography>
+        ) : null}
+      </Alert>
+    )
+  }
+
+  const renderStatus = (entry: WorldbookEntryItem) =>
+    entry.status === 'quarantined' && entry.quarantine_reason === 'auto_blocked' ? (
+      <ThemedTooltip title={t('detail.autoQuarantined', { count: entry.blocked_round_hits })}>
+        <Box component="span">
+          <WorldbookStatusChip status={entry.status} enabled={entry.enabled} />
+        </Box>
+      </ThemedTooltip>
+    ) : (
+      <WorldbookStatusChip status={entry.status} enabled={entry.enabled} />
+    )
+
+  // 与「书」标签的书目表同一套表格：纸面容器、表头底色、行斑马纹与悬停、固定列宽
+  const entryColumns: ServerDataTableColumn<WorldbookEntryItem>[] = [
+    // 标题列不给宽度：固定布局下由它吃掉其余列剩下的空间
+    { key: 'title', header: t('detail.columns.title'), render: renderTitle },
+    { key: 'keys', header: t('detail.columns.keys'), width: 220, render: renderKeys },
+    {
+      key: 'position',
+      header: t('detail.columns.positionOrder'),
+      width: 150,
+      hideOnMobile: true,
+      render: entry => (
+        <Typography variant="body2" sx={{ whiteSpace: 'nowrap' }}>
+          {`${worldbookPositionText(entry.position, entry.depth, t)} · ${entry.order}`}
+        </Typography>
+      ),
+    },
+    { key: 'status', header: t('detail.columns.status'), width: 100, render: renderStatus },
+    {
+      key: 'trust',
+      header: t('detail.columns.trust'),
+      width: 72,
+      align: 'center',
+      hideOnMobile: true,
+      render: entry => <WorldbookTrustIcon trusted={entry.trusted} />,
+    },
+    {
+      key: 'actions',
+      header: t('detail.columns.actions'),
+      width: 64,
+      align: 'center',
+      render: entry => (
+        <ThemedTooltip title={t('detail.moreActions')}>
+          <IconActionButton
+            tone="subtle"
+            size="small"
+            aria-label={t('detail.moreActions')}
+            onClick={event => {
+              event.stopPropagation()
+              setEntryMenu({ anchor: event.currentTarget, entry })
+            }}
+          >
+            <MoreHorizRoundedIcon fontSize="small" />
+          </IconActionButton>
+        </ThemedTooltip>
+      ),
+    },
+  ]
+
   return (
     <Box
       sx={{
         p: { xs: 1.5, sm: 2, md: 3 },
         height: '100%',
+        minHeight: 0,
         overflowY: 'auto',
         boxSizing: 'border-box',
         display: 'flex',
@@ -322,6 +569,9 @@ export default function BookDetailPage() {
         gap: 2,
       }}
     >
+      {/* 表格以上的部分按内容定高、不参与收缩：页面是定高的滚动列，条目一多，
+          flex 子项会被压扁，预算横幅就只剩半行（横幅正文自带 overflow） */}
+      <Stack spacing={2} sx={{ flexShrink: 0 }}>
       <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, flexWrap: 'wrap' }}>
         <ThemedTooltip title={t('detail.back')}>
           <IconActionButton
@@ -356,6 +606,18 @@ export default function BookDetailPage() {
               {book.instance_key || t('common.globalPreset')}
             </Typography>
             <WorldbookEnabledChip enabled={book.enabled} />
+            {book.vector_participating > 0 && (
+              <StatusChip
+                tone="active"
+                label={t('detail.semanticParticipating', { count: book.vector_participating })}
+              />
+            )}
+            {book.vector_pending > 0 && (
+              <StatusChip
+                tone="paused"
+                label={t('detail.semanticPending', { count: book.vector_pending })}
+              />
+            )}
             {readOnly && <WorldbookReadOnlyChip />}
           </Box>
           {book.binding_missing && (
@@ -375,14 +637,6 @@ export default function BookDetailPage() {
         {!readOnly && (
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', width: { xs: '100%', sm: 'auto' } }}>
           <ActionButton
-            tone="secondary"
-            size="small"
-            startIcon={<SettingsIcon />}
-            onClick={() => setSettingsOpen(true)}
-          >
-            {t('detail.settings')}
-          </ActionButton>
-          <ActionButton
             tone="primary"
             size="small"
             startIcon={<AddIcon />}
@@ -393,36 +647,64 @@ export default function BookDetailPage() {
           >
             {t('detail.newEntry')}
           </ActionButton>
-          <ActionButton
-            tone="secondary"
-            size="small"
-            startIcon={<UploadFileIcon />}
-            onClick={() => setImportOpen(true)}
+          <IconActionButton
+            aria-label={t('detail.moreActions')}
+            title={t('detail.moreActions')}
+            onClick={event => setHeaderMenuAnchor(event.currentTarget)}
           >
-            {t('detail.appendImport')}
-          </ActionButton>
-          <ActionButton
-            tone="secondary"
-            size="small"
-            startIcon={<DownloadIcon />}
-            disabled={exportMutation.isPending}
-            onClick={() => exportMutation.mutate()}
-          >
-            {t('detail.export')}
-          </ActionButton>
-          <ActionButton
-            tone="danger"
-            size="small"
-            startIcon={<DeleteOutlineIcon />}
-            onClick={() => setDeleteBookOpen(true)}
-          >
-            {t('detail.delete')}
-          </ActionButton>
+            <MoreHorizRoundedIcon />
+          </IconActionButton>
         </Box>
         )}
       </Box>
 
+      <Menu
+        anchorEl={headerMenuAnchor}
+        open={headerMenuAnchor !== null}
+        onClose={() => setHeaderMenuAnchor(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        <MenuItem
+          onClick={() => {
+            setHeaderMenuAnchor(null)
+            setSettingsOpen(true)
+          }}
+        >
+          {t('detail.settings')}
+        </MenuItem>
+        <MenuItem
+          onClick={() => {
+            setHeaderMenuAnchor(null)
+            setImportOpen(true)
+          }}
+        >
+          {t('detail.appendImport')}
+        </MenuItem>
+        <MenuItem
+          disabled={exportMutation.isPending}
+          onClick={() => {
+            setHeaderMenuAnchor(null)
+            exportMutation.mutate()
+          }}
+        >
+          {t('detail.export')}
+        </MenuItem>
+        <Divider />
+        <MenuItem
+          sx={{ color: 'error.main' }}
+          onClick={() => {
+            setHeaderMenuAnchor(null)
+            setDeleteBookOpen(true)
+          }}
+        >
+          {t('detail.delete')}
+        </MenuItem>
+      </Menu>
+
       {readOnly && <Alert severity="info">{t('readOnly.hint')}</Alert>}
+
+      {renderBudgetCheck(budgetQuery.data)}
 
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
         <Typography variant="subtitle2" fontWeight={700}>
@@ -437,187 +719,125 @@ export default function BookDetailPage() {
           />
         </Box>
       </Box>
+      </Stack>
 
-      {entriesQuery.isPending ? (
-        <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
-          <CircularProgress size={24} />
-        </Box>
-      ) : entriesQuery.error ? (
-        isNotFoundError(entriesQuery.error) ? (
-          <WorldbookNotFoundState compact />
-        ) : (
-          <QueryErrorState
-            error={entriesQuery.error}
-            onRetry={() => void entriesQuery.refetch()}
-            compact
-          />
-        )
-      ) : (
-        <Box sx={{ overflowX: 'auto' }}>
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.title')}</TableCell>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.keys')}</TableCell>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.position')}</TableCell>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.order')}</TableCell>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.status')}</TableCell>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.trust')}</TableCell>
-                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('detail.columns.actions')}</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {filteredEntries.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={7} sx={UNIFIED_TABLE_STYLES.cell}>
-                    <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
-                      {t('detail.entriesEmpty')}
-                    </Typography>
-                  </TableCell>
-                </TableRow>
-              ) : (
-                filteredEntries.map(entry => (
-                  <TableRow key={entry.id}>
-                    <TableCell sx={{ ...(UNIFIED_TABLE_STYLES.cell as object), minWidth: 220 }}>
-                      {renderTitle(entry)}
-                    </TableCell>
-                    <TableCell sx={{ ...(UNIFIED_TABLE_STYLES.cell as object), minWidth: 200 }}>
-                      {renderKeys(entry)}
-                    </TableCell>
-                    <TableCell sx={{ ...(UNIFIED_TABLE_STYLES.cell as object), whiteSpace: 'nowrap' }}>
-                      {worldbookPositionText(entry.position, entry.depth, t)}
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>{entry.order}</TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      {entry.status === 'quarantined' && entry.quarantine_reason === 'auto_blocked' ? (
-                        <ThemedTooltip
-                          title={t('detail.autoQuarantined', { count: entry.blocked_round_hits })}
-                        >
-                          <Box component="span">
-                            <WorldbookStatusChip status={entry.status} enabled={entry.enabled} />
-                          </Box>
-                        </ThemedTooltip>
-                      ) : (
-                        <WorldbookStatusChip status={entry.status} enabled={entry.enabled} />
-                      )}
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      <WorldbookTrustChip trusted={entry.trusted} />
-                    </TableCell>
-                    <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                      {/* 不换行：表格本身可以横向滚动，四个图标竖着排会把每一行拉得很高 */}
-                      {readOnly ? (
-                        <ThemedTooltip title={t('detail.actions.view')}>
-                          <IconActionButton
-                            tone="subtle"
-                            size="small"
-                            aria-label={t('detail.actions.view')}
-                            onClick={() => setViewEntry(entry)}
-                          >
-                            <VisibilityOutlinedIcon fontSize="small" />
-                          </IconActionButton>
-                        </ThemedTooltip>
-                      ) : (
-                      <Box sx={{ display: 'flex', gap: 0.25, flexWrap: 'nowrap' }}>
-                        <ThemedTooltip title={t('detail.actions.edit')}>
-                          <IconActionButton
-                            tone="subtle"
-                            size="small"
-                            aria-label={t('detail.actions.edit')}
-                            onClick={() => {
-                              setEntryTarget(entry)
-                              setEntryDialogOpen(true)
-                            }}
-                          >
-                            <EditIcon fontSize="small" />
-                          </IconActionButton>
-                        </ThemedTooltip>
-                        <ThemedTooltip
-                          title={
-                            entry.enabled
-                              ? t('detail.actions.disable')
-                              : t('detail.actions.enable')
-                          }
-                        >
-                          <IconActionButton
-                            tone="subtle"
-                            size="small"
-                            aria-label={
-                              entry.enabled
-                                ? t('detail.actions.disable')
-                                : t('detail.actions.enable')
-                            }
-                            disabled={actionMutation.isPending}
-                            onClick={() =>
-                              actionMutation.mutate({
-                                entryId: entry.id,
-                                action: entry.enabled ? 'disable' : 'enable',
-                              })
-                            }
-                          >
-                            {entry.enabled ? (
-                              <PauseIcon fontSize="small" />
-                            ) : (
-                              <PlayArrowIcon fontSize="small" />
-                            )}
-                          </IconActionButton>
-                        </ThemedTooltip>
-                        <ThemedTooltip
-                          title={
-                            entry.status === 'quarantined'
-                              ? t('detail.actions.restore')
-                              : t('detail.actions.quarantine')
-                          }
-                        >
-                          <IconActionButton
-                            tone={entry.status === 'quarantined' ? 'primary' : 'subtle'}
-                            size="small"
-                            aria-label={
-                              entry.status === 'quarantined'
-                                ? t('detail.actions.restore')
-                                : t('detail.actions.quarantine')
-                            }
-                            disabled={actionMutation.isPending}
-                            onClick={() =>
-                              actionMutation.mutate({
-                                entryId: entry.id,
-                                action:
-                                  entry.status === 'quarantined' ? 'restore' : 'quarantine',
-                              })
-                            }
-                          >
-                            {entry.status === 'quarantined' ? (
-                              <RestoreIcon fontSize="small" />
-                            ) : (
-                              <LockOutlinedIcon fontSize="small" />
-                            )}
-                          </IconActionButton>
-                        </ThemedTooltip>
-                        <ThemedTooltip title={t('detail.actions.delete')}>
-                          <IconActionButton
-                            tone="danger"
-                            size="small"
-                            aria-label={t('detail.actions.delete')}
-                            onClick={() => setDeleteEntryTarget(entry)}
-                          >
-                            <DeleteOutlineIcon fontSize="small" />
-                          </IconActionButton>
-                        </ThemedTooltip>
-                      </Box>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
-        </Box>
-      )}
+      {/* 桌面端吃满剩余高度、表内滚动（表头吸顶）；剩余高度不够时至少留一屏表格，整页滚 */}
+      <Box sx={{ flex: 1, minHeight: { xs: 'auto', md: 360 }, display: 'flex', flexDirection: 'column' }}>
+        <ServerDataTable
+          columns={entryColumns}
+          rows={entries}
+          getRowId={entry => entry.id}
+          total={entriesQuery.data?.total ?? 0}
+          page={page + 1}
+          pageSize={ENTRY_PAGE_SIZE}
+          onPageChange={nextPage => setPage(nextPage - 1)}
+          loading={entriesQuery.isPending}
+          fetching={entriesQuery.isFetching}
+          error={entriesQuery.error}
+          onRetry={() => void entriesQuery.refetch()}
+          renderError={error =>
+            isNotFoundError(error) ? (
+              <WorldbookNotFoundState compact />
+            ) : (
+              <QueryErrorState error={error} onRetry={() => void entriesQuery.refetch()} compact />
+            )
+          }
+          emptyTitle={debouncedSearch ? t('detail.searchEmpty') : t('detail.entriesEmpty')}
+          // 点行即打开：只读书看详情，其余直接编辑；「⋯」里放其余动作
+          onRowClick={entry => {
+            if (readOnly) {
+              setViewEntry(entry)
+              return
+            }
+            setEntryTarget(entry)
+            setEntryDialogOpen(true)
+          }}
+        />
+      </Box>
+
+      <Menu
+        anchorEl={entryMenu?.anchor ?? null}
+        open={entryMenu !== null}
+        onClose={() => setEntryMenu(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        {entryMenu && (
+          <MenuItem
+            onClick={() => {
+              setViewEntry(entryMenu.entry)
+              setEntryMenu(null)
+            }}
+          >
+            {t('detail.actions.view')}
+          </MenuItem>
+        )}
+        {entryMenu && !readOnly && (
+          <MenuItem
+            onClick={() => {
+              setEntryTarget(entryMenu.entry)
+              setEntryDialogOpen(true)
+              setEntryMenu(null)
+            }}
+          >
+            {t('detail.actions.edit')}
+          </MenuItem>
+        )}
+        {entryMenu && !readOnly && (
+          <MenuItem
+            disabled={actionMutation.isPending}
+            onClick={() => {
+              const entry = entryMenu.entry
+              setEntryMenu(null)
+              actionMutation.mutate({
+                entryId: entry.id,
+                action: entry.enabled ? 'disable' : 'enable',
+              })
+            }}
+          >
+            {entryMenu.entry.enabled
+              ? t('detail.actions.disable')
+              : t('detail.actions.enable')}
+          </MenuItem>
+        )}
+        {entryMenu && !readOnly && (
+          <MenuItem
+            disabled={actionMutation.isPending}
+            onClick={() => {
+              const entry = entryMenu.entry
+              setEntryMenu(null)
+              actionMutation.mutate({
+                entryId: entry.id,
+                action: entry.status === 'quarantined' ? 'restore' : 'quarantine',
+              })
+            }}
+          >
+            {entryMenu.entry.status === 'quarantined'
+              ? t('detail.actions.restore')
+              : t('detail.actions.quarantine')}
+          </MenuItem>
+        )}
+        {entryMenu && !readOnly && <Divider />}
+        {entryMenu && !readOnly && (
+          <MenuItem
+            sx={{ color: 'error.main' }}
+            onClick={() => {
+              setDeleteEntryTarget(entryMenu.entry)
+              setEntryMenu(null)
+            }}
+          >
+            {t('detail.actions.delete')}
+          </MenuItem>
+        )}
+      </Menu>
 
       {viewEntry && (
         <NekroDialog
           open
-          onClose={() => setViewEntry(null)}
+          onClose={() => {
+            setViewEntry(null)
+            closeLinkedEntry()
+          }}
           title={viewEntry.comment || `#${viewEntry.id}`}
           maxWidth="md"
         >
@@ -689,6 +909,7 @@ export default function BookDetailPage() {
           onClose={() => {
             setEntryDialogOpen(false)
             setEntryTarget(null)
+            closeLinkedEntry()
           }}
           onSaved={invalidate}
         />

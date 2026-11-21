@@ -67,6 +67,7 @@ from nekro_agent.models.db_mem_prompt_round import DBMemPromptRound
 from nekro_agent.models.db_mem_relation import DBMemRelation
 from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
+from nekro_agent.models.db_rp_preset import DBRpPreset
 from nekro_agent.models.db_wb_book import DBWbBook
 from nekro_agent.models.db_wb_entry import DBWbEntry
 from nekro_agent.schemas.console import (
@@ -1259,6 +1260,9 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
     had_builtin_container = instance.provider.strip().lower() == InstanceProvider.BUILTIN_NAPCAT.value
 
     from nekro_agent.models.db_affection import DBAffection, DBAffectionEvent
+    from nekro_agent.models.db_state_channel import DBStateChannel
+    from nekro_agent.models.db_state_person import DBStatePerson
+    from nekro_agent.models.db_state_snapshot import DBStateSnapshot
     from nekro_agent.services.identity_scope import ScopeDomain
 
     self_affection_domain = ScopeDomain.of_instance(instance.adapter_key, instance_key).as_columns()
@@ -1351,6 +1355,8 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
             "mem_episode": await DBMemEpisode.filter(instance_key=instance_key).count(),
             "mem_entity": await DBMemEntity.filter(instance_key=instance_key).count(),
             "mem_relation": await DBMemRelation.filter(instance_key=instance_key).count(),
+            # 角色扮演预设按 `owner_instance_key` 归属；同名的新实例不能继承旧实例导入的预设。
+            "rp_preset": await DBRpPreset.filter(owner_instance_key=instance_key).count(),
             "adapter_instance_event": await DBAdapterInstanceEvent.filter(instance_id=instance.id).count(),
             "adapter_instance_session": await DBAdapterInstanceSession.filter(instance_id=instance.id).count(),
             "instance_domain_binding": await DBInstanceDomainBinding.filter(
@@ -1400,6 +1406,17 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
             # 自成一域的好感：行与流水的域三列就是这个实例对（`domain_group_id = 0`）
             "affection": await DBAffection.filter(**self_affection_domain).count(),
             "affection_event": await DBAffectionEvent.filter(**self_affection_domain).count(),
+            # 角色状态：频道状态按（适配器, 实例），个人档案按好感同一套域三列，快照按写入时的实例对
+            # （属于实例组的个人档案与它的快照实例为空串，不在这里）。模板跟人设走，不在实例的清理里。
+            "state_channel": await DBStateChannel.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
+            "state_person": await DBStatePerson.filter(**self_affection_domain).count(),
+            "state_snapshot": await DBStateSnapshot.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).count(),
             # 插件与核心配置：有设置的插件个数、有生效覆盖的配置文件个数，文件已在事务之前删掉
             "plugin_settings": settings_counts.plugin_settings,
             "config_overrides": settings_counts.config_overrides,
@@ -1434,10 +1451,20 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
                 book__instance_key=instance_key,
             ).values_list("id", flat=True)
         ]
+        # 书的 ID 也要在删之前取：向量点按 `book_id` 挂在 Qdrant 上，行删掉之后就查不到了。
+        worldbook_book_ids = [
+            int(book_id)
+            for book_id in await DBWbBook.filter(
+                adapter_key=instance.adapter_key,
+                instance_key=instance_key,
+            ).values_list("id", flat=True)
+        ]
         await DBWbBook.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         # 段落的人按段落 ID 挂，必须先清关联行再删段落，否则留下指不到任何段落的孤儿行。
         await persons_of_paragraphs(instance_key=instance_key).delete()
         await DBMemParagraph.filter(instance_key=instance_key).delete()
+        # 角色扮演预设只按实例标识归属：实例没了，这些行再没有任何身份能用上。
+        await DBRpPreset.filter(owner_instance_key=instance_key).delete()
         await DBChatMessage.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBChatChannel.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBAdapterInstanceSession.filter(instance_id=instance.id).delete()
@@ -1450,6 +1477,10 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         await DBInstanceDomainBinding.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBAffectionEvent.filter(**self_affection_domain).delete()
         await DBAffection.filter(**self_affection_domain).delete()
+        # 角色状态同一个理由：同名的新实例会逐列命中旧实例的频道状态、自成一域的个人档案与快照。
+        await DBStateSnapshot.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
+        await DBStatePerson.filter(**self_affection_domain).delete()
+        await DBStateChannel.filter(adapter_key=instance.adapter_key, instance_key=instance_key).delete()
         await DBChannelQuotaDaily.filter(chat_key__startswith=chat_key_prefix).delete()
         await DBChannelQuotaPolicy.filter(quota_policy_condition).delete()
         # 用户登记的服务器凭据跟着实例走：实例没了，这些行再没有任何身份能用上。
@@ -1495,6 +1526,10 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         ).delete()
         await DBAdapterInstance.filter(id=instance.id).delete()
 
+    # SSH 值守的实例名单里摘掉这个实例：实例标识会被重新认领，同名的新实例不能继承值守。
+    # 改的是系统配置文件，所以放在事务提交之后；而且紧接着提交做、单独兜住异常——下面那几步
+    # （向量、表情文件、邮箱、容器回收）抛错时库里的实例已经没了，名单里不能还留着这一项
+    _drop_purged_instance_from_duty_list(instance.adapter_key, instance_key)
     try:
         clear_instance_cache()
         # 删掉的用户服务器凭据：提交之后通知网关，用着它们的连接立刻断开、上游关掉
@@ -1515,6 +1550,12 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         # 的行，下一个拿到同一主键的条目会继承那条记录。
         for worldbook_entry_id in worldbook_entry_ids:
             safe_regex.forget_entry(worldbook_entry_id)
+        # 世界书条目向量：与熔断表同一个时机——数据库行已经删了，Qdrant 不参与事务。
+        # 失败只记 WARNING（孤儿点检索时会与数据库候选取交集），不影响删实例本身。
+        from nekro_agent.services.worldbook import vectors as wb_vectors
+
+        await wb_vectors.delete_entries(worldbook_entry_ids)
+        await wb_vectors.delete_books(worldbook_book_ids)
         await purge_instance_vectors(instance_key)
         # 表情的向量点与文件：行已经在上面的事务里删掉了，这里按事务里提前取好的引用清理。
         # 放在提交之后与记忆向量同一个理由——Qdrant 与文件系统不参与数据库事务。
@@ -1535,6 +1576,20 @@ async def purge_instance(instance: DBAdapterInstance) -> Dict[str, int]:
         # 失败只记警告，建同名实例之前还会再扫一次
         await instance_settings.drop_instance_settings_quietly(instance.adapter_key, instance_key, settings_chat_keys)
     return counts
+
+
+def _drop_purged_instance_from_duty_list(adapter_key: str, instance_key: str) -> None:
+    """彻底删除之后把实例从 SSH 值守名单里摘掉；出错只记日志并点名那一项，不挡后面的清理"""
+    ref = f"{adapter_key}:{instance_key}"
+    try:
+        from nekro_agent.services.ssh_gateway.duty_instances import rewrite_duty_instances
+
+        rewrite_duty_instances(ref, None)
+    except Exception as exc:  # noqa: BLE001 - 库已经删了；名单没摘掉要让平台方看得到是哪一项
+        logger.error(
+            f"彻底删除实例后没能把 {ref} 从 SSH_GATEWAY_DUTY_INSTANCES 里摘掉: {type(exc).__name__}；"
+            "请在后台手动删掉这一项，否则同名实例重新认领后会带上值守",
+        )
 
 
 def email_attachment_root() -> Path:

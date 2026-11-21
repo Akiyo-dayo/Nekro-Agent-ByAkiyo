@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Any, ClassVar, Dict, FrozenSet, List, Literal, Optional, Set
+from typing import Any, ClassVar, Dict, FrozenSet, List, Literal, Optional, Set, Type
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 from nekro_agent.schemas.i18n import SupportedLang, i18n_text, set_system_lang
 from nekro_agent.services.tavern.assemble import DEFAULT_CARD_TEMPLATE
@@ -14,6 +14,10 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = Path(OsEnv.DATA_DIR) / "configs" / "nekro-agent.yaml"
 CHANNEL_CONFIG_DIR = CONFIG_DIR / "channels"
 CHANNEL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+# 模型组上「上下文长度」与「分词系数」的上限：挡的是手误（多打几个 0），不是模型的真实能力
+MODEL_GROUP_CONTEXT_LENGTH_MAX = 10_000_000
+MODEL_GROUP_TOKEN_FACTOR_MAX = 10.0
 
 
 class ModelConfigGroup(ConfigBase):
@@ -48,6 +52,37 @@ class ModelConfigGroup(ConfigBase):
         title="预填方式",
         description="只有声明支持预填的服务才设成非 off；DeepSeek 前缀续写要把接口地址设成它的 beta 地址",
     )
+    API_FORMAT: Literal["openai", "gemini"] = Field(
+        default="openai",
+        title="接口格式",
+        description=(
+            "聊天请求用的接口格式。OpenAI 兼容（默认）适用于绝大多数服务与中转站；"
+            "Gemini 原生直接调用 generateContent，可以拿到被拦的具体原因、用生成配置控制思考预算。"
+            "选 Gemini 原生时接口地址填到版本号为止，例如 https://generativelanguage.googleapis.com/v1beta；"
+            "思考预算、安全阈值等原生参数写在额外请求体的 generationConfig / safetySettings 里。"
+            "只对聊天模型生效。"
+        ),
+    )
+    CONTEXT_LENGTH: int = Field(
+        default=0,
+        ge=0,
+        le=MODEL_GROUP_CONTEXT_LENGTH_MAX,
+        title="上下文长度（token）",
+        description=(
+            "这个模型的上下文窗口。世界书每轮预算按它的百分比算；0 表示未填，按 32768 估。"
+            "照实填：填大了世界书每轮会注入更多、费用跟着涨"
+        ),
+    )
+    TOKEN_COUNT_FACTOR: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=MODEL_GROUP_TOKEN_FACTOR_MAX,
+        title="分词系数",
+        description=(
+            "这个模型的分词器相对 o200k_base 多数还是少数（例如 1.29 表示同一段文字它数出的 token 多 29%）。"
+            "0 表示按模型名自动取（DeepSeek 0.80、Gemini 0.89、Qwen 0.90、Claude 1.29 等）"
+        ),
+    )
     TOKEN_INPUT_RATE: float = Field(default=1.0, title="输入 Token 倍率")
     TOKEN_COMPLETION_RATE: float = Field(default=1.0, title="补全 Token 倍率")
     MODEL_PRICE_RATE: float = Field(default=1.0, title="模型价格倍率")
@@ -76,6 +111,27 @@ MODEL_GROUP_API_KEY_PLACEHOLDER = "nkmask:1"
 def is_model_group_api_key_placeholder(value: str) -> bool:
     """这个值是不是配置文件里的 `API_KEY` 占位符"""
     return value == MODEL_GROUP_API_KEY_PLACEHOLDER
+
+
+# SSH 值守实例名单摘空时留下的占位：空名单的意思是「所有平台方实例」，摘掉最后一个实例不能反而
+# 放宽，所以留这一项表示「一个都不给」。它不含冒号，永远匹配不上任何 `适配器:实例`。
+SSH_GATEWAY_DUTY_INSTANCES_CLOSED = "!none"
+
+
+def normalize_duty_instances(value: Any) -> List[str]:
+    """规整值守实例名单：去空白、去空项、去重；有真实条目时去掉占位（不让两者并存）"""
+    items: List[str] = []
+    for raw in value or []:
+        item = str(raw).strip()
+        if item and item not in items:
+            items.append(item)
+    if any(item != SSH_GATEWAY_DUTY_INSTANCES_CLOSED for item in items):
+        items = [item for item in items if item != SSH_GATEWAY_DUTY_INSTANCES_CLOSED]
+    return items
+
+
+# 角色状态「兼容解析」的出厂档位（私聊默认可用、群里要管理员显式打开）。以后要改成默认关，只改这一处。
+STATE_COMPAT_PARSE_DEFAULT: Literal["private", "all", "off"] = "private"
 
 
 class CoreConfig(ConfigBase):
@@ -704,6 +760,34 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    MEMORY_OTHER_BOT_ACCOUNTS: List[str] = Field(
+        default=[],
+        title="群里其他 Bot 的账号",
+        description=(
+            "这些账号在群里说的话按「别的 Bot 的台词」处理：不当成任何真人的事实，也不为它们记人物信息。"
+            "同一个部署里别的实例的号会自动认出来，不用填；这里填第三方 Bot 的平台账号（QQ 号一类），"
+            "可以按频道单独设。"
+        ),
+        json_schema_extra=ExtraField(
+            sub_item_name="账号",
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="群里其他 Bot 的账号", en_US="Other bots' accounts"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "这些账号在群里说的话按「别的 Bot 的台词」处理：不当成任何真人的事实，也不为它们记人物信息。"
+                    "同一个部署里别的实例的号会自动认出来，不用填；这里填第三方 Bot 的平台账号（QQ 号一类），"
+                    "可以按频道单独设。"
+                ),
+                en_US=(
+                    "Messages from these accounts in groups are treated as another bot's lines: they are not taken "
+                    "as facts about any real person, and no person profile is recorded for them. Accounts of other "
+                    "instances in the same deployment are detected automatically and need not be listed; put "
+                    "third-party bot platform accounts (such as QQ numbers) here. Can be set per channel."
+                ),
+            ),
+        ).model_dump(),
+    )
     MEMORY_CONTEXT_MAX_ITEMS: int = Field(
         default=8,
         ge=1,
@@ -873,6 +957,35 @@ class CoreConfig(ConfigBase):
             i18n_description=i18n_text(
                 zh_CN="增强记忆检索的规划模型调用超时时间。超时后本轮自动回退到规则检索，不影响正常回复；填 0 表示不限制",
                 en_US="Timeout for the enhanced memory retrieval planning model call. On timeout this round falls back to rule-based retrieval without affecting the reply; 0 means no limit",
+            ),
+        ).model_dump(),
+    )
+    MEMORY_RECALL_JUDGE_MODEL_GROUP: str = Field(
+        default="",
+        title="记忆筛选模型组",
+        description=(
+            "填了以后，每轮自动想起的记忆在放进提示词之前，先让这个模型组对照最近几句对话看一遍，"
+            "只留和眼下话题有关的；留空 = 不筛，按相似度取。每轮多一次模型调用，建议填便宜、快的模型。"
+            "只在聊天记忆（域记忆）开着时生效。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
+            ref_model_groups=True,
+            model_type="chat",
+            i18n_title=i18n_text(zh_CN="记忆筛选模型组", en_US="Memory recall filter model group"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "填了以后，每轮自动想起的记忆在放进提示词之前，先让这个模型组对照最近几句对话看一遍，"
+                    "只留和眼下话题有关的；留空 = 不筛，按相似度取。每轮多一次模型调用，建议填便宜、快的模型。"
+                    "只在聊天记忆（域记忆）开着时生效。"
+                ),
+                en_US=(
+                    "When set, memories automatically recalled each round are first checked against the recent "
+                    "conversation by this model group before entering the prompt, and only those related to the "
+                    "current topic are kept; empty = no filtering, keep the similarity ranking. This adds one model "
+                    "call per round, so a cheap and fast model group is recommended. It takes effect only when chat "
+                    "memory (domain memory) is enabled."
+                ),
             ),
         ).model_dump(),
     )
@@ -1243,19 +1356,22 @@ class CoreConfig(ConfigBase):
         ge=0.0,
         le=1.0,
         title="沉淀近重复相似度",
-        description="沉淀写入新段落前，与同一频道、同一人设最近的段落比较向量相似度，达到这个值就当作重复、不再写入。"
-        "只在记忆按域分区打开时生效；0 表示不去重；本项不可覆盖。",
+        description="新记忆与同一频道近两周内、涉及同一批人的已有记忆相似度达到这个值，就当作同一件事："
+        "两段都保留，较笼统的一段放进隔离区（原因：近重复），后台可以放回。"
+        "相似度在 0.84 到这个值之间的，交给沉淀模型判断是不是同一件事。0 = 不查。",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
             i18n_title=i18n_text(zh_CN="沉淀近重复相似度", en_US="Consolidation Near-Duplicate Similarity"),
             i18n_description=i18n_text(
-                zh_CN="沉淀写入新段落前，与同一频道、同一人设最近的段落比较向量相似度，达到这个值就当作重复、不再写入。"
-                "只在记忆按域分区打开时生效；0 表示不去重；本项不可覆盖。",
+                zh_CN="新记忆与同一频道近两周内、涉及同一批人的已有记忆相似度达到这个值，就当作同一件事："
+                "两段都保留，较笼统的一段放进隔离区（原因：近重复），后台可以放回。"
+                "相似度在 0.84 到这个值之间的，交给沉淀模型判断是不是同一件事。0 = 不查。",
                 en_US=(
-                    "Before writing a new paragraph, consolidation compares its vector similarity with the most recent "
-                    "paragraphs of the same channel and preset; at or above this value the paragraph counts as a "
-                    "duplicate and is not written. Applies only when memory domain partitioning is enabled; "
-                    "0 disables deduplication. This item is not overridable"
+                    "When a new memory's similarity to an existing memory from the same channel within the last two "
+                    "weeks and involving the same people reaches this value, they count as the same matter: both are "
+                    "kept, the more general one is moved to quarantine (reason: near-duplicate) and can be restored "
+                    "from the admin page. Between 0.84 and this value, the consolidation model decides whether they "
+                    "are the same matter. 0 disables the check."
                 ),
             ),
         ).model_dump(),
@@ -1340,26 +1456,35 @@ class CoreConfig(ConfigBase):
     MEMORY_RELATION_HALF_LIFE_SECONDS: int = Field(
         default=86400,
         title="关系半衰期",
-        description="新创建关系记忆的默认半衰期秒数。值越小，关系有效权重衰减越快",
+        description="新创建关系记忆的默认半衰期秒数。值越小，关系有效权重衰减越快。沉淀出的关系不短于来源段落的半衰期（偏好、事实、决定抽出的关系按语义半衰期保留）",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
             i18n_title=i18n_text(zh_CN="关系半衰期", en_US="Relation Half-Life"),
             i18n_description=i18n_text(
-                zh_CN="新创建关系记忆的默认半衰期秒数。值越小，关系有效权重衰减越快",
-                en_US="Default half-life in seconds for newly created relation memories. Smaller values decay relation weight faster",
+                zh_CN="新创建关系记忆的默认半衰期秒数。值越小，关系有效权重衰减越快。沉淀出的关系不短于来源段落的半衰期（偏好、事实、决定抽出的关系按语义半衰期保留）",
+                en_US=(
+                    "Default half-life in seconds for newly created relation memories. Smaller values decay relation weight "
+                    "faster. Consolidated relations never decay faster than the paragraph they come from (relations from "
+                    "preferences, facts and decisions keep the semantic half-life)"
+                ),
             ),
         ).model_dump(),
     )
     MEMORY_SEMANTIC_HALF_LIFE_DAYS: int = Field(
         default=30,
+        ge=1,
+        le=3650,
         title="语义记忆半衰期天数",
-        description="CC 语义记忆的默认半衰期天数。较长的值更适合沉淀稳定可复用的经验结论",
+        description="沉淀出的偏好、事实、决定（关于人的稳定信息）与 CC 语义记忆的半衰期天数（1 ~ 3650）。其余沉淀记忆按情景半衰期衰减",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="记忆系统", en_US="Memory System"),
             i18n_title=i18n_text(zh_CN="语义记忆半衰期天数", en_US="Semantic Half-Life Days"),
             i18n_description=i18n_text(
-                zh_CN="CC 语义记忆的默认半衰期天数。较长的值更适合沉淀稳定可复用的经验结论",
-                en_US="Default half-life in days for CC semantic memories. Larger values fit stable and reusable knowledge better",
+                zh_CN="沉淀出的偏好、事实、决定（关于人的稳定信息）与 CC 语义记忆的半衰期天数（1 ~ 3650）。其余沉淀记忆按情景半衰期衰减",
+                en_US=(
+                    "Half-life in days for consolidated preferences, facts and decisions (stable information about people) "
+                    "and for CC semantic memories (1 to 3650). Other consolidated memories decay with the episodic half-life"
+                ),
             ),
         ).model_dump(),
     )
@@ -1701,35 +1826,380 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
-    WORLDBOOK_MAX_CHARS: int = Field(
-        default=3000,
-        ge=0,
-        le=20000,
-        title="世界书每轮正文字数上限",
+    WORLDBOOK_VECTOR_ENABLED: bool = Field(
+        default=True,
+        title="世界书语义触发",
+        description="关掉后这个范围内的世界书只按关键词与常驻匹配；条目和书上的语义设置保留",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="世界书语义触发", en_US="Worldbook Semantic Activation"),
+            i18n_description=i18n_text(
+                zh_CN="关掉后这个范围内的世界书只按关键词与常驻匹配；条目和书上的语义设置保留",
+                en_US=(
+                    "When off, worldbook entries in this scope match only by keyword or constant; "
+                    "the semantic settings on entries and books are kept."
+                ),
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_BUDGET_PERCENT: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        title="世界书预算：占上下文的百分比",
         description=(
-            "每轮注入的世界书正文总字数上限（不含说明文字与标签）；0 表示不注入。"
-            "可在全局、实例、频道三层设置，下层覆盖上层；上限由平台方定，租户管理员只能往下调。"
-            "单条正文比这个数还长时，那一条注入不进去（导入报告会提示）。"
+            "世界书每轮最多占「上下文长度 − 回复预留 4096」的百分之几（与 SillyTavern 的 Context % 同义）。"
+            "上下文长度取这一轮主模型组上填的值，没填按 32768 算。"
+            "可在全局、实例、频道三层设置，下层覆盖上层；租户管理员只能往下调。"
         ),
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
             overridable=True,
             tenant_may_only_lower=True,
-            i18n_title=i18n_text(zh_CN="世界书每轮正文字数上限", en_US="Worldbook Max Chars per Round"),
+            slider=True,
+            i18n_title=i18n_text(zh_CN="世界书预算：占上下文的百分比", en_US="Worldbook Budget: Context %"),
             i18n_description=i18n_text(
                 zh_CN=(
-                    "每轮注入的世界书正文总字数上限（不含说明文字与标签）；0 表示不注入。"
-                    "可在全局、实例、频道三层设置，下层覆盖上层；上限由平台方定，租户管理员只能往下调。"
-                    "单条正文比这个数还长时，那一条注入不进去（导入报告会提示）。"
+                    "世界书每轮最多占「上下文长度 − 回复预留 4096」的百分之几（与 SillyTavern 的 Context % 同义）。"
+                    "上下文长度取这一轮主模型组上填的值，没填按 32768 算。"
+                    "可在全局、实例、频道三层设置，下层覆盖上层；租户管理员只能往下调。"
                 ),
                 en_US=(
-                    "Total characters of worldbook body text injected per round, excluding headers and "
-                    "tags; 0 means inject nothing. It can be set at the global, instance and channel levels, "
-                    "each overriding the one above; the platform sets the ceiling and tenant administrators "
-                    "may only lower it. An entry whose body is longer than this can never be injected (the "
-                    "import report points this out)."
+                    'The share of "context length minus a 4096-token reply reserve" that worldbook entries may '
+                    "use per round, like SillyTavern's Context %. The context length is the one set on this "
+                    "round's main model group, or 32768 when it is not set. It can be set at the global, instance "
+                    "and channel levels, each overriding the one above; tenant administrators may only lower it."
                 ),
             ),
+        ).model_dump(),
+    )
+    WORLDBOOK_BUDGET_CAP_TOKENS: int = Field(
+        default=0,
+        ge=0,
+        le=65536,
+        title="世界书预算：token 上限",
+        description=(
+            "世界书每轮 token 数的上限（与 SillyTavern 的 Budget Cap 同义）。预算取「按百分比算出的数」与这个上限中"
+            "较小的一个；0 表示不另设上限、只按百分比算，但每轮预算无论如何不超过 65536。可在全局、实例、频道三层设置，"
+            "下层覆盖上层；平台方可以在全局给一个上限，免得填了大上下文的模型组把费用一下子放大；"
+            "租户管理员只能往下调，上一层设了上限时不能改成 0。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            overridable=True,
+            tenant_may_only_lower=True,
+            zero_means_unlimited=True,
+            slider=True,
+            i18n_title=i18n_text(zh_CN="世界书预算：token 上限", en_US="Worldbook Budget: Token Cap"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "世界书每轮 token 数的上限（与 SillyTavern 的 Budget Cap 同义）。预算取「按百分比算出的数」与这个上限中"
+                    "较小的一个；0 表示不另设上限、只按百分比算，但每轮预算无论如何不超过 65536。可在全局、实例、频道三层设置，"
+                    "下层覆盖上层；平台方可以在全局给一个上限，免得填了大上下文的模型组把费用一下子放大；"
+                    "租户管理员只能往下调，上一层设了上限时不能改成 0。"
+                ),
+                en_US=(
+                    "A cap on worldbook tokens per round, like SillyTavern's Budget Cap. The budget is the smaller "
+                    "of the percentage-based figure and this cap; 0 means no extra cap, so only the percentage "
+                    "applies, but the budget never exceeds 65536 tokens per round. It can be set at the global, "
+                    "instance and channel levels, each overriding the one above. The platform may set a global cap "
+                    "so that a model group with a large context does not multiply the cost at once; tenant "
+                    "administrators may only lower it and cannot set it to 0 while the level above has a cap."
+                ),
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_LOOKUP_MAX_TOKENS: int = Field(
+        default=3000,
+        ge=200,
+        le=20000,
+        title="世界书查询：每次带回的 token 上限",
+        description=(
+            "模型每次查询世界书最多带回多少 token。可在全局、实例、频道三层设置，下层覆盖上层；"
+            "租户管理员只能往下调。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            overridable=True,
+            tenant_may_only_lower=True,
+            slider=True,
+            i18n_title=i18n_text(
+                zh_CN="世界书查询：每次带回的 token 上限",
+                en_US="Worldbook Lookup: Tokens per Call",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "模型每次查询世界书最多带回多少 token。可在全局、实例、频道三层设置，下层覆盖上层；"
+                    "租户管理员只能往下调。"
+                ),
+                en_US=(
+                    "The most tokens a single worldbook lookup may bring back. It can be set at the global, "
+                    "instance and channel levels, each overriding the one above; tenant administrators may "
+                    "only lower it."
+                ),
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_LOOKUP_MAX_CALLS_PER_ROUND: int = Field(
+        default=4,
+        ge=0,
+        le=20,
+        title="世界书查询：每轮次数上限",
+        description=(
+            "模型每轮最多可以查几次世界书（搜索与按编号读取共用）。0 表示不让模型查。"
+            "可在全局、实例、频道三层设置，下层覆盖上层；租户管理员只能往下调。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            overridable=True,
+            tenant_may_only_lower=True,
+            slider=True,
+            i18n_title=i18n_text(
+                zh_CN="世界书查询：每轮次数上限",
+                en_US="Worldbook Lookup: Calls per Round",
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "模型每轮最多可以查几次世界书（搜索与按编号读取共用）。0 表示不让模型查。"
+                    "可在全局、实例、频道三层设置，下层覆盖上层；租户管理员只能往下调。"
+                ),
+                en_US=(
+                    "How many worldbook lookups the model may make per round; search and read by id share "
+                    "this count. 0 means the model cannot look anything up. It can be set at the global, "
+                    "instance and channel levels, each overriding the one above; tenant administrators may "
+                    "only lower it."
+                ),
+            ),
+        ).model_dump(),
+    )
+    # 角色状态（可选内置插件 `state_table`）的两项要能按频道覆盖，插件配置只有实例级，所以放在这里。
+    # 插件关着时这两项不起作用。0 表示「不注入状态块」，与世界书上限的「不设上限」意思相反，所以
+    # 不标 `zero_means_unlimited`：租户往下调到 0 就是在自己的实例或频道里关掉状态块。
+    STATE_PROMPT_MAX_TOKENS: int = Field(
+        default=1200,
+        ge=0,
+        le=8192,
+        title="角色状态：状态块 token 上限",
+        description=(
+            "角色状态插件每轮注入的状态块最多多少 token（约 1.25 字一个 token），单独计、不占世界书预算；"
+            "超了按字段的优先级整组截掉。0 表示不注入状态块（状态照常更新）。可在全局、实例、频道三层设置，"
+            "租户管理员只能往下调。插件没开时不起作用。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="角色状态", en_US="Character State"),
+            overridable=True,
+            tenant_may_only_lower=True,
+            slider=True,
+            i18n_title=i18n_text(zh_CN="角色状态：状态块 token 上限", en_US="Character State: Block Token Cap"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "角色状态插件每轮注入的状态块最多多少 token（约 1.25 字一个 token），单独计、不占世界书预算；"
+                    "超了按字段的优先级整组截掉。0 表示不注入状态块（状态照常更新）。可在全局、实例、频道三层设置，"
+                    "租户管理员只能往下调。插件没开时不起作用。"
+                ),
+                en_US=(
+                    "The most tokens the character state plugin injects as its state block each round. It is "
+                    "counted on its own and does not use the worldbook budget; when over, lower-priority field "
+                    "groups are cut as a whole. 0 means no state block is injected (the state is still updated). "
+                    "It can be set at the global, instance and channel levels; tenant administrators may only "
+                    "lower it. It has no effect while the plugin is off."
+                ),
+            ),
+        ).model_dump(),
+    )
+    STATE_PRESENT_WINDOW_MINUTES: int = Field(
+        default=30,
+        ge=1,
+        le=1440,
+        title="角色状态：在场的人（分钟）",
+        description=(
+            "状态块只写最近这么多分钟内在频道里说过话的人的个人档案，由系统按发言时间算，不让模型判断。"
+            "可在全局、实例、频道三层设置。插件没开时不起作用。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="角色状态", en_US="Character State"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="角色状态：在场的人（分钟）", en_US="Character State: Present Window (Minutes)"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "状态块只写最近这么多分钟内在频道里说过话的人的个人档案，由系统按发言时间算，不让模型判断。"
+                    "可在全局、实例、频道三层设置。插件没开时不起作用。"
+                ),
+                en_US=(
+                    "The state block only includes the profiles of people who spoke in the channel within the "
+                    "last this many minutes; the system decides this from message times, not the model. It can "
+                    "be set at the global, instance and channel levels. It has no effect while the plugin is off."
+                ),
+            ),
+        ).model_dump(),
+    )
+    STATE_COMPAT_PARSE: Literal["private", "all", "off"] = Field(
+        default=STATE_COMPAT_PARSE_DEFAULT,
+        title="角色状态：解析回复里的变量更新块",
+        description=(
+            "酒馆卡要求模型在回复里写变量更新块（`<UpdateVariable>` 一类）时，发送前剥掉的块要不要用来更新状态。"
+            "私聊＝只在私聊里用；全部＝群聊也用（群里只认频道状态的路径，个人档案的路径一律不收）；关＝只剥不用。"
+            "块里的改动和其它更新一样过系统的校验，被拦或失败的轮次不用。可在全局、实例、频道三层设置。插件没开时不起作用。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="角色状态", en_US="Character State"),
+            overridable=True,
+            i18n_title=i18n_text(
+                zh_CN="角色状态：解析回复里的变量更新块", en_US="Character State: Parse Variable Blocks in Replies"
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "酒馆卡要求模型在回复里写变量更新块（`<UpdateVariable>` 一类）时，发送前剥掉的块要不要用来更新状态。"
+                    "私聊＝只在私聊里用；全部＝群聊也用（群里只认频道状态的路径，个人档案的路径一律不收）；关＝只剥不用。"
+                    "块里的改动和其它更新一样过系统的校验，被拦或失败的轮次不用。可在全局、实例、频道三层设置。插件没开时不起作用。"
+                ),
+                en_US=(
+                    "When a tavern card asks the model to write variable update blocks (such as `<UpdateVariable>`) "
+                    "in its replies, whether the blocks stripped before sending are used to update the state. "
+                    "private = only in private chats; all = group chats too (in groups only channel state paths are "
+                    "accepted, never profile paths); off = strip only. The changes go through the same system "
+                    "validation as other updates, and rounds that were blocked or failed are not used. It can be set "
+                    "at the global, instance and channel levels. It has no effect while the plugin is off."
+                ),
+            ),
+        ).model_dump(),
+    )
+    STATE_IMAGE_SEND_MODE: Literal["command", "every_reply", "every_n"] = Field(
+        default="command",
+        title="角色状态：状态图什么时候发",
+        description=(
+            "只在命令时＝群友发「/状态 图」才发；每次回复后＝每轮回复成功后发一张；每 N 轮＝每隔「状态图间隔」轮发一张。"
+            "自动发的图在群里只画频道状态里不私密的部分，不进聊天记录。平台方可以设间隔的下限，"
+            "「每次回复后」也受这个下限约束。可在全局、实例、频道三层设置。插件没开时不起作用。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="角色状态", en_US="Character State"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="角色状态：状态图什么时候发", en_US="Character State: When to Send the Image"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "只在命令时＝群友发「/状态 图」才发；每次回复后＝每轮回复成功后发一张；每 N 轮＝每隔「状态图间隔」轮发一张。"
+                    "自动发的图在群里只画频道状态里不私密的部分，不进聊天记录。平台方可以设间隔的下限，"
+                    "「每次回复后」也受这个下限约束。可在全局、实例、频道三层设置。插件没开时不起作用。"
+                ),
+                en_US=(
+                    "command = only when someone sends `/state image`; every_reply = one image after every "
+                    "successful reply; every_n = one image every 'image interval' rounds. Images sent "
+                    "automatically show only the non-private part of the channel state in groups and are not "
+                    "recorded in the chat history. The platform may set a minimum interval, which also applies to "
+                    "every_reply. It can be set at the global, instance and channel levels. It has no effect while "
+                    "the plugin is off."
+                ),
+            ),
+        ).model_dump(),
+    )
+    STATE_IMAGE_EVERY_N: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        title="角色状态：状态图间隔（轮）",
+        description=(
+            "「每 N 轮」时隔多少轮发一张，只数回复成功的轮次；实际间隔不小于平台方设的下限。"
+            "可在全局、实例、频道三层设置。插件没开时不起作用。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="角色状态", en_US="Character State"),
+            overridable=True,
+            i18n_title=i18n_text(zh_CN="角色状态：状态图间隔（轮）", en_US="Character State: Image Interval (Rounds)"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "「每 N 轮」时隔多少轮发一张，只数回复成功的轮次；实际间隔不小于平台方设的下限。"
+                    "可在全局、实例、频道三层设置。插件没开时不起作用。"
+                ),
+                en_US=(
+                    "With every_n, how many rounds between images; only successful rounds count, and the actual "
+                    "interval is never below the platform minimum. It can be set at the global, instance and "
+                    "channel levels. It has no effect while the plugin is off."
+                ),
+            ),
+        ).model_dump(),
+    )
+    STATE_IMAGE_MIN_N: int = Field(
+        default=1,
+        ge=1,
+        le=1000,
+        title="角色状态：状态图间隔下限（轮）",
+        description=(
+            "自动发状态图时，间隔至少这么多轮（防刷屏）；「每次回复后」按 1 轮算，也会被拉到这个下限。"
+            "只有平台方能设，不能按实例或频道覆盖。插件没开时不起作用。"
+        ),
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="角色状态", en_US="Character State"),
+            i18n_title=i18n_text(
+                zh_CN="角色状态：状态图间隔下限（轮）", en_US="Character State: Minimum Image Interval (Rounds)"
+            ),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "自动发状态图时，间隔至少这么多轮（防刷屏）；「每次回复后」按 1 轮算，也会被拉到这个下限。"
+                    "只有平台方能设，不能按实例或频道覆盖。插件没开时不起作用。"
+                ),
+                en_US=(
+                    "When images are sent automatically, at least this many rounds pass between two images (to "
+                    "avoid flooding); every_reply counts as 1 and is raised to this minimum too. Only the platform "
+                    "can set it; it cannot be overridden per instance or channel. It has no effect while the "
+                    "plugin is off."
+                ),
+            ),
+        ).model_dump(),
+    )
+    # 已废弃：0.4.7 起世界书预算按 token 计（`WORLDBOOK_BUDGET_PERCENT` 与 `WORLDBOOK_BUDGET_CAP_TOKENS`）。启动时迁移一次（见
+    # `services/worldbook/budget_migration.py`），之后运行时不再读它；保留字段只为让旧配置文件照常加载，
+    # 0.4.8 删除。仍保留覆盖与「租户只能调低」两个标记：旧的覆盖文件照常读得进来，迁移前也不会被放宽。
+    WORLDBOOK_MAX_CHARS: int = Field(
+        default=3000,
+        ge=0,
+        le=20000,
+        title="（已废弃）世界书每轮正文字数上限",
+        description="0.4.7 起改为按 token 计的两项（占上下文的百分比、token 上限），启动时已自动迁移；本项不再生效，0.4.8 删除。",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            is_hidden=True,
+            overridable=True,
+            tenant_may_only_lower=True,
+            i18n_title=i18n_text(
+                zh_CN="（已废弃）世界书每轮正文字数上限",
+                en_US="(Deprecated) Worldbook Max Chars per Round",
+            ),
+            i18n_description=i18n_text(
+                zh_CN="0.4.7 起改为按 token 计的两项（占上下文的百分比、token 上限），启动时已自动迁移；本项不再生效，0.4.8 删除。",
+                en_US=(
+                    "Replaced in 0.4.7 by the two token-based items (context % and token cap) and migrated at "
+                    "startup; this item no longer has any effect and will be removed in 0.4.8."
+                ),
+            ),
+        ).model_dump(),
+    )
+    WORLDBOOK_BUDGET_MIGRATED: bool = Field(
+        default=False,
+        title="世界书预算已迁移到按 token 计",
+        description="启动时把旧的字数上限迁移到 token 预算以后置为 true，之后不再迁移。由系统维护，不要手改",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            is_hidden=True,
+        ).model_dump(),
+    )
+    WORLDBOOK_VECTOR_BACKFILLED: bool = Field(
+        default=False,
+        title="世界书向量激活标记已回填",
+        description="启动时把旧条目 ext 里的 vectorized 回填到列上以后置为 true，之后不再回填。由系统维护，不要手改",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            is_hidden=True,
+        ).model_dump(),
+    )
+    WORLDBOOK_BUDGET_MIGRATION_NOTICE: List[str] = Field(
+        default_factory=list,
+        title="世界书预算迁移记录",
+        description="迁移逐层做了什么；非空时世界书配置页顶部显示一次性提示，平台方点「知道了」后清空。由系统维护",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="世界书", en_US="Worldbook"),
+            is_hidden=True,
         ).model_dump(),
     )
     WORLDBOOK_MAX_ENTRIES_PER_ROUND: int = Field(
@@ -1828,26 +2298,22 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    # 已废弃：开场白自 0.4.7 起不再发进聊天，本项不再被运行时读取；保留字段只为让旧配置文件与覆盖文件
+    # 照常加载，下一个版本删除。导入、编辑、导出照常保存开场白。
     PERSONA_GREETING_ENABLED: bool = Field(
-        default=True,
-        title="发送人设开场白",
-        description=(
-            "频道切到某个人设或执行 /reset 之后，下一次被叫到时先发这个人设的开场白，再照常回复。"
-            "平台方与租户管理员都能为自己的实例或频道开关"
-        ),
+        default=False,
+        title="发送人设开场白（已废弃）",
+        description="已废弃：开场白不再发进聊天，本项不起作用，下一个版本删除。导入、编辑、导出照常保存开场白",
         json_schema_extra=ExtraField(
+            is_hidden=True,
             overridable=True,
             i18n_category=i18n_text(zh_CN="酒馆兼容", en_US="Tavern Compatibility"),
-            i18n_title=i18n_text(zh_CN="发送人设开场白", en_US="Send Persona Greeting"),
+            i18n_title=i18n_text(zh_CN="发送人设开场白（已废弃）", en_US="Send Persona Greeting (Deprecated)"),
             i18n_description=i18n_text(
-                zh_CN=(
-                    "频道切到某个人设或执行 /reset 之后，下一次被叫到时先发这个人设的开场白，再照常回复。"
-                    "平台方与租户管理员都能为自己的实例或频道开关"
-                ),
+                zh_CN="已废弃：开场白不再发进聊天，本项不起作用，下一个版本删除。导入、编辑、导出照常保存开场白",
                 en_US=(
-                    "After a channel switches to a persona or runs /reset, the next time it is called the persona's "
-                    "greeting is sent first and the normal reply follows. Both the platform and tenant "
-                    "administrators may turn it on or off for their own instances or channels."
+                    "Deprecated: greetings are no longer sent to the chat, so this item has no effect and will be "
+                    "removed in the next version. Importing, editing and exporting still keep greetings."
                 ),
             ),
         ).model_dump(),
@@ -1910,6 +2376,57 @@ class CoreConfig(ConfigBase):
                     "to the model. The administrator is responsible for the content, its consequences and the "
                     "compliance of the corresponding key. Both the platform and tenant administrators may turn it on "
                     "or off for their own instances or channels."
+                ),
+            ),
+        ).model_dump(),
+    )
+    PROMPT_STABLE_PREFIX_ORDER: bool = Field(
+        default=False,
+        title="提示词稳定前缀顺序",
+        description=(
+            "开启后，世界书「人设之后」组的本轮命中与好感块从人设之后挪到系统提示词末尾（插件说明与运维说明之后），"
+            "它们前面的部分更容易命中上游的提示词缓存。人设里的酒馆宏（随触发人变化的 {{user}}、{{time}}、{{random}} 等）、"
+            "插件说明里的激活轮数提示、运维说明的有无仍会让前缀变化。会改变提示词里各段的先后，建议先在部分频道试用。"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            audit_changes=True,
+            i18n_category=i18n_text(zh_CN="高级提示词槽位", en_US="Advanced Prompt Slots"),
+            i18n_title=i18n_text(zh_CN="提示词稳定前缀顺序", en_US="Stable Prompt Prefix Order"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "开启后，世界书「人设之后」组的本轮命中与好感块从人设之后挪到系统提示词末尾（插件说明与运维说明之后），"
+                    "它们前面的部分更容易命中上游的提示词缓存。人设里的酒馆宏（随触发人变化的 {{user}}、{{time}}、{{random}} 等）、"
+                    "插件说明里的激活轮数提示、运维说明的有无仍会让前缀变化。会改变提示词里各段的先后，建议先在部分频道试用。"
+                ),
+                en_US=(
+                    "When enabled, this round's world info hits in the after-persona group and the affection block move "
+                    "from right after the persona to the end of the system prompt (after the plugin and ops instructions), "
+                    "so the part before them is more likely to hit the upstream prompt cache. Tavern macros in the persona "
+                    "(such as {{user}}, which follows whoever triggered the round, {{time}} and {{random}}), plugin "
+                    "activation hints and whether the ops section is present still change the prefix. This changes the "
+                    "order of the sections; try it in a few channels first."
+                ),
+            ),
+        ).model_dump(),
+    )
+    PROMPT_RP_PRESET_ID: int = Field(
+        default=0,
+        title="角色扮演预设",
+        description=(
+            "选一份导入的酒馆预设；只在「启用高级提示词槽位」打开、且人设走酒馆兼容运行时的频道生效。0 = 不用"
+        ),
+        json_schema_extra=ExtraField(
+            overridable=True,
+            audit_changes=True,
+            ref_rp_presets=True,
+            i18n_category=i18n_text(zh_CN="高级提示词槽位", en_US="Advanced Prompt Slots"),
+            i18n_title=i18n_text(zh_CN="角色扮演预设", en_US="Roleplay Preset"),
+            i18n_description=i18n_text(
+                zh_CN="选一份导入的酒馆预设；只在「启用高级提示词槽位」打开、且人设走酒馆兼容运行时的频道生效。0 = 不用",
+                en_US=(
+                    "Pick an imported tavern preset. It only applies when advanced prompt slots are enabled and the "
+                    "persona runs through the tavern-compatible runtime. 0 means not used."
                 ),
             ),
         ).model_dump(),
@@ -2500,32 +3017,42 @@ class CoreConfig(ConfigBase):
     )
     AI_CHAT_DAILY_REPLY_LIMIT: int = Field(
         default=0,
-        title="每日回复数量限制",
-        description="每个频道每日 AI 回复数量上限，0 表示不限制",
+        title="每日回复上限（自限）",
+        description=(
+            "每个频道每天最多回复多少个回合（一轮发几条消息都只算一次），0 表示不限制。"
+            "按额度时区的零点换天。这是在平台方额度以内自己再调低的那一档"
+        ),
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
-                zh_CN="回复配额",
-                en_US="Reply Quota",
+                zh_CN="额度",
+                en_US="Quota",
             ),
             overridable=True,
             i18n_title=i18n_text(
-                zh_CN="每日回复数量限制",
-                en_US="Daily Reply Limit",
+                zh_CN="每日回复上限（自限）",
+                en_US="Daily Reply Limit (Self Limit)",
             ),
             i18n_description=i18n_text(
-                zh_CN="每个频道每日 AI 回复数量上限，0 表示不限制",
-                en_US="Maximum AI replies per channel per day, 0 = unlimited",
+                zh_CN=(
+                    "每个频道每天最多回复多少个回合（一轮发几条消息都只算一次），0 表示不限制。"
+                    "按额度时区的零点换天。这是在平台方额度以内自己再调低的那一档"
+                ),
+                en_US=(
+                    "Maximum reply rounds per channel per day (a round counts once no matter how many "
+                    "messages it sends), 0 = unlimited. The day resets at midnight in the quota timezone. "
+                    "This is the lower self-imposed ceiling inside the platform quota"
+                ),
             ),
         ).model_dump(),
     )
     AI_CHAT_ENABLE_HOURLY_LIMIT: bool = Field(
         default=False,
         title="启用每小时限额",
-        description="启用后将根据每日限额自动计算每小时回复上限，使回复更均匀分布",
+        description="启用后将根据每日限额自动计算每小时回复回合上限，使回复更均匀分布（一轮回复拆成几条消息也只算一次）",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
-                zh_CN="回复配额",
-                en_US="Reply Quota",
+                zh_CN="额度",
+                en_US="Quota",
             ),
             overridable=True,
             i18n_title=i18n_text(
@@ -2533,8 +3060,11 @@ class CoreConfig(ConfigBase):
                 en_US="Enable Hourly Limit",
             ),
             i18n_description=i18n_text(
-                zh_CN="启用后将根据每日限额自动计算每小时回复上限，使回复更均匀分布",
-                en_US="Auto-calculate hourly reply limit from daily limit for even distribution",
+                zh_CN="启用后将根据每日限额自动计算每小时回复回合上限，使回复更均匀分布（一轮回复拆成几条消息也只算一次）",
+                en_US=(
+                    "Auto-calculate the hourly reply-round limit from the daily limit for even distribution "
+                    "(a round counts once no matter how many messages it sends)"
+                ),
             ),
         ).model_dump(),
     )
@@ -2542,7 +3072,7 @@ class CoreConfig(ConfigBase):
         default=[],
         title="配额白名单用户",
         json_schema_extra=ExtraField(
-            i18n_category=i18n_text(zh_CN="回复配额", en_US="Reply Quota"),
+            i18n_category=i18n_text(zh_CN="额度", en_US="Quota"),
             i18n_title=i18n_text(zh_CN="配额白名单用户", en_US="Quota Whitelist Users"),
             i18n_description=i18n_text(
                 zh_CN=(
@@ -2563,7 +3093,7 @@ class CoreConfig(ConfigBase):
         default=True,
         title="管理员不受配额限制",
         json_schema_extra=ExtraField(
-            i18n_category=i18n_text(zh_CN="回复配额", en_US="Reply Quota"),
+            i18n_category=i18n_text(zh_CN="额度", en_US="Quota"),
             i18n_title=i18n_text(zh_CN="管理员不受配额限制", en_US="Super Users Exempt from Quota"),
             i18n_description=i18n_text(
                 zh_CN="启用后，SUPER_USERS 中的管理员发送的消息不受配额限制",
@@ -2577,13 +3107,22 @@ class CoreConfig(ConfigBase):
     CHANNEL_QUOTA_TIMEZONE: str = Field(
         default="Asia/Shanghai",
         title="频道额度日界时区",
-        description="频道每日额度按这个时区的零点换天，留空或时区名非法时回落 Asia/Shanghai",
+        description=(
+            "频道每日额度按这个时区的零点换天，留空或时区名非法时回落 Asia/Shanghai。"
+            "回复上限（自限）与临时加额也按它换天"
+        ),
         json_schema_extra=ExtraField(
-            i18n_category=i18n_text(zh_CN="频道额度", en_US="Channel Quota"),
+            i18n_category=i18n_text(zh_CN="额度", en_US="Quota"),
             i18n_title=i18n_text(zh_CN="频道额度日界时区", en_US="Channel Quota Day Boundary Timezone"),
             i18n_description=i18n_text(
-                zh_CN="频道每日额度按这个时区的零点换天，留空或时区名非法时回落 Asia/Shanghai",
-                en_US="Channel daily quota resets at midnight in this timezone; falls back to Asia/Shanghai",
+                zh_CN=(
+                    "频道每日额度按这个时区的零点换天，留空或时区名非法时回落 Asia/Shanghai。"
+                    "回复上限（自限）与临时加额也按它换天"
+                ),
+                en_US=(
+                    "Channel daily quota resets at midnight in this timezone; falls back to Asia/Shanghai. "
+                    "The reply limit (self limit) and temporary boosts reset with it too"
+                ),
             ),
         ).model_dump(),
     )
@@ -2596,7 +3135,7 @@ class CoreConfig(ConfigBase):
             "其余调用照样记账、照样在后台按场景显示，但不计入额度、暂停时也不停"
         ),
         json_schema_extra=ExtraField(
-            i18n_category=i18n_text(zh_CN="频道额度", en_US="Channel Quota"),
+            i18n_category=i18n_text(zh_CN="额度", en_US="Quota"),
             i18n_title=i18n_text(zh_CN="频道额度 token 计入范围", en_US="Channel Quota Token Scope"),
             i18n_description=i18n_text(
                 zh_CN=(
@@ -2617,7 +3156,7 @@ class CoreConfig(ConfigBase):
         title="频道额度告警阈值",
         description="用量达到这些百分比时各告警一次（当天去重）",
         json_schema_extra=ExtraField(
-            i18n_category=i18n_text(zh_CN="频道额度", en_US="Channel Quota"),
+            i18n_category=i18n_text(zh_CN="额度", en_US="Quota"),
             i18n_title=i18n_text(zh_CN="频道额度告警阈值", en_US="Channel Quota Alert Thresholds"),
             i18n_description=i18n_text(
                 zh_CN="用量达到这些百分比时各告警一次（当天去重）",
@@ -3018,6 +3557,29 @@ class CoreConfig(ConfigBase):
         ).model_dump(),
     )
 
+    AI_CHAT_BLOCKED_RETRY_MESSAGES: int = Field(
+        default=6,
+        ge=0,
+        le=32,
+        title="被拦后重发带几条消息",
+        description="一轮的第一次请求被模型上游按内容拦下时，只带最近这么多条消息、不带记忆 / 摘要 / 好感 / 关键词世界书再发一次；0 = 不重发，直接提示被拦",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(
+                zh_CN="聊天配置",
+                en_US="Chat Configuration",
+            ),
+            overridable=True,
+            i18n_title=i18n_text(
+                zh_CN="被拦后重发带几条消息",
+                en_US="Messages to Keep on a Blocked Retry",
+            ),
+            i18n_description=i18n_text(
+                zh_CN="一轮的第一次请求被模型上游按内容拦下时，只带最近这么多条消息、不带记忆 / 摘要 / 好感 / 关键词世界书再发一次；0 = 不重发，直接提示被拦",
+                en_US="When the first request of a round is blocked by the model provider for content, resend once with only the most recent messages and without memory, summaries, affection, or keyword-matched world info. 0 disables the retry and reports the block directly",
+            ),
+        ).model_dump(),
+    )
+
     SESSION_STALL_REPEAT_THRESHOLD: int = Field(
         default=2,
         title="无进展提前收尾阈值",
@@ -3310,7 +3872,7 @@ class CoreConfig(ConfigBase):
     SANDBOX_ONEBOT_SERVER_MOUNT_DIR: str = Field(
         default="/app/nekro_agent_data",
         title="协议端挂载 NA 数据目录",
-        description="该目录用于 NA 向 OneBot 协议端上传资源文件时，指定文件访问的路径使用，请确保协议端能通过该目录访问到 NA 的应用数据，如果协议端运行在 Docker 容器中则需要将此目录挂载到容器中对应位置",
+        description="该目录用于 NA 向 OneBot 协议端上传资源文件时，指定文件访问的路径使用。NA 交给协议端发送的文件都放在数据目录的 uploads 下：协议端运行在 Docker 容器中时，把 NA 数据目录下的 uploads 只读挂载到容器里本目录下的 uploads 即可，不要把整个数据目录挂给它",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
                 zh_CN="沙盒配置",
@@ -3321,16 +3883,17 @@ class CoreConfig(ConfigBase):
                 en_US="OneBot Server NA Data Mount Directory",
             ),
             i18n_description=i18n_text(
-                zh_CN="NA 向 OneBot 协议端上传资源文件时使用的路径，确保协议端能访问",
-                en_US="Path for NA to upload resources to OneBot server, ensure server can access",
+                zh_CN="NA 向 OneBot 协议端上传资源文件时使用的路径；协议端只需能读到其中的 uploads（只读挂载即可）",
+                en_US="Path for NA to upload resources to OneBot server; the server only needs read access to its uploads subdirectory",
             ),
         ).model_dump(),
     )
 
     """CC Workspace 配置"""
     # 默认用本 fork 自建的 cc-sandbox 镜像（公开 fork Akiyo-dayo/nekro-cc-sandbox）：Claude Code、
-    # Node 与浏览器组件都钉了版本，tini 当 1 号进程。标签固定不变、从不发 latest；
-    # 回滚就改回上游的 `kromiose/nekro-cc-sandbox` / `0.1.14` 并重建容器
+    # Node 与浏览器组件都钉了版本，tini 当 1 号进程；ak4 起强制取消后的下一条消息不再空返回，
+    # `.claude.json` 也留在挂载的 ~/.claude 里。标签固定不变、从不发 latest；
+    # 回滚就改回上一版 `0.1.14-ak3-cc2.1.311`（或上游的 `kromiose/nekro-cc-sandbox` / `0.1.14`）并重建容器
     CC_SANDBOX_IMAGE: str = Field(
         default="ghcr.io/akiyo-dayo/nekro-cc-sandbox",
         title="CC 沙盒镜像名称",
@@ -3343,7 +3906,7 @@ class CoreConfig(ConfigBase):
         ).model_dump(),
     )
     CC_SANDBOX_IMAGE_TAG: str = Field(
-        default="0.1.14-ak3-cc2.1.311",
+        default="0.1.14-ak4-cc2.1.311",
         title="CC 沙盒镜像标签",
         json_schema_extra=ExtraField(
             i18n_category=i18n_text(
@@ -4106,6 +4669,102 @@ class CoreConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    # 值守模式：平台方服务器可以标成「值守」，平台方实例上有人报故障就能让 Bot 自己连上去处理。四项默认值都不改变现有行为；
+    # 与上面各项一样按前缀 `SSH_GATEWAY_` 只给平台方读写（`routers/config.py`）
+    SSH_GATEWAY_DEFAULT_DUTY_MODE: str = Field(
+        default="strict",
+        title="平台方服务器默认模式",
+        description="服务器上没单独设模式时取这个：strict（严格，只认所有者本人）或 duty（值守）。默认 strict",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="平台方服务器默认模式", en_US="Default Platform Server Mode"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "服务器上没单独设模式时取这个：strict（严格，只认所有者本人叫醒的一轮）或 duty（值守：平台方实例上"
+                    "有人报故障，Bot 就能自己连这台服务器去查、去修）。其它取值按 strict。默认 strict"
+                ),
+                en_US=(
+                    "Used when a server has no mode of its own: strict (only rounds woken by the owners) or duty "
+                    "(anyone who reaches the bot on a platform instance can have it connect to fix things). Any other "
+                    "value counts as strict. Default strict."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_DUTY_INSTANCES: List[str] = Field(
+        default=[],
+        title="能触发值守的平台方实例",
+        description="写成 适配器:实例；空 = 所有平台方实例。只能收窄：租户实例写进来也不生效",
+        json_schema_extra=ExtraField(
+            sub_item_name="实例",
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="能触发值守的平台方实例", en_US="Instances That May Trigger Duty Mode"),
+            i18n_description=i18n_text(
+                zh_CN=(
+                    "哪些平台方实例的频道能让值守服务器被连，条目写成 适配器:实例（例如 onebot_v11:inst1）；"
+                    "空 = 所有平台方实例。只能收窄：租户实例写进来也不生效。不含冒号的条目永远匹配不上"
+                    "（删掉、划走名单里最后一个实例时会留下 !none，表示一个都不给；别把它当垃圾删掉，"
+                    "删了就成了所有平台方实例。加上真实条目时它会自动去掉）"
+                ),
+                en_US=(
+                    "Which platform instances' chats may make duty-mode servers usable, as adapter:instance "
+                    "(e.g. onebot_v11:inst1). Empty means every platform instance. This only narrows: tenant "
+                    "instances listed here still do not count. Entries without a colon never match. When the last "
+                    "listed instance is deleted or transferred, the list becomes !none, meaning no instance at all; "
+                    "deleting !none would allow every platform instance. Adding a real entry removes it automatically."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_DUTY_REPORT_CHAT_KEYS: List[str] = Field(
+        default=[],
+        title="值守摘要发到哪些会话",
+        description="值守用过服务器后的摘要发到这些会话；空 = 私聊发给所有者名单里同一适配器的账号",
+        json_schema_extra=ExtraField(
+            sub_item_name="会话标识",
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="值守摘要发到哪些会话", en_US="Duty Report Chats"),
+            i18n_description=i18n_text(
+                zh_CN="值守用过服务器后的摘要发到这些会话；空 = 私聊发给所有者名单里同一适配器的账号",
+                en_US=(
+                    "Chats that receive the report after a duty-mode server was used. Empty sends it privately "
+                    "to the owner accounts on the same adapter."
+                ),
+            ),
+        ).model_dump(),
+    )
+    SSH_GATEWAY_RUNBOOK_IN_PROMPT_CHARS: int = Field(
+        default=8000,
+        title="任务正文里运维手册的总字数",
+        description="拍到授权时随任务正文带的运维手册合计最多多少字；0 = 不带",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="CC 工作区", en_US="CC Workspace"),
+            i18n_title=i18n_text(zh_CN="任务正文里运维手册的总字数", en_US="Runbook Characters in Task Text"),
+            i18n_description=i18n_text(
+                zh_CN="拍到授权时随任务正文带的运维手册合计最多多少字，超了按服务器均分截断；0 = 不带",
+                en_US=(
+                    "Maximum total characters of runbooks attached to the task text when servers are authorized; "
+                    "split evenly across servers when over. 0 attaches none."
+                ),
+            ),
+        ).model_dump(),
+    )
+
+    @field_validator("SSH_GATEWAY_DUTY_INSTANCES", mode="after")
+    @classmethod
+    def _normalize_duty_instances(cls, value: List[str]) -> List[str]:
+        """加载配置时规整值守实例名单（写入时由 `normalize_config_value` 规整）"""
+        return normalize_duty_instances(value)
+
+    @classmethod
+    def normalize_config_value(cls, key: str, value: Any) -> Any:
+        """后台写入一项之前的规整（`ConfigService.parse_config_value` 调）；没有规整规则的原样返回
+
+        值守实例名单：平台方往里加实例时自动去掉占位 `!none`，不让它和真实条目并存。
+        """
+        if key == "SSH_GATEWAY_DUTY_INSTANCES":
+            return normalize_duty_instances(value)
+        return value
 
     OPS_AGENT_GROUPS: List[str] = Field(
         default=[],
@@ -4854,13 +5513,30 @@ class CoreConfig(ConfigBase):
             self._mask_model_group_secrets = previous
 
 
-# 写入侧对「租户只能调低」的字段按类型分两支比较前后两档生效值：bool 比的是「开 / 关」，
-# int 比的是数值大小。标记一旦落到别的类型上（字符串、字面量枚举……），比较会失去意义、
-# 判据会静默失效，因此在这里直接让模块导入失败，而不是等运行时才发现。
-for _field_name, _field in CoreConfig.model_fields.items():
-    _extra = _field.json_schema_extra
-    if isinstance(_extra, dict) and _extra.get("tenant_may_only_lower") and _field.annotation not in (bool, int):
-        raise TypeError(f"配置项 {_field_name} 标了 tenant_may_only_lower，但类型既不是 bool 也不是 int")
+def check_tenant_limit_markers(model_cls: Type[ConfigBase]) -> None:
+    """「租户只能调低」与「0 表示不设上限」两个标记的导入期校验；不合规就抛 `TypeError`
+
+    写入侧对「租户只能调低」的字段按类型分两支比较前后两档生效值：bool 比的是「开 / 关」，
+    int 比的是数值大小。标记一旦落到别的类型上（字符串、字面量枚举……），比较会失去意义、
+    判据会静默失效，因此在这里直接让模块导入失败，而不是等运行时才发现。
+
+    「0 表示不设上限」只在「租户只能调低」的判据里有意义（把 0 当作无穷大）；标在别处等于没标，
+    而且一定是漏标了另一个：整数上限项没有「只能调低」，租户写 0 就放开了。
+    """
+    for field_name, field in model_cls.model_fields.items():
+        extra = field.json_schema_extra
+        if not isinstance(extra, dict):
+            continue
+        if extra.get("tenant_may_only_lower") and field.annotation not in (bool, int):
+            raise TypeError(f"配置项 {field_name} 标了 tenant_may_only_lower，但类型既不是 bool 也不是 int")
+        if extra.get("zero_means_unlimited"):
+            if field.annotation is not int:
+                raise TypeError(f"配置项 {field_name} 标了 zero_means_unlimited，但类型不是 int")
+            if not extra.get("tenant_may_only_lower"):
+                raise TypeError(f"配置项 {field_name} 标了 zero_means_unlimited，但没有同时标 tenant_may_only_lower")
+
+
+check_tenant_limit_markers(CoreConfig)
 
 
 # 设置配置键和文件路径

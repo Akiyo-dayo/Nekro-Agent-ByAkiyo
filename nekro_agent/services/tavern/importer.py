@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -36,12 +37,14 @@ from nekro_agent.schemas.tavern import (
     CardImportResult,
     CardInspectReport,
     CardNoteItem,
+    CardVerdict,
     CleanupRuleInspect,
     DepthPromptInspect,
     TargetGates,
 )
 from nekro_agent.services.tavern import card_book as card_book_service
-from nekro_agent.services.tavern import cleanup
+from nekro_agent.services.tavern import cleanup, state_hook
+from nekro_agent.services.tavern import remote_books as remote_books_service
 from nekro_agent.services.tavern.assemble import assemble_content, content_sha256
 from nekro_agent.services.tavern.card_format import (
     CardNote,
@@ -53,7 +56,10 @@ from nekro_agent.services.tavern.card_format import (
 )
 from nekro_agent.services.tavern.card_png import PngCardInfo
 from nekro_agent.services.tavern.limits import LONG_CONTENT_WARN_CHARS, MAX_IMAGE_SIDE
-from nekro_agent.services.worldbook import st_format
+from nekro_agent.services.worldbook import name_vars, st_format
+from nekro_agent.services.worldbook import purpose as wb_purpose
+from nekro_agent.services.worldbook import unsupported as wb_unsupported
+from nekro_agent.services.worldbook.budget import WorldbookBudget
 from nekro_agent.tools.image_utils import process_image_data_url
 
 # 卡片字段 ↔ 人设正文拼装占位。导入与导出都按这张表，顺序无关，但不能漏。
@@ -78,6 +84,12 @@ MAX_TAGS_CHARS = 512
 MAX_AUTHOR_CHARS = 128
 MAX_NAME_CHARS = 256
 MAX_TITLE_CHARS = 128
+
+# 人设正文里 `{{user}}`（含旧式 `<user>`）到这个次数就提醒「这张卡是围绕一对一写的」。
+USER_DENSITY_WARN = 20
+# 宏名不分大小写，花括号内允许首尾空白；旧式写法同理。两处重复都封了顶。
+_USER_MACRO = re.compile(r"\{\{\s{0,8}user\s{0,8}\}\}", re.IGNORECASE)
+_LEGACY_USER_MACRO = re.compile(r"<\s{0,8}user\s{0,8}>", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -203,29 +215,196 @@ async def _process_avatar(parsed: ParsedCard, info: PngCardInfo | None, data: by
 def _over_budget_note(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
     notes: list[st_format.ImportNote],
-    budget_chars: int,
+    budget: WorldbookBudget | None,
 ) -> CardNote | None:
     """把 `budget_notes` 判出的超预算条目汇成检查页上的一条说明，点名最长的几条
 
-    判据只在 `st_format.budget_notes` 一处；这里只是按条目编号回查标题与字数，写成人能读的一句。
+    判据只在 `st_format.budget_notes` 一处；这里只是按条目编号回查标题与 token 数，写成人能读的一句。
     """
     over_keys = {note.entry_key for note in notes if note.kind == "over_budget"}
-    if not over_keys:
+    if not over_keys or budget is None:
         return None
     over = [columns for columns, _ext in rows if str(columns.get("uid", "")) in over_keys]
-    over.sort(key=lambda columns: len(str(columns.get("content") or "")), reverse=True)
+    sized = [(budget.count(str(columns.get("content") or "")), columns) for columns in over]
+    sized.sort(key=lambda item: item[0], reverse=True)
     listed = "、".join(
-        f"「{str(columns.get('comment') or '').strip()[:_OVER_BUDGET_TITLE_CHARS] or '未命名'}」"
-        f"{len(str(columns.get('content') or ''))} 字"
-        for columns in over[:_OVER_BUDGET_LISTED]
+        f"「{str(columns.get('comment') or '').strip()[:_OVER_BUDGET_TITLE_CHARS] or '未命名'}」约 {size} token"
+        for size, columns in sized[:_OVER_BUDGET_LISTED]
     )
     more = f" 等 {len(over)} 条" if len(over) > _OVER_BUDGET_LISTED else ""
     return CardNote(
         "character_book",
         "over_budget",
-        f"卡内知识书有 {len(over)} 条正文比这个实例每轮注入上限 WORLDBOOK_MAX_CHARS（{budget_chars} 字）还长，"
-        f"按现在的设置注入不进去：{listed}{more}",
+        f"卡内知识书有 {len(over)} 条正文比这个实例每轮世界书预算（{budget.budget} token，"
+        f"按模型组 {budget.model_group or '（未设置）'} 算）还长，按现在的设置注入不进去：{listed}{more}",
     )
+
+
+_TEMPLATE_NOTE_KINDS = ("state_only", "unsupported_template", "suspected_trap", "template_not_analyzed")
+
+
+def _template_routing_note(
+    rows: list[tuple[dict[str, Any], dict[str, Any]]],
+    notes: list[st_format.ImportNote],
+) -> CardNote | None:
+    """把卡内书里「按用途不进主提示词 / 含不支持的模板 / 疑似防盗」汇成检查页上的一条说明
+
+    判据在 `worldbook.purpose.template_import_notes` 一处；这里只数个数、点名疑似防盗的几条。
+    """
+    by_kind: dict[str, set[str]] = {kind: set() for kind in _TEMPLATE_NOTE_KINDS}
+    for note in notes:
+        if note.kind in by_kind:
+            by_kind[note.kind].add(note.entry_key)
+    if not any(by_kind.values()):
+        return None
+    parts: list[str] = []
+    if by_kind["state_only"]:
+        parts.append(f"{len(by_kind['state_only'])} 条仅在开启角色状态时使用（变量更新规则、初值、状态渲染）")
+    if by_kind["unsupported_template"]:
+        parts.append(f"{len(by_kind['unsupported_template'])} 条含不支持的模板")
+    text = f"卡内知识书里{'、'.join(parts)}，这些条目照样导入，但不进主提示词" if parts else ""
+    if by_kind["suspected_trap"]:
+        titles = [
+            str(columns.get("comment") or "").strip()[:_OVER_BUDGET_TITLE_CHARS] or "未命名"
+            for columns, _ext in rows
+            if str(columns.get("uid", "")) in by_kind["suspected_trap"]
+        ]
+        listed = "、".join(f"「{title}」" for title in titles[:_OVER_BUDGET_LISTED])
+        more = f" 等 {len(titles)} 条" if len(titles) > _OVER_BUDGET_LISTED else ""
+        trap = f"另有 {len(titles)} 条疑似防盗条目（模板针对不执行模板的客户端埋了大段诱饵文字，NA 不会注入它们）：{listed}{more}"
+        text = f"{text}；{trap}" if text else trap
+    if by_kind["template_not_analyzed"]:
+        skipped = (
+            f"{len(by_kind['template_not_analyzed'])} 条带模板的条目超出了一次检查的分析上限，没有逐条分析"
+            "（导入后运行时命中再分析，不支持的写法、疑似防盗照样不注入）"
+        )
+        text = f"{text}；{skipped}" if text else skipped
+    return CardNote("character_book", "template_routing", text)
+
+
+def _name_var_note(
+    rows: list[tuple[dict[str, Any], dict[str, Any]]],
+    notes: list[st_format.ImportNote],
+) -> CardNote | None:
+    """把卡内书里「读名字的变量换成了宏」汇成检查页上的一条说明
+
+    变量名与处数从条目原文重算：`columns` 里的正文已经换成宏，原始变量名只留在 `ext` 的
+    正文里。判据只在 `worldbook.name_vars` 一处，这里只负责点名、去重与写成人能读的一句。
+    """
+    name_keys = {note.entry_key for note in notes if note.kind == "name_var"}
+    if not name_keys:
+        return None
+    counts: dict[str, tuple[str, int]] = {}
+    total = 0
+    for columns, ext in rows:
+        if str(columns.get("uid", "")) not in name_keys:
+            continue
+        original = ext.get("content") if isinstance(ext, Mapping) else None
+        if not isinstance(original, str):
+            continue
+        _content, replacements = name_vars.rewrite_name_vars(original)
+        for item in replacements:
+            total += item.count
+            old = counts.get(item.var_name)
+            counts[item.var_name] = (item.macro, item.count if old is None else old[1] + item.count)
+    if not counts:
+        return None
+    listed = "、".join(f"「{var_name}」→ {macro}" for var_name, (macro, _count) in list(counts.items())[:5])
+    more = f" 等 {len(counts)} 个" if len(counts) > 5 else ""
+    return CardNote(
+        "character_book",
+        "name_var",
+        f"卡内知识书里 {len(name_keys)} 条把读名字的变量换成了宏（共 {total} 处：{listed}{more}）；"
+        "猜错了可以在导入后的书详情里改回",
+    )
+
+
+def _budget_check_note(notes: list[st_format.ImportNote]) -> CardNote | None:
+    """卡内书的预算体检（常驻条目合计多少、按每轮预算能进几条）；判据在 `worldbook.budget_check`"""
+    for note in notes:
+        if note.kind == "budget_check":
+            return CardNote("character_book", "budget_check", "卡内知识书" + note.detail)
+    return None
+
+
+def _html_rules_note(rules: list[dict[str, Any]]) -> CardNote | None:
+    """输出 HTML 的清理规则：按四类计数，写明导入后各自怎么处理"""
+    kinds = [cleanup.html_kind_of(rule) for rule in rules]
+    html_rules = [(rule, kind) for rule, kind in zip(rules, kinds) if kind]
+    if not html_rules:
+        return None
+    tally = "、".join(
+        f"{wb_unsupported.CODE_KIND_LABELS[kind]} {kinds.count(kind)} 条"
+        for kind in wb_unsupported.CODE_KINDS
+        if kind in kinds
+    )
+    text_only = sum(1 for rule, _ in html_rules if rule.get("enabled") and cleanup.output_mode_of(rule) == cleanup.OUTPUT_TEXT)
+    dropped = sum(1 for rule, _ in html_rules if rule.get("enabled") and cleanup.output_mode_of(rule) == cleanup.OUTPUT_DROP)
+    disabled = sum(1 for rule, _ in html_rules if not rule.get("enabled"))
+    handled = "、".join(
+        part
+        for part, count in (
+            (f"{text_only} 条「只留正文」", text_only),
+            (f"{dropped} 条带图片的「整段删掉」", dropped),
+            (f"{disabled} 条停用", disabled),
+        )
+        if count
+    )
+    return CardNote(
+        "extensions.regex_scripts",
+        "html_rules",
+        f"卡里有 {len(html_rules)} 条输出 HTML 的清理规则（{tally}）。QQ 显示不了网页，NA 不渲染它们："
+        f"导入后 {handled or '照替换文字输出'}，可以在扩展页逐条改成停用、只留正文、整段删掉或按替换文字",
+    )
+
+
+def _user_density_note(assembled: str) -> CardNote | None:
+    """人设正文里 `{{user}}` 太多时提醒：这张卡是围绕一对一写的"""
+    count = len(_USER_MACRO.findall(assembled)) + len(_LEGACY_USER_MACRO.findall(assembled))
+    if count < USER_DENSITY_WARN:
+        return None
+    return CardNote(
+        "description",
+        "user_density",
+        f"人设正文里 {{{{user}}}} 出现了 {count} 次，这张卡是围绕一对一写的。"
+        f"放进群里时谁说话谁就是 {{{{user}}}}，建议只在私聊里用。",
+    )
+
+
+def _verdict(
+    *,
+    state_only: int,
+    scripts: int,
+    html_rules: int,
+    remote_books: int,
+    unsupported_templates: int,
+) -> CardVerdict:
+    """检查报告最上面的一句结论
+
+    输入都是已经数好的计数：卡内书里按用途「仅在开启角色状态时使用」的条目数、酒馆助手
+    脚本数、输出 HTML 的清理规则数、脚本在线加载的世界书数、含不支持模板的条目数。
+    疑似防盗条目是故意不注入的，不算进结论。
+    """
+    if state_only > 0:
+        return CardVerdict(
+            level="state",
+            text=(
+                "这张卡的玩法靠变量推进（MVU 一类）：人设和世界书能直接用，剧情进度和数值要打开"
+                "「角色状态」插件才会动；脚本做的界面在 QQ 里用不上。"
+            ),
+        )
+    parts: list[str] = []
+    if scripts > 0:
+        parts.append(f"酒馆助手脚本 {scripts} 个（NA 不执行）")
+    if html_rules > 0:
+        parts.append(f"输出网页的清理规则 {html_rules} 条（QQ 显示不了，处理方式见下方说明）")
+    if remote_books > 0:
+        parts.append(f"脚本在线加载的世界书 {remote_books} 本（可以在下方让 NA 代下）")
+    if unsupported_templates > 0:
+        parts.append(f"不支持的模板 {unsupported_templates} 条（不注入）")
+    if parts:
+        return CardVerdict(level="partial", text="能用，少了这些附加功能：" + "、".join(parts) + "。")
+    return CardVerdict(level="full", text="可完整使用：人设和世界书都能直接生效。")
 
 
 async def inspect_card(
@@ -233,12 +412,16 @@ async def inspect_card(
     *,
     template: str,
     target: TargetGates,
-    budget_chars: int = 0,
+    tenant_key: str = "platform",
+    budget: WorldbookBudget | None = None,
+    owner_instance_key: str = "",
 ) -> CardInspectReport:
     """解析一张卡并给出导入前的检查报告；不写任何表
 
-    `budget_chars` 是导入目标这一层的 `WORLDBOOK_MAX_CHARS`（调用方按实例或全局取）；> 0 时，
-    卡内书里正文比它长的条目记进知识书说明的 `over_budget`，并在说明里点名。
+    `budget` 是导入目标这一层的每轮世界书预算（调用方按实例或全局算）；给了的话，
+    卡内书里正文比它长的条目记进知识书说明的 `over_budget`，并在说明里点名。卡内书的分析在
+    卡片检查专用的执行器里跑，每个租户（`tenant_key`）同一时间一个，不和导入抢队列。
+    `owner_instance_key` 是导入目标实例（全局为空串），角色状态模板的预览按它判插件开没开。
     """
     parsed, info = parse_card_file(data)
     card_data = parsed.data
@@ -251,24 +434,61 @@ async def inspect_card(
     book_notes: dict[str, int] = st_format.summarize_notes([])
     invalid_keys = 0
     over_budget: CardNote | None = None
+    budget_check: CardNote | None = None
+    template_routing: CardNote | None = None
+    name_var_note: CardNote | None = None
+    rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    book_import_notes: list[st_format.ImportNote] = []
+    book_columns: list[dict[str, Any]] = []
     if book_present:
-        _book_ext, rows, book_import_notes = card_book_service.build_book_rows(book, budget_chars=budget_chars)
+        # 数 token、逐条映射与模板分析都是纯 CPU 活：放进卡片检查专用的执行器，不占默认线程池。
+        _book_ext, rows, book_import_notes = await wb_purpose.run_inspect_analysis(
+            card_book_service.prepare_card_book,
+            book,
+            budget=budget,
+            tenant_key=tenant_key,
+        )
         book_notes = st_format.summarize_notes(book_import_notes)
         invalid_keys = sum(1 for note in book_import_notes if note.kind == "invalid_key")
-        over_budget = _over_budget_note(rows, book_import_notes, budget_chars)
+        over_budget = _over_budget_note(rows, book_import_notes, budget)
+        budget_check = _budget_check_note(book_import_notes)
+        template_routing = _template_routing_note(rows, book_import_notes)
+        name_var_note = _name_var_note(rows, book_import_notes)
+        book_columns = [columns for columns, _ext in rows]
 
     extensions = card_data.get("extensions")
+    extension_map = extensions if isinstance(extensions, dict) else {}
     depth_raw = extensions.get("depth_prompt") if isinstance(extensions, dict) else None
     depth = depth_raw if isinstance(depth_raw, dict) else {}
     avatar_source, avatar_note = _avatar_source(parsed, info)
     unsupported = detect_unsupported(card_data)
+    rules = rules_of(card_data)
+    remote_books = await remote_books_service.detect_remote_books_async(extension_map)
+    verdict = _verdict(
+        state_only=len({note.entry_key for note in book_import_notes if note.kind == "state_only"}),
+        scripts=len(wb_unsupported.tavern_helper_scripts(extension_map)),
+        html_rules=sum(1 for rule in rules if cleanup.html_kind_of(rule)),
+        remote_books=len(remote_books),
+        unsupported_templates=len(
+            {note.entry_key for note in book_import_notes if note.kind == "unsupported_template"}
+        ),
+    )
     notes = [note for note in parsed.notes if note.kind != "unsupported"]
-    if over_budget is not None:
-        notes.append(over_budget)
+    for extra in (
+        over_budget,
+        budget_check,
+        template_routing,
+        name_var_note,
+        _html_rules_note(rules),
+        _user_density_note(assembled),
+    ):
+        if extra is not None:
+            notes.append(extra)
 
     return CardInspectReport(
         spec=parsed.spec,
         source_format=parsed.source_format,
+        verdict=verdict,
         name=str(card_data.get("name") or ""),
         nickname=str(card_data.get("nickname") or ""),
         creator=str(card_data.get("creator") or ""),
@@ -302,14 +522,19 @@ async def inspect_card(
                 replace=rule.get("replace") or "",
                 enabled=bool(rule.get("enabled")),
                 disabled_reason=rule.get("disabled_reason") or "",
+                output_mode=cleanup.output_mode_of(rule),
+                html_kind=cleanup.html_kind_of(rule),
             )
-            for index, rule in enumerate(rules_of(card_data))
+            for index, rule in enumerate(rules)
         ],
         avatar_source=avatar_source,
         avatar_note=avatar_note,
         unsupported=[CardNoteItem(field=note.field, kind=note.kind, detail=note.detail) for note in unsupported],
         notes=[CardNoteItem(field=note.field, kind=note.kind, detail=note.detail) for note in notes],
         target=target,
+        remote_books=remote_books,
+        # 条目用的是导入时会写进库的那一份列（与真正导入同一套规整）
+        state_template=await state_hook.inspect(book_columns, owner_instance_key) if book_present else None,
     )
 
 
@@ -440,6 +665,7 @@ async def import_parsed_card(
     username: str,
     template: str,
     avatar: str,
+    tenant_key: str = "platform",
     content_override: str | None = None,
     extra: CardExtras | None = None,
     preset_fields: PresetFields | None = None,
@@ -447,9 +673,10 @@ async def import_parsed_card(
     """把一张已解析的卡落库：建人设、扩展行与人设书，整笔一个事务
 
     头像由调用方在事务之前算好传进来（普通导入要重新编码，云端下载按现有规则原样
-    使用云端头像）。`content_override` 不为空时人设正文直接用它，来源字段与摘要仍按
-    当前模板计算；`preset_fields` 给定时名字、标题、描述、标签、作者、云端编号与
-    共享状态用云端值，而不是卡片里的同名值。
+    使用云端头像）。卡内书的分析也在事务之前、在导入执行器里做（每个租户同一时间一个，
+    见 `worldbook.purpose.run_import_analysis`），分析期间不占数据库连接。`content_override`
+    不为空时人设正文直接用它，来源字段与摘要仍按当前模板计算；`preset_fields` 给定时名字、
+    标题、描述、标签、作者、云端编号与共享状态用云端值，而不是卡片里的同名值。
     """
     columns, assembled, notes = prepare_card_columns(parsed, options, template=template, extra=extra)
     card_data = parsed.data
@@ -475,6 +702,16 @@ async def import_parsed_card(
 
     content = content_override if content_override is not None else assembled
     book = card_data.get("character_book")
+    include_book = options.include_book and isinstance(book, dict) and isinstance(book.get("entries"), list)
+    prepared_book = None
+    if include_book:
+        prepared_book = await wb_purpose.run_import_analysis(
+            card_book_service.prepare_card_book_for_owner,
+            book,
+            book_owner,
+            tenant_key=tenant_key,
+            rewrite_names=options.rewrite_name_vars,
+        )
 
     async with in_transaction():
         preset = await DBPreset.create(
@@ -500,17 +737,30 @@ async def import_parsed_card(
 
         book_id: int | None = None
         book_report = None
-        if options.include_book and isinstance(book, dict) and isinstance(book.get("entries"), list):
+        if include_book and prepared_book is not None:
             created_book, book_report = await card_book_service.create_card_book(
                 book_owner,
                 preset.id,
                 _book_name(card_data, name),
                 book,
                 username=username,
+                prepared=prepared_book,
             )
             book_id = created_book.id
 
-    return CardImportResult(preset_id=preset.id, book_id=book_id, book_report=book_report, notes=notes)
+    extensions = card_data.get("extensions")
+    # 角色状态模板在事务之后按刚建好的书推导（插件没登记、没开或推不出来都不影响导入）
+    state_template = await state_hook.persist(preset.id, owner_instance_key) if book_id is not None else None
+    return CardImportResult(
+        preset_id=preset.id,
+        book_id=book_id,
+        book_report=book_report,
+        notes=notes,
+        remote_books=await remote_books_service.detect_remote_books_async(
+            extensions if isinstance(extensions, dict) else {}
+        ),
+        state_template=state_template,
+    )
 
 
 async def import_card(
@@ -521,6 +771,7 @@ async def import_card(
     book_owner: tuple[str, str],
     username: str,
     template: str,
+    tenant_key: str = "platform",
 ) -> CardImportResult:
     """导入一张卡：处理头像、解析，然后把解析结果交给落库那一段
 
@@ -538,6 +789,7 @@ async def import_card(
         username=username,
         template=template,
         avatar=avatar,
+        tenant_key=tenant_key,
     )
     if avatar_note and avatar == DEFAULT_PRESET_AVATAR:
         # 头像说明排在导入选项说明之前：管理员先要知道「头像为什么不是卡里的那张」。

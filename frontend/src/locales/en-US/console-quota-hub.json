@@ -1,0 +1,9 @@
+{
+  "title": "Quota & Usage",
+  "subtitle": "The platform quota is the daily allowance the platform grants to every group / private chat; a self-limit is a reply cap you lower within it. Both roll over at midnight in the same timezone.",
+  "tabs": {
+    "channelQuota": "Channel Quota",
+    "instanceSelfLimit": "Instance Self-Limit",
+    "usage": "Usage & Cost"
+  }
+}

@@ -1,11 +1,20 @@
 import { useMemo, useState } from 'react'
-import { Box, Stack, Typography } from '@mui/material'
+import {
+  Box,
+  Chip,
+  Divider,
+  Menu,
+  MenuItem,
+  Stack,
+  Typography,
+  useTheme,
+} from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { useSearchParams } from 'react-router-dom'
-import DeleteForeverIcon from '@mui/icons-material/DeleteForever'
-import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
-import RestoreIcon from '@mui/icons-material/Restore'
+import MoreHorizRoundedIcon from '@mui/icons-material/MoreHorizRounded'
+import ActionButton from '../../components/common/ActionButton'
+import FilterSelect from '../../components/common/FilterSelect'
 import IconActionButton from '../../components/common/IconActionButton'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import ServerDataTable, {
@@ -15,14 +24,17 @@ import { SimpleTooltip } from '../../components/common/ThemedTooltip'
 import DeleteConfirmDialog from '../../components/memory/DeleteConfirmDialog'
 import MemoryItemDialog from '../../components/memory/MemoryItemDialog'
 import MemoryNotFoundState from '../../components/memory/MemoryNotFoundState'
-import { MemoryBlockedHitsChip, MemoryKindChip } from '../../components/memory/MemoryStatusChips'
+import { MemoryKindChip } from '../../components/memory/MemoryStatusChips'
 import ScopeFilterBar from '../../components/memory/ScopeFilterBar'
-import { formatDateTime } from '../../components/memory/format'
+import { formatFullDateTime, formatListTime } from '../../components/memory/format'
 import {
   DEFAULT_MEMORY_PAGE_SIZE,
+  MEMORY_PAGE_SIZE_OPTIONS,
+  MEMORY_TAB_FILTER_FIELDS,
   filtersFromSearchParams,
   filtersToQuarantineQuery,
   filtersToSearchParams,
+  parsePageSize,
   type MemoryFilterState,
 } from '../../components/memory/filters'
 import { useMemoryScopeOptions } from '../../components/memory/useMemoryScopeOptions'
@@ -35,6 +47,7 @@ import {
   type QuarantineListItem,
 } from '../../services/api/memory'
 import { memoryErrorMessage } from '../../components/memory/errorMessage'
+import { CHIP_VARIANTS } from '../../theme/variants'
 
 /**
  * 「隔离区」标签
@@ -51,11 +64,12 @@ interface QuarantineTabProps {
   isScopeReady: boolean
 }
 
-const FIELDS: Array<keyof MemoryFilterState> = ['chatKey', 'presetId', 'partition']
+const FIELDS: Array<keyof MemoryFilterState> = [...MEMORY_TAB_FILTER_FIELDS.quarantine]
 
 const QUARANTINE_REASON_KEYS: Record<string, string> = {
   manual: 'quarantineReason.manual',
   auto_blocked: 'quarantineReason.auto_blocked',
+  dedup: 'quarantineReason.dedup',
 }
 
 /** 隔离区只有段落与事件；其余类型不会出现在这个列表里 */
@@ -69,7 +83,13 @@ interface DeleteTarget {
   hard: boolean
 }
 
+interface ActionMenuState {
+  anchorEl: HTMLElement
+  row: QuarantineListItem
+}
+
 export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProps) {
+  const theme = useTheme()
   const notification = useNotification()
   const queryClient = useQueryClient()
   const { t } = useTranslation('memory')
@@ -77,7 +97,9 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
   const [searchParams, setSearchParams] = useSearchParams()
 
   const filters = useMemo(() => filtersFromSearchParams(searchParams), [searchParams])
+  const pageSize = parsePageSize(searchParams.get('pageSize'))
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
+  const [actionMenu, setActionMenu] = useState<ActionMenuState | null>(null)
   const [detailTarget, setDetailTarget] = useState<{
     memoryType: MemoryType
     id: number
@@ -87,15 +109,22 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
     void queryClient.invalidateQueries({ queryKey: ['memory'] })
   }
 
-  const writeQuery = (next: MemoryFilterState) => {
-    setSearchParams(filtersToSearchParams(next), { replace: true })
+  const writeQuery = (
+    nextFilters: MemoryFilterState,
+    nextPageSize: number = pageSize
+  ) => {
+    const params = filtersToSearchParams(nextFilters)
+    if (nextPageSize !== DEFAULT_MEMORY_PAGE_SIZE) {
+      params.set('pageSize', String(nextPageSize))
+    }
+    setSearchParams(params, { replace: true })
   }
 
   const listQuery = useQuery({
-    queryKey: ['memory', 'quarantine', scope, filters],
+    queryKey: ['memory', 'quarantine', scope, filters, pageSize],
     queryFn: () =>
       memoryApi.listQuarantine({
-        ...filtersToQuarantineQuery(filters, DEFAULT_MEMORY_PAGE_SIZE),
+        ...filtersToQuarantineQuery(filters, pageSize),
         ...scope,
       }),
     enabled: isScopeReady,
@@ -117,6 +146,12 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
   const reasonLabel = (reason: string) =>
     reason ? t(QUARANTINE_REASON_KEYS[reason] ?? 'quarantineReason.unknown') : '—'
 
+  const reasonColor = (reason: string) => {
+    if (reason === 'manual') return theme.palette.info.main
+    if (reason === 'auto_blocked') return theme.palette.warning.main
+    return theme.palette.text.secondary
+  }
+
   const restoreMutation = useMutation({
     mutationFn: (row: QuarantineListItem) =>
       memoryApi.actOnItem(memoryTypeOf(row.memory_type), row.id, 'restore'),
@@ -136,12 +171,38 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
   const items = listQuery.data?.items ?? []
   const total = listQuery.data?.total ?? 0
 
+  const pageSizeSelect = (
+    <FilterSelect
+      label={t('filters.pageSize')}
+      value={String(pageSize)}
+      fullWidth={false}
+      options={MEMORY_PAGE_SIZE_OPTIONS.map(size => ({
+        value: String(size),
+        label: t('filters.pageSizeOption', { count: size }),
+      }))}
+      onChange={value => writeQuery({ ...filters, page: 1 }, parsePageSize(value))}
+      sx={{ width: 150 }}
+    />
+  )
+
   const columns: ServerDataTableColumn<QuarantineListItem>[] = [
     {
       key: 'type',
       header: t('columns.type'),
-      width: 90,
-      render: row => <MemoryKindChip memoryType={row.memory_type} />,
+      width: 140,
+      // 段落行带知识类型，与「段落 / 事件」并排；事件行没有这一项，不占位
+      render: row => (
+        <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap" useFlexGap>
+          <MemoryKindChip memoryType={row.memory_type} />
+          {row.knowledge_type ? (
+            <Chip
+              size="small"
+              label={t(`knowledge.${row.knowledge_type}`, { defaultValue: row.knowledge_type })}
+              sx={CHIP_VARIANTS.base(true)}
+            />
+          ) : null}
+        </Stack>
+      ),
     },
     {
       key: 'content',
@@ -168,94 +229,77 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
     {
       key: 'reason',
       header: t('columns.quarantineReason'),
-      width: 160,
+      width: 170,
       hideOnMobile: true,
-      render: row => (
-        <Typography variant="body2" noWrap>
-          {reasonLabel(row.quarantine_reason)}
-        </Typography>
-      ),
-    },
-    {
-      key: 'hits',
-      header: t('columns.blockedHits'),
-      width: 90,
-      align: 'right',
-      hideOnMobile: true,
-      render: row => <MemoryBlockedHitsChip count={row.blocked_round_hits} />,
+      render: row =>
+        row.quarantine_reason ? (
+          // 被拦次数并进原因的 tooltip；没被拦过就不弹一个「0」
+          <SimpleTooltip
+            title={
+              row.blocked_round_hits > 0
+                ? t('quarantineReason.hitsTooltip', { count: row.blocked_round_hits })
+                : ''
+            }
+          >
+            <Chip
+              size="small"
+              label={reasonLabel(row.quarantine_reason)}
+              sx={CHIP_VARIANTS.getCustomColorChip(reasonColor(row.quarantine_reason), true)}
+            />
+          </SimpleTooltip>
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            —
+          </Typography>
+        ),
     },
     {
       key: 'quarantinedAt',
       header: t('columns.quarantinedAt'),
-      width: 170,
+      width: 150,
       hideOnMobile: true,
       render: row => (
-        <Typography variant="body2" noWrap>
-          {formatDateTime(row.quarantined_at)}
-        </Typography>
+        <SimpleTooltip title={formatFullDateTime(row.quarantined_at)}>
+          <Typography variant="body2" noWrap>
+            {formatListTime(row.quarantined_at)}
+          </Typography>
+        </SimpleTooltip>
       ),
     },
     {
       key: 'actions',
       header: t('columns.actions'),
-      width: 150,
-      align: 'center',
+      width: 130,
+      align: 'right',
       render: row => (
-        <Stack direction="row" spacing={0.5} justifyContent="center">
-          <SimpleTooltip title={t('actions.restore')}>
-            <span>
-              <IconActionButton
-                tone="primary"
-                size="small"
-                aria-label={t('actions.restore')}
-                disabled={restoreMutation.isPending}
-                onClick={event => {
-                  event.stopPropagation()
-                  restoreMutation.mutate(row)
-                }}
-              >
-                <RestoreIcon fontSize="small" />
-              </IconActionButton>
-            </span>
-          </SimpleTooltip>
-          <SimpleTooltip title={t('actions.delete')}>
-            <span>
-              <IconActionButton
-                tone="subtle"
-                size="small"
-                aria-label={t('actions.delete')}
-                onClick={event => {
-                  event.stopPropagation()
-                  setDeleteTarget({
-                    memoryType: memoryTypeOf(row.memory_type),
-                    id: row.id,
-                    hard: false,
-                  })
-                }}
-              >
-                <DeleteOutlineIcon fontSize="small" />
-              </IconActionButton>
-            </span>
-          </SimpleTooltip>
-          <SimpleTooltip title={t('actions.hardDelete')}>
-            <span>
-              <IconActionButton
-                tone="danger"
-                size="small"
-                aria-label={t('actions.hardDelete')}
-                onClick={event => {
-                  event.stopPropagation()
-                  setDeleteTarget({
-                    memoryType: memoryTypeOf(row.memory_type),
-                    id: row.id,
-                    hard: true,
-                  })
-                }}
-              >
-                <DeleteForeverIcon fontSize="small" />
-              </IconActionButton>
-            </span>
-          </SimpleTooltip>
+        <Stack
+          direction="row"
+          spacing={0.5}
+          justifyContent="flex-end"
+          alignItems="center"
+        >
+          <ActionButton
+            tone="ghost"
+            size="small"
+            disabled={restoreMutation.isPending}
+            onClick={event => {
+              event.stopPropagation()
+              restoreMutation.mutate(row)
+            }}
+          >
+            {t('actions.restore')}
+          </ActionButton>
+          <IconActionButton
+            tone="subtle"
+            size="small"
+            aria-label={tCommon('actions.more')}
+            onClick={event => {
+              event.stopPropagation()
+              setActionMenu({ anchorEl: event.currentTarget, row })
+            }}
+          >
+            <MoreHorizRoundedIcon fontSize="small" />
+          </IconActionButton>
         </Stack>
       ),
     },
@@ -276,7 +320,7 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
         getRowId={row => `${row.memory_type}-${row.id}`}
         total={total}
         page={filters.page}
-        pageSize={DEFAULT_MEMORY_PAGE_SIZE}
+        pageSize={pageSize}
         onPageChange={page => writeQuery({ ...filters, page })}
         loading={listQuery.isPending}
         fetching={listQuery.isFetching}
@@ -294,7 +338,49 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
         onRowClick={row =>
           setDetailTarget({ memoryType: memoryTypeOf(row.memory_type), id: row.id })
         }
+        paginationExtra={pageSizeSelect}
       />
+
+      <Menu
+        anchorEl={actionMenu?.anchorEl ?? null}
+        open={Boolean(actionMenu)}
+        onClose={() => setActionMenu(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+      >
+        <MenuItem
+          onClick={() => {
+            const row = actionMenu?.row
+            setActionMenu(null)
+            if (!row) return
+            setDeleteTarget({
+              memoryType: memoryTypeOf(row.memory_type),
+              id: row.id,
+              hard: false,
+            })
+          }}
+        >
+          <Typography variant="body2">{t('actions.delete')}</Typography>
+        </MenuItem>
+        <Divider sx={{ my: 0.5 }} />
+        <MenuItem
+          sx={{ color: 'error.main' }}
+          onClick={() => {
+            const row = actionMenu?.row
+            setActionMenu(null)
+            if (!row) return
+            setDeleteTarget({
+              memoryType: memoryTypeOf(row.memory_type),
+              id: row.id,
+              hard: true,
+            })
+          }}
+        >
+          <Typography variant="body2" color="inherit">
+            {t('actions.hardDelete')}
+          </Typography>
+        </MenuItem>
+      </Menu>
 
       <MemoryItemDialog
         memoryType={detailTarget?.memoryType ?? 'paragraph'}

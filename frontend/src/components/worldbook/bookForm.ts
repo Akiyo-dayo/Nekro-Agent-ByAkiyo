@@ -5,9 +5,11 @@ import {
   WORLDBOOK_SCAN_DEPTH_MAX,
   WORLDBOOK_SCAN_DEPTH_MIN,
   WORLDBOOK_SCOPE_KINDS,
+  type WorldbookActiveScene,
   type WorldbookBookCreateRequest,
   type WorldbookBookDetail,
   type WorldbookBookUpdateRequest,
+  type WorldbookInjectMode,
   type WorldbookScopeKind,
 } from '../../services/api/worldbook'
 
@@ -26,9 +28,16 @@ export interface WorldbookBookFormState {
   personAccount: string
   enabled: boolean
   scanDepth: string
-  budgetChars: string
+  budgetTokens: string
+  injectMode: WorldbookInjectMode
+  activeScene: WorldbookActiveScene
   caseSensitive: boolean
   matchWholeWords: boolean
+  scanNames: boolean
+  vectorAll: boolean
+  vectorQueryMessages: string
+  vectorMaxEntries: string
+  vectorThreshold: string
 }
 
 export interface WorldbookBookFormErrors {
@@ -37,6 +46,9 @@ export interface WorldbookBookFormErrors {
   scope?: string
   scanDepth?: string
   budget?: string
+  vectorQueryMessages?: string
+  vectorMaxEntries?: string
+  vectorThreshold?: string
 }
 
 export const DEFAULT_WORLDBOOK_BOOK_FORM: WorldbookBookFormState = {
@@ -48,9 +60,16 @@ export const DEFAULT_WORLDBOOK_BOOK_FORM: WorldbookBookFormState = {
   personAccount: '',
   enabled: true,
   scanDepth: '',
-  budgetChars: '0',
+  budgetTokens: '0',
+  injectMode: 'both',
+  activeScene: 'both',
   caseSensitive: false,
   matchWholeWords: false,
+  scanNames: false,
+  vectorAll: false,
+  vectorQueryMessages: '2',
+  vectorMaxEntries: '5',
+  vectorThreshold: '0.25',
 }
 
 export function bookFormFromBook(book: WorldbookBookDetail): WorldbookBookFormState {
@@ -67,9 +86,16 @@ export function bookFormFromBook(book: WorldbookBookDetail): WorldbookBookFormSt
     personAccount: book.person_account,
     enabled: book.enabled,
     scanDepth: String(book.scan_depth),
-    budgetChars: String(book.budget_chars),
+    budgetTokens: String(book.budget_tokens),
+    injectMode: book.inject_mode,
+    activeScene: book.active_scene,
     caseSensitive: book.case_sensitive,
     matchWholeWords: book.match_whole_words,
+    scanNames: book.scan_names,
+    vectorAll: book.vector_all,
+    vectorQueryMessages: String(book.vector_query_messages),
+    vectorMaxEntries: String(book.vector_max_entries),
+    vectorThreshold: String(book.vector_threshold),
   }
 }
 
@@ -145,9 +171,26 @@ export function validateBookForm(
     errors.scanDepth = 'bookForm.scanDepthInvalid'
   }
 
-  const budget = parseBudget(state.budgetChars)
+  const budget = parseBudget(state.budgetTokens)
   if (budget === null || budget < 0 || budget > WORLDBOOK_BUDGET_MAX) {
     errors.budget = 'bookForm.budgetInvalid'
+  }
+
+  const queryMessages = Number(state.vectorQueryMessages)
+  if (
+    !Number.isInteger(queryMessages) ||
+    queryMessages < 1 ||
+    queryMessages > 10
+  ) {
+    errors.vectorQueryMessages = 'bookForm.semantic.queryMessagesInvalid'
+  }
+  const maxEntries = Number(state.vectorMaxEntries)
+  if (!Number.isInteger(maxEntries) || maxEntries < 1 || maxEntries > 20) {
+    errors.vectorMaxEntries = 'bookForm.semantic.maxEntriesInvalid'
+  }
+  const threshold = Number(state.vectorThreshold)
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    errors.vectorThreshold = 'bookForm.semantic.thresholdInvalid'
   }
 
   return errors
@@ -166,9 +209,16 @@ export function bookFormToCreateRequest(
     person_account: state.scopeKind === 'person' ? state.personAccount.trim() : '',
     enabled: state.enabled,
     scan_depth: parseOptionalInteger(state.scanDepth),
-    budget_chars: parseBudget(state.budgetChars) ?? 0,
+    budget_tokens: parseBudget(state.budgetTokens) ?? 0,
+    inject_mode: state.injectMode,
+    active_scene: state.activeScene,
     case_sensitive: state.caseSensitive,
     match_whole_words: state.matchWholeWords,
+    scan_names: state.scanNames,
+    vector_all: state.vectorAll,
+    vector_query_messages: Number(state.vectorQueryMessages),
+    vector_max_entries: Number(state.vectorMaxEntries),
+    vector_threshold: Number(state.vectorThreshold),
   }
 }
 
@@ -186,13 +236,25 @@ export function bookFormToUpdateRequest(
   const scanDepth = parseOptionalInteger(state.scanDepth)
   if (scanDepth !== null && scanDepth !== book.scan_depth) body.scan_depth = scanDepth
 
-  const budget = parseBudget(state.budgetChars)
-  if (budget !== null && budget !== book.budget_chars) body.budget_chars = budget
+  const budget = parseBudget(state.budgetTokens)
+  if (budget !== null && budget !== book.budget_tokens) body.budget_tokens = budget
+
+  if (state.injectMode !== book.inject_mode) body.inject_mode = state.injectMode
+  if (state.activeScene !== book.active_scene) body.active_scene = state.activeScene
 
   if (state.caseSensitive !== book.case_sensitive) body.case_sensitive = state.caseSensitive
   if (state.matchWholeWords !== book.match_whole_words) {
     body.match_whole_words = state.matchWholeWords
   }
+  if (state.scanNames !== book.scan_names) body.scan_names = state.scanNames
+
+  if (state.vectorAll !== book.vector_all) body.vector_all = state.vectorAll
+  const queryMessages = Number(state.vectorQueryMessages)
+  if (queryMessages !== book.vector_query_messages) body.vector_query_messages = queryMessages
+  const maxEntries = Number(state.vectorMaxEntries)
+  if (maxEntries !== book.vector_max_entries) body.vector_max_entries = maxEntries
+  const threshold = Number(state.vectorThreshold)
+  if (threshold !== book.vector_threshold) body.vector_threshold = threshold
 
   return body
 }

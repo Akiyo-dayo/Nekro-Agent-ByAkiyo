@@ -4,6 +4,8 @@
   "stats": {
     "cost": "折算费用",
     "tokens": "Token 合计",
+    "inputCacheHitRate": "输入缓存命中率",
+    "cachedTokens": "命中 token",
     "records": "请求条数",
     "wasted": "白花的钱 / 成功率"
   },
@@ -36,6 +38,8 @@
     "records": "条数",
     "tokens": "Token",
     "input": "输入",
+    "cached": "缓存命中",
+    "cacheHitRate": "缓存命中率",
     "output": "输出",
     "cost": "费用",
     "tenant": "租户"

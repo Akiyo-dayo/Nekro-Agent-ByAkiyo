@@ -2,7 +2,7 @@
 
 ## 为什么要有它
 
-CC 工作区目录整个以读写方式挂进容器（`/workspace`），`.claude_home` 还是 0777；沙盒的
+CC 工作区目录整个以读写方式挂进容器（`/workspace`），挂成 `~/.claude` 的 CC home 还是 0777；沙盒的
 共享目录同样挂进沙盒容器。容器里的代码能在这些目录里能写的地方放符号链接，或者把子目录
 换成符号链接。NA 宿主侧（Docker 部署里通常是 root）一旦按路径去读、写、删、复制、改权限，
 就会跟着链接走到宿主的任意位置：读平台方 Key 所在的配置、覆盖任意文件、删任意目录。
@@ -22,9 +22,10 @@ CC 工作区目录整个以读写方式挂进容器（`/workspace`），`.claude
   上限（`MAX_TREE_DEPTH`），超了抛 `TreeTooDeepError`，不会撞上 Python 的递归上限；
 - 判类型在真正打开之前（Linux）：先 `O_PATH|O_NOFOLLOW` 拿到条目本身、`fstat`，确认是普通
   文件才经 `/proc/self/fd/N` 重新打开，FIFO、设备文件从不被真正打开；
-- 改权限：先 `O_NOFOLLOW` 打开再 `fchmod`，不按路径 `chmod`。
+- 改权限：先 `O_NOFOLLOW` 打开再 `fchmod`，不按路径 `chmod`；
+- 改属主：按目录句柄 `fchownat(..., AT_SYMLINK_NOFOLLOW)`，是链接只改链接本身；整棵改时链接不进去。
 
-`.claude_home/settings.json` 等由 CC 镜像相关代码写入的文件，也用这里的函数。
+CC home 里的 `settings.json`、`nk-ssh` 等由 CC 镜像相关代码写入的文件，也用这里的函数。
 
 ## 不支持目录句柄的平台
 
@@ -76,6 +77,13 @@ DEFAULT_MAX_READ_BYTES = 8 * 1024 * 1024
 # 虚拟环境）几十层封顶；更深的多半是容器故意造的。不设上限的话，递归会撞上 Python 的
 # 递归上限抛 RecursionError，而且每一层都占着一个目录句柄
 MAX_TREE_DEPTH = 128
+
+# 改属主（`DirHandle.chown`、`chown_tree`）只在 POSIX 上有；Windows 开发机上调用方什么都不做
+CHOWN_SUPPORTED = os.name == "posix" and hasattr(os, "chown")
+
+# `chown_tree` 处理的条目总数上限：它用在 NA 自己写进去的东西上（从技能库整棵复制进来的技能
+# 目录），几百个条目封顶；超过的多半是容器往里塞的
+MAX_CHOWN_ENTRIES = 100_000
 
 
 class UnsafePathError(OSError):
@@ -661,6 +669,58 @@ class DirHandle:
             os.fchmod(fd, mode)
         finally:
             os.close(fd)
+
+    def chown(self, name: str, uid: int, gid: int) -> None:
+        """不跟随链接地改一个条目的属主：是链接只改链接本身（`AT_SYMLINK_NOFOLLOW`），不碰链接那头
+
+        只在 POSIX 上可用（`CHOWN_SUPPORTED`）。条目不在了抛 `FileNotFoundError`。
+        """
+        split_rel([name])
+        if self._fd is not None:
+            os.chown(name, uid, gid, dir_fd=self._fd, follow_symlinks=False)
+            return
+        os.lchown(self.path / name, uid, gid)
+
+    def chown_tree(self, name: str, uid: int, gid: int, *, max_entries: Optional[int] = None) -> int:
+        """改一个条目的属主；是目录就连同里面所有条目一起。返回改了几个
+
+        链接一律不改、不进去（它不是 NA 写的）；子目录逐级 `O_NOFOLLOW` 打开，看过之后被换成链接的
+        跳过。嵌套超过 `MAX_TREE_DEPTH` 抛 `TreeTooDeepError`，条目超过 `max_entries`（默认
+        `MAX_CHOWN_ENTRIES`）抛 `UnsafePathError`；已经改过的不恢复。
+        """
+        kind = self.kind(name)
+        if kind is None or kind == "link":
+            return 0
+        limit = MAX_CHOWN_ENTRIES if max_entries is None else max_entries
+        self.chown(name, uid, gid)
+        count = 1
+        if kind != "dir":
+            return count
+
+        def walk(directory: "DirHandle", depth: int) -> None:
+            nonlocal count
+            if depth > MAX_TREE_DEPTH:
+                raise TreeTooDeepError(f"{name} 嵌套超过 {MAX_TREE_DEPTH} 层")
+            for child, child_kind in directory.iter_entries():
+                if child_kind == "link":
+                    continue
+                count += 1
+                if count > limit:
+                    raise UnsafePathError(f"{name} 里的条目超过 {limit} 个，属主没有改完")
+                with contextlib.suppress(FileNotFoundError):
+                    directory.chown(child, uid, gid)
+                if child_kind != "dir":
+                    continue
+                try:
+                    sub = directory.subdir(child)
+                except (FileNotFoundError, UnsafePathError):
+                    continue  # 列完之后被删掉或换成了链接
+                with sub:
+                    walk(sub, depth + 1)
+
+        with self.subdir(name) as top:
+            walk(top, 1)
+        return count
 
     def unlink(self, name: str) -> bool:
         """删一个非目录条目（链接只删链接本身）；不存在返回 False，是目录抛 `UnsafePathError`

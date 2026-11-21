@@ -15,6 +15,7 @@ import {
   TableRow,
   TextField,
   Typography,
+  useTheme,
 } from '@mui/material'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -22,7 +23,7 @@ import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
 import IconActionButton from '../../components/common/IconActionButton'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import TablePaginationStyled from '../../components/common/TablePaginationStyled'
-import { UNIFIED_TABLE_STYLES } from '../../theme/variants'
+import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 import {
   CONSOLE_OPS_AUDIT_QUERY_KEYS,
   consoleOpsAuditApi,
@@ -44,6 +45,7 @@ function outcomeColor(outcome: string): 'success' | 'warning' | 'error' | 'defau
 }
 
 export default function OpsAuditPage() {
+  const theme = useTheme()
   const { t } = useTranslation('console-ops-audit')
 
   const [page, setPage] = useState(0)
@@ -206,7 +208,7 @@ export default function OpsAuditPage() {
             </Box>
           ) : (
             <>
-              <Box sx={{ overflowX: 'auto' }}>
+              <Box sx={UNIFIED_TABLE_STYLES.embedded}>
                 <Table size="small" sx={UNIFIED_TABLE_STYLES.getTableBase(false, false)}>
                   <TableHead>
                     <TableRow>
@@ -238,7 +240,7 @@ export default function OpsAuditPage() {
                           <TableCell>
                             <Chip
                               size="small"
-                              color={outcomeColor(item.outcome)}
+                              sx={CHIP_VARIANTS.getPaletteChip(theme, outcomeColor(item.outcome), true)}
                               label={t(`outcome.${item.outcome}`, {
                                 defaultValue: item.outcome,
                               })}

@@ -301,19 +301,24 @@ class TestTimedStateStore:
         assert isinstance(timed_state_store, TimedStateStore)
 
 
+def _by_len(entry: MatchEntry) -> int:
+    """纯函数用例的数法：一字一 token，便于手算（真实数法见 `test_worldbook_tokens.py`）"""
+    return len(entry.content)
+
+
 class TestSelectHits:
     def test_selected_order_is_order_desc_then_id_asc(self) -> None:
         hits = [hit(1, order=100), hit(2, order=300), hit(3, order=100)]
-        selection = select_hits(hits, max_chars=10_000, max_entries=10, book_budgets={})
+        selection = select_hits(hits, max_tokens=10_000, max_entries=10, book_budgets={}, count=_by_len)
         assert [item.entry.id for item in selection.selected] == [2, 1, 3]
 
     def test_global_char_budget_skips_whole_entry(self) -> None:
         """放不下就整条跳过，不截断单条：切一半的设定比不注入更糟"""
         hits = [hit(1, content="a" * 6), hit(2, content="b" * 6)]
-        selection = select_hits(hits, max_chars=10, max_entries=10, book_budgets={})
+        selection = select_hits(hits, max_tokens=10, max_entries=10, book_budgets={}, count=_by_len)
         assert [item.entry.id for item in selection.selected] == [1]
-        assert [(item.entry.id, reason) for item, reason in selection.dropped] == [(2, "global_chars")]
-        assert selection.total_chars == 6
+        assert [(item.entry.id, reason) for item, reason in selection.dropped] == [(2, "global_tokens")]
+        assert selection.total_tokens == 6
 
     def test_book_budget_is_per_book(self) -> None:
         hits = [
@@ -321,32 +326,79 @@ class TestSelectHits:
             hit(2, content="b" * 6, book_id=2),
             hit(3, content="c" * 6, book_id=1),
         ]
-        selection = select_hits(hits, max_chars=1000, max_entries=10, book_budgets={1: 10})
+        selection = select_hits(hits, max_tokens=1000, max_entries=10, book_budgets={1: 10}, count=_by_len)
         assert [item.entry.id for item in selection.selected] == [1, 2]
-        assert [(item.entry.id, reason) for item, reason in selection.dropped] == [(3, "book_chars")]
+        assert [(item.entry.id, reason) for item, reason in selection.dropped] == [(3, "book_tokens")]
 
     def test_zero_book_budget_means_unlimited(self) -> None:
         hits = [hit(1, content="a" * 600, book_id=1)]
-        selection = select_hits(hits, max_chars=1000, max_entries=10, book_budgets={1: 0})
+        selection = select_hits(hits, max_tokens=1000, max_entries=10, book_budgets={1: 0}, count=_by_len)
         assert len(selection.selected) == 1
 
     def test_max_entries_skips_the_rest(self) -> None:
         hits = [hit(index, order=100 - index) for index in range(1, 6)]
-        selection = select_hits(hits, max_chars=10_000, max_entries=2, book_budgets={})
+        selection = select_hits(hits, max_tokens=10_000, max_entries=2, book_budgets={}, count=_by_len)
         assert [item.entry.id for item in selection.selected] == [1, 2]
         assert {reason for _, reason in selection.dropped} == {"max_entries"}
         assert len(selection.dropped) == 3
 
+    def test_max_entries_keeps_a_known_route_alongside(self) -> None:
+        """条数上限之后的条目不分析；缓存里已知要分流的，两个原因一起记"""
+        hits = [hit(index, order=100 - index) for index in range(1, 5)]
+        known = {3: "template_unsupported"}
+        selection = select_hits(
+            hits,
+            max_tokens=10_000,
+            max_entries=2,
+            book_budgets={},
+            count=_by_len,
+            known_route=lambda item: known.get(item.entry.id),
+        )
+        assert [(item.entry.id, reason) for item, reason in selection.dropped] == [
+            (3, "max_entries|template_unsupported"),
+            (4, "max_entries"),
+        ]
+
     def test_empty_hits(self) -> None:
-        selection = select_hits([], max_chars=100, max_entries=10, book_budgets={})
+        selection = select_hits([], max_tokens=100, max_entries=10, book_budgets={}, count=_by_len)
         assert selection.selected == ()
         assert selection.dropped == ()
-        assert selection.total_chars == 0
+        assert selection.total_tokens == 0
 
-    def test_total_chars_counts_selected_only(self) -> None:
+    def test_total_tokens_counts_selected_only(self) -> None:
         hits = [hit(1, content="abc"), hit(2, content="de")]
-        selection = select_hits(hits, max_chars=100, max_entries=10, book_budgets={})
-        assert selection.total_chars == 5
+        selection = select_hits(hits, max_tokens=100, max_entries=10, book_budgets={}, count=_by_len)
+        assert selection.total_tokens == 5
+
+    def test_tokens_are_counted_on_the_prepared_text_and_routed_out_entries_take_no_budget(self) -> None:
+        """模板条目按 `prepare` 换过的正文数；被分流的条目不数、不占预算，也不占条数"""
+        counted: list[str] = []
+
+        def count(entry: MatchEntry) -> int:
+            counted.append(entry.content)
+            return len(entry.content)
+
+        def prepare(item: Hit) -> Hit | str:
+            if item.entry.id == 1:
+                return replace(item, entry=replace(item.entry, content="短"))
+            if item.entry.id == 2:
+                return "state_only"
+            return item
+
+        hits = [
+            hit(1, content="模板原文" * 50, order=300),
+            hit(2, content="分流出去的长正文" * 50, order=200),
+            hit(3, content="普通", order=100),
+        ]
+        selection = select_hits(hits, max_tokens=3, max_entries=2, book_budgets={}, count=count, prepare=prepare)
+
+        assert [item.entry.id for item in selection.selected] == [1, 3]
+        assert selection.selected[0].entry.content == "短"
+        assert counted == ["短", "普通"], "原文与被分流的正文都不数"
+        assert dict(selection.tokens) == {1: 1, 3: 2}
+        assert selection.total_tokens == 3
+        assert [(item.entry.id, reason) for item, reason in selection.routed_out] == [(2, "state_only")]
+        assert selection.dropped == ()
 
 
 class TestGroupForRender:

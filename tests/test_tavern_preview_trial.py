@@ -644,7 +644,7 @@ class TestPreview:
 
         async def plugins(*_args: Any, **kwargs: Any) -> Any:
             stats["plugin_inject"].append(kwargs.get("call_inject"))
-            return type("Rendered", (), {"runtime_prompt": "", "system_prompt": ""})()
+            return type("Rendered", (), {"runtime_prompt": "", "system_prompt": "", "depth_blocks": []})()
 
         monkeypatch.setattr(round_prompt_module, "schedule_affection_evaluation", schedule)
         monkeypatch.setattr(context_guard, "note_rendered_history", note)
@@ -678,13 +678,13 @@ class TestPreview:
         assert stats["memory"] == 0
         assert stats["plugin_inject"] == [False]
 
-    async def test_greeting_meta_comes_from_card(self, world: dict[str, Any]) -> None:
+    async def test_preview_reports_greeting_never_sent(self, world: dict[str, Any]) -> None:
         response = await tavern.preview_prompt(
             TavernPreviewRequest(chat_key=T1),
             _current_user=world["tenant"],
         )
 
-        assert response.greeting == {"will_send": True, "text": "开场白正文"}
+        assert response.greeting == {"will_send": False, "text": ""}
 
     async def test_slots_disabled_keep_preview_text_but_not_rendered(
         self,

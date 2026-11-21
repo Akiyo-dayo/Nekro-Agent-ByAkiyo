@@ -1,5 +1,4 @@
 import math
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,8 +38,14 @@ class QuotaService:
     # ------------------------------------------------------------------
 
     def _today_str(self) -> str:
-        """返回今天的日期字符串，格式 YYYY-MM-DD"""
-        return datetime.now().strftime("%Y-%m-%d")
+        """返回额度时区下的今天（临时加额与频道额度用同一个换天时刻）
+
+        延迟导入：`channel_quota` 的计数模块会反过来读 `quota_service` 的加额，
+        模块级导入会成环。
+        """
+        from nekro_agent.services.channel_quota.counter import quota_day
+
+        return quota_day()
 
     def _current_hour(self) -> int:
         """返回当前小时 (0-23)"""
@@ -274,6 +279,9 @@ async def collect_instance_quota_usage(instance_keys: List[str], limits: Dict[st
     只给一个实例总数会误导运维：真正需要看的是"这个实例有几个频道已经撞到上限了"。
     这里按 (实例, 频道) 聚合一次，再在内存里折算成实例视角的指标。
 
+    数据来自频道额度计数表 `DBChannelQuotaDaily` 的 `replies`（回复回合数），日期键与
+    判定共用 `CHANNEL_QUOTA_TIMEZONE`；不再回头数 `DBChatMessage` 的 Bot 消息条数。
+
     Args:
         instance_keys: 需要统计的实例标识
         limits: 各实例当前生效的每日上限，用于算出撞线频道数（<=0 表示不限制）
@@ -281,9 +289,8 @@ async def collect_instance_quota_usage(instance_keys: List[str], limits: Dict[st
     Returns:
         instance_key -> {replies_today, active_channels, peak_channel_replies, channels_at_limit}
     """
-    from tortoise.functions import Count
-
-    from nekro_agent.models.db_chat_message import DBChatMessage
+    from nekro_agent.models.db_channel_quota import DBChannelQuotaDaily
+    from nekro_agent.services.channel_quota.counter import quota_day
 
     usage: Dict[str, Dict[str, int]] = {
         key: {"replies_today": 0, "active_channels": 0, "peak_channel_replies": 0, "channels_at_limit": 0}
@@ -292,24 +299,17 @@ async def collect_instance_quota_usage(instance_keys: List[str], limits: Dict[st
     if not instance_keys:
         return usage
 
-    today_start = int(time.time() - (time.time() % 86400))
-    rows = (
-        await DBChatMessage.filter(
-            instance_key__in=instance_keys,
-            sender_id="-1",
-            send_timestamp__gte=today_start,
-        )
-        .exclude(sender_name="SYSTEM")
-        .annotate(reply_count=Count("id"))
-        .group_by("instance_key", "chat_key")
-        .values("instance_key", "chat_key", "reply_count")
-    )
+    rows = await DBChannelQuotaDaily.filter(
+        instance_key__in=instance_keys,
+        day=quota_day(),
+        replies__gt=0,
+    ).values("instance_key", "chat_key", "replies")
 
     for row in rows:
         entry = usage.get(str(row["instance_key"]))
         if entry is None:
             continue
-        count = int(row["reply_count"] or 0)
+        count = int(row["replies"] or 0)
         entry["replies_today"] += count
         entry["active_channels"] += 1
         entry["peak_channel_replies"] = max(entry["peak_channel_replies"], count)

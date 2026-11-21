@@ -37,6 +37,11 @@ from nekro_agent.services.memory.feature_flags import (
     is_memory_system_enabled,
 )
 from nekro_agent.services.memory.maintenance import prune_all_workspaces
+from nekro_agent.services.memory.relation_retention import (
+    extend_stable_relation_half_life,
+    restore_pruned_stable_relations,
+)
+from nekro_agent.services.memory.retention import extend_stable_half_life, restore_pruned_stable
 from nekro_agent.services.memory.text_terms import warm_up_tokenizer_async
 
 if TYPE_CHECKING:  # pragma: no cover - 避免与沉淀器成环
@@ -55,6 +60,9 @@ DOMAIN_REBUILD_RETRY_DELAY_SECONDS = 30.0
 AGING_STEP_SECONDS = 120.0
 # 队列观测日志的最短间隔：只在队列非空或有沉淀在跑时打，每分钟最多一行。
 QUEUE_REPORT_INTERVAL_SECONDS = 60.0
+
+# 自动清理两轮之间至少隔这么久（秒），配置的小时数再小也不低于它。
+PRUNE_MIN_INTERVAL_SECONDS = 3600.0
 # 主循环在「有事但没有可派发的项」时最长等多久再自检一次：兜住按时打观测日志，也兜住漏掉的唤醒。
 # 队列空、也没有沉淀在跑时不设上限，只等新入队唤醒。
 LOOP_IDLE_CHECK_SECONDS = 30.0
@@ -148,6 +156,7 @@ class MemoryMaintenanceScheduler:
         self._loop_task: asyncio.Task | None = None
         self._prune_task: asyncio.Task | None = None
         self._recovery_task: asyncio.Task | None = None
+        self._retention_task: asyncio.Task | None = None
         self._tokenizer_warmup_task: asyncio.Task | None = None
         self._execution_tasks: set[asyncio.Task] = set()
         self._wakeup = asyncio.Event()
@@ -196,8 +205,8 @@ class MemoryMaintenanceScheduler:
             return
         self._running = True
         self._loop_task = asyncio.create_task(self._run_loop())
-        if config.MEMORY_PRUNE_ENABLED:
-            self._prune_task = asyncio.create_task(self._run_prune_loop())
+        # 清理循环总是起：开关每一轮现读，关着就跳过这一轮，改了开关不用重启就生效。
+        self._prune_task = asyncio.create_task(self._run_prune_loop())
         # 启动后扫一遍积压。完整的启动恢复默认关闭（达到阈值的频道全部补排，避免启动后大批量补跑
         # 拖垮接口响应）；关着时也要兜底：积压超过一批的频道至少排上一项。内存里的待沉淀计数
         # 重启后从 0 算起，不兜底的话这些积压只能等后续新消息一批一批带，换一次版就要消十几个小时。
@@ -211,6 +220,9 @@ class MemoryMaintenanceScheduler:
                     max_tasks=0,
                 ),
             )
+        # 补齐存量稳定类型的半衰期并捞回被清理的（见 `retention`；域行与工作区行都算）。清理循环
+        # 每轮也会先补一次，这里只是让召回排序不必等到第一次清理（默认 6 小时后）才用上新的衰减速度。
+        self._retention_task = asyncio.create_task(self._extend_stable_half_life())
         # 预热切词词典。放线程里 + **不 await**：加载是约 0.85s 的纯 CPU 过程，压在事件循环上
         # 等于单进程里的几十个实例一起停摆，而放进启动链路 await 又会让每次重启都多等这一下。
         # 加载完成之前切词自动回落到启发式档（见 `text_terms` 的模块文档）。
@@ -227,6 +239,8 @@ class MemoryMaintenanceScheduler:
             self._prune_task.cancel()
         if self._recovery_task and not self._recovery_task.done():
             self._recovery_task.cancel()
+        if self._retention_task and not self._retention_task.done():
+            self._retention_task.cancel()
         if self._tokenizer_warmup_task and not self._tokenizer_warmup_task.done():
             self._tokenizer_warmup_task.cancel()
         for task in list(self._execution_tasks):
@@ -531,14 +545,41 @@ class MemoryMaintenanceScheduler:
             f"chat_key={oldest.chat_key}, priority={oldest.priority.name}",
         )
 
+    async def _extend_stable_half_life(self) -> None:
+        """补齐存量半衰期，再捞回按旧半衰期被清理掉的稳定类型段落与关系
+
+        启动时跑一次，之后清理循环每一轮跑一次（清理开关关着也跑：先核对捞回数、再开清理是
+        升级后的正常顺序）。两种捞回都是一次性的，做完一遍以后这里只剩两条不命中的 UPDATE。
+        段落先捞、关系后捞：跟着段落一起被清的关系，要等段落回来才在范围里。
+        失败只记日志，下一轮再来。取消要往上抛：`stop()` 落在这里时，调用方不能接着跑一整轮清理。
+        """
+        try:
+            await extend_stable_half_life()
+            await extend_stable_relation_half_life()
+            await restore_pruned_stable()
+            await restore_pruned_stable_relations()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"补齐存量域记忆半衰期或捞回被清理的段落失败（下一轮再试）: error={e}")
+
     async def _run_prune_loop(self) -> None:
-        """后台定期清理低价值记忆。"""
-        interval_seconds = max(3600, config.MEMORY_PRUNE_INTERVAL_HOURS * 3600)
+        """后台定期清理低价值记忆
+
+        `MEMORY_PRUNE_ENABLED` 与间隔每一轮现读：关掉开关，下一轮起就不再清理；再打开也不用重启。
+        """
         while self._running:
             try:
+                interval_seconds = max(PRUNE_MIN_INTERVAL_SECONDS, config.MEMORY_PRUNE_INTERVAL_HOURS * 3600)
                 await asyncio.sleep(interval_seconds)
                 if not self._running:
                     return
+                await self._extend_stable_half_life()
+                if not self._running:
+                    return
+                if not config.MEMORY_PRUNE_ENABLED:
+                    logger.debug("自动记忆清理已关闭，本轮跳过")
+                    continue
                 results = await prune_all_workspaces()
                 total_paragraphs = sum(item.paragraphs_pruned for item in results.values())
                 total_relations = sum(item.relations_pruned for item in results.values())
@@ -700,10 +741,19 @@ class MemoryMaintenanceScheduler:
                     # 结果表：失败不清 pending、不记 last_consolidation_at；成功与跳过按实际处理量扣减。
                     if result.failed_reason:
                         retry_delay = await self._mark_failure_backoff(scope, result.retry_after)
-                        logger.warning(
-                            f"沉淀失败，退避后重试: workspace={workspace_id}, chat_key={task.chat_key}, "
-                            f"reason={result.failed_reason}, delay={retry_delay:.1f}s",
-                        )
+                        if result.failed_reason == "backoff":
+                            # 沉淀器还在上一次失败的退避期里，这一轮根本没有执行：不是新的失败，
+                            # 记成失败会让人以为这个频道又坏了一次。
+                            logger.info(
+                                f"沉淀处于退避期，跳过，到点重排: workspace={workspace_id}, "
+                                f"chat_key={task.chat_key}, retry_after={result.retry_after}, "
+                                f"delay={retry_delay:.1f}s",
+                            )
+                        else:
+                            logger.warning(
+                                f"沉淀失败，退避后重试: workspace={workspace_id}, chat_key={task.chat_key}, "
+                                f"reason={result.failed_reason}, delay={retry_delay:.1f}s",
+                            )
                     else:
                         # 真正推进了游标的一轮，用库里游标之后的实际条数校正待沉淀数：内存计数重启后
                         # 从 0 算起，只靠它判断「后面还有没有」会低估积压，续排就不触发。

@@ -307,6 +307,29 @@ class TestParticipantSelection:
         assert rendered == ""
 
 
+class TestPromptBlockContent:
+    """好感块只写关系状态，不带「这是群聊」之类的场景提示"""
+
+    async def test_group_chat_has_no_scene_hint(self, affection_db: None) -> None:
+        await apply_delta(
+            KEY_A,
+            delta=30,
+            reason="一起打游戏",
+            source=AffectionEventSource.LLM,
+            state_text="挺聊得来",
+        )
+        await add_message(CHAT_KEY_A, INSTANCE_A, USER_ID, "早")
+
+        rendered = await render_affection_prompt(
+            db_chat_channel=_StubChannel(CHAT_KEY_A, INSTANCE_A),  # type: ignore[arg-type]
+            one_time_code=ONE_TIME_CODE,
+            config=make_config(),
+        )
+
+        assert "Relationship State" in rendered
+        assert "group chat" not in rendered.lower()
+
+
 class TestFailOpen:
     """好感度出任何问题，主对话都必须照常进行"""
 

@@ -582,6 +582,9 @@ class TestLists:
         assert entries[0].id == paragraph_a.id
         assert entries[0].title_or_summary == "隔离段落"
         assert entries[0].quarantine_reason == "manual"
+        # 认知 / 知识类型只有段落有；episode 没有这两维，给 None 而不是空串
+        assert (entries[0].cognitive_type, entries[0].knowledge_type) == ("semantic", "fact")
+        assert (entries[1].cognitive_type, entries[1].knowledge_type) == (None, None)
         assert entries[1].origin_chat_key == CHAT
 
     async def test_build_detail_and_trace(self, env: AsyncQdrantClient) -> None:
@@ -597,11 +600,21 @@ class TestLists:
         await _log(paragraph.id)
         await _log(paragraph.id)
 
-        detail = await build_paragraph_detail(paragraph)
+        async def visible(_episode: DBMemEpisode) -> bool:
+            return True
+
+        async def hidden(_episode: DBMemEpisode) -> bool:
+            return False
+
+        detail = await build_paragraph_detail(paragraph, episode_visible=visible)
         assert detail["status"] == "active"
-        assert detail["persons"] == [{"account": "u151", "display_name": "甲"}]
+        # 称呼来自好感记录；这里没有好感记录，就是空串
+        assert detail["persons"] == [{"account": "u151", "display_name": "甲", "call_name": "", "name_source": "chat"}]
         assert detail["origin_channel_name"] == "频道一"
-        assert detail["episode"] == {"id": episode.id, "title": "所属事件"}
+        assert detail["episode"] == {"id": episode.id, "title": "所属事件", "visible": True}
+        # 看不见所属事件时只给编号
+        hidden_detail = await build_paragraph_detail(paragraph, episode_visible=hidden)
+        assert hidden_detail["episode"] == {"id": episode.id, "title": "", "visible": False}
         assert detail["reinforcement_count"] == 2
 
         trace = await trace_paragraph(paragraph)

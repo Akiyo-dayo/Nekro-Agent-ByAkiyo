@@ -141,7 +141,11 @@ function NetworkEntryCard({
               {entry.name || t('panel.network.entry.unnamed')}
             </Typography>
             {managed ? (
-              <Chip size="small" color="primary" label={t('panel.network.entry.managedBadge')} />
+              <Chip
+                size="small"
+                label={t('panel.network.entry.managedBadge')}
+                sx={CHIP_VARIANTS.getPaletteChip(theme, 'primary', true)}
+              />
             ) : null}
           </Stack>
           <Stack direction="row" spacing={1} alignItems="center">

@@ -10,14 +10,18 @@ from contextlib import suppress
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
-from typing import Any, Sequence
-from urllib.parse import urlparse
+from typing import Sequence
 
 import aiofiles
 
 from nekro_agent.adapters.email.base import EMAIL_PROVIDER_CONFIGS
 from nekro_agent.adapters.email.config import EmailAccount
 from nekro_agent.core.logger import get_sub_logger
+
+# 「连校验过的地址」与「让代理 CONNECT 校验过的地址」是租户出站的公共做法（`tools/tenant_egress.py`），
+# 这里沿用原来的名字，调用处与用例都不用改
+from nekro_agent.tools.tenant_egress import connect_pinned as _connect_pinned
+from nekro_agent.tools.tenant_egress import connect_via_http_proxy as _connect_via_http_proxy
 
 from .base import EmailRawContent
 
@@ -32,6 +36,19 @@ def is_imap_sequence_number(value: bytes | str) -> bool:
     return bool(_SEQUENCE_NUMBER.fullmatch(raw))
 
 
+def make_mail_tls_context(verify: bool) -> ssl.SSLContext:
+    """收发信用的 TLS 上下文
+
+    `verify=True`：`ssl.create_default_context()`，校验证书链、核对主机名。
+    `verify=False`：只给平台方内网自签证书的邮件服务器用（`EmailAccount.tls_verify_required`）。
+    """
+    context = ssl.create_default_context()
+    if not verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 class MailPeerRejectedError(ConnectionError):
     """连上之后核对对端没过
 
@@ -43,10 +60,18 @@ class MailPeerRejectedError(ConnectionError):
 class ProxiedIMAP4SSL(imaplib.IMAP4_SSL):
     """经 HTTP CONNECT 代理连 IMAP；`connect_host` 非空时让代理连这个（校验过的）地址，SNI 仍用主机名"""
 
-    def __init__(self, host: str, port: int, proxy_url: str, timeout: int, connect_host: str = ""):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        proxy_url: str,
+        timeout: int,
+        connect_host: str = "",
+        ssl_context: ssl.SSLContext | None = None,
+    ):
         self.proxy_url = proxy_url
         self.connect_host = connect_host
-        super().__init__(host=host, port=port, timeout=timeout)
+        super().__init__(host=host, port=port, timeout=timeout, ssl_context=ssl_context)
 
     def _create_socket(self, timeout):
         sock = _connect_via_http_proxy(self.connect_host or self.host, self.port, self.proxy_url, timeout)
@@ -64,38 +89,37 @@ class ProxiedSMTP(smtplib.SMTP):
 
 
 class ProxiedSMTPSSL(smtplib.SMTP_SSL):
-    def __init__(self, host: str, port: int, proxy_url: str, timeout: int, connect_host: str = ""):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        proxy_url: str,
+        timeout: int,
+        connect_host: str = "",
+        context: ssl.SSLContext | None = None,
+    ):
         self.proxy_url = proxy_url
         self.connect_host = connect_host
-        super().__init__(host=host, port=port, timeout=timeout)
+        super().__init__(host=host, port=port, timeout=timeout, context=context)
 
     def _get_socket(self, host, port, timeout):
         sock = _connect_via_http_proxy(self.connect_host or host, port, self.proxy_url, timeout)
         return self.context.wrap_socket(sock, server_hostname=host)
 
 
-def _connect_pinned(addresses: Sequence[str], port: int, timeout: Any) -> socket.socket:
-    """按顺序连校验过的地址，连上第一个就返回；全连不上抛最后一个错误
-
-    `timeout` 原样交给 `socket.create_connection`（`imaplib` 给 None 表示不设，`smtplib` 可能给它自己的默认哨兵）。
-    """
-    last_error: OSError | None = None
-    for address in addresses:
-        try:
-            if timeout is None:
-                return socket.create_connection((address, port))
-            return socket.create_connection((address, port), timeout)
-        except OSError as e:
-            last_error = e
-    raise last_error or OSError("没有可连接的地址")
-
-
 class PinnedIMAP4SSL(imaplib.IMAP4_SSL):
     """直接连校验过的地址（不让 `imaplib` 再解析一遍主机名）；SNI 与证书主机名仍用主机名"""
 
-    def __init__(self, host: str, port: int, addresses: Sequence[str], timeout: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        addresses: Sequence[str],
+        timeout: int,
+        ssl_context: ssl.SSLContext | None = None,
+    ):
         self.pinned_addresses = tuple(addresses)
-        super().__init__(host=host, port=port, timeout=timeout)
+        super().__init__(host=host, port=port, timeout=timeout, ssl_context=ssl_context)
 
     def _create_socket(self, timeout):
         sock = _connect_pinned(self.pinned_addresses, self.port, timeout)
@@ -114,47 +138,20 @@ class PinnedSMTP(smtplib.SMTP):
 
 
 class PinnedSMTPSSL(smtplib.SMTP_SSL):
-    def __init__(self, host: str, port: int, addresses: Sequence[str], timeout: int):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        addresses: Sequence[str],
+        timeout: int,
+        context: ssl.SSLContext | None = None,
+    ):
         self.pinned_addresses = tuple(addresses)
-        super().__init__(host=host, port=port, timeout=timeout)
+        super().__init__(host=host, port=port, timeout=timeout, context=context)
 
     def _get_socket(self, host, port, timeout):
         sock = _connect_pinned(self.pinned_addresses, port, timeout)
         return self.context.wrap_socket(sock, server_hostname=host)
-
-
-def _connect_via_http_proxy(host: str, port: int, proxy_url: str, timeout: int | float | None):
-    parsed = urlparse(proxy_url)
-    if parsed.scheme not in {"http", "https"}:
-        raise RuntimeError("IMAP/SMTP 代理目前仅支持 HTTP CONNECT 代理")
-    if not parsed.hostname:
-        raise RuntimeError("代理地址缺少主机名")
-    proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    raw_sock = socket.create_connection((parsed.hostname, proxy_port), timeout=timeout)
-    if parsed.scheme == "https":
-        raw_sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=parsed.hostname)
-
-    # IPv6 字面量（校验过的地址）在 CONNECT 目标里要加方括号
-    connect_target = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
-    headers = [
-        f"CONNECT {connect_target} HTTP/1.1",
-        f"Host: {connect_target}",
-    ]
-    if parsed.username or parsed.password:
-        auth = f"{parsed.username or ''}:{parsed.password or ''}"
-        headers.append("Proxy-Authorization: Basic " + base64.b64encode(auth.encode()).decode())
-    raw_sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = raw_sock.recv(4096)
-        if not chunk:
-            break
-        response += chunk
-    status_line = response.split(b"\r\n", 1)[0].decode(errors="ignore")
-    if " 200 " not in status_line:
-        raw_sock.close()
-        raise RuntimeError(f"代理 CONNECT 失败: {status_line}")
-    return raw_sock
 
 
 class ImapSmtpPasswordClient:
@@ -171,7 +168,7 @@ class ImapSmtpPasswordClient:
         self.conn = await asyncio.to_thread(self._connect_sync, addresses)
 
     async def _checked_addresses(self, host: str, port: int) -> tuple[str, ...] | None:
-        """租户填的服务器：解析一次、校验全部结果（拒内网与 Fake-IP 段），返回要连的地址；其余返回 None
+        """租户填的服务器：解析一次、校验全部结果（拒内网，判据与下载同一份），返回要连的地址；其余返回 None
 
         连接时直接连这些地址（`Pinned*` / 代理的 `connect_host`），不让 `imaplib` / `smtplib` 再解析一遍：
         校验一次、连接再解析一次，两次之间可以被 DNS 重绑，NA 就真的连上了内网的某个端口。
@@ -183,9 +180,9 @@ class ImapSmtpPasswordClient:
         """
         if not self.account.is_tenant_host(host):
             return None
-        from nekro_agent.tools.common_util import resolve_tenant_host
+        from nekro_agent.tools.tenant_egress import resolve_tenant_host
 
-        return await resolve_tenant_host(host, port, subject="邮箱服务器", exclude_fake_ip=True)
+        return await resolve_tenant_host(host, port, subject="邮箱服务器")
 
     async def close(self) -> None:
         if not self.conn:
@@ -319,7 +316,7 @@ class ImapSmtpPasswordClient:
             with suppress(OSError):
                 peer = str(sock.getpeername()[0])
         try:
-            assert_tenant_connected_peer_safe(peer, exclude_fake_ip=True)
+            assert_tenant_connected_peer_safe(peer)
         except UnsafeDownloadUrlError as e:
             raise MailPeerRejectedError("连不上邮件服务器") from e
 
@@ -330,12 +327,16 @@ class ImapSmtpPasswordClient:
             raise ValueError(f"邮箱提供商 {self.account.EMAIL_ACCOUNT} 缺少 imap_host 配置")
         return str(imap_host), int(provider_config.get("imap_port", 993))
 
+    def _tls_context(self, host: str) -> ssl.SSLContext:
+        return make_mail_tls_context(self.account.tls_verify_required(host))
+
     def _open_imap(self, imap_host: str, imap_port: int, addresses: Sequence[str] | None) -> imaplib.IMAP4_SSL:
         """建 IMAP 连接（构造函数里就连上了）并核对对端，**不登录**；密码与 OAuth2 两种客户端共用
 
         `addresses` 是 `_checked_addresses` 校验过的地址：租户填的主机必须给，否则拒绝连接——
         不能退回去让 `imaplib` 自己解析主机名。
         """
+        context = self._tls_context(imap_host)
         if addresses:
             if self.proxy_url:
                 conn: imaplib.IMAP4_SSL = ProxiedIMAP4SSL(
@@ -344,15 +345,16 @@ class ImapSmtpPasswordClient:
                     self.proxy_url,
                     self.imap_timeout,
                     connect_host=addresses[0],
+                    ssl_context=context,
                 )
             else:
-                conn = PinnedIMAP4SSL(imap_host, imap_port, addresses, self.imap_timeout)
+                conn = PinnedIMAP4SSL(imap_host, imap_port, addresses, self.imap_timeout, ssl_context=context)
         elif self.account.is_tenant_host(imap_host):
             raise RuntimeError("租户填的邮件服务器要先校验地址，再按校验过的地址连接")
         elif self.proxy_url:
-            conn = ProxiedIMAP4SSL(imap_host, imap_port, self.proxy_url, self.imap_timeout)
+            conn = ProxiedIMAP4SSL(imap_host, imap_port, self.proxy_url, self.imap_timeout, ssl_context=context)
         else:
-            conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=self.imap_timeout)
+            conn = imaplib.IMAP4_SSL(imap_host, imap_port, ssl_context=context, timeout=self.imap_timeout)
         try:
             self._guard_peer(getattr(conn, "sock", None), imap_host)
         except Exception:
@@ -387,7 +389,7 @@ class ImapSmtpPasswordClient:
         server = self._new_smtp(smtp_host, port, use_ssl, timeout, addresses)
         try:
             if not use_ssl:
-                server.starttls()
+                server.starttls(context=self._tls_context(smtp_host))
             server.login(self.account.USERNAME, self.account.PASSWORD)
         except Exception:
             with suppress(Exception):
@@ -411,9 +413,16 @@ class ImapSmtpPasswordClient:
         if addresses:
             if use_ssl:
                 server = (
-                    ProxiedSMTPSSL(smtp_host, port, self.proxy_url, timeout, connect_host=addresses[0])
+                    ProxiedSMTPSSL(
+                        smtp_host,
+                        port,
+                        self.proxy_url,
+                        timeout,
+                        connect_host=addresses[0],
+                        context=self._tls_context(smtp_host),
+                    )
                     if self.proxy_url
-                    else PinnedSMTPSSL(smtp_host, port, addresses, timeout)
+                    else PinnedSMTPSSL(smtp_host, port, addresses, timeout, context=self._tls_context(smtp_host))
                 )
             else:
                 server = (
@@ -425,9 +434,9 @@ class ImapSmtpPasswordClient:
             raise RuntimeError("租户填的邮件服务器要先校验地址，再按校验过的地址连接")
         elif use_ssl:
             if self.proxy_url:
-                server = ProxiedSMTPSSL(smtp_host, port, self.proxy_url, timeout)
+                server = ProxiedSMTPSSL(smtp_host, port, self.proxy_url, timeout, context=self._tls_context(smtp_host))
             else:
-                server = smtplib.SMTP_SSL(smtp_host, port, timeout=timeout)
+                server = smtplib.SMTP_SSL(smtp_host, port, timeout=timeout, context=self._tls_context(smtp_host))
         elif self.proxy_url:
             server = ProxiedSMTP(smtp_host, port, self.proxy_url, timeout)
         else:

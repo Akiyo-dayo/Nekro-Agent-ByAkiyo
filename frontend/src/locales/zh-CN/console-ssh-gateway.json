@@ -20,7 +20,15 @@
     "connections": "连接数",
     "channels": "通道数",
     "runningLeases": "在跑租约数",
-    "configHint": "开关、所有者名单、用户白名单在系统配置里改（SSH_GATEWAY_ENABLED、SSH_GATEWAY_OWNER_ACCOUNTS、SSH_GATEWAY_USER_ACCOUNTS）",
+    "defaultDutyMode": "平台方服务器默认模式",
+    "dutyInstances": "能触发值守的实例",
+    "dutyInstancesAll": "所有平台方实例",
+    "dutyInstancesClosed": "名单已清空，值守对所有实例关闭",
+    "dutyModes": {
+      "strict": "严格",
+      "duty": "值守"
+    },
+    "configHint": "开关、所有者名单、用户白名单在系统配置里改（SSH_GATEWAY_ENABLED、SSH_GATEWAY_OWNER_ACCOUNTS、SSH_GATEWAY_USER_ACCOUNTS）；值守模式的默认值与实例名单也在那里（SSH_GATEWAY_DEFAULT_DUTY_MODE、SSH_GATEWAY_DUTY_INSTANCES）",
     "states": {
       "off": "未开启",
       "starting": "启动中",
@@ -52,6 +60,8 @@
       "user": "用户 {{account}}"
     },
     "ownerNotWhitelisted": "凭据主人不在白名单，暂时用不了",
+    "dutyBadge": "值守",
+    "dutyBadgeHint": "能找到这台 Bot 的人报故障，都能让它连这台服务器去查、去修",
     "status": {
       "active": "可用",
       "disabled": "已停用",

@@ -529,3 +529,25 @@ class TestBothBranchesAreGuarded:
         assert "LLMContentBlockedError" in _raised_names(branch.orelse), "非流式分支没判拦截"
         assert "LLMMalformedToolCallError" in _raised_names(branch.body), "流式分支没判工具调用损坏"
         assert "LLMMalformedToolCallError" in _raised_names(branch.orelse), "非流式分支没判工具调用损坏"
+
+    def test_gemini_stream_and_non_stream_branches_both_raise_the_blocked_error(self) -> None:
+        """Gemini 原生分支的 `if stream_mode:` 两侧同样要有拦截判据
+
+        OpenAI 兼容分支与 Gemini 原生分支各有一对自己/非流式语句；只给其中一条分支
+        补判据，另一条分支上的拒答就会重新变成「一个字都没返回」。
+        """
+        source = Path(openai_module.__file__).read_text(encoding="utf-8")
+        function = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "gen_openai_chat_response"
+        )
+        stream_branches = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "stream_mode"
+        ]
+        assert len(stream_branches) >= 2, "应当同时有 OpenAI 分支与 Gemini 分支的 stream_mode 判断"
+        for index, branch in enumerate(stream_branches):
+            assert "LLMContentBlockedError" in _raised_names(branch.body), f"第 {index} 条流式分支没判拦截"
+            assert "LLMContentBlockedError" in _raised_names(branch.orelse), f"第 {index} 条非流式分支没判拦截"

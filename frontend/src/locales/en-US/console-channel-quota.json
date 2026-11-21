@@ -1,12 +1,6 @@
 {
   "title": "Channel Quota",
   "subtitle": "The daily allowance the platform grants to every group and private chat, settled in the quota timezone.",
-  "intro": {
-    "text": "This page shows the platform's daily allowance per group / private chat. It is a separate layer from the reply quota on the ",
-    "quotaLink": "Quota page",
-    "after": " (that one is a tenant's own self-limit); both must allow a reply.",
-    "settingsHint": "Timezone, token scope and alert thresholds live under System Settings → Channel Quota."
-  },
   "actions": {
     "refresh": "Refresh",
     "editPolicy": "Edit this channel's policy",

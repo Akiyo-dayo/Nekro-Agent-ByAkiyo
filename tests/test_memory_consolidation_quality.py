@@ -331,7 +331,9 @@ class TestGateOpenPrompt:
         # 一条要求占一行：行首是编号、编号后是句点
         numbers = [int(match.group(1)) for match in re.finditer(r"^(\d+)\. ", extra, re.MULTILINE)]
         assert numbers == list(range(1, len(numbers) + 1))
-        expected = 4 + 2 + 1 + (1 if chat_type == "group" else 0) + (1 if summary_on else 0)
+        # 4 条通用 + Bot 台词 / 知识类型 / 敏感标记 / 账号号码 4 条 + 不可信素材 1 条；
+        # 群聊多 persons 与「别的 Bot」2 条，摘要开着多 1 条
+        expected = 4 + 4 + 1 + (2 if chat_type == "group" else 0) + (1 if summary_on else 0)
         assert len(numbers) == expected
 
         has_persons = "persons：这条记忆涉及的人" in prompt
@@ -488,7 +490,11 @@ class TestNearDuplicate:
         result = await _run(chat_key, monkeypatch, _item("小满和阿青约好周末去看展"))
 
         assert result.paragraphs_created == 0
-        assert await DBMemParagraph.all().count() == 1
+        # 不丢信息：重复的那条照样写库，但直接进隔离区（原因 dedup），后台能放回
+        assert await DBMemParagraph.filter(is_inactive=False).count() == 1
+        [set_aside] = await DBMemParagraph.filter(is_inactive=True)
+        assert set_aside.quarantine_reason == "dedup"
+        assert set_aside.last_manual_action == "dedup"
 
     async def test_different_content_is_written(
         self,
@@ -526,8 +532,13 @@ class TestNearDuplicate:
             _item("阿青和小满说好了周末一起看展"),
         )
 
-        assert result.paragraphs_created == 1
-        assert await DBMemParagraph.all().count() == 1
+        # 第二种说法更长（更具体）：它留下，先写的那条进隔离区
+        assert result.paragraphs_created == 2
+        [kept] = await DBMemParagraph.filter(is_inactive=False)
+        assert kept.content == "阿青和小满说好了周末一起看展"
+        [set_aside] = await DBMemParagraph.filter(is_inactive=True)
+        assert set_aside.content == "小满和阿青约好周末去看展"
+        assert set_aside.quarantine_reason == "dedup"
 
     async def test_other_preset_or_channel_is_written(
         self,

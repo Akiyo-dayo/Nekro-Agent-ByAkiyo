@@ -1143,6 +1143,10 @@ class TestStatusRoute:
             "connections",
             "channels",
             "running_leases",
+            # 值守：默认模式与能触发值守的实例名单（`适配器:实例`），不含凭据与主机
+            "default_duty_mode",
+            "duty_instances",
+            "duty_instances_closed",
         }
         assert "password" not in payload
         assert "private_key" not in payload

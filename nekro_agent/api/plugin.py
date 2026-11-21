@@ -10,7 +10,7 @@ from nekro_agent.services.command.group import CommandGroup
 from nekro_agent.services.command.schemas import Arg, CommandExecutionContext, CommandResponse
 from nekro_agent.services.plugin.base import ConfigBase, NekroPlugin, PluginStore
 from nekro_agent.services.plugin.packages import dynamic_import_pkg
-from nekro_agent.services.plugin.schema import SandboxMethod, SandboxMethodType
+from nekro_agent.services.plugin.schema import PromptInjection, SandboxMethod, SandboxMethodType
 from nekro_agent.services.plugin.task import (
     AsyncTaskHandle,
     TaskCtl,
@@ -31,6 +31,7 @@ __all__ = [
     "ExtraField",
     "NekroPlugin",
     "PluginStore",
+    "PromptInjection",
     "SandboxMethod",
     "SandboxMethodType",
     "TaskCtl",

@@ -21,7 +21,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import socket
 from typing import Any, Dict, List
 
@@ -38,7 +37,7 @@ OTHER_INSTANCE = "inst2"
 
 
 def fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> List[str]:
-    """让当前事件循环的 getaddrinfo 按 zone 回答，不在 zone 里的一律解析失败
+    """让出站解析按 zone 回答，不在 zone 里的一律解析失败
 
     用例不联网：真实 `getaddrinfo` 在校验主机名时会查 DNS，而 CI 里既没有网络也不该有。
     """
@@ -52,7 +51,7 @@ def fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> List[str]
             raise socket.gaierror(socket.EAI_NONAME, "not in fake zone")
         return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (zone[name], port))]
 
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake)
+    monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake)
     return looked_up
 
 

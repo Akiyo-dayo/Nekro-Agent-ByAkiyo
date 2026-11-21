@@ -20,7 +20,7 @@
 """
 
 from pathlib import Path
-from typing import Any, List
+from typing import List
 
 from pydantic import Field
 
@@ -38,6 +38,7 @@ from nekro_agent.services.agent.creator import ContentSegment, OpenAIChatMessage
 from nekro_agent.services.agent.openai import gen_openai_chat_response
 from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
 from nekro_agent.tools.path_convertor import convert_to_host_path
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 from nekro_agent.tools.untrusted_content import UntrustedToolResult, sanitize_block_text
 
 # 视觉模型的描述正文字数上限，给"模型啰嗦"或"图里整页文字被转述"兜底
@@ -192,6 +193,8 @@ async def view_image(_ctx: AgentCtx, images: List[str]) -> UntrustedToolResult |
                 messages=[vision_msg.to_dict()],
                 base_url=vision_model_group.BASE_URL,
                 api_key=vision_model_group.API_KEY,
+                api_format=vision_model_group.API_FORMAT,
+                tenant_egress=is_tenant_owned_group(vision_model_group),
             )
         # 响应对象现在是 OpenAIResponse
         description = description_response.response_content

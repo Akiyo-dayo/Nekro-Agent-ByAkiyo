@@ -48,7 +48,12 @@ def test_overridable_chinese_descriptions_do_not_say_this_channel() -> None:
 def test_switches_explain_the_three_levels() -> None:
     """改名后的三个开关在说明里写清「全局、实例、频道三层都能覆盖」"""
     fields = CoreConfig.model_fields
-    for name in ("WORLDBOOK_ENABLED", "WORLDBOOK_MAX_CHARS", "MEMORY_ENABLE_FOR_CHAT"):
+    for name in (
+        "WORLDBOOK_ENABLED",
+        "WORLDBOOK_BUDGET_PERCENT",
+        "WORLDBOOK_BUDGET_CAP_TOKENS",
+        "MEMORY_ENABLE_FOR_CHAT",
+    ):
         extra = fields[name].json_schema_extra
         assert isinstance(extra, dict)
         assert "全局、实例、频道三层" in extra["i18n_description"]["zh-CN"], name

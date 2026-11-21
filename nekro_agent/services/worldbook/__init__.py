@@ -20,7 +20,15 @@
   拉起来。
 """
 
-from .matcher import HitReason, book_active_for_person, entry_hit, key_hit, normalize_for_match, scan_text
+from .matcher import (
+    HitReason,
+    book_active_for_person,
+    entry_hit,
+    key_hit,
+    normalize_for_match,
+    present_person_accounts,
+    scan_text,
+)
 from .safe_regex import RegexRunner, RegexSpec, disabled_regex_keys, forget_entry, parse_regex_key, validate_regex_key
 from .selection import Hit, RenderGroups, Selection, group_for_render, select_hits
 from .st_format import (
@@ -108,6 +116,7 @@ __all__ = [
     "normalize_for_match",
     "parse_regex_key",
     "parse_world_file",
+    "present_person_accounts",
     "scan_text",
     "select_hits",
     "st_entry_to_columns",

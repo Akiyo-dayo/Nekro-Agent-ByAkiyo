@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -245,9 +246,23 @@ def _labels(workspace_id: int, *, scope: Optional[str] = None) -> Dict[str, str]
 
 
 def _expected(workspace_id: int) -> List[str]:
-    """这个工作区的容器应有的挂载（字面路径），在测试里自己算，不借被测代码的函数"""
+    """这个工作区旧布局容器（home 还在工作区目录里）应有的挂载（字面路径），在测试里自己算，不借被测代码的函数"""
     ws_dir = os.path.abspath(str(Path(manager_module.WORKSPACE_ROOT_DIR) / str(workspace_id)))
     binds = [f"{ws_dir}:/workspace:rw", f"{ws_dir}{os.sep}.claude_home:/home/appuser/.claude:rw"]
+    if Path("/etc/localtime").exists():
+        binds.append("/etc/localtime:/etc/localtime:ro")
+    return binds
+
+
+def _new_home(workspace_id: int) -> Path:
+    """建容器时 home 迁到的新位置（工作区目录之外），在测试里自己拼"""
+    return Path(manager_module.WORKSPACE_ROOT_DIR) / ".nk-homes" / str(workspace_id) / "claude"
+
+
+def _expected_new(workspace_id: int) -> List[str]:
+    """新布局容器应有的挂载（字面路径）"""
+    ws_dir = os.path.abspath(str(Path(manager_module.WORKSPACE_ROOT_DIR) / str(workspace_id)))
+    binds = [f"{ws_dir}:/workspace:rw", f"{os.path.abspath(str(_new_home(workspace_id)))}:/home/appuser/.claude:rw"]
     if Path("/etc/localtime").exists():
         binds.append("/etc/localtime:/etc/localtime:ro")
     return binds
@@ -461,7 +476,7 @@ class TestCreateAndStart:
         """状态是 failed、旧容器却还活着：先停掉删掉它，再修、再挂载"""
         del db
         workspace = await _workspace("cc-old", status="failed")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         journal.add("cc-old", binds=_expected(workspace.id), labels=_labels(workspace.id))
         _patch_docker(monkeypatch, journal)
 
@@ -480,21 +495,23 @@ class TestCreateAndStart:
         _link(alias, real, is_dir=True)
         monkeypatch.setattr(manager_module, "WORKSPACE_ROOT_DIR", str(alias / "workspaces"))
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(alias / "workspaces" / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
 
         await SandboxContainerManager.create_and_start(workspace)
 
         binds = journal.configs[0]["HostConfig"]["Binds"]
         literal = os.path.abspath(str(alias / "workspaces" / str(workspace.id)))
+        literal_home = os.path.abspath(str(alias / "workspaces" / ".nk-homes" / str(workspace.id) / "claude"))
         assert binds[0] == f"{literal}:/workspace:rw"
-        assert binds[1] == f"{literal}{os.sep}.claude_home:/home/appuser/.claude:rw"
+        assert binds[1] == f"{literal_home}:/home/appuser/.claude:rw"
+        assert binds == _expected_new(workspace.id)
 
     async def test_every_container_of_the_workspace_is_removed_before_mounting(self, db, host, monkeypatch) -> None:
         """库里记的、按标签认出的孤儿、升级前建的（没标签、按挂载认）：一律删掉；别的工作区、别的部署的不动"""
         del db
         workspace = await _workspace("cc-old", status="failed")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         real_ws = os.path.realpath(str(host.root / str(workspace.id)))
         journal.add("cc-old", binds=_expected(workspace.id), labels=_labels(workspace.id))
         journal.add("cc-orphan", binds=[], labels=_labels(workspace.id))
@@ -515,7 +532,7 @@ class TestCreateAndStart:
         """删不掉、还在跑的同工作区容器：拒绝启动、记 ERROR，不建新容器"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         journal.add("cc-stuck", binds=_expected(workspace.id), labels=_labels(workspace.id))
         journal.undeletable.add("cc-stuck")
         _patch_docker(monkeypatch, journal)
@@ -532,7 +549,7 @@ class TestCreateAndStart:
     async def test_the_new_container_is_labelled_and_cannot_gain_privileges(self, db, host, monkeypatch) -> None:
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
 
         await SandboxContainerManager.create_and_start(workspace)
@@ -547,7 +564,7 @@ class TestCreateAndStart:
         """旧容器（包括没删掉的孤儿）拿着的那把 token 在新容器上作废"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
 
         await SandboxContainerManager.create_and_start(workspace)
@@ -565,7 +582,7 @@ class TestCreateAndStart:
         """容器起来了、记进库之前出了异常：当场删掉，不留一个库里不认识的容器"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         original_show = _Container.show
 
@@ -589,7 +606,7 @@ class TestSerialisation:
         """两次启动同时到：后到的直接拒绝（「正在启停」），只建一个容器"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         gate = asyncio.Event()
 
@@ -621,7 +638,7 @@ class TestSerialisation:
         """停止排在启动后面（撤销凭据时必须停得下来），停的是启动刚建好的那个容器"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         gate = asyncio.Event()
 
@@ -649,7 +666,7 @@ class TestSerialisation:
         """库里已经是 transitioning（别处在启停）：比较替换不成就拒绝"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         await DBWorkspace.filter(id=workspace.id).update(status="transitioning")
 
@@ -657,6 +674,184 @@ class TestSerialisation:
             await SandboxContainerManager.create_and_start(workspace)
         _raised(raised, "WorkspaceBusyError")
         assert journal.events == []
+
+
+class TestHomeLayoutInTheContainerFlow:
+    """home 搬到工作区目录之外：建容器时迁移，重启沿用旧挂载、不迁移"""
+
+    async def test_starting_moves_the_legacy_home_out_before_mounting(self, db, host, monkeypatch) -> None:
+        del db
+        workspace = await _workspace(None, status="stopped")
+        legacy = host.root / str(workspace.id) / ".claude_home"
+        (legacy / "projects").mkdir(parents=True)
+        (legacy / "projects" / "session.jsonl").write_text("history", encoding="utf-8")
+        seen_at_init: List[bool] = []
+        journal = _Journal(_new_home(workspace.id))
+        _patch_docker(monkeypatch, journal, on_init=lambda ws: seen_at_init.append(_new_home(ws.id).is_dir()))
+
+        await SandboxContainerManager.create_and_start(workspace)
+
+        assert seen_at_init == [True], "迁移要排在写配置之前"
+        assert (_new_home(workspace.id) / "projects" / "session.jsonl").read_text(encoding="utf-8") == "history"
+        assert not os.path.lexists(legacy)
+        assert journal.configs[0]["HostConfig"]["Binds"] == _expected_new(workspace.id)
+        assert journal.kind_at_mount == ["dir"]
+
+    async def test_a_failed_move_starts_with_the_legacy_home(self, db, host, monkeypatch, logs) -> None:
+        del db
+        workspace = await _workspace(None, status="stopped")
+        (host.root / str(workspace.id) / ".claude_home").mkdir(parents=True)
+        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        _patch_docker(monkeypatch, journal)
+
+        def cross_device(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError(18, "Invalid cross-device link")
+
+        monkeypatch.setattr(safe_fs.DirHandle, "rename_to", cross_device)
+
+        result = await SandboxContainerManager.create_and_start(workspace)
+
+        assert result.status == "active"
+        assert journal.configs[0]["HostConfig"]["Binds"] == _expected(workspace.id)
+        assert journal.kind_at_mount == ["dir"]
+        assert any("没能挪到工作区之外" in message for message in logs)
+
+    async def test_restart_keeps_the_legacy_mount_and_does_not_migrate(self, db, host, monkeypatch) -> None:
+        """重启沿用容器创建时的挂载：这时候挪走旧 home，容器重启后就看不到自己的会话了"""
+        del db
+        workspace, journal = await _restartable(host, monkeypatch)
+
+        await SandboxContainerManager.restart(workspace)
+
+        assert journal.events[-1] == "start:cc-old"
+        assert (host.root / str(workspace.id) / ".claude_home").is_dir()
+        assert not (host.root / ".nk-homes").exists()
+
+    async def test_restart_refuses_when_the_legacy_home_vanished_while_stopped(self, db, host, monkeypatch) -> None:
+        """旧容器停下来之前把工作区里的 `.claude_home` 删了：home 落到新位置，容器记着的旧挂载
+        不再指向刚核对过的目录——不重启，要求重建"""
+        del db
+
+        def vanish(ws: DBWorkspace) -> None:
+            legacy = host.root / str(ws.id) / ".claude_home"
+            for path in sorted(legacy.rglob("*"), reverse=True):
+                path.rmdir() if path.is_dir() else path.unlink()
+            legacy.rmdir()
+
+        workspace, journal = await _restartable(host, monkeypatch, on_init=vanish)
+
+        with pytest.raises(container_module.UnsafeBindSourceError):
+            await SandboxContainerManager.restart(workspace)
+
+        assert not any(event.startswith("start:") for event in journal.events)
+        status, last_error, _ = await _status(workspace)
+        assert status == "failed"
+        assert last_error is not None and "重建" in last_error
+
+    async def test_a_migrated_container_passes_the_startup_check(self, db, host, monkeypatch) -> None:
+        del db
+        workspace = await _workspace()
+        _new_home(workspace.id).mkdir(parents=True)
+        (host.root / str(workspace.id)).mkdir()
+        journal = _Journal(_new_home(workspace.id))
+        journal.add("cc-old", binds=_expected_new(workspace.id), labels=_labels(workspace.id))
+        _patch_docker(monkeypatch, journal)
+
+        await SandboxContainerManager.recover_on_startup()
+
+        assert (await _status(workspace))[0] == "active"
+        assert journal.containers["cc-old"].running is True
+
+    async def test_a_legacy_mount_is_flagged_once_the_home_has_moved(self, db, host, monkeypatch, logs) -> None:
+        """home 已经在新位置，容器却挂着旧路径（例如回滚后又升级、手工搬过）：停掉，要求重建"""
+        del db
+        workspace = await _workspace()
+        _new_home(workspace.id).mkdir(parents=True)
+        (host.root / str(workspace.id) / ".claude_home").mkdir(parents=True)
+        journal = _Journal(_new_home(workspace.id))
+        journal.add("cc-old", binds=_expected(workspace.id), labels=_labels(workspace.id))
+        _patch_docker(monkeypatch, journal)
+
+        await SandboxContainerManager.recover_on_startup()
+
+        assert journal.containers["cc-old"].running is False
+        assert (await _status(workspace))[0] == "failed"
+        assert any("挂载与预期不一致" in message for message in logs)
+        # 容器停下来之后，工作区目录里那份旧 home 挪出工作区：重建之后容器在 `/workspace` 里看不到它
+        assert not os.path.lexists(host.root / str(workspace.id) / ".claude_home")
+        assert list((host.root / ".nk-homes" / str(workspace.id)).glob("legacy-*"))
+
+    async def test_restart_moves_a_leftover_legacy_home_out_while_stopped(self, db, host, monkeypatch) -> None:
+        """已经在用新位置，工作区目录里又有一份旧的（退回旧版本又升级回来）：重启不迁移，但停着的时候把它挪走"""
+        del db
+        workspace = await _workspace()
+        _new_home(workspace.id).mkdir(parents=True)
+        legacy = host.root / str(workspace.id) / ".claude_home"
+        (legacy / "nk-ssh").mkdir(parents=True)
+        (legacy / "settings.json").write_text(SECRET, encoding="utf-8")
+        seen_at_init: List[bool] = []
+        journal = _Journal(_new_home(workspace.id))
+        journal.add("cc-old", binds=_expected_new(workspace.id), labels=_labels(workspace.id))
+        _patch_docker(monkeypatch, journal, on_init=lambda _ws: seen_at_init.append(os.path.lexists(legacy)))
+
+        await SandboxContainerManager.restart(workspace)
+
+        assert journal.events[-1] == "start:cc-old"
+        assert seen_at_init == [False]
+        assert not os.path.lexists(legacy)
+        (retired,) = list((host.root / ".nk-homes" / str(workspace.id)).glob("legacy-*"))
+        assert (retired / "settings.json").read_text(encoding="utf-8") == SECRET
+
+    async def test_the_startup_check_moves_a_leftover_out_next_to_a_running_container(self, db, host, monkeypatch) -> None:
+        del db
+        workspace = await _workspace()
+        _new_home(workspace.id).mkdir(parents=True)
+        legacy = host.root / str(workspace.id) / ".claude_home"
+        legacy.mkdir(parents=True)
+        journal = _Journal(_new_home(workspace.id))
+        journal.add("cc-old", binds=_expected_new(workspace.id), labels=_labels(workspace.id))
+        _patch_docker(monkeypatch, journal)
+
+        await SandboxContainerManager.recover_on_startup()
+
+        assert journal.containers["cc-old"].running is True
+        assert not os.path.lexists(legacy)
+
+    async def test_the_startup_check_lists_workspaces_still_on_the_legacy_layout(self, db, host, monkeypatch, logs) -> None:
+        del db
+        running = await _workspace()
+        (host.root / str(running.id) / ".claude_home").mkdir(parents=True)
+        stopped = await DBWorkspace.create(name="ws-stopped", description="", status="stopped")
+        (host.root / str(stopped.id) / ".claude_home").mkdir(parents=True)
+        migrated = await DBWorkspace.create(name="ws-migrated", description="", status="stopped")
+        _new_home(migrated.id).mkdir(parents=True)
+        journal = _Journal(host.root / str(running.id) / ".claude_home")
+        journal.add("cc-old", binds=_expected(running.id), labels=_labels(running.id))
+        _patch_docker(monkeypatch, journal)
+
+        await SandboxContainerManager.recover_on_startup()
+
+        lines = [message for message in logs if "旧布局" in message]
+        assert len(lines) == 1, lines
+        assert f"{running.id}, {stopped.id}" in lines[0]
+        assert str(migrated.id) not in lines[0].split(":", 1)[1]
+        # 在跑的旧布局容器照旧在跑，home 不动
+        assert journal.containers["cc-old"].running is True
+        assert (host.root / str(running.id) / ".claude_home").is_dir()
+
+    async def test_a_container_mounting_only_the_new_home_counts_as_this_workspaces(self, db, host, monkeypatch) -> None:
+        """没有标签、只挂了这个工作区新位置 home 的容器，建新容器前同样要清掉"""
+        del db
+        workspace = await _workspace(None, status="stopped")
+        journal = _Journal(_new_home(workspace.id))
+        home_literal = os.path.abspath(str(_new_home(workspace.id)))
+        journal.add("cc-stray", binds=[f"{home_literal}:/home/appuser/.claude:rw"], labels={"nekro.owner.scope": "x"})
+        _patch_docker(monkeypatch, journal)
+
+        await SandboxContainerManager.create_and_start(workspace)
+
+        assert "cc-stray" not in journal.containers
+        assert journal.events.index("delete:cc-stray") < journal.events.index("create")
 
 
 class TestRebuild:
@@ -867,7 +1062,7 @@ class TestDeletingAndSettling:
     async def test_nothing_starts_once_the_workspace_is_being_deleted(self, db, host, monkeypatch) -> None:
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         await SandboxContainerManager.remove(workspace)
 
@@ -881,7 +1076,7 @@ class TestDeletingAndSettling:
     async def test_remove_during_a_fresh_transition_is_refused(self, db, host, monkeypatch) -> None:
         del db
         workspace = await _workspace("cc-old")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         await DBWorkspace.filter(id=workspace.id).update(status="transitioning", update_time=timezone.now())
 
@@ -894,7 +1089,7 @@ class TestDeletingAndSettling:
         """最终状态在内存里改成了 active、落库那一下失败：库里要是 failed，不能卡在 transitioning"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         _patch_docker(monkeypatch, journal)
         original_save = DBWorkspace.save
 
@@ -920,7 +1115,7 @@ class TestDeletingAndSettling:
             raise RuntimeError("disk full")
 
         workspace = await _workspace("cc-old", status="failed")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
         journal.add("cc-old", binds=_expected(workspace.id), labels=_labels(workspace.id))
         _patch_docker(monkeypatch, journal, on_init=broken)
 
@@ -994,10 +1189,13 @@ class TestGuardedMetadata:
 
 class TestForeignWriters:
     async def test_a_foreign_container_writing_the_workspace_root_blocks_the_start(self, db, host, monkeypatch, logs) -> None:
-        """别的容器以读写方式挂着工作区根：它能在核对之后换掉 `.claude_home`，拒绝启动"""
+        """别的容器以读写方式挂着工作区根：它能在核对之后换掉 `.claude_home`，拒绝启动——而且在迁移之前
+        拒绝：迁移要在没有别的容器写得到工作区目录与 `.nk-homes` 的时候做"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        legacy = host.root / str(workspace.id) / ".claude_home"
+        legacy.mkdir(parents=True)
+        journal = _Journal(_new_home(workspace.id))
         journal.add("backup-sidecar", binds=[f"{os.path.abspath(str(host.root))}:/data:rw"])
         _patch_docker(monkeypatch, journal)
 
@@ -1006,11 +1204,27 @@ class TestForeignWriters:
         _raised(raised, "WorkspaceContainerConflictError")
         assert "create" not in journal.events
         assert any("backup-sidecar" in message for message in logs)
+        assert legacy.is_dir() and not (host.root / ".nk-homes").exists(), "拒绝排在迁移之前"
 
-    async def test_read_only_mounts_napcat_and_na_itself_are_allowed(self, db, host, monkeypatch) -> None:
+    async def test_a_foreign_container_writing_the_homes_dir_blocks_the_start(self, db, host, monkeypatch, logs) -> None:
+        """新布局 home 的上级（`.nk-homes`）被别的容器读写挂着：它能把 home 换成链接，同样拒绝启动"""
         del db
         workspace = await _workspace(None, status="stopped")
-        journal = _Journal(host.root / str(workspace.id) / ".claude_home")
+        journal = _Journal(_new_home(workspace.id))
+        journal.add("homes-sidecar", binds=[f"{os.path.abspath(str(host.root / '.nk-homes'))}:/homes:rw"])
+        _patch_docker(monkeypatch, journal)
+
+        with pytest.raises(RuntimeError) as raised:
+            await SandboxContainerManager.create_and_start(workspace)
+        _raised(raised, "WorkspaceContainerConflictError")
+        assert "create" not in journal.events
+        assert any("homes-sidecar" in message for message in logs)
+
+    async def test_read_only_mounts_legacy_napcat_and_na_itself_are_allowed(self, db, host, monkeypatch, logs) -> None:
+        """还按旧挂法（读写挂着整个数据目录）的 NapCat 这个版本放行，但每次启动记一条 WARNING"""
+        del db
+        workspace = await _workspace(None, status="stopped")
+        journal = _Journal(_new_home(workspace.id))
         data_dir = os.path.abspath(str(host.tmp))
         journal.add("reader", binds=[f"{data_dir}:/data:ro"])
         journal.add("napcat-console", binds=[f"{data_dir}:/app/nekro_agent_data:rw"], labels={"nekro.napcat.instance": "1"})
@@ -1023,6 +1237,93 @@ class TestForeignWriters:
         result = await SandboxContainerManager.create_and_start(workspace)
 
         assert result.status == "active"
+        warnings = [message for message in logs if "旧的挂法" in message]
+        assert len(warnings) == 1
+        assert "napcat-console" in warnings[0] and "napcat-compose" in warnings[0]
+        assert "na-self" not in warnings[0] and "reader" not in warnings[0]
+
+    async def test_a_napcat_mounting_only_uploads_read_only_is_not_warned_about(self, db, host, monkeypatch, logs) -> None:
+        """新的挂法：数据目录只挂 uploads、只读，QQ 数据目录读写——碰不到工作区，不记 WARNING"""
+        del db
+        workspace = await _workspace(None, status="stopped")
+        journal = _Journal(_new_home(workspace.id))
+        data_dir = os.path.abspath(str(host.tmp))
+        journal.add(
+            "napcat-narrow",
+            binds=[
+                f"{data_dir}{os.sep}uploads:/app/nekro_agent_data/uploads:ro",
+                f"{data_dir}{os.sep}napcat_data{os.sep}inst{os.sep}QQ:/app/.config/QQ:rw",
+            ],
+            labels={"nekro.napcat.instance": "inst"},
+        )
+        _patch_docker(monkeypatch, journal)
+
+        result = await SandboxContainerManager.create_and_start(workspace)
+
+        assert result.status == "active"
+        assert not any("旧的挂法" in message for message in logs)
+
+    async def test_napcat_from_the_bundled_compose_file_is_allowed(self, db, host, monkeypatch) -> None:
+        """随项目发布的 compose 文件里 NapCat 的服务名是 `nekro_napcat`；升级前的那份读写挂着整个数据目录：
+        只认 `napcat` 的话，用这份 compose 起了 NapCat 的部署上 CC 工作区就起不来（旧挂法这个版本还放行）"""
+        del db
+        workspace = await _workspace(None, status="stopped")
+        journal = _Journal(_new_home(workspace.id))
+        data_dir = os.path.abspath(str(host.tmp))
+        journal.add(
+            "nekro_napcat",
+            binds=[f"{data_dir}:/app/nekro_agent_data:rw"],
+            labels={"com.docker.compose.service": "nekro_napcat"},
+        )
+        _patch_docker(monkeypatch, journal)
+
+        result = await SandboxContainerManager.create_and_start(workspace)
+
+        assert result.status == "active"
+
+
+def test_every_napcat_service_in_the_bundled_compose_files_is_recognized() -> None:
+    """compose 文件里改了 NapCat 的服务名而这里没跟上，就会回到「CC 工作区起不来」"""
+    compose_dir = Path(__file__).resolve().parents[1] / "docker"
+    service_line = re.compile(r"^  ([A-Za-z0-9_.-]*napcat[A-Za-z0-9_.-]*):\s*$")
+    services = {
+        match.group(1)
+        for compose in sorted(compose_dir.glob("docker-compose*.yml"))
+        for line in compose.read_text(encoding="utf-8").splitlines()
+        if (match := service_line.match(line))
+    }
+    assert services, "compose 文件里应当至少有一个 NapCat 服务"
+    for service in services:
+        assert container_module._is_trusted_napcat({"Labels": {"com.docker.compose.service": service}}), service
+    assert not container_module._is_trusted_napcat({"Labels": {"com.docker.compose.service": "backup"}})
+
+
+def test_the_bundled_napcat_mounts_only_uploads_read_only() -> None:
+    """随项目发布的 compose 文件里，NapCat 只把数据目录下的 uploads 只读挂进去，整个数据目录不给它"""
+    compose_dir = Path(__file__).resolve().parents[1] / "docker"
+    mounts: List[Tuple[str, str]] = []
+    for compose in sorted(compose_dir.glob("docker-compose*.yml")):
+        in_napcat = in_volumes = False
+        for line in compose.read_text(encoding="utf-8").splitlines():
+            if re.match(r"^\S", line):
+                in_napcat = in_volumes = False
+                continue
+            service = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", line)
+            if service:
+                in_napcat, in_volumes = "napcat" in service.group(1), False
+                continue
+            if not in_napcat:
+                continue
+            if re.match(r"^    volumes:\s*$", line):
+                in_volumes = True
+            elif re.match(r"^    \S", line):
+                in_volumes = False
+            elif in_volumes and (volume := re.match(r"^      - (\S+)\s*$", line)):
+                mounts.append((compose.name, volume.group(1)))
+    data_mounts = [(name, volume) for name, volume in mounts if ":/app/nekro_agent_data" in volume]
+    assert data_mounts, "没认出 NapCat 的数据目录挂载——判据脱靶，不是产品没问题"
+    for name, volume in data_mounts:
+        assert volume.endswith("/uploads:/app/nekro_agent_data/uploads:ro"), (name, volume)
 
 
 class TestRecoverInspectErrors:

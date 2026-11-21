@@ -224,6 +224,20 @@ class ExtraField(BaseModel):
             "见 routers/config.py:_assert_tenant_may_not_raise_only_field"
         ),
     )
+    zero_means_unlimited: bool = Field(
+        default=False,
+        title="0 表示不设上限",
+        description=(
+            "设置为True时，这个整数项的 0 表示「不设上限」而不是最小值：「租户只能调低」的判据把 0 当作无穷大"
+            "（否则租户写 0 就绕过了平台方的上限），前端把 0 显示成「不设上限」。"
+            "标了它的项必须同时标 tenant_may_only_lower（导入期校验）"
+        ),
+    )
+    slider: bool = Field(
+        default=False,
+        title="用滑块编辑",
+        description="设置为True时，前端用滑块编辑这个整数项，范围取字段的 ge / le（配置项列表里的 minimum / maximum）",
+    )
     is_outbound_url: bool = Field(
         default=False,
         title="出网目标地址",
@@ -282,6 +296,11 @@ class ExtraField(BaseModel):
         default=False,
         title="人设引用标识",
         description="设置为True时，表示该字段需要从系统中已配置的人设中选择，值为人设ID",
+    )
+    ref_rp_presets: bool = Field(
+        default=False,
+        title="角色扮演预设引用标识",
+        description="设置为True时，表示该字段需要从已导入的酒馆对话补全预设中选择，值为预设ID",
     )
     ref_presets_no_default: bool = Field(
         default=False,

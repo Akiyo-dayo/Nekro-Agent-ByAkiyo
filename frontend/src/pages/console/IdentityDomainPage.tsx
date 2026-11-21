@@ -43,15 +43,17 @@ import {
   MenuItem,
   Select,
   Stack,
+  type SxProps,
   Tab,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableRow,
-  Tabs,
   TextField,
+  type Theme,
   Typography,
+  useTheme,
 } from '@mui/material'
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
 import AddRoundedIcon from '@mui/icons-material/AddRounded'
@@ -59,7 +61,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import ActionButton from '../../components/common/ActionButton'
 import NekroDialog from '../../components/common/NekroDialog'
+import { PageTabs } from '../../components/common/NekroTabs'
 import QueryErrorState from '../../components/common/QueryErrorState'
+import { CHIP_VARIANTS, SCROLL_COLUMN_STYLES, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 import { useNotification } from '../../hooks/useNotification'
 import { useIdentity } from '../../hooks/useIdentity'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
@@ -104,6 +108,7 @@ function SectionTitle({ title, hint }: { title: string; hint: string }) {
 
 /** 页签一：把实例编进域 */
 function DomainTab({ readOnly }: { readOnly: boolean }) {
+  const theme = useTheme()
   const { t } = useTranslation('console-identity')
   const notification = useNotification()
   const queryClient = useQueryClient()
@@ -275,7 +280,8 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
       {data && data.items.length === 0 && <Alert severity="success">{t('domain.empty')}</Alert>}
 
       {data && data.items.length > 0 && (
-        <Table size="small">
+        <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+          <Table size="small">
           <TableHead>
             <TableRow>
               <TableCell>{t('domain.columns.domain')}</TableCell>
@@ -309,8 +315,8 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
                         <Chip
                           key={`${member.adapter_key}:${member.instance_key}`}
                           size="small"
-                          variant="outlined"
                           label={member.display_name || member.instance_key}
+                          sx={CHIP_VARIANTS.getPaletteChip(theme, 'primary', true)}
                         />
                       ))}
                     </Stack>
@@ -331,7 +337,8 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
               </TableRow>
             ))}
           </TableBody>
-        </Table>
+          </Table>
+        </Box>
       )}
 
       <Divider />
@@ -339,7 +346,8 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
       <SectionTitle title={t('domain.bindTitle')} hint={t('domain.bindHint')} />
 
       {data && (
-        <Table size="small">
+        <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+          <Table size="small">
           <TableHead>
             <TableRow>
               <TableCell>{t('domain.bindColumns.instance')}</TableCell>
@@ -364,13 +372,11 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
                   </Typography>
                 </TableCell>
                 <TableCell>
+                  {/* 表格里的下拉不挂浮动标签：列头已经写明「所属域」。标签加 `displayEmpty`
+                      又不缩起时，会和「自成一域（默认）」叠在同一行上 */}
                   <FormControl size="small" fullWidth disabled={readOnly || bindMutation.isPending}>
-                    <InputLabel id={`domain-${instance.instance_key}`}>
-                      {t('domain.bindColumns.domain')}
-                    </InputLabel>
                     <Select
-                      labelId={`domain-${instance.instance_key}`}
-                      label={t('domain.bindColumns.domain')}
+                      inputProps={{ 'aria-label': t('domain.bindColumns.domain') }}
                       // `displayEmpty` 不是样式偏好，是**默认态能不能显示出来**：
                       // 「自成一域」的取值是空串（MUI 的受控 Select 不接受 null），
                       // 而 MUI 在没有 `displayEmpty` 时把空串当成「还没选」，渲染一个
@@ -414,7 +420,8 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
               </TableRow>
             ))}
           </TableBody>
-        </Table>
+          </Table>
+        </Box>
       )}
 
       <NekroDialog
@@ -460,10 +467,14 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
               所以这里不会出现一个"选了建出来也没用"的租户。 */}
           {data?.can_choose_tenant && (
             <FormControl size="small" fullWidth>
-              <InputLabel id="domain-owner-tenant">{t('domain.ownerLabel')}</InputLabel>
+              {/* 取值为空串时也有文字显示，标签必须固定缩到框线上，否则两行字叠在一起 */}
+              <InputLabel id="domain-owner-tenant" shrink>
+                {t('domain.ownerLabel')}
+              </InputLabel>
               <Select
                 labelId="domain-owner-tenant"
                 label={t('domain.ownerLabel')}
+                notched
                 // 同上：默认档「平台方」的取值也是空串
                 displayEmpty
                 value={ownerTenantId === null ? SELF_DOMAIN : String(ownerTenantId)}
@@ -629,6 +640,7 @@ function DomainTab({ readOnly }: { readOnly: boolean }) {
 
 /** 页签二：账号合并（先预览后执行、可撤销） */
 function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: boolean }) {
+  const theme = useTheme()
   const { t } = useTranslation('console-identity')
   const notification = useNotification()
   const queryClient = useQueryClient()
@@ -831,7 +843,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
               </Alert>
             ))}
 
-            <Table size="small">
+            <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+              <Table size="small">
               <TableHead>
                 <TableRow>
                   <TableCell>{t('merge.columns.account')}</TableCell>
@@ -858,7 +871,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
                   </TableRow>
                 ))}
               </TableBody>
-            </Table>
+              </Table>
+            </Box>
 
             <Typography variant="caption" color="text.secondary">
               {t('merge.memoryLine', {
@@ -872,7 +886,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
                 <Typography variant="subtitle2" fontWeight={700}>
                   {t('merge.transferTitle')}
                 </Typography>
-                <Table size="small">
+                <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+                  <Table size="small">
                   <TableHead>
                     <TableRow>
                       <TableCell>{t('merge.transferColumns.preset')}</TableCell>
@@ -890,10 +905,11 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
                           {!transfer.preset_exists && (
                             <Chip
                               size="small"
-                              color="warning"
-                              variant="outlined"
                               label={t('merge.presetDeleted')}
-                              sx={{ ml: 1 }}
+                              sx={[
+                                CHIP_VARIANTS.getPaletteChip(theme, 'warning', true),
+                                { ml: 1 },
+                              ] as SxProps<Theme>}
                             />
                           )}
                         </TableCell>
@@ -908,7 +924,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
                       </TableRow>
                     ))}
                   </TableBody>
-                </Table>
+                  </Table>
+                </Box>
               </>
             )}
 
@@ -948,7 +965,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
         </Alert>
       )}
       {requestsQuery.data && requestsQuery.data.items.length > 0 && (
-        <Table size="small">
+        <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+          <Table size="small">
           <TableHead>
             <TableRow>
               <TableCell>{t('requests.columns.reporter')}</TableCell>
@@ -998,7 +1016,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
               </TableRow>
             ))}
           </TableBody>
-        </Table>
+          </Table>
+        </Box>
       )}
 
       <Divider />
@@ -1020,7 +1039,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
         <Alert severity="success">{t('merge.aliasesEmpty')}</Alert>
       )}
       {aliasesQuery.data && aliasesQuery.data.items.length > 0 && (
-        <Table size="small">
+        <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+          <Table size="small">
           <TableHead>
             <TableRow>
               <TableCell>{t('merge.aliasColumns.alias')}</TableCell>
@@ -1038,12 +1058,16 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
                 <TableCell>
                   <Chip
                     size="small"
-                    variant="outlined"
                     label={
                       item.source === 'self_report'
                         ? t('merge.sourceSelfReport')
                         : t('merge.sourceManual')
                     }
+                    sx={CHIP_VARIANTS.getPaletteChip(
+                      theme,
+                      item.source === 'self_report' ? 'info' : 'default',
+                      true
+                    )}
                   />
                 </TableCell>
                 <TableCell>{item.operator || '-'}</TableCell>
@@ -1057,7 +1081,8 @@ function MergeTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: bo
               </TableRow>
             ))}
           </TableBody>
-        </Table>
+          </Table>
+        </Box>
       )}
 
       <NekroDialog
@@ -1204,7 +1229,8 @@ function OrphanTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: b
       )}
 
       {orphansQuery.data && orphansQuery.data.items.length > 0 && (
-        <Table size="small">
+        <Box sx={UNIFIED_TABLE_STYLES.embedded}>
+          <Table size="small">
           <TableHead>
             <TableRow>
               <TableCell>{t('orphan.columns.preset')}</TableCell>
@@ -1233,7 +1259,8 @@ function OrphanTab({ instanceKey, readOnly }: { instanceKey: string; readOnly: b
               </TableRow>
             ))}
           </TableBody>
-        </Table>
+          </Table>
+        </Box>
       )}
 
       <NekroDialog
@@ -1294,16 +1321,10 @@ export default function IdentityDomainPage() {
 
   return (
     <Box
-      sx={{
-        p: { xs: 1.5, sm: 2, md: 3 },
-        height: '100%',
-        minHeight: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 2,
-        overflow: 'auto',
-        boxSizing: 'border-box',
-      }}
+      sx={[
+        SCROLL_COLUMN_STYLES,
+        { p: { xs: 1.5, sm: 2, md: 3 }, height: '100%', gap: 2, boxSizing: 'border-box' },
+      ] as SxProps<Theme>}
     >
       <Box>
         <Typography variant="h6" fontWeight={700}>
@@ -1316,14 +1337,16 @@ export default function IdentityDomainPage() {
 
       {isReadOnly && <Alert severity="info">{t('readOnlyHint')}</Alert>}
 
-      <Tabs value={tab} onChange={(_event, next: number) => setTab(next)} variant="scrollable">
-        <Tab label={t('tabs.domains')} />
-        <Tab label={t('tabs.merge')} />
-        <Tab label={t('tabs.orphans')} />
-      </Tabs>
+      <Box sx={UNIFIED_TABLE_STYLES.pageTabContainer}>
+        <PageTabs value={tab} onChange={(_event, next: number) => setTab(next)} variant="scrollable">
+          <Tab label={t('tabs.domains')} />
+          <Tab label={t('tabs.merge')} />
+          <Tab label={t('tabs.orphans')} />
+        </PageTabs>
+      </Box>
 
       {tab !== 0 && instances.length > 1 && (
-        <FormControl size="small" sx={{ maxWidth: 320 }}>
+        <FormControl size="small" sx={{ maxWidth: 320, mt: 0.5 }}>
           <InputLabel id="identity-scope">{t('scopePicker')}</InputLabel>
           <Select
             labelId="identity-scope"

@@ -14,6 +14,9 @@ import axios from './axios'
 
 export type SshOwnerKind = 'platform' | 'user'
 
+/** 平台方服务器的值守模式：空串表示跟随全局默认 */
+export type SshDutyMode = '' | 'strict' | 'duty'
+
 export interface SshHostKeyView {
   /** 类型与 base64 两段 */
   entry: string
@@ -97,6 +100,25 @@ export interface SshCredentialView {
   can_reveal: boolean
   /** 后端判定的「能不能改连接信息」；聊天登记的行对租户恒为假 */
   can_edit_connection: boolean
+  /** '' = 跟随默认, 'strict', 'duty' */
+  duty_mode: string
+  /** '' 或 'strict' / 'duty'：此刻生效的模式 */
+  effective_duty_mode: string
+}
+
+/** Bot 在任务结束后追加的一条运维经验 */
+export interface SshRunbookEntryView {
+  id: number
+  content: string
+  task_ref: string
+  created_at: string | null
+}
+
+/** 一台平台方服务器的运维手册与 Bot 追加的经验（新的在前） */
+export interface SshRunbookView {
+  credential_id: number
+  runbook: string
+  entries: SshRunbookEntryView[]
 }
 
 /** 绑在工作区上的一个实例对（新建用户行时选归属实例用） */
@@ -200,6 +222,11 @@ export interface SshGatewayStatusResponse {
   connections: number
   channels: number
   running_leases: number
+  default_duty_mode: 'strict' | 'duty'
+  /** 能触发值守的平台方实例，写法 "适配器:实例" */
+  duty_instances: string[]
+  /** true = 名单已被清空，值守对所有实例关闭 */
+  duty_instances_closed: boolean
 }
 
 /** 导入成功的一条：工作区、别名与来源资源名 */
@@ -231,6 +258,8 @@ export const SSH_GATEWAY_QUERY_KEYS = {
     ['ssh-gateway', 'workspace-credentials', workspaceId] as const,
   credential: (workspaceId: number, credentialId: number) =>
     ['ssh-gateway', 'credential', workspaceId, credentialId] as const,
+  runbook: (workspaceId: number, credentialId: number) =>
+    ['ssh-gateway', 'runbook', workspaceId, credentialId] as const,
   allCredentials: () => ['ssh-gateway', 'all-credentials'] as const,
   status: () => ['ssh-gateway', 'status'] as const,
   audit: (workspaceId?: number) =>
@@ -291,6 +320,55 @@ export const sshGatewayApi = {
     const action = enabled ? 'enable' : 'disable'
     const response = await axios.post<SshCredentialView>(
       `${WORKSPACE_BASE(workspaceId)}/${credentialId}/${action}`
+    )
+    return response.data
+  },
+
+  /** 平台方：设置一行平台方服务器的值守模式；空串表示跟随默认 */
+  async setDutyMode(
+    workspaceId: number,
+    credentialId: number,
+    dutyMode: SshDutyMode
+  ): Promise<SshCredentialView> {
+    const response = await axios.put<SshCredentialView>(
+      `${WORKSPACE_BASE(workspaceId)}/${credentialId}/duty-mode`,
+      { duty_mode: dutyMode }
+    )
+    return response.data
+  },
+
+  /** 平台方：读一台平台方服务器的运维手册与 Bot 追加的经验 */
+  async getRunbook(
+    workspaceId: number,
+    credentialId: number
+  ): Promise<SshRunbookView> {
+    const response = await axios.get<SshRunbookView>(
+      `${WORKSPACE_BASE(workspaceId)}/${credentialId}/runbook`
+    )
+    return response.data
+  },
+
+  /** 平台方：保存运维手册正文 */
+  async updateRunbook(
+    workspaceId: number,
+    credentialId: number,
+    runbook: string
+  ): Promise<SshRunbookView> {
+    const response = await axios.put<SshRunbookView>(
+      `${WORKSPACE_BASE(workspaceId)}/${credentialId}/runbook`,
+      { runbook }
+    )
+    return response.data
+  },
+
+  /** 平台方：删除一条 Bot 追加的经验 */
+  async deleteRunbookEntry(
+    workspaceId: number,
+    credentialId: number,
+    entryId: number
+  ): Promise<SshRunbookView> {
+    const response = await axios.delete<SshRunbookView>(
+      `${WORKSPACE_BASE(workspaceId)}/${credentialId}/runbook/entries/${entryId}`
     )
     return response.data
   },

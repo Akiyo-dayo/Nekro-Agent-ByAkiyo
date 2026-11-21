@@ -20,7 +20,15 @@
     "connections": "Connections",
     "channels": "Channels",
     "runningLeases": "Running leases",
-    "configHint": "Change the switch, owner allowlist and user allowlist in system settings (SSH_GATEWAY_ENABLED, SSH_GATEWAY_OWNER_ACCOUNTS, SSH_GATEWAY_USER_ACCOUNTS)",
+    "defaultDutyMode": "Default mode for platform servers",
+    "dutyInstances": "Instances that may trigger duty mode",
+    "dutyInstancesAll": "All platform instances",
+    "dutyInstancesClosed": "List cleared: duty mode is off for every instance",
+    "dutyModes": {
+      "strict": "Strict",
+      "duty": "Duty"
+    },
+    "configHint": "Change the switch, owner allowlist and user allowlist in system settings (SSH_GATEWAY_ENABLED, SSH_GATEWAY_OWNER_ACCOUNTS, SSH_GATEWAY_USER_ACCOUNTS); the duty-mode default and instance list are there too (SSH_GATEWAY_DEFAULT_DUTY_MODE, SSH_GATEWAY_DUTY_INSTANCES)",
     "states": {
       "off": "Off",
       "starting": "Starting",
@@ -52,6 +60,8 @@
       "user": "User {{account}}"
     },
     "ownerNotWhitelisted": "The credential owner is not on the allowlist, so this cannot be used yet",
+    "dutyBadge": "Duty",
+    "dutyBadgeHint": "Anyone who can reach this bot can have it connect to this server to investigate and fix problems",
     "status": {
       "active": "Active",
       "disabled": "Disabled",

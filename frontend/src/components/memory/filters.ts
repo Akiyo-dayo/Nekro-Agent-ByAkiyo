@@ -9,6 +9,7 @@ import {
   type CognitiveType,
   type EpisodeListParams,
   type KnowledgeType,
+  type MemoryGraphParams,
   type MemoryOrder,
   type MemoryPartition,
   type MemorySort,
@@ -18,6 +19,7 @@ import {
   type ParagraphListParams,
   type QuarantineListParams,
 } from '../../services/api/memory'
+import type { MemoryPageTab } from '../../router/routes'
 
 /**
  * 记忆页的筛选状态与 URL 的互转
@@ -37,6 +39,10 @@ export type MemoryDomain = (typeof MEMORY_DOMAINS)[number]
 export const MEMORY_KINDS = ['paragraph', 'episode'] as const
 export type MemoryKind = (typeof MEMORY_KINDS)[number]
 
+/** 敏感筛选：空串看全部，`only` 只看敏感，`exclude` 不含敏感 */
+export const MEMORY_SENSITIVE_FILTERS = ['only', 'exclude'] as const
+export type MemorySensitiveFilter = '' | (typeof MEMORY_SENSITIVE_FILTERS)[number]
+
 export interface MemoryFilterState {
   /** 发给后端时叫 `q` */
   search: string
@@ -48,8 +54,16 @@ export interface MemoryFilterState {
   person: string
   cognitiveType: CognitiveType | ''
   knowledgeType: KnowledgeType | ''
+  sensitive: MemorySensitiveFilter
   /** 来源类型；空串 = 全部来源 */
   originKind: OriginKind | ''
+  /**
+   * 所属事件：空串不筛，`none` = 没归入任何事件，数字串 = 事件 ID
+   *
+   * 「按事件分组」视图里点「在列表里看这一组」时带上；筛选栏里不单独画控件，由列表上方的
+   * 一枚可删除的标签表示。
+   */
+  episode: string
   timeFrom: string
   timeTo: string
   sort: MemorySort
@@ -67,7 +81,9 @@ export const DEFAULT_MEMORY_FILTERS: MemoryFilterState = {
   person: '',
   cognitiveType: '',
   knowledgeType: '',
+  sensitive: '',
   originKind: '',
+  episode: '',
   timeFrom: '',
   timeTo: '',
   sort: 'create_time',
@@ -75,7 +91,46 @@ export const DEFAULT_MEMORY_FILTERS: MemoryFilterState = {
   page: 1,
 }
 
+/**
+ * 每个标签页认哪些筛选项
+ *
+ * 切标签时只把这些字段带过去，其余回落默认：隔离区不认「知识类型」「认知类型」，
+ * 带过去只会让列表一直是空的。三张表与各标签页筛选栏里的 `fields` 必须一致。
+ */
+export const MEMORY_TAB_FILTER_FIELDS: Record<
+  MemoryPageTab,
+  readonly (keyof MemoryFilterState)[]
+> = {
+  graph: ['chatKey', 'presetId', 'partition', 'domain', 'person', 'timeFrom', 'timeTo'],
+  items: [
+    'search',
+    'status',
+    'chatKey',
+    'presetId',
+    'partition',
+    'domain',
+    'person',
+    'cognitiveType',
+    'knowledgeType',
+    'sensitive',
+    'originKind',
+    'timeFrom',
+    'timeTo',
+    'sort',
+    'order',
+  ],
+  quarantine: ['chatKey', 'presetId', 'partition'],
+}
+
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/
+
+/** 事件筛选只认 `none` 与正整数；别的回落成不筛，不把非法值交给后端换一个 400 */
+export function parseEpisodeFilter(value: string | null): string {
+  if (value === null) return ''
+  const text = value.trim().toLowerCase()
+  if (text === 'none') return 'none'
+  return /^[1-9][0-9]{0,17}$/.test(text) ? text : ''
+}
 
 const includes = <T extends string>(values: readonly T[], value: string | null): value is T =>
   value !== null && (values as readonly string[]).includes(value)
@@ -125,6 +180,7 @@ export function filtersFromSearchParams(searchParams: URLSearchParams): MemoryFi
   const domain = searchParams.get('domain')
   const cognitive = searchParams.get('cognitive')
   const knowledge = searchParams.get('knowledge')
+  const sensitive = searchParams.get('sensitive')
   const origin = searchParams.get('origin')
   const sort = searchParams.get('sort')
   const order = searchParams.get('order')
@@ -139,7 +195,9 @@ export function filtersFromSearchParams(searchParams: URLSearchParams): MemoryFi
     person: searchParams.get('person') ?? '',
     cognitiveType: includes(COGNITIVE_TYPES, cognitive) ? cognitive : '',
     knowledgeType: includes(KNOWLEDGE_TYPES, knowledge) ? knowledge : '',
+    sensitive: includes(MEMORY_SENSITIVE_FILTERS, sensitive) ? sensitive : '',
     originKind: includes(ORIGIN_KINDS, origin) ? origin : '',
+    episode: parseEpisodeFilter(searchParams.get('episode')),
     timeFrom: parseDateInput(searchParams.get('from')),
     timeTo: parseDateInput(searchParams.get('to')),
     sort: includes(SORTS, sort) ? sort : 'create_time',
@@ -164,7 +222,9 @@ export function filtersToSearchParams(filters: MemoryFilterState): URLSearchPara
   put('person', filters.person.trim())
   put('cognitive', filters.cognitiveType)
   put('knowledge', filters.knowledgeType)
+  put('sensitive', filters.sensitive)
   put('origin', filters.originKind)
+  put('episode', parseEpisodeFilter(filters.episode))
   put('from', filters.timeFrom)
   put('to', filters.timeTo)
   if (filters.sort !== DEFAULT_MEMORY_FILTERS.sort) put('sort', filters.sort)
@@ -195,6 +255,13 @@ function localDayEnd(value: string): string | undefined {
   return date.toISOString()
 }
 
+/** 敏感筛选转成后端的布尔参数：不筛时不传，避免 `false` 被当成「只看非敏感」 */
+function sensitiveParam(value: MemorySensitiveFilter): boolean | undefined {
+  if (value === 'only') return true
+  if (value === 'exclude') return false
+  return undefined
+}
+
 /** 段落列表的查询参数（不含作用域，作用域由调用方拼上） */
 export function filtersToParagraphQuery(
   filters: MemoryFilterState,
@@ -208,7 +275,9 @@ export function filtersToParagraphQuery(
     status: filters.status,
     cognitive_type: filters.cognitiveType || undefined,
     knowledge_type: filters.knowledgeType || undefined,
+    sensitive: sensitiveParam(filters.sensitive),
     origin_kind: filters.originKind || undefined,
+    episode: parseEpisodeFilter(filters.episode) || undefined,
     time_from: localDayStart(filters.timeFrom),
     time_to: localDayEnd(filters.timeTo),
     q: filters.search.trim().slice(0, MEMORY_SEARCH_MAX_LENGTH) || undefined,
@@ -217,6 +286,26 @@ export function filtersToParagraphQuery(
     page: filters.page,
     page_size: pageSize,
   }
+}
+
+/**
+ * 分组视图（按人 / 按事件）的查询参数：与段落列表同一套筛选，不带排序与分页
+ *
+ * 分组本身就是「按哪一维看」，按人分组时人这一项、按事件分组时事件这一项都不该再当筛选
+ * 带上——否则分出来永远只有一组。
+ */
+export function filtersToGroupQuery(
+  filters: MemoryFilterState,
+  by: 'person' | 'topic'
+): Omit<ParagraphListParams, 'sort' | 'order' | 'page' | 'page_size'> {
+  const {
+    sort: _sort,
+    order: _order,
+    page: _page,
+    page_size: _pageSize,
+    ...rest
+  } = filtersToParagraphQuery(filters, DEFAULT_MEMORY_PAGE_SIZE)
+  return by === 'person' ? { ...rest, person: undefined } : { ...rest, episode: undefined }
 }
 
 /** episode 列表不接受按人 / 认知类型 / 知识类型筛选 */
@@ -264,10 +353,29 @@ export function filtersToParagraphSelection(
     status: filters.status,
     cognitive_type: filters.cognitiveType || undefined,
     knowledge_type: filters.knowledgeType || undefined,
+    sensitive: sensitiveParam(filters.sensitive),
     time_from: localDayStart(filters.timeFrom),
     time_to: localDayEnd(filters.timeTo),
     q: filters.search.trim().slice(0, MEMORY_SEARCH_MAX_LENGTH) || undefined,
     // 批量接口也认来源类型：「按筛选全选」选中的必须正是列表里看到的那一批
     origin_kind: filters.originKind || undefined,
+    // 同上：从「按事件分组」点进来的列表只看那一组，全选也只能选那一组
+    episode: parseEpisodeFilter(filters.episode) || undefined,
+  }
+}
+
+/** 图谱的查询参数：分区、频道、人设、人、时间与列表同义；失活与否由图谱自己的开关决定 */
+export function filtersToGraphQuery(
+  filters: MemoryFilterState,
+  includeInactive: boolean
+): MemoryGraphParams {
+  return {
+    partition: filters.partition,
+    chat_key: filters.chatKey || undefined,
+    preset_id: filters.presetId ?? undefined,
+    person: filters.person.trim() || undefined,
+    include_inactive: includeInactive || undefined,
+    time_from: localDayStart(filters.timeFrom),
+    time_to: localDayEnd(filters.timeTo),
   }
 }

@@ -14,8 +14,8 @@
 | | 能在这台机器上以 NA 的身份执行代码的人同样能解密。 |
 
 ⚠️ 磁盘上还有同一份 Key 的**第二份载体**：`services/model_group_service.refresh_runtime_view()`
-会把运行时视图 dump 回配置文件（`<数据目录>/configs/nekro-agent.yaml`）。自 #61 修复后，
-那份 YAML 里的 `API_KEY` 不再含明文：有 Key 的组是占位符 `nkmask:1`、没配 Key 的组是空串
+会把运行时视图 dump 回配置文件（`<数据目录>/configs/nekro-agent.yaml`）。
+那份 YAML 里的 `API_KEY` 不含明文：有 Key 的组是占位符 `nkmask:1`、没配 Key 的组是空串
 （`core/config.py`），**明文与密文都不落盘**，
 整目录打包的备份不再带出 Key。代价是 YAML 从此**不是凭据的恢复来源**：密钥材料丢了，
 唯一的恢复路径是把密钥材料找回来（环境变量或 `credential_secret.key` 的备份），
@@ -59,7 +59,7 @@
 **不会**把密文当成 Key 发给上游（那只会在上游侧留下一次带密文的鉴权失败）。
 
 ⚠️ 解不开的行**不会被无脑抹掉**。启动时的整批升级（`upgrade_credentials_at_rest()`）
-跳过它们并在日志里逐个点名；自 #64 修复后，`DBModelGroup.save()` 上还有一道回查守卫：
+跳过它们并在日志里逐个点名；`DBModelGroup.save()` 上还有一道回查守卫：
 解不开的行在任何一次普通保存里也原样保留 `api_key` 原列（后台改个名字、走一遍
 "掩码=保持不变"都不再毁掉密文），落点与语义见 `models/db_model_group.py` 模块文档。
 仍会覆盖它的只剩"显式填入新 Key"——那本来就是一次覆盖指令。
@@ -352,6 +352,37 @@ def _key_ring_cached() -> _KeyRing:
 def credential_cipher_status() -> CipherStatus:
     """当前的密钥来源与可用性（会触发一次密钥解析）"""
     return _key_ring_cached().status
+
+
+# 从主密钥派生别的用途的密钥时用的盐：与加密用的那组参数分开，派生出来的密钥推不回主密钥。
+_PURPOSE_KDF_SALT = b"nekro-agent/purpose-key/v1"
+
+
+def derive_purpose_key(purpose: str) -> Optional[bytes]:
+    """从凭据加密的主密钥派生一把别的用途的 32 字节密钥（HKDF，按用途分开）；没有主密钥时返回 None
+
+    给需要「重启前后不变、条目作者算不出」的一把密钥、又不该自己另存一份的地方用（例如世界书模板
+    诱饵判断的哨兵种子）。主密钥本来就要跨版本保持不变（换了库里的密文就解不开），不随 JWT 轮换。
+
+    不会因为这次调用去生成密钥文件：主密钥还没解析过、环境变量没配、数据目录里也没有密钥文件时
+    直接返回 None（正常启动时 `model_group_service` 已经解析过）。主密钥从文件换成环境变量后，
+    派生出来的这把也跟着换。
+    """
+    ring = _key_ring
+    if ring is None:
+        if not (OsEnv.CREDENTIAL_SECRET_KEY or "").strip() and not _key_file_path().is_file():
+            return None
+        ring = _key_ring_cached()
+    if ring.primary is None:
+        return None
+    derived = HKDF(
+        master=ring.primary,
+        key_len=32,
+        salt=_PURPOSE_KDF_SALT,
+        hashmod=SHA256,
+        context=purpose.encode("utf-8"),
+    )
+    return derived if isinstance(derived, bytes) else derived[0]
 
 
 def is_encrypted_envelope(value: str) -> bool:

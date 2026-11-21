@@ -56,7 +56,16 @@ import asyncssh
 from nekro_agent.core.config import config
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
-from nekro_agent.services.ssh_gateway import audit_queue, authority, events, keys, lease, registry, supervisor
+from nekro_agent.services.ssh_gateway import (
+    audit_queue,
+    authority,
+    duty_report,
+    events,
+    keys,
+    lease,
+    registry,
+    supervisor,
+)
 from nekro_agent.services.ssh_gateway import bridge as bridge_module
 from nekro_agent.services.ssh_gateway import constants as C
 from nekro_agent.services.ssh_gateway.authority import Decision
@@ -81,6 +90,8 @@ RECHECK_ERROR_GRACE_SECONDS = 60.0
 MAX_ENV_VARS = 16
 MAX_ENV_NAME_BYTES = 64
 MAX_ENV_VALUE_BYTES = 256
+# `nk-runbook-append` 从 stdin 最多收这么多字节（经验本身截到 800 字，UTF-8 下够用），多的丢掉
+RUNBOOK_APPEND_MAX_BYTES = 8192
 
 
 def _as_limit(value: Any) -> int:
@@ -157,6 +168,8 @@ class GatewayBackendImpl:
         self._host_key = asyncssh.read_private_key(str(path))
         if not self._subscribed:
             lease.on_lease_end(self._on_lease_end)
+            # 排在断连接之后：摘要等这一批通道的关闭审计入队后再读
+            lease.on_lease_end(duty_report.on_lease_end)
             events.on_credential_changed(self._credential_callback)
             supervisor.supervisor.on_yield_change(self._on_yield_change)
             self._subscribed = True
@@ -941,6 +954,40 @@ class GatewayServer(asyncssh.SSHServer):
             actor="gateway",
         )
 
+    def _audit_runbook_channel(self, kind: str, subsystem: str) -> bool:
+        """运维手册子系统的通道审计：种类记短名（`channel_kind` 只有 24 字）
+
+        Returns:
+            审计有没有入队；没入队（队列满）时调用方拒绝这个通道，与别的通道一样
+        """
+        decision = self.decision
+        if decision is None or decision.target is None:
+            return False
+        return audit_queue.enqueue(
+            workspace_id=int(decision.workspace_id or 0),
+            credential_id=int(decision.target.credential_id),
+            owner_kind=self.owner_kind,
+            owner_account=self.owner_account,
+            adapter_key=self.adapter_key,
+            instance_key=self.instance_key,
+            event=C.EVENT_CHANNEL,
+            allowed=True,
+            reason="",
+            task_ref=str(decision.task_ref or ""),
+            lease_id=str(decision.lease_id or ""),
+            conn_id=self.conn_id,
+            triggered_by=list(decision.triggered_by),
+            channel_kind=str(kind),
+            detail=str(subsystem),
+            input_head="",
+            exit_status=None,
+            bytes_up=None,
+            bytes_down=None,
+            duration_ms=None,
+            host_key_fp="",
+            actor="gateway",
+        )
+
     def _audit_connection_close(self, bytes_up: int, bytes_down: int) -> None:
         decision = self.decision
         if decision is None or decision.target is None:
@@ -1039,6 +1086,10 @@ class GatewaySession(ServerSide):
         self._command = ""
         self._subsystem = ""
         self._last_term_size: Optional[Tuple[int, int, int, int]] = None
+        # 网关自己处理的运维手册子系统（不转发给上游）：读 / 追加
+        self._runbook_mode = ""
+        self._runbook_input = bytearray()
+        self._runbook_input_truncated = False
 
     # ---- 请求 ----
 
@@ -1108,8 +1159,111 @@ class GatewaySession(ServerSide):
 
     def subsystem_requested(self, subsystem: str) -> bool:
         self._subsystem = str(subsystem)
+        if self._subsystem in (C.SUBSYSTEM_RUNBOOK_READ, C.SUBSYSTEM_RUNBOOK_APPEND):
+            return self._begin_runbook(self._subsystem)
         kind = "sftp" if self._subsystem == "sftp" else f"subsystem:{self._subsystem}"
         return self._begin(kind, detail=self._subsystem)
+
+    # ---- 运维手册子系统：网关自己处理，不转发给上游 ----
+
+    def _begin_runbook(self, name: str) -> bool:
+        """网关自己处理：不建桥、不取上游会话；通道名额在 `session_requested` 里已经占了
+
+        上游在连接认证时就登过了（`_authorize_and_login`），这里不再碰目标服务器。读手册
+        立刻开始；追加要等容器把内容写完（EOF）再复核、写库。
+        """
+        if self.bridge is not None or self._runbook_mode:
+            return False
+        if self.chan is None or self.slot.released or self.gateway.decision is None:
+            return False
+        kind = C.CHANNEL_KIND_RUNBOOK_READ if name == C.SUBSYSTEM_RUNBOOK_READ else C.CHANNEL_KIND_RUNBOOK_APPEND
+        if not self.gateway._audit_runbook_channel(kind, name):  # noqa: SLF001
+            # 审计队列满：与别的通道一样拒绝，不开一条没有审计的通道
+            return False
+        self._runbook_mode = name
+        self._holds.discard("starting")
+        try:
+            self.chan.resume_reading()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        if name == C.SUBSYSTEM_RUNBOOK_READ:
+            self._task = asyncio.create_task(self._serve_runbook_read())
+        return True
+
+    def _runbook_received(self, data: bytes) -> None:
+        room = RUNBOOK_APPEND_MAX_BYTES - len(self._runbook_input)
+        if room <= 0:
+            self._runbook_input_truncated = True
+            return
+        if len(data) > room:
+            self._runbook_input_truncated = True
+        self._runbook_input.extend(data[:room])
+
+    async def _runbook_row(self) -> Optional[Any]:
+        decision = self.gateway.decision
+        if decision is None or decision.target is None:
+            return None
+        if not await self.gateway._recheck():  # noqa: SLF001
+            return None
+        from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
+
+        return await DBWsSshCredential.get_or_none(id=int(decision.target.credential_id))
+
+    async def _serve_runbook_read(self) -> None:
+        try:
+            row = await self._runbook_row()
+            if row is None:
+                self._runbook_finish("ssh gateway: 授权没有通过复核\n", 1, to_stderr=True)
+                return
+            from nekro_agent.services.ssh_gateway.runbook import read_full
+
+            if row.owner_kind != C.OWNER_PLATFORM:
+                self._runbook_finish("ssh gateway: 只有平台方服务器有运维手册\n", 1, to_stderr=True)
+                return
+            self._runbook_finish(await read_full(row), 0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 读失败给容器一个明确的非零退出
+            logger.warning(f"SSH 网关连接 {self.gateway.conn_id} 读运维手册失败: {type(exc).__name__}")
+            self._runbook_finish("ssh gateway: 读运维手册失败\n", 1, to_stderr=True)
+
+    async def _serve_runbook_append(self) -> None:
+        try:
+            row = await self._runbook_row()
+            if row is None:
+                self._runbook_finish("ssh gateway: 授权没有通过复核\n", 1, to_stderr=True)
+                return
+            from nekro_agent.services.ssh_gateway.runbook import append_entry
+
+            decision = self.gateway.decision
+            text = bytes(self._runbook_input).decode("utf-8", "replace")
+            ok, message = await append_entry(
+                row,
+                text,
+                lease_id=str(getattr(decision, "lease_id", "") or ""),
+                task_ref=str(getattr(decision, "task_ref", "") or ""),
+            )
+            if self._runbook_input_truncated:
+                message += f"（输入超过 {RUNBOOK_APPEND_MAX_BYTES} 字节，只收了前 {RUNBOOK_APPEND_MAX_BYTES} 字节）"
+            self._runbook_finish(message + "\n", 0 if ok else 1, to_stderr=not ok)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"SSH 网关连接 {self.gateway.conn_id} 追加运维经验失败: {type(exc).__name__}")
+            self._runbook_finish("ssh gateway: 追加运维经验失败\n", 1, to_stderr=True)
+
+    def _runbook_finish(self, text: str, status: int, *, to_stderr: bool = False) -> None:
+        if self.chan is None or self._closed:
+            return
+        try:
+            payload = text.encode("utf-8")
+            if to_stderr:
+                self.chan.write_stderr(payload)  # type: ignore[attr-defined]
+            else:
+                self.chan.write(payload)  # type: ignore[attr-defined]
+            self.chan.exit(int(status))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
 
     def _begin(self, kind: str, *, detail: str, command: str = "", record_input: bool = False) -> bool:
         if self.bridge is not None:
@@ -1194,10 +1348,18 @@ class GatewaySession(ServerSide):
     # ---- 数据/信号 ----
 
     def data_received(self, data: bytes, datatype: Optional[int] = None) -> None:
+        if self._runbook_mode:
+            if self._runbook_mode == C.SUBSYSTEM_RUNBOOK_APPEND and datatype is None:
+                self._runbook_received(bytes(data))
+            return
         if self.bridge is not None:
             self.bridge.forward(self, data, datatype)
 
     def eof_received(self) -> bool:
+        if self._runbook_mode:
+            if self._runbook_mode == C.SUBSYSTEM_RUNBOOK_APPEND and self._task is None:
+                self._task = asyncio.create_task(self._serve_runbook_append())
+            return True
         if self.bridge is not None:
             self.bridge.eof(self)
             return True

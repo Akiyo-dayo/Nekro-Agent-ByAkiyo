@@ -94,7 +94,12 @@ from nekro_agent.services.sandbox.credential_guard import issue_sandbox_call_gra
 from nekro_agent.services.usage import flush_llm_usage
 from nekro_agent.services.usage.ledger import reset_usage_recorder
 from nekro_agent.tools import file_utils, path_convertor
-from nekro_agent.tools.common_util import UnsafeDownloadUrlError, assert_connected_peer_safe, assert_download_url_safe
+from nekro_agent.tools.common_util import (
+    UnsafeDownloadUrlError,
+    assert_connected_peer_safe,
+    assert_download_url_safe,
+    tenant_target_unavailable_message,
+)
 from nekro_agent.tools.file_utils import FileSystem
 from nekro_agent.tools.untrusted_content import (
     UNTRUSTED_RESULT_PLACEHOLDER,
@@ -105,6 +110,9 @@ from plugins.builtin.video_analysis import inference, main, media, source
 from plugins.builtin.video_analysis import process as process_module
 from plugins.builtin.video_analysis.media import VideoAnalysisError, VideoMeta
 from plugins.builtin.video_analysis.plugin import HARD_RANGES, VideoAnalysisConfig, plugin
+
+# 视频链接被拒时给出去的那一句：解析不到、指向内网、建连接时对端不对，都是它
+REFUSED = re.escape(tenant_target_unavailable_message("视频链接"))
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -378,6 +386,11 @@ class Harness:
         self.jobs_seen: List[str] = []
 
     def core(self) -> Any:
+        # 这里的组都当平台方的组用（指向本机的假上游）。归属判不出来时按租户出站，平台方的组要登记过才照旧，
+        # 与运行时 `refresh_runtime_view` 按库重建视图时做的登记一样
+        from nekro_agent.tools.tenant_egress import register_model_groups
+
+        register_model_groups(tenant=[], platform=list(self.groups.items()))
         return SimpleNamespace(
             MODEL_GROUPS=self.groups,
             USE_MODEL_GROUP=self.primary,
@@ -427,10 +440,21 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Harness
     monkeypatch.setattr(main, "_active_jobs", {})
     register_session_token(CONTAINER_KEY, SESSION_TOKEN)
     reset_capability_marks()
+    from nekro_agent.tools.tenant_egress import reset_model_group_registry
+
+    reset_model_group_registry()
     yield h
+    reset_model_group_registry()
     clear_session_token(CONTAINER_KEY)
     reset_capability_marks()
     plugin_scope.invalidate_scoped_config(plugin.key)
+
+
+def _register_platform_group(resolved: Any) -> None:
+    """直接调转写、不经过 `Harness.core()` 的用例：把这个组登记成平台方的（指向本机的假上游）"""
+    from nekro_agent.tools.tenant_egress import register_model_groups
+
+    register_model_groups(tenant=[], platform=[(resolved.name, resolved.group)])
 
 
 async def _ctx(chat_key: str = CHAT_KEY) -> AgentCtx:
@@ -914,7 +938,7 @@ class TestSsrf:
         monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
         monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
         dest = tmp_path / "out"
-        with pytest.raises(VideoAnalysisError, match="出站防护"):
+        with pytest.raises(VideoAnalysisError, match=REFUSED):
             await source.download_video(template.format(port=upstream.port), dest, max_bytes=1024, max_redirects=3)
         assert upstream.get_paths == []
         assert not dest.exists()
@@ -933,7 +957,7 @@ class TestSsrf:
         """首跳过了校验不代表后面安全：`http://公网/` 302 到元数据地址是最常见的绕过"""
         monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
         monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "127.0.0.1/32")
-        with pytest.raises(VideoAnalysisError, match="出站防护"):
+        with pytest.raises(VideoAnalysisError, match=REFUSED):
             await source.download_video(f"{upstream.base_url}/redirect?to={target}", tmp_path / "out", max_bytes=1024, max_redirects=3)
         assert upstream.get_paths == ["/redirect"]
 
@@ -959,7 +983,7 @@ class TestSsrf:
         monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
         harness.groups["vision"] = _group(f"{upstream.base_url}/v1")
         await _store_shared("vision")
-        with pytest.raises(VideoAnalysisError, match="出站防护"):
+        with pytest.raises(VideoAnalysisError, match=REFUSED):
             await main.analyze_video(await _ctx(), f"{upstream.base_url}/video.mp4", "q")
         assert upstream.get_paths == []
         assert harness.spawned == []
@@ -1576,6 +1600,7 @@ class TestUsage:
         audio = tmp_path / "audio.m4a"
         audio.write_bytes(b"sound")
         resolved = inference.ResolvedGroup("asr", _group(f"{upstream.base_url}/v1", model="whisper-1"))
+        _register_platform_group(resolved)
 
         if status is LLMUsageStatus.SUCCESS:
             assert await inference.transcribe_audio(resolved, audio, chat_key=CHAT_KEY) == "spoken"
@@ -1597,6 +1622,7 @@ class TestUsage:
         audio = tmp_path / "audio.m4a"
         audio.write_bytes(b"sound")
         resolved = inference.ResolvedGroup("asr", _group(f"{upstream.base_url}/v1", model="whisper-1"))
+        _register_platform_group(resolved)
         task = asyncio.create_task(inference.transcribe_audio(resolved, audio, chat_key=CHAT_KEY))
         await _until(lambda: upstream.transcribe_bodies, task)
         task.cancel()
@@ -2267,7 +2293,7 @@ class TestMessageSource:
         await self._prepare(harness, upstream.base_url)
         await self._seed()
         self._bot(monkeypatch, f"{upstream.base_url}/video.mp4")
-        with pytest.raises(VideoAnalysisError, match="出站防护"):
+        with pytest.raises(VideoAnalysisError, match=REFUSED):
             await main.analyze_video(await _ctx(), "message:777", "q")
         assert upstream.get_paths == []
 
@@ -2306,7 +2332,7 @@ class TestOutboundPeerCheck:
             await assert_download_url_safe("http://[64:ff9b::7f00:1]/x")
 
     async def test_dns_rebinding_never_reaches_the_disk(self, tmp_path: Path, upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch) -> None:
-        """解析时是公网、连接时是内网：校验通过之后对端才露馅，响应不能落盘"""
+        """预检时是公网、建连接时是内网：建连接那一步按同一判据再查一次，连都不连，更不会落盘"""
 
         async def resolved_public(_url: str) -> None:
             return None
@@ -2316,9 +2342,10 @@ class TestOutboundPeerCheck:
         monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
         upstream.video = b"internal-secret"
         dest = tmp_path / "out"
-        with pytest.raises(VideoAnalysisError, match="出站防护") as raised:
+        with pytest.raises(VideoAnalysisError, match=REFUSED) as raised:
             await source.download_video(f"{upstream.base_url}/video.mp4", dest, max_bytes=1024, max_redirects=0)
         assert not dest.exists()
+        assert upstream.get_paths == [], "建连接那一步就拒了，请求一次都没发出去"
         assert "127.0.0.1" not in str(raised.value)
 
     async def test_a_redirect_from_a_rebound_peer_is_not_followed(self, tmp_path: Path, upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2328,9 +2355,9 @@ class TestOutboundPeerCheck:
         monkeypatch.setattr(source, "assert_download_url_safe", resolved_public)
         monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
         monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
-        with pytest.raises(VideoAnalysisError, match="出站防护"):
+        with pytest.raises(VideoAnalysisError, match=REFUSED):
             await source.download_video(f"{upstream.base_url}/redirect?to=/video.mp4", tmp_path / "out", max_bytes=1024, max_redirects=3)
-        assert upstream.get_paths == ["/redirect"]
+        assert upstream.get_paths == [], "建连接那一步就拒了，首跳都没发出去"
 
     async def test_the_refusal_text_is_fixed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
@@ -2339,16 +2366,29 @@ class TestOutboundPeerCheck:
             await source.download_video("http://10.0.0.1/x", tmp_path / "out", max_bytes=10, max_redirects=0)
         assert "10.0.0.1" not in str(raised.value)
 
-    async def test_the_client_ignores_proxy_environment(self, tmp_path: Path, upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch) -> None:
-        """走代理时对端是代理，校验无从谈起"""
+    async def test_the_client_goes_through_the_pinning_transport(self, tmp_path: Path, upstream: FakeUpstream, monkeypatch: pytest.MonkeyPatch) -> None:
+        """建连接那一步固定校验过的地址、核对对端；环境代理由它处理（经 HTTP(S) 代理时 CONNECT 校验过的地址），
+        所以客户端自己不读环境变量（固定地址与 CONNECT 的细节见 test_tenant_egress 的下载用例）"""
+        from nekro_agent.tools.tenant_egress import DOWNLOAD_POLICY, TenantHTTPTransport
+
+        built: List[Any] = []
+        real_client = source.httpx.AsyncClient
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            built.append(kwargs)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(source.httpx, "AsyncClient", spy)
         monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", True)
-        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
-        monkeypatch.delenv("NO_PROXY", raising=False)
-        monkeypatch.delenv("no_proxy", raising=False)
         upstream.video = b"ok"
         dest = tmp_path / "out"
         await source.download_video(f"{upstream.base_url}/video.mp4", dest, max_bytes=10, max_redirects=0)
         assert dest.read_bytes() == b"ok"
+        assert len(built) == 1
+        transport = built[0]["transport"]
+        assert isinstance(transport, TenantHTTPTransport)
+        assert transport._policy is DOWNLOAD_POLICY  # noqa: SLF001
+        assert built[0]["trust_env"] is False
 
 
 def _huge_index_mp4(samples: int) -> bytes:

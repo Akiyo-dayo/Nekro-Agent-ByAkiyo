@@ -47,7 +47,10 @@ services:
     ports:
       - "6199:6099" # 使用 6199 避免与默认 6099 冲突
     volumes:
-      - ../data/nekro_agent:/app/nekro_agent_data
+      # 只挂 uploads、只读（NA 交给 NapCat 发送的文件都在那里），见 docker-compose-x-napcat.yml。
+      # 第一次起之前先建好这个目录（在仓库根目录 `mkdir -p data/nekro_agent/uploads`）：目录不在时
+      # Docker 会以 root 身份替你建，宿主上跑的开发版 NA 就写不进去了
+      - ../data/nekro_agent/uploads:/app/nekro_agent_data/uploads:ro
       - ../data/nekro_agent/napcat_data/QQ:/app/.config/QQ
       - ../data/nekro_agent/napcat_data/napcat:/app/napcat/config
     networks:

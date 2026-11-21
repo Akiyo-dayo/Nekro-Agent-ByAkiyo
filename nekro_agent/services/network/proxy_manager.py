@@ -51,16 +51,23 @@ def _build_authenticated_proxy_url(raw_proxy_url: str, username: str, password: 
     return urlunsplit((split.scheme, f"{auth_part}@{host_part}", split.path, split.query, split.fragment))
 
 
-def build_proxy_url(feature: SystemProxyFeature) -> Optional[str]:
-    if not is_proxy_enabled(feature):
-        return None
+def build_default_proxy_url() -> Optional[str]:
+    """系统默认代理（带上单独配的用户名 / 密码）；没配返回 None，配错抛 ValueError
 
+    给「每次由管理员勾选要不要走代理」的功能用（例如下载卡片脚本要的世界书），不看功能开关。
+    """
     raw_proxy_url = (config.DEFAULT_PROXY or "").strip()
     if not raw_proxy_url:
         return None
 
     username, password = _get_proxy_credentials()
     return _build_authenticated_proxy_url(raw_proxy_url, username, password)
+
+
+def build_proxy_url(feature: SystemProxyFeature) -> Optional[str]:
+    if not is_proxy_enabled(feature):
+        return None
+    return build_default_proxy_url()
 
 
 def build_httpx_proxies(feature: SystemProxyFeature) -> Optional[dict[str, str]]:

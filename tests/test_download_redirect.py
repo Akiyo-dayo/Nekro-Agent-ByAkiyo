@@ -87,6 +87,8 @@ def web(monkeypatch: pytest.MonkeyPatch) -> InstallWeb:
 
         def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
             fake.client_kwargs.append(dict(kwargs))
+            # 建连接那一层（固定地址、核对对端）换成假的；它本身由 test_tenant_egress 的下载用例钉
+            kwargs.pop("transport", None)
             return real_client(*args, transport=httpx.MockTransport(fake.handle), **kwargs)
 
         monkeypatch.setattr(common_util.httpx, "AsyncClient", client_factory)
@@ -96,19 +98,18 @@ def web(monkeypatch: pytest.MonkeyPatch) -> InstallWeb:
 
 
 def _fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> List[str]:
-    """让当前事件循环的 getaddrinfo 按 zone 回答（只认 ASCII 主机名）；不在 zone 里的交给真实实现，用例里只会是 IP 字面量"""
+    """让出站解析按 zone 回答（只认 ASCII 主机名）；不在 zone 里的交给真实实现，用例里只会是 IP 字面量"""
     looked_up: List[str] = []
-    loop = asyncio.get_running_loop()
-    real = loop.getaddrinfo
+    real = common_util._system_getaddrinfo  # noqa: SLF001
 
     async def fake(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
         name = host.decode("ascii") if isinstance(host, bytes) else host
         looked_up.append(name)
         if name in zone:
             return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (zone[name], port))]
-        return await real(host, port, *args, **kwargs)
+        return await real(host, port)
 
-    monkeypatch.setattr(loop, "getaddrinfo", fake)
+    monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake)
     return looked_up
 
 
@@ -127,6 +128,14 @@ class TestFollowsRedirects:
         assert fake.requested == [FIRST, CDN]
         # 跳转必须由我们自己跟：交给 httpx 跟，跳转目标就不再过校验
         assert fake.client_kwargs and all(kwargs.get("follow_redirects") is False for kwargs in fake.client_kwargs)
+        # 建连接那一步固定校验过的地址（按下载判据）；环境代理交给它处理，客户端自己不读环境变量
+        from nekro_agent.tools.tenant_egress import DOWNLOAD_POLICY, TenantHTTPTransport
+
+        for kwargs in fake.client_kwargs:
+            transport = kwargs.get("transport")
+            assert isinstance(transport, TenantHTTPTransport)
+            assert transport._policy is DOWNLOAD_POLICY  # noqa: SLF001
+            assert kwargs.get("trust_env") is False
 
     async def test_every_hop_is_checked_before_it_is_requested(self, tmp_path: Path, web: InstallWeb,monkeypatch: pytest.MonkeyPatch) -> None:
         hop2 = "http://8.8.8.8/hop2/b.gif"

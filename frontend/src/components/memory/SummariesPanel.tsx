@@ -10,7 +10,7 @@ import ScopeFilterBar from './ScopeFilterBar'
 import SummaryDialog from './SummaryDialog'
 import SummarySourceChip from './SummarySourceChip'
 import MemoryNotFoundState from './MemoryNotFoundState'
-import { formatDateTime, truncateText } from './format'
+import { formatShortDateTime, truncateText } from './format'
 import { channelNameOf, presetNameOf } from './scopeLabels'
 import { useMemoryScopeOptions } from './useMemoryScopeOptions'
 import {
@@ -117,10 +117,14 @@ export default function SummariesPanel({
     {
       key: 'latest',
       header: t('summaries.columns.latest'),
+      // 用生成时间称呼最新一版（「11-11 23:10 生成」），版号只在悬停提示里
       render: row => (
         <Stack direction="row" spacing={0.5} alignItems="center" sx={{ flexWrap: 'wrap' }}>
-          <Typography variant="body2">
-            {t('summaries.latestVersion', { version: row.version })}
+          <Typography
+            variant="body2"
+            title={t('summaries.latestVersion', { version: row.version })}
+          >
+            {t('summaries.generatedAt', { time: formatShortDateTime(row.create_time) })}
           </Typography>
           <SummarySourceChip source={row.source} />
         </Stack>
@@ -140,7 +144,13 @@ export default function SummariesPanel({
       key: 'versionCount',
       header: t('summaries.columns.versionCount'),
       hideOnMobile: true,
-      render: row => <Typography variant="body2">{row.version_count}</Typography>,
+      render: row => (
+        <Typography variant="body2" color={row.version_count > 1 ? 'text.primary' : 'text.secondary'}>
+          {row.version_count > 1
+            ? t('summaries.historyCount', { count: row.version_count - 1 })
+            : t('summaries.noHistory')}
+        </Typography>
+      ),
     },
     {
       key: 'status',
@@ -157,16 +167,6 @@ export default function SummariesPanel({
             —
           </Typography>
         ),
-    },
-    {
-      key: 'updatedAt',
-      header: t('summaries.columns.updatedAt'),
-      hideOnMobile: true,
-      render: row => (
-        <Typography variant="caption" color="text.secondary">
-          {formatDateTime(row.create_time)}
-        </Typography>
-      ),
     }
   )
 

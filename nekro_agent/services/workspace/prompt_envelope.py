@@ -51,6 +51,11 @@ class CcPromptEnvelope:
 
     空元组时 `to_prompt()` 与 `to_metadata_json()` 与改造前逐字一致。
     """
+    ssh_runbooks: str = ""
+    """授权服务器的运维手册（`ssh_gateway.runbook.render_for_prompt` 的输出），接在服务器说明后面。
+
+    空串时正文与改造前逐字一致；没有授权别名时不出现。
+    """
 
     # ------------------------------------------------------------------
     # 构造辅助方法
@@ -107,11 +112,14 @@ class CcPromptEnvelope:
     def _ssh_note(self) -> str:
         """本任务被授权使用的服务器说明；没有授权别名时调用方不会拼它"""
         aliases = "、".join(self.ssh_servers)
-        return (
+        note = (
             f"本任务可用的服务器：{aliases}。"
             "用 `ssh -T <别名> '命令'`；`scp` / `rsync` / `git` 用 `<别名>:路径`。"
             "其余登记过的服务器本任务没有授权。"
         )
+        if self.ssh_runbooks:
+            note = f"{note}\n\n{self.ssh_runbooks}"
+        return note
 
     def to_prompt(self) -> str:
         """生成发送给 CC 的完整 prompt 字符串。

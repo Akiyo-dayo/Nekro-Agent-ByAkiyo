@@ -1,8 +1,7 @@
 import { useRef, useState, type ReactNode } from 'react'
-import { Box, TextField } from '@mui/material'
+import { Box, Chip, TextField } from '@mui/material'
 import { useTranslation } from 'react-i18next'
 import FilterListIcon from '@mui/icons-material/FilterList'
-import ClearAllIcon from '@mui/icons-material/ClearAll'
 import ActionButton from '../common/ActionButton'
 import FilterSelect from '../common/FilterSelect'
 import SearchField from '../common/SearchField'
@@ -24,24 +23,33 @@ import {
   MEMORY_DOMAINS,
   MEMORY_SEARCH_MAX_LENGTH,
   type MemoryFilterState,
+  type MemorySensitiveFilter,
 } from './filters'
+import MoreFiltersPopover from './MoreFiltersPopover'
+import PersonFilterField from './PersonFilterField'
 import { useMemoryScopeOptions } from './useMemoryScopeOptions'
 
 /**
  * 记忆页筛选栏
  *
- * 频道与人设的选项只来自 `GET /memory/scope-options`：那份响应已经按当前身份裁剪，
+ * 频道、人设与人的选项只来自 `GET /memory/scope-options`：那份响应已经按当前身份裁剪，
  * 从别的列表拼一份出来就等于多了一条会飘的授权判据。
  *
  * 组件是受控的：每个标签页只用 `fields` 声明自己支持哪几项。episode 没有「某个人 /
  * 认知类型 / 知识类型」，后端会直接 400，所以在这里就不画。
+ *
+ * 主行只放最常用的搜索、频道、人与状态，其余条件收进「更多筛选」浮层；已经生效的
+ * 高级条件会在主行下方以可删除的 Chip 列出，关掉浮层也看得见当前筛了什么。
  */
 
+// 「涉及的人」不在这里：按人筛选是记忆页最常用的一项，放在主行（候选带昵称与称呼）
 const ADVANCED_FIELDS: Array<keyof MemoryFilterState> = [
+  'presetId',
+  'originKind',
   'partition',
   'domain',
-  'person',
   'cognitiveType',
+  'sensitive',
   'knowledgeType',
   'timeFrom',
   'timeTo',
@@ -57,6 +65,8 @@ export interface ScopeFilterBarProps {
   scope: MemoryScopeParams
   /** 与筛选同一行、排在最左的前置控件（记忆条目的段落 / 事件切换） */
   leading?: ReactNode
+  /** 与筛选同一行、排在右端的控件（段落列表的平铺 / 按人 / 按事件） */
+  trailing?: ReactNode
 }
 
 function isFieldActive(value: MemoryFilterState, field: keyof MemoryFilterState): boolean {
@@ -79,6 +89,8 @@ function isFieldActive(value: MemoryFilterState, field: keyof MemoryFilterState)
       return value.cognitiveType !== ''
     case 'knowledgeType':
       return value.knowledgeType !== ''
+    case 'sensitive':
+      return value.sensitive !== ''
     case 'originKind':
       return value.originKind !== ''
     case 'timeFrom':
@@ -96,11 +108,21 @@ function isFieldActive(value: MemoryFilterState, field: keyof MemoryFilterState)
   }
 }
 
-/** 控件在窄屏整行、宽屏固定宽度；视觉上与 FilterSelect 同高 */
+/**
+ * 控件在窄屏整行、宽屏固定宽度；视觉上与 FilterSelect 同高
+ *
+ * 宽度按 1280 屏、侧栏展开时一行放下「段落|事件 · 搜索 · 频道 · 人 · 状态 · 更多筛选 ·
+ * 平铺|按人|按主题」来定，改宽之前先算一遍总宽，免得主行折成两行。
+ */
 function FilterSlot({ children, wide = false }: { children: ReactNode; wide?: boolean }) {
   return (
-    <Box sx={{ width: { xs: '100%', sm: wide ? 240 : 170 }, flexShrink: 0 }}>{children}</Box>
+    <Box sx={{ width: { xs: '100%', sm: wide ? 160 : 120 }, flexShrink: 0 }}>{children}</Box>
   )
+}
+
+/** 浮层里的控件占满一格，不跟随主行的固定宽度 */
+function AdvancedSlot({ children }: { children: ReactNode }) {
+  return <Box sx={{ minWidth: 0, width: '100%' }}>{children}</Box>
 }
 
 export default function ScopeFilterBar({
@@ -109,12 +131,13 @@ export default function ScopeFilterBar({
   fields,
   scope,
   leading,
+  trailing,
 }: ScopeFilterBarProps) {
   const notification = useNotification()
   const { t } = useTranslation('memory')
   const { data: options } = useMemoryScopeOptions(scope)
 
-  const [expanded, setExpanded] = useState(false)
+  const [moreAnchor, setMoreAnchor] = useState<HTMLElement | null>(null)
   const searchLimitNotified = useRef(false)
 
   const update = (patch: Partial<MemoryFilterState>) => {
@@ -126,7 +149,8 @@ export default function ScopeFilterBar({
     fields.includes(field) && (field !== 'domain' || Boolean(scope.instance_key))
 
   const visibleAdvancedFields = ADVANCED_FIELDS.filter(showField)
-  const activeAdvancedCount = visibleAdvancedFields.filter(field => isFieldActive(value, field)).length
+  const activeAdvancedFields = visibleAdvancedFields.filter(field => isFieldActive(value, field))
+  const activeAdvancedCount = activeAdvancedFields.length
 
   const statusOptions = MEMORY_STATUS_FILTERS.map(status => ({
     value: status,
@@ -175,6 +199,12 @@ export default function ScopeFilterBar({
     })),
   ]
 
+  const sensitiveOptions = [
+    { value: '', label: t('filters.sensitiveAll') },
+    { value: 'only', label: t('filters.sensitiveOnly') },
+    { value: 'exclude', label: t('filters.sensitiveExclude') },
+  ]
+
   // 来源类型：空串是「全部」，与后端 `origin_kind=` 留空等价
   const originOptions = [
     { value: '', label: t('filters.allOrigins') },
@@ -183,6 +213,122 @@ export default function ScopeFilterBar({
 
   const sortOptions = SORTS.map(sort => ({ value: sort, label: t(`sort.${sort}`) }))
   const orderOptions = ORDERS.map(order => ({ value: order, label: t(`order.${order}`) }))
+
+  const chipValue = (label: string, text: string) => t('filters.chipValue', { label, value: text })
+
+  /** 已生效的高级条件怎么读；不生效时返回 null */
+  const advancedChipLabel = (field: keyof MemoryFilterState): string | null => {
+    switch (field) {
+      case 'presetId':
+        return value.presetId === null
+          ? null
+          : chipValue(
+              t('filters.preset'),
+              presetOptions.find(option => option.value === String(value.presetId))?.label ??
+                String(value.presetId)
+            )
+      case 'originKind':
+        return value.originKind
+          ? chipValue(t('filters.origin'), t(`origin.${value.originKind}`))
+          : null
+      case 'partition':
+        return value.partition !== DEFAULT_MEMORY_FILTERS.partition
+          ? chipValue(t('filters.partition'), t(`partition.${value.partition}`))
+          : null
+      case 'domain':
+        return value.domain !== DEFAULT_MEMORY_FILTERS.domain
+          ? chipValue(t('filters.domain'), t(`domain.${value.domain}`))
+          : null
+      case 'cognitiveType':
+        return value.cognitiveType
+          ? chipValue(t('filters.cognitive'), t(`cognitive.${value.cognitiveType}`))
+          : null
+      case 'sensitive':
+        if (!value.sensitive) return null
+        return chipValue(
+          t('filters.sensitive'),
+          t(value.sensitive === 'only' ? 'filters.sensitiveOnly' : 'filters.sensitiveExclude')
+        )
+      case 'knowledgeType':
+        return value.knowledgeType
+          ? chipValue(t('filters.knowledge'), t(`knowledge.${value.knowledgeType}`))
+          : null
+      case 'timeFrom':
+        return value.timeFrom ? chipValue(t('filters.timeFrom'), value.timeFrom) : null
+      case 'timeTo':
+        return value.timeTo ? chipValue(t('filters.timeTo'), value.timeTo) : null
+      case 'sort':
+        return value.sort !== DEFAULT_MEMORY_FILTERS.sort
+          ? chipValue(t('filters.sort'), t(`sort.${value.sort}`))
+          : null
+      case 'order':
+        return value.order !== DEFAULT_MEMORY_FILTERS.order
+          ? chipValue(t('filters.order'), t(`order.${value.order}`))
+          : null
+      default:
+        return null
+    }
+  }
+
+  /** 删掉某一个高级条件 */
+  const clearAdvancedField = (field: keyof MemoryFilterState) => {
+    switch (field) {
+      case 'presetId':
+        update({ presetId: null })
+        break
+      case 'originKind':
+        update({ originKind: '' })
+        break
+      case 'partition':
+        update({ partition: DEFAULT_MEMORY_FILTERS.partition })
+        break
+      case 'domain':
+        update({ domain: DEFAULT_MEMORY_FILTERS.domain })
+        break
+      case 'cognitiveType':
+        update({ cognitiveType: '' })
+        break
+      case 'sensitive':
+        update({ sensitive: DEFAULT_MEMORY_FILTERS.sensitive })
+        break
+      case 'knowledgeType':
+        update({ knowledgeType: '' })
+        break
+      case 'timeFrom':
+        update({ timeFrom: '' })
+        break
+      case 'timeTo':
+        update({ timeTo: '' })
+        break
+      case 'sort':
+        update({ sort: DEFAULT_MEMORY_FILTERS.sort })
+        break
+      case 'order':
+        update({ order: DEFAULT_MEMORY_FILTERS.order })
+        break
+      default:
+        break
+    }
+  }
+
+  /** 浮层底部的「清空」只清高级条件，主行的关键词与选择保留 */
+  const clearAdvanced = () => {
+    onChange({
+      ...value,
+      presetId: DEFAULT_MEMORY_FILTERS.presetId,
+      originKind: DEFAULT_MEMORY_FILTERS.originKind,
+      partition: DEFAULT_MEMORY_FILTERS.partition,
+      domain: DEFAULT_MEMORY_FILTERS.domain,
+      cognitiveType: DEFAULT_MEMORY_FILTERS.cognitiveType,
+      sensitive: DEFAULT_MEMORY_FILTERS.sensitive,
+      knowledgeType: DEFAULT_MEMORY_FILTERS.knowledgeType,
+      timeFrom: DEFAULT_MEMORY_FILTERS.timeFrom,
+      timeTo: DEFAULT_MEMORY_FILTERS.timeTo,
+      sort: DEFAULT_MEMORY_FILTERS.sort,
+      order: DEFAULT_MEMORY_FILTERS.order,
+      page: 1,
+    })
+  }
 
   const handleSearchChange = (next: string) => {
     if (next.length > MEMORY_SEARCH_MAX_LENGTH) {
@@ -212,7 +358,13 @@ export default function ScopeFilterBar({
         <Box sx={{ flexShrink: 0, width: { xs: '100%', sm: 'auto' } }}>{leading}</Box>
       )}
       {showField('search') && (
-        <Box sx={{ flexGrow: 1, minWidth: { sm: 240 }, width: { xs: '100%', sm: 'auto' } }}>
+        <Box
+          sx={{
+            flex: { sm: '1 1 140px' },
+            minWidth: { sm: 140 },
+            width: { xs: '100%', sm: 'auto' },
+          }}
+        >
           <SearchField
             value={value.search}
             onChange={handleSearchChange}
@@ -222,16 +374,6 @@ export default function ScopeFilterBar({
             fullWidth
           />
         </Box>
-      )}
-      {showField('status') && (
-        <FilterSlot>
-          <FilterSelect
-            label={t('filters.status')}
-            value={value.status}
-            options={statusOptions}
-            onChange={next => update({ status: next as MemoryStatusFilter })}
-          />
-        </FilterSlot>
       )}
       {showField('chatKey') && (
         <FilterSlot wide>
@@ -243,23 +385,23 @@ export default function ScopeFilterBar({
           />
         </FilterSlot>
       )}
-      {showField('presetId') && (
+      {showField('person') && (
         <FilterSlot wide>
-          <FilterSelect
-            label={t('filters.preset')}
-            value={value.presetId === null ? '' : String(value.presetId)}
-            options={presetOptions}
-            onChange={next => update({ presetId: next === '' ? null : Number(next) })}
+          <PersonFilterField
+            value={value.person}
+            onChange={next => update({ person: next })}
+            scope={scope}
+            filters={value}
           />
         </FilterSlot>
       )}
-      {showField('originKind') && (
-        <FilterSlot wide>
+      {showField('status') && (
+        <FilterSlot>
           <FilterSelect
-            label={t('filters.origin')}
-            value={value.originKind}
-            options={originOptions}
-            onChange={next => update({ originKind: next as MemoryFilterState['originKind'] })}
+            label={t('filters.status')}
+            value={value.status}
+            options={statusOptions}
+            onChange={next => update({ status: next as MemoryStatusFilter })}
           />
         </FilterSlot>
       )}
@@ -268,7 +410,7 @@ export default function ScopeFilterBar({
           tone="ghost"
           size="small"
           startIcon={<FilterListIcon />}
-          onClick={() => setExpanded(previous => !previous)}
+          onClick={event => setMoreAnchor(event.currentTarget)}
           sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}
         >
           {activeAdvancedCount > 0
@@ -276,54 +418,75 @@ export default function ScopeFilterBar({
             : t('filters.more')}
         </ActionButton>
       )}
+      {trailing && (
+        <Box sx={{ flexShrink: 0, width: { xs: '100%', sm: 'auto' }, ml: { sm: 'auto' } }}>
+          {trailing}
+        </Box>
+      )}
     </Box>
   )
 
-  const advancedRow = expanded && visibleAdvancedFields.length > 0 && (
-    <Box
-      sx={{
-        display: 'flex',
-        flexDirection: { xs: 'column', sm: 'row' },
-        flexWrap: { sm: 'wrap' },
-        gap: 1,
-        alignItems: { xs: 'stretch', sm: 'center' },
-      }}
-    >
+  const activeChips = activeAdvancedFields.length > 0 && (
+    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75 }}>
+      {activeAdvancedFields.map(field => {
+        const label = advancedChipLabel(field)
+        if (!label) return null
+        return (
+          <Chip
+            key={field}
+            size="small"
+            label={label}
+            onDelete={() => clearAdvancedField(field)}
+          />
+        )
+      })}
+    </Box>
+  )
+
+  const advancedFields = (
+    <>
+      {showField('presetId') && (
+        <AdvancedSlot>
+          <FilterSelect
+            label={t('filters.preset')}
+            value={value.presetId === null ? '' : String(value.presetId)}
+            options={presetOptions}
+            onChange={next => update({ presetId: next === '' ? null : Number(next) })}
+          />
+        </AdvancedSlot>
+      )}
+      {showField('originKind') && (
+        <AdvancedSlot>
+          <FilterSelect
+            label={t('filters.origin')}
+            value={value.originKind}
+            options={originOptions}
+            onChange={next => update({ originKind: next as MemoryFilterState['originKind'] })}
+          />
+        </AdvancedSlot>
+      )}
       {showField('partition') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <FilterSelect
             label={t('filters.partition')}
             value={value.partition}
             options={partitionOptions}
             onChange={next => update({ partition: next as MemoryFilterState['partition'] })}
           />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
       {showField('domain') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <FilterSelect
             label={t('filters.domain')}
             value={value.domain}
             options={domainOptions}
             onChange={next => update({ domain: next as MemoryFilterState['domain'] })}
           />
-        </FilterSlot>
-      )}
-      {showField('person') && (
-        <FilterSlot wide>
-          <TextField
-            label={t('filters.person')}
-            placeholder={t('filters.personPlaceholder')}
-            value={value.person}
-            size="small"
-            fullWidth
-            sx={INPUT_VARIANTS.default.styles}
-            onChange={event => update({ person: event.target.value })}
-          />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
       {showField('cognitiveType') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <FilterSelect
             label={t('filters.cognitive')}
             value={value.cognitiveType}
@@ -332,10 +495,20 @@ export default function ScopeFilterBar({
               update({ cognitiveType: next as MemoryFilterState['cognitiveType'] })
             }
           />
-        </FilterSlot>
+        </AdvancedSlot>
+      )}
+      {showField('sensitive') && (
+        <AdvancedSlot>
+          <FilterSelect
+            label={t('filters.sensitive')}
+            value={value.sensitive}
+            options={sensitiveOptions}
+            onChange={next => update({ sensitive: next as MemorySensitiveFilter })}
+          />
+        </AdvancedSlot>
       )}
       {showField('knowledgeType') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <FilterSelect
             label={t('filters.knowledge')}
             value={value.knowledgeType}
@@ -344,10 +517,10 @@ export default function ScopeFilterBar({
               update({ knowledgeType: next as MemoryFilterState['knowledgeType'] })
             }
           />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
       {showField('timeFrom') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <TextField
             label={t('filters.timeFrom')}
             type="date"
@@ -358,10 +531,10 @@ export default function ScopeFilterBar({
             sx={INPUT_VARIANTS.default.styles}
             onChange={event => update({ timeFrom: event.target.value })}
           />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
       {showField('timeTo') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <TextField
             label={t('filters.timeTo')}
             type="date"
@@ -372,45 +545,44 @@ export default function ScopeFilterBar({
             sx={INPUT_VARIANTS.default.styles}
             onChange={event => update({ timeTo: event.target.value })}
           />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
       {showField('sort') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <FilterSelect
             label={t('filters.sort')}
             value={value.sort}
             options={sortOptions}
             onChange={next => update({ sort: next as MemoryFilterState['sort'] })}
           />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
       {showField('order') && (
-        <FilterSlot>
+        <AdvancedSlot>
           <FilterSelect
             label={t('filters.order')}
             value={value.order}
             options={orderOptions}
             onChange={next => update({ order: next as MemoryFilterState['order'] })}
           />
-        </FilterSlot>
+        </AdvancedSlot>
       )}
-      <ActionButton
-        tone="ghost"
-        size="small"
-        startIcon={<ClearAllIcon />}
-        onClick={() => onChange({ ...DEFAULT_MEMORY_FILTERS })}
-        sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}
-      >
-        {t('filters.clear')}
-      </ActionButton>
-    </Box>
+    </>
   )
 
-  // 窄屏没有更多空间时把两行纵向排开；宽屏下也是上下两行，展开不会挤掉主行
+  // 窄屏没有更多空间时把各行纵向排开；宽屏下也是上下两行，展开不会挤掉主行
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, width: '100%' }}>
       {basicRow}
-      {advancedRow}
+      {activeChips}
+      <MoreFiltersPopover
+        open={Boolean(moreAnchor)}
+        anchorEl={moreAnchor}
+        onClose={() => setMoreAnchor(null)}
+        onClear={clearAdvanced}
+      >
+        {advancedFields}
+      </MoreFiltersPopover>
     </Box>
   )
 }

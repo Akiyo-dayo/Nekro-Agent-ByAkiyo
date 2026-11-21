@@ -51,8 +51,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -67,6 +67,7 @@ from nekro_agent.models.db_instance_group import SELF_DOMAIN_GROUP_ID, DBInstanc
 from nekro_agent.models.db_mem_paragraph import DBMemParagraph
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.errors import NotFoundError, ValidationError
+from nekro_agent.services.affection.graph_view import GraphRow, build_affection_graph
 from nekro_agent.services.affection.key import AffectionKey
 from nekro_agent.services.affection.merge import list_person_accounts
 from nekro_agent.services.affection.milestones import clear_for_reset, paragraph_ids_in_domain
@@ -106,7 +107,12 @@ from nekro_agent.services.identity_scope import (
 )
 from nekro_agent.services.user.deps import get_current_active_user
 from nekro_agent.services.user.perm import Role, require_role
-from nekro_agent.services.user.tenant_perm import InstanceRef, assert_instance_accessible, get_tenant_scope
+from nekro_agent.services.user.tenant_perm import (
+    InstanceRef,
+    accessible_instance_refs,
+    assert_instance_accessible,
+    get_tenant_scope,
+)
 
 router = APIRouter(prefix="/affection", tags=["Affection"])
 
@@ -247,6 +253,61 @@ class AffectionStageCount(BaseModel):
     value: str
     label: str
     count: int
+
+
+# 关系图一次最多画多少份好感（最近更新的在前）
+GRAPH_ROW_MIN = 10
+GRAPH_ROW_MAX = 300
+GRAPH_ROW_DEFAULT = 100
+
+
+class AffectionGraphNode(BaseModel):
+    """关系图节点：`memory_type` 是节点种类（`preset` / `person` / `milestone` / `channel`）
+
+    字段与记忆图谱的节点同形，前端两张图用的是同一个画布。「人」节点的 `metadata.records` 列出
+    这个人在各人设下的那几份好感（分数、阶段、称呼、最近出现时间），点开详情用其中的 `record_id`。
+    """
+
+    id: str
+    memory_type: str
+    ref_id: int
+    label: str
+    subtitle: str = ""
+    status: str = "active"
+    cognitive_type: Optional[str] = None
+    weight: float = 0.0
+    size: float = 1.0
+    importance: float = 0.0
+    paragraph_id: Optional[int] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AffectionGraphEdge(BaseModel):
+    """关系图的边：`affection`（人 → 人设，就是那一份好感）、`milestone`、`last_seen`"""
+
+    id: str
+    source: str
+    target: str
+    edge_type: str
+    label: str = ""
+    weight: float = 0.0
+    strength: float = 0.0
+    status: str = "active"
+    cognitive_type: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AffectionGraphResponse(BaseModel):
+    generated_at: datetime
+    # 满足筛选的好感份数 / 画进图里的份数 / 因为是合并后休眠的副号行而没画的份数
+    total: int
+    drawn: int
+    skipped_merged: int = 0
+    node_count: int
+    edge_count: int
+    nodes: List[AffectionGraphNode]
+    edges: List[AffectionGraphEdge]
+    stages: List[AffectionStageInfo]
 
 
 class AffectionAdjustRequest(BaseModel):
@@ -472,6 +533,20 @@ async def _scoped_query(scope: str, adapter_key: str = "") -> QuerySet[DBAffecti
     return DBAffection.filter(**domain.as_columns())
 
 
+def _apply_list_filters(
+    query: QuerySet[DBAffection],
+    search: str,
+    stage: Optional[AffectionStage],
+) -> QuerySet[DBAffection]:
+    """列表与关系图共用的筛选：昵称或账号里含关键词、关系阶段"""
+    keyword = search.strip()
+    if keyword:
+        query = query.filter(Q(nickname__icontains=keyword) | Q(platform_userid__icontains=keyword))
+    if stage is not None:
+        query = query.filter(stage=stage.value)
+    return query
+
+
 async def _get_visible_record(record_id: int, scope: str, adapter_key: str = "") -> DBAffection:
     """取一条对该作用域可见的记录，越权一律按不存在处理"""
     record = await (await _scoped_query(scope, adapter_key)).filter(id=record_id).first()
@@ -486,19 +561,23 @@ async def get_affection_list(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     search: str = Query(default=""),
+    person: str = "",
     stage: Optional[AffectionStage] = Query(default=None),
     sort_by: str = Query(default="score_desc"),
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionListResponse:
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
-    query = await _scoped_query(scope, adapter_key)
+    query = _apply_list_filters(await _scoped_query(scope, adapter_key), search, stage)
 
-    keyword = search.strip()
-    if keyword:
-        query = query.filter(Q(nickname__icontains=keyword) | Q(platform_userid__icontains=keyword))
-    if stage is not None:
-        query = query.filter(stage=stage.value)
+    # 人这一维只在域内唯一：有实例时先换成域，才能把副账号解析成主账号；
+    # 全局视图没有域可解析（同一个人在不同域里本来就是不同的 person_uid），按传入账号精确筛。
+    person_uid = person.strip()
+    if person_uid:
+        domain = await affection_domain_of_instance(scope, adapter_key=adapter_key) if scope else None
+        if domain is not None:
+            person_uid = await resolve_person_uid(domain, person_uid)
+        query = query.filter(platform_userid=person_uid)
 
     total = await query.count()
     order = {
@@ -519,11 +598,18 @@ async def get_affection_list(
 @router.get("/summary", summary="获取好感度分布概览", response_model=AffectionSummary)
 @require_role(Role.Admin)
 async def get_affection_summary(
+    search: str = Query(default=""),
     instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
     _current_user: DBUser = Depends(get_current_active_user),
 ) -> AffectionSummary:
+    """概览的四个数都只统计筛出来的行
+
+    `search` 与列表、关系图同一个口径（昵称或账号里含关键词）：空串时不加条件，
+    与不传逐字节相同。`total`、各阶段计数、`top_score` 走同一份筛选后的查询，
+    避免出现「总数对得上、最高分却来自被筛掉的行」。
+    """
     adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
-    query = await _scoped_query(scope, adapter_key)
+    query = _apply_list_filters(await _scoped_query(scope, adapter_key), search, None)
 
     total = await query.count()
     counts = {stage.value: 0 for stage in all_stages()}
@@ -541,6 +627,86 @@ async def get_affection_summary(
         ],
         top_score=top_score,
     )
+
+
+@router.get("/graph", summary="好感关系图", response_model=AffectionGraphResponse)
+@require_role(Role.Admin)
+async def get_affection_graph(
+    search: str = Query(default=""),
+    stage: Optional[AffectionStage] = Query(default=None),
+    limit: int = Query(default=GRAPH_ROW_DEFAULT, description="最多画多少份好感（10 ~ 300，最近更新的在前）"),
+    instance_key: str = Query(default="", description=INSTANCE_SCOPE_DESC),
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> AffectionGraphResponse:
+    """人设在中间、人与关系里程碑与频道围在外面的星形图（只读）
+
+    取数与列表同一套：`resolve_instance_scope` + `_scoped_query`，搜索与阶段筛选同义。
+    合并后休眠的副号行不画（Bot 读的是主账号那一行，画出来就是同一个人两份），只给个数。
+    里程碑沿用详情页「关系里程碑」一栏的判据（`_milestone_items`），挪到别的租户、被真删的不给正文；
+    频道名只给这个身份看得见的频道，其余只显示会话标识（列表本来就给 `last_chat_key`）。
+    人与人之间不画边：数据里没有这种关系。
+
+    定义在 `GET /{record_id}` 之前：后者只吃一段路径，字面量 `graph` 会被当成记录编号去解析。
+    """
+    adapter_key, scope = await resolve_instance_scope(_current_user, instance_key)
+    query = _apply_list_filters(await _scoped_query(scope, adapter_key), search, stage)
+    total = await query.count()
+    size = max(GRAPH_ROW_MIN, min(GRAPH_ROW_MAX, int(limit)))
+    records = list(await query.order_by("-update_time", "-id").limit(size))
+
+    merged = await _merged_into_map(records)
+    live = [record for record in records if not merged.get((_domain_of(record).domain_id, record.platform_userid))]
+    names = await preset_names(sorted({record.preset_id for record in live}))
+    in_use = await _in_use_channel_counts(live)
+    groups = await group_names([_domain_of(record).group_id for record in live])
+    rows: List[GraphRow] = []
+    for record in live:
+        domain = _domain_of(record)
+        milestones = await _milestone_items(key_of_record(record))
+        rows.append(
+            GraphRow(
+                record=record,
+                domain=domain,
+                domain_label=domain_label(domain, groups.get(domain.group_id, "")),
+                preset_name=preset_display_name(record.preset_id, names),
+                in_use_channels=in_use.get((domain.domain_id, record.preset_id), 0),
+                milestones=[item.model_dump() for item in milestones],
+            ),
+        )
+    channel_names = await _visible_channel_names(
+        _current_user,
+        {record.last_chat_key for record in live if record.last_chat_key},
+    )
+    graph = build_affection_graph(rows, channel_names=channel_names)
+    return AffectionGraphResponse(
+        generated_at=datetime.now(timezone.utc),
+        total=total,
+        drawn=len(live),
+        skipped_merged=len(records) - len(live),
+        node_count=len(graph.nodes),
+        edge_count=len(graph.edges),
+        nodes=[AffectionGraphNode.model_validate(node) for node in graph.nodes],
+        edges=[AffectionGraphEdge.model_validate(edge) for edge in graph.edges],
+        stages=[AffectionStageInfo(value=item.value, label=stage_label(item)) for item in all_stages()],
+    )
+
+
+async def _visible_channel_names(user: DBUser, chat_keys: set[str]) -> Dict[str, str]:
+    """这些会话里当前身份看得见的那些的频道名
+
+    平台方全都看得见；租户只看归自己名下实例的频道（与 `admin_row_visible` 同一判据：
+    频道行上的实例对成对命中自己的实例）。看不见的、没有名字的不在返回值里。
+    """
+    if not chat_keys:
+        return {}
+    refs = None if get_tenant_scope(user) is None else set(await accessible_instance_refs(user))
+    names: Dict[str, str] = {}
+    for channel in await DBChatChannel.filter(chat_key__in=sorted(chat_keys)):
+        if refs is not None and (channel.adapter_key, channel.instance_key) not in refs:
+            continue
+        if channel.channel_name:
+            names[channel.chat_key] = channel.channel_name
+    return names
 
 
 @router.get(

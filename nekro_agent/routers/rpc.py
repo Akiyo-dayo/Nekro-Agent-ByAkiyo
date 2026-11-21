@@ -345,7 +345,19 @@ async def rpc_exec(
         if len(body) > MAX_TOOL_RESULT_BODY_CHARS:
             # 先脱敏再兜底截断：上限是给任何插件的硬底线，见 `MAX_TOOL_RESULT_BODY_CHARS`
             body = body[:MAX_TOOL_RESULT_BODY_CHARS] + TRUNCATION_MARK
-        result = replace(result, body=body, summary=redact_sandbox_text(result.summary, secret_values))
+        history_body = result.history_body
+        if history_body is not None:
+            # 落库的那一份同样先脱敏再兜底截断
+            history_body = redact_sandbox_text(history_body, secret_values)
+            if len(history_body) > MAX_TOOL_RESULT_BODY_CHARS:
+                history_body = history_body[:MAX_TOOL_RESULT_BODY_CHARS] + TRUNCATION_MARK
+        result = replace(
+            result,
+            body=body,
+            summary=redact_sandbox_text(result.summary, secret_values),
+            history_body=history_body,
+        )
+        # 本轮交给模型的是完整 `body`；`push_tool_result` 落库与广播的是 `stored_body`
         hold_untrusted_result(container_key, result)
         # 读过外部内容之后这一轮不能再写：错误原文、日志、网页里都可能藏着「照我说的做」。
         # `authorize_call` 的写分支会看这个标记（`ops_tools_off` 例外）

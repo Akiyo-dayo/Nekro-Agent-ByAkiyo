@@ -31,6 +31,7 @@ import CloseIcon from '@mui/icons-material/Close'
 import { useTranslation } from 'react-i18next'
 import ActionButton from '../common/ActionButton'
 import IconActionButton from '../common/IconActionButton'
+import RemoteBooksSection from './RemoteBooksSection'
 import { ApiError } from '../../services/api/axios'
 import {
   tavernApi,
@@ -38,6 +39,9 @@ import {
   type CardInspectReport,
   type CleanupRuleInspect,
   type SlotsOffChannel,
+  type StateTemplateReport,
+  type TavernCleanupHtmlKind,
+  type TavernCleanupOutputMode,
   type TavernScope,
 } from '../../services/api/tavern'
 import { I18nDict, getLocalizedText } from '../../services/api/types'
@@ -48,6 +52,21 @@ import { CARD_VARIANTS, CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/
  * 服务端还会与平台配置 `MAX_UPLOAD_SIZE_MB`（默认 10）取小，那一道由服务端的报错说明。
  */
 const CARD_IMPORT_MAX_BYTES = 20 * 1024 * 1024
+
+/** 处理方式与替换文字带 HTML 时的类别名；只用来显示，不参与导入选项 */
+const OUTPUT_MODE_LABEL_KEYS: Record<TavernCleanupOutputMode, string> = {
+  replace: 'import.ruleOutputMode.replace',
+  text: 'import.ruleOutputMode.text',
+  drop: 'import.ruleOutputMode.drop',
+}
+
+const HTML_KIND_LABEL_KEYS: Record<TavernCleanupHtmlKind, string> = {
+  '': '',
+  display: 'import.htmlKindReveal.display',
+  external: 'import.htmlKindReveal.external',
+  interactive: 'import.htmlKindReveal.interactive',
+  remote: 'import.htmlKindReveal.remote',
+}
 
 /**
  * 允许在导入时被打开的原因
@@ -61,6 +80,15 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+}
+
+/** 只取主机名：报告页只需要让人认出「从哪台机器下载」，完整地址不进这张表 */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host || url
+  } catch {
+    return url
+  }
 }
 
 /** 取给管理员看的错误文字：`ApiError.message` 已经是后端写好的中文原因 */
@@ -192,6 +220,7 @@ export default function CardImportDialog({
   onImported,
 }: CardImportDialogProps) {
   const { t, i18n } = useTranslation('tavern')
+  const { t: tState } = useTranslation('state')
   const { t: tCommon } = useTranslation('common')
   const theme = useTheme()
   const isSmall = useMediaQuery(theme.breakpoints.down('sm'))
@@ -210,6 +239,8 @@ export default function CardImportDialog({
   const [includePostHistory, setIncludePostHistory] = useState(true)
   const [includeDepth, setIncludeDepth] = useState(true)
   const [includeBook, setIncludeBook] = useState(true)
+  // 卡内书里读名字的变量默认换成宏；只换输出名字的写法，导入说明里会列出换了哪些
+  const [rewriteNameVars, setRewriteNameVars] = useState(true)
   const [greetingPick, setGreetingPick] = useState<'first' | 'random'>('first')
   // 只记与卡片默认值不同的开关；提交时也只发这些序号
   const [ruleOverrides, setRuleOverrides] = useState<Record<number, boolean>>({})
@@ -229,6 +260,7 @@ export default function CardImportDialog({
     setIncludePostHistory(true)
     setIncludeDepth(true)
     setIncludeBook(true)
+    setRewriteNameVars(true)
     setGreetingPick('first')
     setRuleOverrides({})
     setOpenContent(false)
@@ -291,6 +323,7 @@ export default function CardImportDialog({
           include_post_history: includePostHistory,
           include_depth_prompt: includeDepth,
           include_book: includeBook,
+          rewrite_name_vars: rewriteNameVars,
           greeting_pick: greetingPick,
           // 空对象也照发：后端把「没出现的键」当默认值，语义一致
           rule_enabled: ruleOverrides,
@@ -332,6 +365,50 @@ export default function CardImportDialog({
 
   const reasonText = (reason: string) =>
     reason ? t(`rule.reason.${reason}`, { defaultValue: reason }) : ''
+
+  /**
+   * 角色状态模板这一节
+   *
+   * 检查页与结果页各用一次：`status` 说这一步发生了什么，`fields` 只在真的推出字段时
+   * 才有意义，`note` 是后端写好的补充说明。整个字段为空表示插件没登记或卡里没有书，
+   * 这时整节不出现 —— 画一个空标题只会让人以为漏了什么。
+   */
+  const renderStateTemplate = (stateTemplate: StateTemplateReport | null | undefined) => {
+    if (!stateTemplate) return null
+    const privatePaths = stateTemplate.private_paths ?? []
+    return (
+      <Section title={tState('import.title')}>
+        <Stack spacing={0.5}>
+          <Typography variant="body2">
+            {tState(`import.status.${stateTemplate.status}`, { defaultValue: stateTemplate.status })}
+          </Typography>
+          {stateTemplate.fields > 0 ? (
+            <Typography variant="body2">
+              {tState('import.fields', {
+                fields: stateTemplate.fields,
+                hidden: stateTemplate.hidden,
+                entries: stateTemplate.entries,
+              })}
+            </Typography>
+          ) : null}
+          {privatePaths.length > 0 ? (
+            <Box>
+              <Typography variant="caption" color="text.secondary">
+                {tState('import.privatePaths')}
+              </Typography>
+              <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', mt: 0.5 }}>
+                {/* 路径是模板里写进来的文字，一律纯文本 */}
+                {privatePaths.map(path => (
+                  <Chip key={path} size="small" label={path} sx={CHIP_VARIANTS.base(isSmall)} />
+                ))}
+              </Box>
+            </Box>
+          ) : null}
+          {stateTemplate.note ? <Alert severity="info">{stateTemplate.note}</Alert> : null}
+        </Stack>
+      </Section>
+    )
+  }
 
   const bookNoteEntries = report
     ? Object.entries(report.book.notes).filter(([, n]) => n !== 0)
@@ -545,6 +622,18 @@ export default function CardImportDialog({
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>{rule.index + 1}</TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                       <EllipsisCell text={rule.name} maxWidth={120} />
+                      {rule.html_kind ? (
+                        <Tooltip title={t('import.htmlKindHint')}>
+                          <Chip
+                            size="small"
+                            label={t(HTML_KIND_LABEL_KEYS[rule.html_kind])}
+                            sx={{
+                              ...CHIP_VARIANTS.getCustomColorChip(theme.palette.warning.main, true),
+                              mt: 0.5,
+                            }}
+                          />
+                        </Tooltip>
+                      ) : null}
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                       <EllipsisCell text={rule.find} />
@@ -564,6 +653,12 @@ export default function CardImportDialog({
                           />
                         </span>
                       </Tooltip>
+                      {/* 启用后不是按替换文字的，处理方式决定输出什么，比正则本身更值得先看到 */}
+                      {ruleValue(rule) && rule.output_mode !== 'replace' ? (
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          {t(OUTPUT_MODE_LABEL_KEYS[rule.output_mode])}
+                        </Typography>
+                      ) : null}
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                       <Typography variant="caption" color="text.secondary">
@@ -580,10 +675,74 @@ export default function CardImportDialog({
     )
   }
 
+  /**
+   * 卡片脚本要下载的远程世界书
+   *
+   * 报告页只列认出的来源，不给操作：这时候人设还没建出来，导入不导入是下一步的事。
+   * 导入完成后结果页才给一份带按钮的清单。
+   */
+  const renderRemoteBooks = () => {
+    if (!report || report.remote_books.length === 0) return null
+    return (
+      <Section title={t('import.remoteBooks')}>
+        <Box sx={{ overflowX: 'auto' }}>
+          <Table size="small" sx={{ minWidth: 620 }}>
+            <TableHead>
+              <TableRow>
+                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('remoteBooks.fileName')}</TableCell>
+                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('remoteBooks.host')}</TableCell>
+                <TableCell sx={UNIFIED_TABLE_STYLES.header}>{t('remoteBooks.scripts')}</TableCell>
+                <TableCell sx={UNIFIED_TABLE_STYLES.header}>
+                  {t('remoteBooks.versionHint')}
+                </TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {report.remote_books.map(book => (
+                <TableRow key={book.key}>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                    <Typography variant="caption" sx={{ wordBreak: 'break-all' }}>
+                      {book.file_name}
+                    </Typography>
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                    <Typography variant="caption" sx={{ wordBreak: 'break-all' }}>
+                      {book.urls.length > 0 ? hostOf(book.urls[0]) : '—'}
+                      {book.urls.length > 1
+                        ? ` · ${t('remoteBooks.mirrors', { n: book.urls.length - 1 })}`
+                        : ''}
+                    </Typography>
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                    <Typography variant="caption" sx={{ wordBreak: 'break-word' }}>
+                      {book.scripts.length > 0 ? book.scripts.join(', ') : '—'}
+                    </Typography>
+                  </TableCell>
+                  <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                    <Typography variant="caption" color="text.secondary">
+                      {book.version_hint || '—'}
+                    </Typography>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Box>
+        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+          {t('import.remoteBooksHint')}
+        </Typography>
+      </Section>
+    )
+  }
+
   const renderReport = () => {
     if (!report) return null
+    const verdict = report.verdict
+    const verdictSeverity =
+      verdict?.level === 'state' ? 'warning' : verdict?.level === 'partial' ? 'info' : 'success'
     return (
       <Stack spacing={2.5}>
+        {verdict?.text ? <Alert severity={verdictSeverity}>{verdict.text}</Alert> : null}
         <Section title={t('import.cardInfo')}>
           <Stack spacing={0.5}>
             <Field label={t('import.name')} value={report.name} />
@@ -753,6 +912,21 @@ export default function CardImportDialog({
                 }
                 label={t('import.includeBook')}
               />
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={rewriteNameVars}
+                    onChange={e => setRewriteNameVars(e.target.checked)}
+                  />
+                }
+                label={t('import.rewriteNameVars', {
+                  userMacro: '{{user}}',
+                  charMacro: '{{char}}',
+                })}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t('import.rewriteNameVarsHint')}
+              </Typography>
               <Typography variant="caption" color="text.secondary">
                 {report.target.worldbook_enabled
                   ? t('import.bookGateOn')
@@ -766,6 +940,10 @@ export default function CardImportDialog({
         </Section>
 
         {renderRules()}
+
+        {renderRemoteBooks()}
+
+        {renderStateTemplate(report.state_template)}
 
         {report.unsupported.length > 0 ? (
           <Section title={t('import.unsupported')}>
@@ -870,6 +1048,12 @@ export default function CardImportDialog({
               </Box>
             ) : null}
           </Section>
+        ) : null}
+        {/* 模板是在导入时按卡里的书生成的，这里才第一次能看到它落到哪一步 */}
+        {renderStateTemplate(result.state_template)}
+        {/* 人设已经建出来，这里给的清单才能直接把书导进它名下 */}
+        {result.remote_books.length > 0 ? (
+          <RemoteBooksSection presetId={result.preset_id} scope={scope} />
         ) : null}
       </Stack>
     )

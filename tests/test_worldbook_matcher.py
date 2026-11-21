@@ -1,7 +1,7 @@
 """世界书的命中判定
 
 判据是「哪一条进提示词」的唯一依据，因此这里逐条钉死：主关键词、四种次关键词逻辑、
-常驻、大小写与整词的两种默认来源、归一化的三类写法、扫描深度、扫描文本不含昵称、
+常驻、大小写与整词的两种默认来源、归一化的三类写法、扫描深度、扫描文本默认不含说话人名字、
 `person` 书的在场判定（含别名与 Bot 排除）。
 """
 
@@ -12,12 +12,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from nekro_agent.services.memory.persons import human_accounts
 from nekro_agent.services.worldbook.matcher import (
     HitReason,
     book_active_for_person,
     entry_hit,
     key_hit,
     normalize_for_match,
+    present_person_accounts,
     scan_text,
 )
 from nekro_agent.services.worldbook.safe_regex import RegexRunner
@@ -41,7 +43,7 @@ def make_book(**extra: object) -> MatchBook:
         "scope_kind": ScopeKind.DOMAIN,
         "person_account": "",
         "scan_depth": 4,
-        "budget_chars": 0,
+        "budget_tokens": 0,
         "case_sensitive": False,
         "match_whole_words": False,
     }
@@ -232,9 +234,9 @@ class TestScanWindow:
         messages = list(reversed(window("一", "二", "三")))
         assert scan_text(messages, 2) == "二\n三"
 
-    def test_scan_text_has_no_nickname(self) -> None:
-        """昵称不参与扫描：类型里就没有这个字段"""
-        message = WindowMessage(id=1, sender_id="s1", platform_userid="u1", content_text="正文")
+    def test_scan_text_has_no_names_by_default(self) -> None:
+        """说话人名字默认不参与扫描：只有书打开「扫描时带上说话人名字」才拼进去"""
+        message = WindowMessage(id=1, sender_id="s1", platform_userid="u1", content_text="正文", speaker="龙骑士")
         assert scan_text([message], 1) == "正文"
         assert not hasattr(message, "sender_nickname")
 
@@ -280,7 +282,7 @@ class TestConversion:
             "scope_kind": "person",
             "person_account": "u1",
             "scan_depth": 12,
-            "budget_chars": 500,
+            "budget_tokens": 500,
             "case_sensitive": True,
             "match_whole_words": True,
         }
@@ -317,7 +319,7 @@ class TestConversion:
         assert book.scope_kind is ScopeKind.PERSON
         assert book.person_account == "u1"
         assert book.scan_depth == 12
-        assert book.budget_chars == 500
+        assert book.budget_tokens == 500
         assert book.case_sensitive is True
 
     def test_book_scan_depth_is_clamped(self) -> None:
@@ -455,6 +457,165 @@ class TestPersonBook:
         case = _WindowCase(("你好",), ("u1",))
         book = make_book(scope_kind=ScopeKind.PERSON, person_account="")
         assert book_active_for_person(book, case.messages(), bot_account=None, alias_groups={}) is False
+
+
+class TestPresentPersonAccounts:
+    """个人书主人实际发言用的账号：与 `book_active_for_person` 同一套在场判据"""
+
+    def _book(self, account: str = "u1", depth: int = 4) -> MatchBook:
+        return make_book(scope_kind=ScopeKind.PERSON, person_account=account, scan_depth=depth)
+
+    def test_non_person_book_has_no_accounts(self) -> None:
+        book = make_book(scope_kind=ScopeKind.DOMAIN, person_account="u1")
+        assert present_person_accounts(book, window("你好"), bot_account=None, alias_groups={}) == ()
+
+    def test_book_without_account_has_no_accounts(self) -> None:
+        book = make_book(scope_kind=ScopeKind.PERSON, person_account="")
+        assert present_person_accounts(book, window("你好"), bot_account=None, alias_groups={}) == ()
+
+    def test_only_the_owner_is_returned(self) -> None:
+        """窗口里的其它人不能被标到这本书上"""
+        messages = [
+            WindowMessage(id=1, sender_id="s1", platform_userid="u2", content_text="别人"),
+            WindowMessage(id=2, sender_id="s1", platform_userid="u1", content_text="主人"),
+        ]
+        assert present_person_accounts(self._book(), messages, bot_account=None, alias_groups={}) == ("u1",)
+
+    def test_newest_first_and_deduped(self) -> None:
+        messages = [
+            WindowMessage(id=1, sender_id="s1", platform_userid="u1", content_text="早"),
+            WindowMessage(id=2, sender_id="s1", platform_userid="u2", content_text="别人"),
+            WindowMessage(id=3, sender_id="s1", platform_userid="u1", content_text="晚"),
+        ]
+        assert present_person_accounts(self._book(), messages, bot_account=None, alias_groups={}) == ("u1",)
+
+    def test_alias_accounts_are_returned_in_recency_order(self) -> None:
+        messages = [
+            WindowMessage(id=1, sender_id="s1", platform_userid="u2", content_text="副号先说"),
+            WindowMessage(id=2, sender_id="s1", platform_userid="u9", content_text="别人"),
+            WindowMessage(id=3, sender_id="s1", platform_userid="u3", content_text="另一个副号"),
+        ]
+        aliases = {"u2": frozenset({"u1", "u2"}), "u3": frozenset({"u1", "u3"})}
+        assert present_person_accounts(self._book(), messages, bot_account=None, alias_groups=aliases) == (
+            "u3",
+            "u2",
+        )
+
+    def test_outside_scan_depth_is_not_returned(self) -> None:
+        messages = [
+            WindowMessage(id=1, sender_id="s1", platform_userid="u1", content_text="太早"),
+            WindowMessage(id=2, sender_id="s1", platform_userid="u2", content_text="别的"),
+        ]
+        assert present_person_accounts(self._book(depth=1), messages, bot_account=None, alias_groups={}) == ()
+
+    def test_bot_is_excluded(self) -> None:
+        messages = [
+            WindowMessage(id=1, sender_id="-1", platform_userid="u1", content_text="Bot"),
+            WindowMessage(id=2, sender_id="s1", platform_userid="u1", content_text="主人"),
+        ]
+        assert present_person_accounts(self._book(), messages, bot_account="u1", alias_groups={}) == ()
+
+    @pytest.mark.parametrize(
+        ("scope_kind", "account", "depth", "accounts", "aliases", "bot"),
+        [
+            (ScopeKind.PERSON, "u1", 4, ("u1",), {}, None),
+            (ScopeKind.PERSON, "u1", 1, ("u1", "u2"), {}, None),
+            (ScopeKind.PERSON, "u1", 1, ("u2",), {"u2": frozenset({"u1", "u2"})}, None),
+            (ScopeKind.PERSON, "u1", 4, ("u1",), {}, "u1"),
+            (ScopeKind.PERSON, "", 4, ("u1",), {}, None),
+            (ScopeKind.PERSON, "u9", 4, ("u1",), {}, None),
+            (ScopeKind.PERSON, "u1", 0, ("u1",), {}, None),
+        ],
+    )
+    def test_active_verdict_matches_the_presence_verdict(
+        self,
+        scope_kind: ScopeKind,
+        account: str,
+        depth: int,
+        accounts: tuple[str, ...],
+        aliases: dict[str, frozenset[str]],
+        bot: str | None,
+    ) -> None:
+        """改前改后等价：个人书的在场判定必须恒等于「新函数返回非空」"""
+        book = make_book(scope_kind=scope_kind, person_account=account, scan_depth=depth)
+        messages = [
+            WindowMessage(id=index + 1, sender_id="s1", platform_userid=value, content_text="发言")
+            for index, value in enumerate(accounts)
+        ]
+
+        assert book_active_for_person(book, messages, bot_account=bot, alias_groups=aliases) is bool(
+            present_person_accounts(book, messages, bot_account=bot, alias_groups=aliases),
+        )
+
+    def test_non_person_books_stay_active(self) -> None:
+        """非个人书恒在场（交给场景过滤），与「标志号」的新函数不是一回事"""
+        book = make_book(scope_kind=ScopeKind.DOMAIN, person_account="u1")
+        assert book_active_for_person(book, [], bot_account=None, alias_groups={}) is True
+        assert present_person_accounts(book, [], bot_account=None, alias_groups={}) == ()
+
+
+def _legacy_book_active_for_person(
+    book: MatchBook,
+    window: list[WindowMessage],
+    *,
+    bot_account: str | None,
+    alias_groups: dict[str, frozenset[str]],
+) -> bool:
+    """改造前的在场判定，逐字抄下来只做对照
+
+    新实现把这一套取法收进了 :func:`present_person_accounts`；这段对照实现保证「收进去的
+    同时不改判据」这件事有用例钉着，而不只是靠人读 diff。
+    """
+    if book.scope_kind != "person":
+        return True
+    if not book.person_account:
+        return False
+    ordered = sorted(window, key=lambda message: message.id)
+    recent = ordered[-book.scan_depth :]
+    present_accounts = human_accounts(
+        [SimpleNamespace(sender_id=m.sender_id, platform_userid=m.platform_userid) for m in recent],
+        bot_account=bot_account,
+    )
+    present: set[str] = set()
+    for account in present_accounts:
+        present.add(account)
+        present.update(alias_groups.get(account, ()))
+    return book.person_account in present
+
+
+@pytest.mark.parametrize(
+    ("scope_kind", "account", "depth"),
+    [
+        (ScopeKind.PERSON, "u1", 4),
+        (ScopeKind.PERSON, "u2", 1),
+        (ScopeKind.PERSON, "u3", 2),
+        (ScopeKind.PERSON, "", 4),
+        (ScopeKind.DOMAIN, "u1", 4),
+        (ScopeKind.PRESET, "u2", 0),
+    ],
+)
+@pytest.mark.parametrize("alias_on", [False, True])
+def test_book_active_is_byte_equivalent_to_the_legacy_verdict(
+    scope_kind: ScopeKind,
+    account: str,
+    depth: int,
+    alias_on: bool,
+) -> None:
+    """同一组窗口在改造前后结论逐例相同（含别名、Bot、深度、空账号与非个人书）"""
+    book = make_book(scope_kind=scope_kind, person_account=account, scan_depth=depth)
+    messages = [
+        WindowMessage(id=1, sender_id="u1", platform_userid="u1", content_text="甲"),
+        WindowMessage(id=2, sender_id="-1", platform_userid="u2", content_text="Bot"),
+        WindowMessage(id=3, sender_id="u3", platform_userid="u2", content_text="乙"),
+        WindowMessage(id=4, sender_id="u4", platform_userid="   ", content_text="没账号"),
+        WindowMessage(id=5, sender_id="u1", platform_userid="u1", content_text="甲又说"),
+        WindowMessage(id=6, sender_id="u5", platform_userid="bot1", content_text="另一个 Bot"),
+    ]
+    aliases = {"u2": frozenset({"u1", "u2"}), "u1": frozenset({"u1"})} if alias_on else {}
+    for bot in (None, "bot1"):
+        assert book_active_for_person(book, messages, bot_account=bot, alias_groups=aliases) is (
+            _legacy_book_active_for_person(book, messages, bot_account=bot, alias_groups=aliases)
+        )
 
 
 @pytest.mark.parametrize("depth", [1, 2, 3, 50])

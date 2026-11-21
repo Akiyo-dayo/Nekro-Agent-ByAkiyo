@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -33,6 +34,7 @@ from nekro_agent.models.db_chat_channel import DBChatChannel, DefaultPreset
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_preset import DBPreset
 from nekro_agent.models.db_preset_card import DBPresetCard
+from nekro_agent.models.db_rp_preset import DBRpPreset
 from nekro_agent.schemas.chat_message import ChatMessage
 from nekro_agent.services.agent.prefill import PrefillSpec
 from nekro_agent.services.memory import prompt_rounds
@@ -79,9 +81,63 @@ class TavernRound:
     post_history: str
     prefill: Optional[PrefillSpec]
     slots: Optional[AdvancedSlots]
+    # 这一轮启用的角色扮演预设；没选、槽位关着、看不见或读库失败时是 `None`。
+    rp_preset: Optional[DBRpPreset] = None
 
 
 _rounds: dict[str, TavernRound] = {}
+
+# 引用了看不见 / 已删除预设时，同一频道 10 分钟内只记一条 WARNING：频道每个回合都会
+# 解析一次，不收敛的话日志会被同一个 id 刷满。
+_RP_WARNING_INTERVAL_SECONDS = 600.0
+_rp_preset_warnings: dict[str, float] = {}
+
+
+def _warn_rp_preset_once(chat_key: str, message: str) -> None:
+    now = time.monotonic()
+    last = _rp_preset_warnings.get(chat_key)
+    if last is not None and now - last < _RP_WARNING_INTERVAL_SECONDS:
+        return
+    if len(_rp_preset_warnings) >= MAX_ROUNDS:
+        _rp_preset_warnings.clear()
+    _rp_preset_warnings[chat_key] = now
+    logger.warning(message)
+
+
+async def _resolve_rp_preset(channel: DBChatChannel, config: Any) -> Optional[DBRpPreset]:
+    """按频道生效配置解析这一轮的角色扮演预设
+
+    只在 `PROMPT_RP_PRESET_ID > 0` 时查库；读库失败、行不存在、或归属不是「全局 /
+    本实例」都返回 `None`，调用方据此让提示词与没选预设时完全一样（fail-open）。
+    """
+    try:
+        preset_id = int(getattr(config, "PROMPT_RP_PRESET_ID", 0) or 0)
+    except (TypeError, ValueError):
+        preset_id = 0
+    if preset_id <= 0:
+        return None
+    try:
+        row = await DBRpPreset.filter(id=preset_id).first()
+    except Exception as error:  # noqa: BLE001 - 读路径 fail-open
+        _warn_rp_preset_once(
+            channel.chat_key,
+            f"读取角色扮演预设失败，这一轮按没选预设处理: chat_key={channel.chat_key}, id={preset_id}, error={error!r}",
+        )
+        return None
+    if row is None:
+        _warn_rp_preset_once(
+            channel.chat_key,
+            f"引用的角色扮演预设不存在，这一轮按没选预设处理: chat_key={channel.chat_key}, id={preset_id}",
+        )
+        return None
+    if row.owner_instance_key not in ("", channel.instance_key):
+        _warn_rp_preset_once(
+            channel.chat_key,
+            f"引用的角色扮演预设不属于本实例，这一轮按没选预设处理: "
+            f"chat_key={channel.chat_key}, id={preset_id}, owner={row.owner_instance_key}",
+        )
+        return None
+    return row
 
 
 def cached_tavern_round(code: str) -> Optional[TavernRound]:
@@ -105,6 +161,22 @@ def _preset_id_of(preset: PresetLike) -> int:
     """
     preset_id = getattr(preset, "id", None)
     return preset_id if isinstance(preset_id, int) and preset_id > 0 else 0
+
+
+def _examples_raw(card: Optional[DBPresetCard]) -> str:
+    """卡片示例对话原文；没有卡片或字段形状不对时是空串
+
+    `{{mesExamplesRaw}}` 要的就是导入时保存的那段原文，其中的 `{{char}}` / `{{user}}`
+    留给宏展开的下一遍处理。`source_fields` 是 JSON 列，历史数据或手工改库可能不是
+    dict，任何一种形状不对都按空串处理，不让一轮对话因此失败。
+    """
+    if card is None:
+        return ""
+    fields = getattr(card, "source_fields", None)
+    if not isinstance(fields, dict):
+        return ""
+    value = fields.get("mes_example")
+    return value if isinstance(value, str) else ""
 
 
 async def _resolve_user_name(channel: DBChatChannel, trigger_message: Optional[ChatMessage]) -> str:
@@ -247,6 +319,7 @@ async def _resolve_enabled_round(
         lang=str(global_config.SYSTEM_LANG),
         chat_key=channel.chat_key,
         preset_id=preset_id,
+        examples_raw=_examples_raw(card),
     )
     stats: dict[str, Any] = {"expanded": 0, "guarded": False}
 
@@ -285,6 +358,8 @@ async def _resolve_enabled_round(
         prefill=prefill,
         slots=slots,
     )
+    if slots.enabled:
+        result.rp_preset = await _resolve_rp_preset(channel, config)
 
     if not dry_run:
         prompt_rounds.note_tavern(

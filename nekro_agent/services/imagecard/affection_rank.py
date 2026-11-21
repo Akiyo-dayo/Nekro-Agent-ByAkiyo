@@ -57,9 +57,9 @@ import io
 import time
 from dataclasses import dataclass
 from math import ceil
-from typing import Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Dict, Optional, Protocol, Sequence, Tuple
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_affection import DBAffection
@@ -74,7 +74,7 @@ from nekro_agent.services.identity_scope import (
 from nekro_agent.tools.untrusted_content import sanitize_inline_text
 
 from .fonts import FontRole, load_font
-from .painter import RGBA, corner_glow, draw_text, ellipsize, rounded_rect
+from .painter import RGBA, draw_text, ellipsize, rounded_rect
 
 logger = get_sub_logger("imagecard")
 
@@ -171,23 +171,32 @@ class RankView:
 
 @dataclass(frozen=True)
 class RankTheme:
-    """排行榜配色"""
+    """macOS 风格浅色毛玻璃配色。"""
 
-    card_bg: RGBA = (255, 255, 255, 255)
-    card_border: RGBA = (214, 234, 217, 255)
-    glow: Tuple[int, int, int] = (76, 175, 108)
-    icon_bg: RGBA = (60, 173, 106, 255)
+    card_bg: RGBA = (247, 249, 253, 255)
+    card_border: RGBA = (255, 255, 255, 220)
+    glow: Tuple[int, int, int] = (10, 132, 255)
+    icon_bg: RGBA = (10, 132, 255, 255)
     icon_glyph: RGBA = (255, 255, 255, 255)
-    title: RGBA = (26, 94, 55, 255)
-    subtitle: RGBA = (150, 160, 154, 255)
-    pill_border: RGBA = (144, 205, 166, 255)
-    pill_text: RGBA = (72, 152, 103, 255)
-    name: RGBA = (46, 56, 50, 255)
-    suffix: RGBA = (166, 177, 170, 255)
-    score: RGBA = (46, 56, 50, 255)
-    separator: RGBA = (238, 244, 239, 255)
-    highlight_bg: RGBA = (231, 246, 235, 255)
-    highlight_border: RGBA = (152, 210, 172, 255)
+    title: RGBA = (29, 29, 31, 255)
+    subtitle: RGBA = (110, 110, 115, 255)
+    pill_border: RGBA = (255, 255, 255, 230)
+    pill_text: RGBA = (70, 105, 145, 255)
+    name: RGBA = (35, 35, 40, 255)
+    suffix: RGBA = (142, 142, 147, 255)
+    score: RGBA = (29, 29, 31, 255)
+    separator: RGBA = (206, 212, 224, 220)
+    highlight_bg: RGBA = (218, 237, 255, 185)
+    highlight_border: RGBA = (10, 132, 255, 255)
+    background_top: RGBA = (232, 241, 255, 255)
+    panel_bg: RGBA = (255, 255, 255, 145)
+    panel_border: RGBA = (255, 255, 255, 205)
+    rank_text: RGBA = (134, 139, 150, 255)
+    bar_bg: RGBA = (215, 221, 232, 255)
+    bar_fill: RGBA = (10, 132, 255, 255)
+    top_one: RGBA = (208, 150, 35, 255)
+    top_two: RGBA = (126, 135, 150, 255)
+    top_three: RGBA = (181, 116, 76, 255)
 
 
 def display_score(score: int) -> float:
@@ -352,59 +361,52 @@ async def collect_rank_entries(
 def render_rank_card(
     view: RankView,
     *,
-    title: str = "好感度",
+    title: str = "好感度排行榜",
     subtitle: str,
-    badge: str = "好感查看",
+    badge: str = "LIVE RANK",
     scale: int = 2,
     theme: Optional[RankTheme] = None,
 ) -> bytes:
-    """渲染好感度排行榜卡片
+    """渲染 macOS 风格浅色毛玻璃排行榜卡片。
 
-    Args:
-        view: 已整理好的榜单视图
-        subtitle: 头部小字，例如 "群 123456 · 近30天活跃 227 人"
-
-    Returns:
-        PNG 字节流
-
-    Raises:
-        ValueError: 榜单为空
-        RuntimeError: 环境缺少可用中文字体
+    视觉层与取数层完全分离：名次、信号条和查询者高亮都只读取 ``RankView``，
+    不改变好感度数值、排序范围或截断规则。
     """
     if not view.rows:
         raise ValueError("好感度榜单没有任何可展示的记录")
 
     palette = theme or RankTheme()
-    metrics = _RankMetrics(scale)
 
+    # 先按原倍率计算最终尺寸，再以 2 倍分辨率绘制全部文字和图形。
+    # 最后用 LANCZOS 缩回，圆角、细边框和进度条才会带真实的抗锯齿过渡像素，
+    # 而不是把锯齿交给 QQ 客户端在缩放、压缩时进一步放大。
+    supersample = 2
+    output_metrics = _RankMetrics(scale)
+    output_columns_width = (
+        view.columns * output_metrics.column_width + max(0, view.columns - 1) * output_metrics.column_gap
+    )
+    output_width = max(
+        output_metrics.pad * 2 + output_columns_width,
+        _header_min_width(output_metrics, title, subtitle, badge),
+    )
+    output_body_top = output_metrics.pad + output_metrics.header_height
+    output_footer_top = output_body_top + view.rows_per_column * output_metrics.row_height
+    output_height = output_footer_top + output_metrics.footer_height + output_metrics.pad
+
+    metrics = _RankMetrics(scale * supersample)
     columns_width = view.columns * metrics.column_width + max(0, view.columns - 1) * metrics.column_gap
-    # 人少时列区很窄，但头部的图标 + 标题 + 药丸按钮是有固有宽度的：
-    # 只按列区定宽会让标题直接压在按钮上（三个人的群就会撞车）
     width = max(metrics.pad * 2 + columns_width, _header_min_width(metrics, title, subtitle, badge))
     column_origin = max(metrics.pad, (width - columns_width) // 2)
     body_top = metrics.pad + metrics.header_height
-    height = body_top + view.rows_per_column * metrics.row_height + metrics.pad
+    footer_top = body_top + view.rows_per_column * metrics.row_height
+    height = footer_top + metrics.footer_height + metrics.pad
 
-    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    image = _draw_background(width, height, metrics, palette)
     draw = ImageDraw.Draw(image)
-
-    rounded_rect(
-        draw,
-        (0, 0, width - 1, height - 1),
-        metrics.card_radius,
-        fill=palette.card_bg,
-        outline=palette.card_border,
-        width=metrics.hairline,
-    )
-
-    glow = corner_glow((width, height), palette.glow, reach=0.55, max_alpha=26)
-    # 光晕要被卡片的圆角裁掉，否则会在圆角外面露出四方形的直角
-    corner_mask = Image.new("L", (width, height), 0)
-    rounded_rect(ImageDraw.Draw(corner_mask), (0, 0, width - 1, height - 1), metrics.card_radius, fill=(255,))
-    image.paste(glow, (0, 0), ImageChops.multiply(glow.getchannel("A"), corner_mask))
-
     _draw_header(draw, width, metrics, palette, title=title, subtitle=subtitle, badge=badge)
-    _draw_columns(draw, view, metrics, palette, body_top=body_top, height=height, column_origin=column_origin)
+    _draw_columns(image, view, metrics, palette, body_top=body_top, column_origin=column_origin)
+    _draw_footer(draw, view, width, footer_top, metrics, palette)
+    image = image.resize((output_width, output_height), Image.Resampling.LANCZOS)
 
     buffer = io.BytesIO()
     image.convert("RGB").save(buffer, format="PNG", optimize=True)
@@ -412,63 +414,96 @@ def render_rank_card(
 
 
 class _RankMetrics:
-    """排行榜卡片的度量"""
+    """毛玻璃卡片的统一度量。"""
 
     def __init__(self, scale: int) -> None:
         if scale < 1:
             raise ValueError(f"缩放倍率必须不小于 1: {scale}")
         self.scale = scale
-        self.pad = 26 * scale
-        self.card_radius = 20 * scale
+        self.pad = 28 * scale
+        self.card_radius = 26 * scale
         self.hairline = max(1, scale)
 
-        self.header_height = 84 * scale
-        self.icon_size = 46 * scale
-        self.icon_radius = 13 * scale
-        self.title_size = 27 * scale
-        self.subtitle_size = 13 * scale
-        self.header_gap = 14 * scale
-        self.badge_size = 13 * scale
-        self.badge_pad_x = 14 * scale
-        self.badge_pad_y = 8 * scale
+        self.header_height = 104 * scale
+        self.header_label_size = 9 * scale
+        self.title_size = 30 * scale
+        self.subtitle_size = 12 * scale
+        self.header_gap = 18 * scale
+        self.badge_size = 10 * scale
+        self.badge_pad_x = 12 * scale
+        self.badge_pad_y = 7 * scale
+        self.badge_dot = 6 * scale
 
-        self.column_width = 168 * scale
-        self.column_gap = 14 * scale
-        self.row_height = 26 * scale
+        self.column_width = 198 * scale
+        self.column_gap = 12 * scale
+        self.row_height = 34 * scale
+        self.row_radius = 10 * scale
+        self.row_pad_x = 9 * scale
+        self.rank_width = 31 * scale
+        self.rank_size = 11 * scale
         self.name_size = 13 * scale
-        self.suffix_size = 10 * scale
-        self.score_size = 13 * scale
+        self.suffix_size = 9 * scale
+        self.score_size = 14 * scale
         self.name_suffix_gap = 5 * scale
-        self.score_gap = 8 * scale
-        self.row_pad_x = 6 * scale
-        self.subtitle_max_width = 330 * scale
+        self.score_gap = 9 * scale
+        self.bar_height = 2 * scale
+        self.footer_height = 40 * scale
+        self.footer_size = 9 * scale
+        self.subtitle_max_width = 360 * scale
+
+
+def _draw_background(width: int, height: int, metrics: _RankMetrics, palette: RankTheme) -> Image.Image:
+    """柔和浅色渐变、虚化色块与半透明磨砂层，全部用原生绘图生成。"""
+    gradient = Image.new("RGBA", (width, height), palette.card_bg)
+    gradient_draw = ImageDraw.Draw(gradient)
+    top = palette.background_top
+    bottom = palette.card_bg
+    for y in range(height):
+        ratio = y / max(1, height - 1)
+        color = tuple(round(top[channel] * (1 - ratio) + bottom[channel] * ratio) for channel in range(3)) + (255,)
+        gradient_draw.line((0, y, width, y), fill=color)
+
+    blobs = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    blob_draw = ImageDraw.Draw(blobs)
+    blob_specs = (
+        ((-0.10, -0.14, 0.32, 0.34), (156, 199, 255, 125)),
+        ((0.72, -0.14, 1.10, 0.30), (215, 192, 255, 115)),
+        ((0.62, 0.72, 1.06, 1.16), (255, 203, 219, 90)),
+        ((-0.08, 0.72, 0.28, 1.14), (188, 235, 222, 75)),
+    )
+    for (left, top_y, right, bottom_y), color in blob_specs:
+        blob_draw.ellipse((width * left, height * top_y, width * right, height * bottom_y), fill=color)
+    blobs = blobs.filter(ImageFilter.GaussianBlur(56 * metrics.scale))
+    gradient = Image.alpha_composite(gradient, blobs)
+
+    mask = Image.new("L", (width, height), 0)
+    rounded_rect(ImageDraw.Draw(mask), (0, 0, width - 1, height - 1), metrics.card_radius, fill=(255,))
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    image.paste(gradient, (0, 0), mask)
+
+    frost = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    frost_draw = ImageDraw.Draw(frost)
+    rounded_rect(
+        frost_draw,
+        (0, 0, width - 1, height - 1),
+        metrics.card_radius,
+        fill=(255, 255, 255, 62),
+        outline=palette.card_border,
+        width=metrics.hairline,
+    )
+    return Image.alpha_composite(image, frost)
 
 
 def _header_min_width(metrics: _RankMetrics, title: str, subtitle: str, badge: str) -> int:
-    """头部内容不被挤压所需的最小卡片宽度
-
-    副标题可以很长（群号 + 活跃人数），完全按它定宽会让人少的卡片变得又宽又空，
-    所以副标题只保证一个上限内的宽度，超出的部分交给省略号。
-    """
     font_title = load_font(FontRole.BOLD, metrics.title_size)
     font_subtitle = load_font(FontRole.REGULAR, metrics.subtitle_size)
-    font_badge = load_font(FontRole.REGULAR, metrics.badge_size)
-
+    font_label = load_font(FontRole.REGULAR, metrics.header_label_size)
     text_width = max(
         font_title.measure(title),
+        font_label.measure("AFFECTION BOARD / GROUP RANKING"),
         min(font_subtitle.measure(subtitle), metrics.subtitle_max_width),
     )
-    badge_width = (font_badge.measure(badge) + metrics.badge_pad_x * 2) if badge else 0
-    return int(
-        ceil(
-            metrics.pad * 2
-            + metrics.icon_size
-            + metrics.header_gap
-            + text_width
-            + metrics.header_gap
-            + badge_width,
-        ),
-    )
+    return int(ceil(metrics.pad * 2 + text_width + metrics.header_gap + _badge_width(metrics, badge)))
 
 
 def _draw_header(
@@ -481,39 +516,36 @@ def _draw_header(
     subtitle: str,
     badge: str,
 ) -> None:
-    icon_box = (
-        float(metrics.pad),
-        float(metrics.pad),
-        float(metrics.pad + metrics.icon_size),
-        float(metrics.pad + metrics.icon_size),
-    )
-    rounded_rect(draw, icon_box, metrics.icon_radius, fill=palette.icon_bg)
-    _draw_heart(draw, icon_box, palette.icon_glyph)
-
+    font_label = load_font(FontRole.REGULAR, metrics.header_label_size)
     font_title = load_font(FontRole.BOLD, metrics.title_size)
     font_subtitle = load_font(FontRole.REGULAR, metrics.subtitle_size)
 
-    text_x = metrics.pad + metrics.icon_size + metrics.header_gap
-    title_top = metrics.pad - metrics.scale
-    draw_text(draw, (text_x, title_top), title, font_title, palette.title)
+    label = "AFFECTION BOARD / GROUP RANKING"
+    label_x = metrics.pad + 27 * metrics.scale
+    draw_text(draw, (label_x, metrics.pad), label, font_label, palette.subtitle)
+    for index, color in enumerate(((255, 95, 86, 255), (255, 189, 46, 255), (39, 201, 63, 255))):
+        cx = metrics.pad + index * 8 * metrics.scale + 3 * metrics.scale
+        cy = metrics.pad + 5 * metrics.scale
+        draw.ellipse((cx - 2 * metrics.scale, cy - 2 * metrics.scale, cx + 2 * metrics.scale, cy + 2 * metrics.scale), fill=color)
 
+    title_top = metrics.pad + 20 * metrics.scale
+    draw_text(draw, (metrics.pad, title_top), title, font_title, palette.title)
     subtitle_top = title_top + metrics.title_size * 1.45
-    badge_left = _badge_left(width, metrics, badge)
-    subtitle_budget = badge_left - text_x - metrics.header_gap
     draw_text(
         draw,
-        (text_x, subtitle_top),
-        ellipsize(subtitle, font_subtitle, subtitle_budget),
+        (metrics.pad, subtitle_top),
+        ellipsize(subtitle, font_subtitle, metrics.subtitle_max_width),
         font_subtitle,
         palette.subtitle,
     )
-
     _draw_badge(draw, width, metrics, palette, badge)
 
 
-def _badge_left(width: int, metrics: _RankMetrics, badge: str) -> float:
+def _badge_width(metrics: _RankMetrics, badge: str) -> float:
+    if not badge:
+        return 0
     font_badge = load_font(FontRole.REGULAR, metrics.badge_size)
-    return width - metrics.pad - font_badge.measure(badge) - metrics.badge_pad_x * 2
+    return font_badge.measure(badge) + metrics.badge_pad_x * 2 + metrics.badge_dot + 7 * metrics.scale
 
 
 def _draw_badge(
@@ -526,57 +558,82 @@ def _draw_badge(
     if not badge:
         return
     font_badge = load_font(FontRole.REGULAR, metrics.badge_size)
-    text_width = font_badge.measure(badge)
+    badge_width = _badge_width(metrics, badge)
     ascent, descent = font_badge.primary.getmetrics()
     box_height = ascent + descent + metrics.badge_pad_y * 2
-    left = width - metrics.pad - text_width - metrics.badge_pad_x * 2
-    top = metrics.pad + (metrics.icon_size - box_height) / 2
-
+    left = width - metrics.pad - badge_width
+    top = metrics.pad - 2 * metrics.scale
     rounded_rect(
         draw,
-        (left, top, left + text_width + metrics.badge_pad_x * 2, top + box_height),
+        (left, top, left + badge_width, top + box_height),
         box_height / 2,
+        fill=palette.panel_bg,
         outline=palette.pill_border,
         width=metrics.hairline,
     )
-    draw_text(draw, (left + metrics.badge_pad_x, top + metrics.badge_pad_y), badge, font_badge, palette.pill_text)
+    dot_x = left + metrics.badge_pad_x
+    dot_y = top + box_height / 2
+    radius = metrics.badge_dot / 2
+    draw.ellipse((dot_x - radius, dot_y - radius, dot_x + radius, dot_y + radius), fill=palette.bar_fill)
+    draw_text(
+        draw,
+        (dot_x + metrics.badge_dot + 4 * metrics.scale, top + metrics.badge_pad_y),
+        badge,
+        font_badge,
+        palette.pill_text,
+    )
+
+
+def _rank_color(index: int, palette: RankTheme) -> RGBA:
+    return (palette.top_one, palette.top_two, palette.top_three)[index] if index < 3 else palette.rank_text
 
 
 def _draw_columns(
-    draw: ImageDraw.ImageDraw,
+    image: Image.Image,
     view: RankView,
     metrics: _RankMetrics,
     palette: RankTheme,
     *,
     body_top: int,
-    height: int,
     column_origin: int,
 ) -> None:
-    font_name = load_font(FontRole.REGULAR, metrics.name_size)
-    font_suffix = load_font(FontRole.REGULAR, metrics.suffix_size)
-    font_score = load_font(FontRole.REGULAR, metrics.score_size)
-
-    name_ascent, name_descent = font_name.primary.getmetrics()
-    text_offset = (metrics.row_height - (name_ascent + name_descent)) / 2
-
+    # 行卡先画在独立透明层上再合成，才能保留真正的磨砂透明感；
+    # 直接在 RGBA 底图上绘制只会把透明通道留到最后的 RGB 转换中丢掉。
+    panels = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    panel_draw = ImageDraw.Draw(panels)
+    cards = []
     for index, row in enumerate(view.rows):
         column = index // view.rows_per_column
         line = index % view.rows_per_column
         col_left = column_origin + column * (metrics.column_width + metrics.column_gap)
         col_right = col_left + metrics.column_width
         row_top = body_top + line * metrics.row_height
+        card_top = row_top + metrics.scale
+        card_bottom = row_top + metrics.row_height - 2 * metrics.scale
+        rounded_rect(
+            panel_draw,
+            (col_left, card_top, col_right, card_bottom),
+            metrics.row_radius,
+            fill=palette.highlight_bg if row.highlighted else palette.panel_bg,
+            outline=palette.highlight_border if row.highlighted else palette.panel_border,
+            width=metrics.hairline,
+        )
+        cards.append((index, row, col_left, col_right, row_top, card_bottom))
+    image.alpha_composite(panels)
 
-        if row.highlighted:
-            rounded_rect(
-                draw,
-                (col_left, row_top + metrics.scale, col_right, row_top + metrics.row_height - metrics.scale),
-                6 * metrics.scale,
-                fill=palette.highlight_bg,
-                outline=palette.highlight_border,
-                width=metrics.hairline,
-            )
+    draw = ImageDraw.Draw(image)
+    font_rank = load_font(FontRole.BOLD, metrics.rank_size)
+    font_name = load_font(FontRole.REGULAR, metrics.name_size)
+    font_suffix = load_font(FontRole.REGULAR, metrics.suffix_size)
+    font_score = load_font(FontRole.BOLD, metrics.score_size)
+    name_ascent, name_descent = font_name.primary.getmetrics()
+    suffix_ascent, suffix_descent = font_suffix.primary.getmetrics()
 
-        text_top = row_top + text_offset
+    for index, row, col_left, col_right, row_top, card_bottom in cards:
+        text_top = row_top + 4 * metrics.scale
+        rank_color = palette.highlight_border if row.highlighted else _rank_color(index, palette)
+        draw_text(draw, (col_left + metrics.row_pad_x, text_top + metrics.scale), f"{index + 1:02d}", font_rank, rank_color)
+
         score_width = font_score.measure(row.score_text)
         draw_text(
             draw,
@@ -587,17 +644,21 @@ def _draw_columns(
             align="right",
         )
 
-        name_left = col_left + metrics.row_pad_x
+        name_left = col_left + metrics.row_pad_x + metrics.rank_width
         suffix_width = font_suffix.measure(row.suffix)
-        name_budget = (
-            col_right - metrics.row_pad_x - score_width - metrics.score_gap - suffix_width - metrics.name_suffix_gap - name_left
+        name_budget = max(
+            0,
+            col_right
+            - metrics.row_pad_x
+            - score_width
+            - metrics.score_gap
+            - suffix_width
+            - metrics.name_suffix_gap
+            - name_left,
         )
         name = font_name.renderable(row.display_name) or f"用户{row.suffix}"
         name = ellipsize(name, font_name, name_budget)
         name_width = draw_text(draw, (name_left, text_top), name, font_name, palette.name)
-
-        # 后缀跟着昵称走而不是固定列位：昵称长短不一，固定列位会在短昵称后留一大段空白
-        suffix_ascent, suffix_descent = font_suffix.primary.getmetrics()
         suffix_top = text_top + (name_ascent + name_descent) - (suffix_ascent + suffix_descent) - metrics.scale
         draw_text(
             draw,
@@ -607,30 +668,31 @@ def _draw_columns(
             palette.suffix,
         )
 
-    for column in range(1, view.columns):
-        x = column_origin + column * (metrics.column_width + metrics.column_gap) - metrics.column_gap / 2
-        draw.line(
-            [(x, body_top), (x, height - metrics.pad)],
-            fill=palette.separator,
-            width=metrics.hairline,
-        )
+        try:
+            progress = min(1.0, max(0.0, float(row.score_text) / 100.0))
+        except ValueError:
+            progress = 0.0
+        bar_left = name_left
+        bar_right = col_right - metrics.row_pad_x
+        bar_y = card_bottom - 4 * metrics.scale
+        draw.line((bar_left, bar_y, bar_right, bar_y), fill=palette.bar_bg, width=metrics.bar_height)
+        if progress > 0:
+            fill_right = bar_left + (bar_right - bar_left) * progress
+            draw.line((bar_left, bar_y, fill_right, bar_y), fill=rank_color if index < 3 or row.highlighted else palette.bar_fill, width=metrics.bar_height)
 
 
-def _draw_heart(draw: ImageDraw.ImageDraw, box: Tuple[float, float, float, float], color: RGBA) -> None:
-    """图标里的白色爱心：两个圆加一个下尖的多边形"""
-    left, top, right, bottom = box
-    size = right - left
-    cx = (left + right) / 2
-    cy = (top + bottom) / 2
-    half_w = size * 0.24
-    lobe = half_w / 2
-    lobe_cy = cy - size * 0.05
-
-    draw.ellipse((cx - half_w, lobe_cy - lobe, cx, lobe_cy + lobe), fill=color)
-    draw.ellipse((cx, lobe_cy - lobe, cx + half_w, lobe_cy + lobe), fill=color)
-    points: List[Tuple[float, float]] = [
-        (cx - half_w, lobe_cy),
-        (cx + half_w, lobe_cy),
-        (cx, cy + size * 0.23),
-    ]
-    draw.polygon(points, fill=color)
+def _draw_footer(
+    draw: ImageDraw.ImageDraw,
+    view: RankView,
+    width: int,
+    footer_top: int,
+    metrics: _RankMetrics,
+    palette: RankTheme,
+) -> None:
+    font_footer = load_font(FontRole.REGULAR, metrics.footer_size)
+    line_y = footer_top + 7 * metrics.scale
+    draw.line((metrics.pad, line_y, width - metrics.pad, line_y), fill=palette.separator, width=metrics.hairline)
+    text_top = line_y + 9 * metrics.scale
+    draw_text(draw, (metrics.pad, text_top), "STAY CLOSE · KEEP IN TOUCH", font_footer, palette.suffix)
+    count_text = f"展示 {len(view.rows)} / {view.total_ranked} 人" if view.truncated else f"共 {view.total_ranked} 人上榜"
+    draw_text(draw, (width - metrics.pad, text_top), count_text, font_footer, palette.subtitle, align="right")

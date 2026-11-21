@@ -101,9 +101,14 @@ class TestInstanceConfigIsReachableByTenants:
         assert _covered(_platform_only_paths(broken), "/settings/system")
 
     def test_the_quota_page_is_the_shape_being_copied(self, navigation_source: str) -> None:
-        """对照组的另一半：`/console/quota` 一直是这个形态（URL 不拦、不标 platformOnly）"""
-        assert not _covered(_platform_only_paths(navigation_source), "/console/quota")
-        assert _visibility_of(_menu_entry(navigation_source, "/console/quota")) != "platformOnly"
+        """对照组的另一半：额度与用量这一格一直是这个形态（URL 不拦、不标平台方专属）
+
+        菜单现在只有 `/console/channel-quota` 一格，`/console/quota` 与 `/console/usage`
+        是同一个页壳的另外两个标签路径，同样不能被平台方清单拦掉。
+        """
+        for path in ("/console/channel-quota", "/console/quota", "/console/usage"):
+            assert not _covered(_platform_only_paths(navigation_source), path)
+        assert _visibility_of(_menu_entry(navigation_source, "/console/channel-quota")) != "platformOnly"
 
     def test_the_visibility_parser_can_still_see_a_platform_only_entry(
         self,

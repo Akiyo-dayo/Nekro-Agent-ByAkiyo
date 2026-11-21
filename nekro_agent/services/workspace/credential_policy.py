@@ -5,8 +5,9 @@
 容器里能读到的东西里，下面几样是**平台方**的、而不是这个工作区自己的：
 
 1. **模型 Key**：`NEKRO_CC_CREDENTIAL_MODE=direct` 时把 CC 模型预设的真实 `auth_token`
-   写进工作区的 `settings.json` 与 CC 用户级设置（`.claude_home/settings.json`，容器里
-   `~/.claude/settings.json`；早先在 `.claude/settings.json`），cc-sandbox 每次拉起 `claude`
+   写进工作区的 `settings.json` 与 CC 用户级设置（CC home 里的 `settings.json`，容器里
+   `~/.claude/settings.json`；home 在哪见 `WorkspaceService.claude_home`；早先在
+   `.claude/settings.json`），cc-sandbox 每次拉起 `claude`
    进程时再把它读进进程环境。于是 CC 的 Bash 一句 `echo` 就能拿到，会话还能用
    `download_file_from_cc` 把文件取回 NA 侧。
 2. **工作区资源**：SSH 私钥、root 口令、数据库密码、访问令牌。它们由平台方建立、由平台方

@@ -226,7 +226,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> Any:
         return ""
 
     async def empty_plugins(*_args: Any, **_kwargs: Any) -> Any:
-        return SimpleNamespace(system_prompt="", runtime_prompt="")
+        return SimpleNamespace(system_prompt="", runtime_prompt="", depth_blocks=[])
 
     async def no_plugins(**_kwargs: Any) -> list[Any]:
         return []

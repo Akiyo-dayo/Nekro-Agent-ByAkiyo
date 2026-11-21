@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Literal, NamedTuple, Optional
 
 from qdrant_client import models as qdrant_models
-from tortoise.expressions import Q
+from tortoise.expressions import Q, Subquery
 from tortoise.queryset import QuerySet
 
 from nekro_agent.core.config import config
@@ -335,7 +335,12 @@ class MemoryScope(NamedTuple):
         """
         if self.is_legacy_shape:
             return Q(workspace_id=workspace_id, **self.as_filter())
-        return to_tortoise_q(self.condition(table, workspace_id=workspace_id), table)
+        cond = self.condition(table, workspace_id=workspace_id)
+        if cond is FALSE:
+            return Q(id__in=[])
+        query = to_tortoise_q(cond, table)
+        sensitive = self._sensitive_q(table)
+        return query if sensitive is None else query & sensitive
 
     def apply(self, queryset: QuerySet[Any], table: MemTable, *, workspace_id: int) -> QuerySet[Any]:
         """把可见范围应用到一条已经带好非范围条件的查询上。
@@ -352,7 +357,43 @@ class MemoryScope(NamedTuple):
         cond = self.condition(table, workspace_id=workspace_id)
         if cond is FALSE:
             return queryset.filter(id__in=[])
-        return queryset.filter(to_tortoise_q(cond, table))
+        queryset = queryset.filter(to_tortoise_q(cond, table))
+        sensitive = self._sensitive_q(table)
+        return queryset if sensitive is None else queryset.filter(sensitive)
+
+    def _sensitive_q(self, table: MemTable) -> Optional[Q]:
+        """带敏感标记的段落只在来源频道本身可见，跨频道开关怎么设都一样
+
+        关于具体某人的敏感事（收入、违规一类）照样记，但只在说出它的那个频道里召回。
+        「本地集」不够窄：绑了工作区的群，本地集里还有同工作区、同域的其他群，敏感段落
+        不能借此流到兄弟群，所以这里只认当前频道的 `chat_key`。
+
+        从敏感段落抽出的关系（`paragraph_id` 指向它）、聚合进去的 episode（叙事里拼了
+        段落正文）同样收窄：指向别的频道的敏感段落的，一律不给。
+
+        只在库侧过滤：向量载荷里没有这一维，加键要升载荷版本并回填存量点；而所有召回路径
+        （自动注入、`memory_tools` 的搜索 / 详情 / 溯源）回表时都经过 :meth:`apply`，
+        向量侧多命中的那几条在这一步被挡掉。旧形状（闸关）与管理端（`visibility is None`、
+        `AdminMemoryScope`）不经过这里：敏感标记只打在闸开的域行上，管理端照常看得到。
+        """
+        if self.visibility is None:
+            return None
+        here = self.visibility.chat_key
+        if table is MemTable.PARAGRAPH:
+            return Q(is_sensitive=False) | Q(origin_chat_key=here)
+        if table not in (MemTable.RELATION, MemTable.EPISODE):
+            return None
+
+        from nekro_agent.models.db_mem_paragraph import DBMemParagraph
+
+        # 来源频道为空的敏感段落也算「别处的」：判不出来源，就不放出去。
+        foreign = DBMemParagraph.filter(
+            Q(is_sensitive=True) & (Q(origin_chat_key__isnull=True) | ~Q(origin_chat_key=here)),
+        )
+        if table is MemTable.RELATION:
+            # `paragraph_id` 为空的关系照常可见；`NOT IN` 碰上 NULL 会把它们一并滤掉，单独放行。
+            return Q(paragraph_id__isnull=True) | ~Q(paragraph_id__in=Subquery(foreign.values("id")))
+        return ~Q(id__in=Subquery(foreign.filter(episode_id__isnull=False).values("episode_id")))
 
     def qdrant_must(self, *, workspace_id: int) -> Optional[list[Any]]:
         """向量侧的范围条件列表。

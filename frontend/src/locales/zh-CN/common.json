@@ -194,6 +194,13 @@
     "invalidJson": "无效的JSON",
     "addItem": "添加{{name}}",
     "selectPreset": "选择人设",
+    "selectRpPreset": "选择角色扮演预设",
+    "rpPresetNone": "不使用",
+    "rpPresetGlobalSuffix": "· 全局",
+    "rpPresetMissing": "当前选择的预设已不存在",
+    "rpPresetMissingValue": "已不存在的预设 #{{id}}",
+    "rpPresetsLoadFailed": "预设列表加载失败，请直接填写预设 ID",
+    "rpPresetsLoadFailedWithReason": "预设列表加载失败：{{reason}}。可直接填写预设 ID",
     "modelTypes": {
       "chat": "聊天",
       "embedding": "嵌入",
@@ -202,6 +209,7 @@
     "addNewItem": "添加新{{name}}",
     "newItemPlaceholder": "输入新键名，按回车添加",
     "headerEnableOverride": "启用覆盖",
+    "headerOverrideShort": "覆盖",
     "headerConfigItem": "配置项",
     "headerAttribute": "属性",
     "headerCategory": "分类",
@@ -212,6 +220,8 @@
     "resetConfig": "重置配置",
     "saveSuccess": "所有修改已保存并导出到配置文件",
     "reloadSuccess": "配置已重载",
+    "staleWrite": "这些配置项在你打开页面之后被别处改过，这次没有保存：{{keys}}。已刷新为最新值，请在最新值上重新修改；其他改动已保留，可以再次保存",
+    "staleWriteSeparator": "、",
     "restartSent": "系统重启请求已发送，请稍候...",
     "restartFailed": "重启系统失败，请检查网络连接",
     "currentModelGroupMissing": "当前选择的模型组已不存在",
@@ -230,7 +240,11 @@
     "overridable": "可覆盖",
     "platformOnly": "平台方专属",
     "tenantMayOnlyLower": "只能调低",
+    "globalOnly": "仅全局可改",
+    "inheritedFromGlobal": "继承全局",
+    "overridableHint": "可按实例/频道覆盖",
     "cannotDisable": "此配置项不支持单独禁用",
+    "noCap": "不另设上限（按百分比算，最多 65536）",
     "jumpToPresetManager": "跳转到人设管理页面",
     "restartWarning": "重启期间 WebUI 功能将无法正常使用，如果长时间未恢复请检查 NekroAgent 容器日志是否出现异常",
     "restartConfirm": "检测到您修改了需要重启才能生效的配置项，确定要重启系统吗？重启过程可能需要大概一分钟，请耐心等待。",
@@ -253,6 +267,15 @@
       "模型配置": "模型配置",
       "系统": "系统"
     }
+  },
+  "worldbookBudget": {
+    "preview": "按模型组 {{modelGroup}}（上下文 {{contextLength}}{{contextNote}}）：每轮世界书最多约 {{budget}} token，约 {{approx}} 字",
+    "contextUnset": "，未填，按 {{defaultContext}} 估",
+    "charsEstimator": "（分词器没加载，按字符估算）",
+    "fallback": "备用模型组 {{modelGroup}} 的上下文只有 {{contextLength}}，换到它重试时世界书可能放不下",
+    "inheritedPercent": "上一层：{{percent}}%",
+    "inheritedCap": "上一层：上限 {{cap}} token",
+    "inheritedUnlimited": "上一层不另设上限（按百分比算，最多 65536 token）"
   },
   "restartCapability": {
     "checking": "正在检测当前部署形态是否支持重启…",

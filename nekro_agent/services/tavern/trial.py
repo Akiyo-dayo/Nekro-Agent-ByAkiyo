@@ -39,6 +39,7 @@ from nekro_agent.services.agent.round_prompt import RoundPrompt
 from nekro_agent.services.agent.run_agent import detect_provider_refusal, is_code_missing
 from nekro_agent.services.agent.upstream_redaction import collect_llm_secret_values, redact_upstream_text
 from nekro_agent.services.usage.context import LLMUsageContext, usage_scope
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 logger = get_sub_logger("tavern.trial")
 
@@ -102,6 +103,8 @@ async def _call_model(
             proxy_url=group.CHAT_PROXY,
             max_wait_time=config.AI_GENERATE_TIMEOUT,
             first_token_timeout=config.AI_STREAM_FIRST_TOKEN_TIMEOUT,
+            api_format=group.API_FORMAT,
+            tenant_egress=is_tenant_owned_group(group),
         )
 
 

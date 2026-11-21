@@ -73,6 +73,8 @@ class AgentCtx(BaseModel):
         None  # 当前聊天频道的数据库聊天频道实例
     )
     _trigger_db_user: Optional["DBUser"] = None  # 触发本次 Agent 的 DBUser 实例
+    # 正式一轮由 `run_agent` 绑上的本轮令牌，见 `bind_round_token`。私有属性：不进 `model_dump` 与 `repr`
+    _round_token: Optional[str] = None
 
     @property
     def chat_key(self) -> str:
@@ -194,9 +196,29 @@ class AgentCtx(BaseModel):
 
         return message
 
+    def bind_round_token(self, one_time_code: str) -> None:
+        """把本轮令牌绑在这个上下文上；只由 `run_agent` 在正式一轮开始时调用
+
+        正式一轮的上下文由 `create_by_chat_key` / `create_by_db_chat_channel` 建出来，`container_key`
+        是 `None`，按容器键查不到令牌。`container_key` 不能为此设上：运维工具靠它判断「这是不是带
+        授权的沙盒回调」。所以单独绑一份，提示词渲染与沙盒方法清单才拿得到本轮令牌。
+
+        提示词预览、Webhook、命令都不绑定，它们的 `one_time_code` 是空串。空串什么都不做。
+        """
+        if one_time_code:
+            self._round_token = one_time_code
+
+    def unbind_round_token(self, one_time_code: str) -> None:
+        """正式一轮收尾时解绑；只有当前绑定的正是这个令牌才清掉，不会清掉别的轮次绑上的"""
+        if one_time_code and self._round_token == one_time_code:
+            self._round_token = None
+
     @property
     def one_time_code(self) -> str:
         """本轮 Agent 运行的一次性会话令牌
+
+        正式一轮里是 `run_agent` 绑上的那一份（`bind_round_token`）；沙盒回调新建的上下文
+        带着 `container_key`，按它在服务端查。其余入口（提示词预览、Webhook、命令）是空串。
 
         插件把**外部内容**（技能文档、网页抓取结果、第三方 API 返回值等）交回给模型时，
         应当用它包裹出可信边界，否则模型无法区分「资料」与「指令」：
@@ -216,6 +238,8 @@ class AgentCtx(BaseModel):
         """
         from nekro_agent.services.agent.session_token import get_session_token
 
+        if self._round_token:
+            return self._round_token
         return get_session_token(self.container_key or "") or ""
 
     async def get_core_config(self) -> CoreConfig:

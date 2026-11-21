@@ -214,13 +214,31 @@ class OsEnv:
     Fake-IP，真实流量由代理按原域名转发，这个地址并不指向部署方网络里的任何一台主机。
     详细取舍见 `nekro_agent/tools/common_util.py` 中 `DEFAULT_EXTRA_ALLOWED_NETWORKS` 的注释。
 
+    对聊天里的下载链接与租户自填的出站地址（模型组、webhook、MCP、自填邮箱）一并生效。开着代理时连过去由代理
+    按域名再解析，内网安全靠代理自己的规则。
+
     置空即可恢复"只认 is_global"的严格行为；也可以填自己的内网单机地址（如 `10.0.0.5/32`），
-    这比直接开 ALLOW_PRIVATE_NETWORK_DOWNLOAD 放开整个内网要安全得多。
+    这比直接开 ALLOW_PRIVATE_NETWORK_DOWNLOAD 放开整个内网要安全得多（同样对租户自填地址放行）。
     """
     DOWNLOAD_EXTRA_ALLOWED_NETWORKS: str = OsEnvTypes.Str(
         "DOWNLOAD_EXTRA_ALLOWED_NETWORKS",
         default="198.18.0.0/15",
     )
+
+    """经部署方环境代理（`HTTP(S)_PROXY` / `ALL_PROXY`）的出站，让代理按主机名解析
+
+    默认关：租户能填的出站地址与聊天里的下载链接经环境代理时，NA 先自己解析、校验，再让代理
+    `CONNECT <校验过的地址>:<端口>`，代理连哪里由 NA 定（见 `nekro_agent/tools/tenant_egress.py`）。
+
+    什么部署要开：本机 DNS 与代理看到的不一致——本机 DNS 被污染或分区解析，靠环境代理出网
+    （例如国内部署经海外代理访问 googleapis / twimg 一类）。这时 NA 解析出的地址是错的（但多半是公网地址，
+    校验照样通过），让代理去连它会 TLS 握手失败。
+
+    开了丢掉什么：经环境代理的这两类出站改发 `CONNECT <主机名>:<端口>`，不再钉地址；NA 仍按自己的解析
+    校验一次，但代理那边解析到哪里、能不能连进内网，靠代理自己。租户自己填的代理、直连都不受影响。
+    刻意放环境变量、不进 WebUI 配置（与 `ALLOW_PRIVATE_NETWORK_DOWNLOAD` 同理）。
+    """
+    EGRESS_ENV_PROXY_RESOLVES_HOSTNAME: bool = OsEnvTypes.Bool("EGRESS_ENV_PROXY_RESOLVES_HOSTNAME")
 
 
 # =============================================================================

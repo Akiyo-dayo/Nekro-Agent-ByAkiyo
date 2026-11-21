@@ -94,6 +94,8 @@ _GATE_OFF_NEW_COLUMNS = {
         "quarantined_at",
         "quarantine_reason",
         "blocked_round_hits",
+        # 敏感标记只在闸开的域行上写，闸关恒为 false；取值由 `tests/test_memory_sensitive.py` 覆盖。
+        "is_sensitive",
     },
     "mem_entity": {"adapter_key", "origin_chat_key"},
     "mem_relation": {"adapter_key", "origin_chat_key"},

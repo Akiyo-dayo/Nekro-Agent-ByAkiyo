@@ -293,6 +293,12 @@ export interface ModelGroupUpsertRequest {
   enable_cot?: boolean
   /** 预填方式；不提交表示保持不变，新建时后端按 off 落库 */
   prefill_mode?: 'off' | 'assistant' | 'deepseek'
+  /** 聊天接口格式；不提交表示保持不变，新建时后端按 openai 落库 */
+  api_format?: 'openai' | 'gemini'
+  /** 模型上下文窗口（token）；0 = 未填 */
+  context_length?: number
+  /** 分词系数（相对 o200k_base）；0 = 按模型名自动取 */
+  token_count_factor?: number
   temperature?: number | null
   top_p?: number | null
   top_k?: number | null

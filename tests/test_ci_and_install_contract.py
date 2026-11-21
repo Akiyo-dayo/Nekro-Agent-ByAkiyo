@@ -179,25 +179,55 @@ class TestTestStepDoesNotHangOnAProcessThatWillNotExit:
         env = _step("Run Backend Tests")["env"]
         assert env["NA_PYTEST_SESSION_STATUS_FILE"] == "pytest-session-status.txt"
 
-    def test_conftest_writes_pytest_own_exit_status(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    @staticmethod
+    def _load_conftest(monkeypatch: pytest.MonkeyPatch, data_dir_check: object) -> object:
         import importlib.util
 
         spec = importlib.util.spec_from_file_location("na_tests_conftest_probe", Path(__file__).parent / "conftest.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        # 会话结束时还会检查仓库 data/ 有没有被写过，那一步另有用例（test_session_data_dir.py）；这里只看落盘的状态
+        monkeypatch.setattr(module, "report_writes_to_the_repo_data_dir", data_dir_check)
+        return module
+
+    def test_conftest_writes_pytest_own_exit_status(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from types import SimpleNamespace
+
+        module = self._load_conftest(monkeypatch, lambda _session: [])
         target = tmp_path / "status.txt"
 
+        def finish(status: pytest.ExitCode) -> None:
+            module.pytest_sessionfinish(SimpleNamespace(exitstatus=status), status)
+
         monkeypatch.setenv(module.SESSION_STATUS_FILE_ENV, str(target))
-        module.pytest_sessionfinish(None, pytest.ExitCode.INTERRUPTED)
+        finish(pytest.ExitCode.INTERRUPTED)
         assert target.read_text(encoding="utf-8") == "2"
-        module.pytest_sessionfinish(None, pytest.ExitCode.OK)
+        finish(pytest.ExitCode.OK)
         assert target.read_text(encoding="utf-8") == "0"
 
         monkeypatch.delenv(module.SESSION_STATUS_FILE_ENV)
         target.unlink()
-        module.pytest_sessionfinish(None, pytest.ExitCode.OK)
+        finish(pytest.ExitCode.OK)
         assert not target.exists(), "没设环境变量时不该写任何文件"
+
+    def test_a_failure_from_the_data_dir_check_reaches_the_status_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """用例全过、但仓库 data/ 被写过：会话改判失败，CI 读到的落盘状态也得是失败"""
+        from types import SimpleNamespace
+
+        def failing_check(session: SimpleNamespace) -> List[str]:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            return ["新增 data/stray.json"]
+
+        module = self._load_conftest(monkeypatch, failing_check)
+        target = tmp_path / "status.txt"
+        monkeypatch.setenv(module.SESSION_STATUS_FILE_ENV, str(target))
+        module.pytest_sessionfinish(SimpleNamespace(exitstatus=pytest.ExitCode.OK), pytest.ExitCode.OK)
+        assert target.read_text(encoding="utf-8") == "1"
 
     def test_the_skip_guard_step_is_still_there(self) -> None:
         assert _step("Assert PostgreSQL tests were not skipped") is not None

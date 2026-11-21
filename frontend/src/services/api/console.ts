@@ -451,6 +451,44 @@ export interface InstanceHealthSnapshot {
   alert_delay_seconds: number
 }
 
+/**
+ * 一个模型组的嵌入（向量化）健康状态
+ *
+ * 只有类别、HTTP 状态码与异常类名，没有错误原文；时间是 ISO 8601，没发生过为 null。
+ * 状态只在后端进程内存里，重启后从头记。
+ */
+export interface EmbeddingHealthItem {
+  model_group: string
+  /** platform / tenant / unknown（库里查不到了，只有平台方看得到） */
+  owner: string
+  /** 当前配置里用它的地方：memory / kb */
+  uses: string[]
+  /** ok / unstable（在失败、还没到长期失败）/ failing（长期失败） */
+  state: 'ok' | 'unstable' | 'failing'
+  consecutive_failures: number
+  /** auth / quota / rejected / server / network；没在失败时为空串 */
+  error_kind: string
+  status_code: number | null
+  error_type: string
+  streak_started_at: string | null
+  failing_since: string | null
+  last_failure_at: string | null
+  last_success_at: string | null
+  /** 跟输入有关的拒绝（400 / 413 / 422）本次启动以来的次数；不计入失败串，不触发长期失败 */
+  input_rejections: number
+  last_input_rejection_at: string | null
+  last_input_status: number | null
+}
+
+export interface EmbeddingHealthResponse {
+  items: EmbeddingHealthItem[]
+  /**
+   * 有效、正文不是空白、却没有向量的记忆段数（全平台，后端最多缓存一分钟）；
+   * 只给平台方，租户恒为 null；没配记忆嵌入模型组时也为 null（记忆页就不显示蓝条）
+   */
+  missing_vectors: number | null
+}
+
 /** 各实例健康状态 */
 export interface InstanceHealthListResponse {
   items: InstanceHealthSnapshot[]
@@ -638,6 +676,12 @@ export const consoleApi = {
   /** 各实例健康状态与掉线时长 */
   async getInstanceHealth(): Promise<InstanceHealthListResponse> {
     const response = await axios.get<InstanceHealthListResponse>(`${CONSOLE_BASE}/health/instances`)
+    return response.data
+  },
+
+  /** 嵌入（向量化）调用的健康状态；租户只看归自己的模型组 */
+  async getEmbeddingHealth(): Promise<EmbeddingHealthResponse> {
+    const response = await axios.get<EmbeddingHealthResponse>(`${CONSOLE_BASE}/health/embedding`)
     return response.data
   },
 

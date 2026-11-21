@@ -4,6 +4,10 @@
 都会在运行时过一遍这里；未知宏原样保留，变量宏与条件宏不会被执行（卡里的状态系
 统因此不会工作，导入报告会提醒）。
 
+`{{group}}` 在 NA 里没有多角色群聊，取当前角色名（与酒馆单角色时一致）；
+`{{mesExamplesRaw}}` 取卡片示例对话原文；`{{trim}}` 只去掉它两侧紧挨着的换行，
+不碰空格——它在所有宏展开完之后统一处理。
+
 由内向外最多展开八遍：先替换内层，外层的 `{{…}}` 下一遍才成为完整宏。每一遍结束
 都检查长度，超过原文的两倍再加四千字就停在上一遍——卡片可以构造出“展开后仍然
 含宏”的文字，没有这道闸，八遍足以把一条消息撑到发不出去。
@@ -24,6 +28,10 @@ from nekro_agent.services.output_filter.normalize import is_invisible_char
 _MACRO = re.compile(r"\{\{((?:(?!\{\{|\}\}).)*)\}\}", re.DOTALL)
 # 旧式占位，酒馆的老卡与部分提示词里还在用。
 _LEGACY = re.compile(r"<(user|bot|char)>", re.IGNORECASE)
+# 酒馆的 `{{trim}}`：去掉宏两侧紧挨着的换行（含 CRLF），空格不动。宏本身在多遍展开里
+# 原样留着，等所有宏展开完之后再整体处理，见 `_apply_trim`。正则只认宏本身：把两侧的
+# 换行也写进正则（酒馆的写法）会在一长串换行上退化成平方级，卡片可以拿它卡住线程。
+_TRIM = re.compile(r"\{\{\s*trim\s*\}\}", re.IGNORECASE)
 # 掷骰：`NdM` 或只写面数 `M`。
 _ROLL_DICE = re.compile(r"^(\d+)[dD](\d+)$")
 _ROLL_PLAIN = re.compile(r"^(\d+)$")
@@ -33,14 +41,36 @@ _WEEKDAYS_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturda
 _MAX_PASSES = 8
 _MAX_USER_NAME_CHARS = 24
 
+# 本模块认得的宏名（小写）。导入报告拿它与预设正文里抽出来的名字比对，判断哪些宏
+# 会在 NA 里原样留着；新增宏时这里必须一起加，否则报告会说「不认得」而实际已经展开。
+SUPPORTED_MACROS = frozenset(
+    {
+        "char",
+        "group",
+        "user",
+        "mesexamplesraw",
+        "time",
+        "date",
+        "weekday",
+        "random",
+        "pick",
+        "roll",
+        "newline",
+        "trim",
+        "original",
+        "comment",
+    },
+)
+
 
 @dataclass
 class MacroContext:
     """一次宏展开需要的上下文
 
     `char_name` 由调用方决定用昵称还是人设名；`user_name` 应已经过
-    :func:`sanitize_user_name`，这里不再清洗。`rng` 只给 `random` 与 `roll`
-    用，`pick` 按种子自己构造随机数，保证同一位置稳定。
+    :func:`sanitize_user_name`，这里不再清洗。`examples_raw` 是卡片示例对话的原文，
+    `{{mesExamplesRaw}}` 直接取它，其中的 `{{char}}` / `{{user}}` 留给下一遍展开。
+    `rng` 只给 `random` 与 `roll` 用，`pick` 按种子自己构造随机数，保证同一位置稳定。
     """
 
     char_name: str
@@ -51,6 +81,7 @@ class MacroContext:
     preset_id: int = 0
     text_kind: str = ""
     original: str = ""
+    examples_raw: str = ""
     rng: random.Random | None = None
 
 
@@ -164,8 +195,13 @@ def _expand_one(content: str, ctx: MacroContext, pick_index: list[int]) -> objec
         return "" if content.lstrip().startswith("//") else _UNCHANGED
     if name == "char":
         return ctx.char_name
+    if name == "group":
+        # NA 没有多角色群聊，与酒馆单角色时一样取当前角色名。
+        return ctx.char_name
     if name == "user":
         return ctx.user_name
+    if name == "mesexamplesraw":
+        return ctx.examples_raw
     if name == "time":
         return ctx.now.strftime("%H:%M")
     if name == "date":
@@ -185,6 +221,9 @@ def _expand_one(content: str, ctx: MacroContext, pick_index: list[int]) -> objec
         return rolled if rolled is not None else _UNCHANGED
     if name == "newline":
         return "\n"
+    if name == "trim":
+        # 不在单遍里处理：要等所有宏展开完，再连同两侧换行一起删。
+        return _UNCHANGED
     if name == "original":
         return ctx.original
     if name == "comment":
@@ -219,6 +258,45 @@ def _expand_pass(text: str, ctx: MacroContext, pick_index: list[int]) -> tuple[s
     return _MACRO.sub(replace, text), replaced
 
 
+def _strip_trailing_newlines(text: str) -> str:
+    """去掉结尾连着的 `\\n` / `\\r\\n`；单独的 `\\r` 不算换行"""
+    end = len(text)
+    while end > 0 and text[end - 1] == "\n":
+        end -= 1
+        if end > 0 and text[end - 1] == "\r":
+            end -= 1
+    return text[:end]
+
+
+def _strip_leading_newlines(text: str) -> str:
+    """去掉开头连着的 `\\n` / `\\r\\n`；单独的 `\\r` 不算换行"""
+    start = 0
+    while True:
+        if text.startswith("\r\n", start):
+            start += 2
+        elif text.startswith("\n", start):
+            start += 1
+        else:
+            return text[start:]
+
+
+def _apply_trim(text: str) -> tuple[str, int]:
+    """删掉每个 `{{trim}}` 连同它两侧紧挨着的换行，返回新文字与删掉的个数
+
+    效果与酒馆把 `(?:\\r?\\n)*{{trim}}(?:\\r?\\n)*` 全局替换成空串一致（相邻两个 `{{trim}}`
+    之间只有换行时，中间的换行一起没了），但只扫一遍，线性。
+    """
+    pieces = _TRIM.split(text)
+    count = len(pieces) - 1
+    if count == 0:
+        return text, 0
+    # pieces[i] 与 pieces[i + 1] 之间原本是一个 `{{trim}}`。
+    for index in range(count):
+        pieces[index] = _strip_trailing_newlines(pieces[index])
+        pieces[index + 1] = _strip_leading_newlines(pieces[index + 1])
+    return "".join(pieces), count
+
+
 def expand_macros(text: str, ctx: MacroContext) -> MacroResult:
     """展开文字里的宏；最多八遍，超长时停在上一遍"""
     current, expanded = _replace_legacy(text, ctx)
@@ -238,5 +316,10 @@ def expand_macros(text: str, ctx: MacroContext) -> MacroResult:
             break
         if replaced == 0:
             break
+
+    # 所有宏展开完之后再处理 `{{trim}}`：去掉它两侧紧挨着的换行，空格不动。
+    # 被长度闸停在上一遍时也照样做，这一步只会让文字变短。
+    current, trimmed = _apply_trim(current)
+    expanded += trimmed
 
     return MacroResult(text=current, expanded=expanded, guarded=guarded)

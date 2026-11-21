@@ -42,6 +42,11 @@ from .db_plugin_data import DBPluginData  # noqa: F401
 from .db_preset import DBPreset  # noqa: F401
 from .db_preset_card import DBPresetCard  # noqa: F401
 from .db_recurring_timer_job import DBRecurringTimerJob  # noqa: F401
+from .db_rp_preset import DBRpPreset  # noqa: F401
+from .db_state_channel import DBStateChannel  # noqa: F401
+from .db_state_person import DBStatePerson  # noqa: F401
+from .db_state_snapshot import DBStateSnapshot  # noqa: F401
+from .db_state_template import DBStateTemplate  # noqa: F401
 from .db_tenant import DBTenant  # noqa: F401
 from .db_user import DBUser  # noqa: F401
 from .db_wb_book import DBWbBook  # noqa: F401
@@ -52,3 +57,4 @@ from .db_workspace_resource import DBWorkspaceResource  # noqa: F401
 from .db_workspace_resource_binding import DBWorkspaceResourceBinding  # noqa: F401
 from .db_ws_ssh_audit import DBWsSshAudit  # noqa: F401
 from .db_ws_ssh_credential import DBWsSshCredential  # noqa: F401
+from .db_ws_ssh_runbook_entry import DBWsSshRunbookEntry  # noqa: F401

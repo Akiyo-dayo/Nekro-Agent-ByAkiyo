@@ -16,6 +16,7 @@ from .ops import (
     InstanceIdCommand,
     LogErrListCommand,
     MemoryBackfillPayloadCommand,
+    MemoryBackfillVectorsCommand,
     MemoryPruneCommand,
     MemoryRebuildChannelCommand,
     MemoryRebuildCommand,
@@ -73,6 +74,7 @@ def register_built_in_commands() -> None:
         MemoryRebuildChannelCommand(),
         MemoryReindexCommand(),
         MemoryBackfillPayloadCommand(),
+        MemoryBackfillVectorsCommand(),
         # 运维 Bot（默认关闭；鉴权见 services/ops_bot/policy.py，不走通用命令权限层）
         OpsBotCommand(),
         # 配额类

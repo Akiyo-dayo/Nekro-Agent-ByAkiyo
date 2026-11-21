@@ -10,7 +10,6 @@ NA 去访问内网服务，或者一次拉下一个超大文件。现在走 `com
 用例打开 `ALLOW_PRIVATE_NETWORK_DOWNLOAD`，所以全文件没有公网地址。
 """
 
-import asyncio
 import socket
 from typing import Any, Dict, List
 
@@ -59,6 +58,8 @@ def web(monkeypatch: pytest.MonkeyPatch) -> FakeWeb:
     real_client = httpx.AsyncClient
 
     def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        # 建连接那一层（固定地址、核对对端）换成假的；它本身由 test_tenant_egress 的下载用例钉，这里测首跳预检与正文守卫
+        kwargs.pop("transport", None)
         return real_client(*args, transport=httpx.MockTransport(fake.handle), **kwargs)
 
     monkeypatch.setattr(common_util.httpx, "AsyncClient", client_factory)
@@ -66,16 +67,15 @@ def web(monkeypatch: pytest.MonkeyPatch) -> FakeWeb:
 
 
 def _fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> None:
-    loop = asyncio.get_running_loop()
-    real = loop.getaddrinfo
+    real = common_util._system_getaddrinfo  # noqa: SLF001
 
     async def fake(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
         name = host.decode("ascii") if isinstance(host, bytes) else host
         if name in zone:
             return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (zone[name], port))]
-        return await real(host, port, *args, **kwargs)
+        return await real(host, port)
 
-    monkeypatch.setattr(loop, "getaddrinfo", fake)
+    monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake)
 
 
 async def _read(url: str) -> bytes:

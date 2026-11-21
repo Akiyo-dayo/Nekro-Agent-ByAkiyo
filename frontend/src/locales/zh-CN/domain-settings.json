@@ -1,0 +1,76 @@
+{
+  "button": "设置",
+  "close": "关闭",
+  "title": {
+    "memory": "记忆设置",
+    "affection": "好感度设置",
+    "worldbook": "世界书设置",
+    "state": "角色状态设置",
+    "promptLab": "提示词设置",
+    "presets": "人设设置"
+  },
+  "page": {
+    "memory": "记忆",
+    "affection": "好感度",
+    "worldbook": "世界书",
+    "state": "角色状态",
+    "promptLab": "提示词预览",
+    "presets": "人设"
+  },
+  "layer": {
+    "label": "编辑层",
+    "global": "全局",
+    "instance": "实例：{{name}}",
+    "instanceOnly": "实例",
+    "instanceMissing": "实例：未选择"
+  },
+  "common": "常用",
+  "advancedSection": "高级（{{count}} 项）",
+  "searchPlaceholder": "搜索设置",
+  "empty": "暂无设置项",
+  "loading": "加载中…",
+  "unsaved": "{{count}} 项未保存",
+  "discard": "放弃",
+  "save": "保存",
+  "restartHint": "有需要重启的项已改动，保存后将在下次重启生效",
+  "unsavedHint": "这些改动还没保存",
+  "unsavedLeaveConfirm": "抽屉里还有未保存的设置，确定离开吗？",
+  "statePlugin": {
+    "hint": "角色状态插件的其余设置",
+    "action": "去插件管理"
+  },
+  "system": {
+    "moved": "这些设置已移到「{{page}}」页",
+    "go": "前往"
+  },
+  "advancedGroups": {
+    "other": "其他",
+    "memory": {
+      "retention": "保留与清理",
+      "injection": "注入与召回",
+      "retrieval": "检索排序",
+      "consolidation": "沉淀",
+      "episode": "事件聚合",
+      "scheduler": "调度与恢复"
+    },
+    "affection": {
+      "prompt": "提示词与节奏",
+      "budget": "数值与收益",
+      "milestone": "里程碑"
+    },
+    "worldbook": {
+      "lookup": "查询",
+      "maintenance": "维护"
+    },
+    "state": {
+      "block": "状态块",
+      "image": "状态图"
+    },
+    "promptLab": {
+      "slots": "槽位内容"
+    },
+    "presets": {
+      "runtime": "运行时"
+    }
+  }
+}

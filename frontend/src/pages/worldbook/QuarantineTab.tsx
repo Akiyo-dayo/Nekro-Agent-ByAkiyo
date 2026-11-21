@@ -12,9 +12,8 @@ import QueryErrorState from '../../components/common/QueryErrorState'
 import ServerDataTable, {
   type ServerDataTableColumn,
 } from '../../components/common/ServerDataTable'
-import { ThemedTooltip } from '../../components/common/ThemedTooltip'
+import { SimpleTooltip, ThemedTooltip } from '../../components/common/ThemedTooltip'
 import { WorldbookQuarantineReasonChip } from '../../components/worldbook/chips'
-import { formatDateTime } from '../../components/memory/format'
 import { memoryErrorMessage } from '../../components/memory/errorMessage'
 import {
   DEFAULT_WORLDBOOK_PAGE_SIZE,
@@ -29,6 +28,7 @@ import {
   type WorldbookQuarantineItem,
   type WorldbookScopeParams,
 } from '../../services/api/worldbook'
+import { formatFullTime, formatListTime } from '../../utils/listTime'
 
 /**
  * 「隔离区」标签
@@ -169,9 +169,13 @@ export default function QuarantineTab({ scope, isScopeReady }: QuarantineTabProp
       width: 180,
       hideOnMobile: true,
       render: row => (
-        <Typography variant="caption" color="text.secondary">
-          {formatDateTime(row.quarantined_at)}
-        </Typography>
+        <SimpleTooltip title={formatFullTime(row.quarantined_at)}>
+          <span>
+            <Typography variant="caption" color="text.secondary">
+              {formatListTime(row.quarantined_at)}
+            </Typography>
+          </span>
+        </SimpleTooltip>
       ),
     },
     {

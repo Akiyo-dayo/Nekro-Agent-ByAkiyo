@@ -21,15 +21,18 @@ import QueryErrorState from '../common/QueryErrorState'
 import ServerDataTable, {
   type ServerDataTableColumn,
 } from '../common/ServerDataTable'
+import { SimpleTooltip } from '../common/ThemedTooltip'
 import DeleteConfirmDialog from './DeleteConfirmDialog'
 import MemoryItemDialog from './MemoryItemDialog'
 import MemoryNotFoundState from './MemoryNotFoundState'
 import PromptRoundWorldbookItems from './PromptRoundWorldbookItems'
 import PromptRoundTavernItems from './PromptRoundTavernItems'
+import PromptRoundStateItems from './PromptRoundStateItems'
 import { summarizeTavernItems } from './tavernItems'
+import { summarizeStateItems } from './stateItems'
 import { MemoryStatusChip } from './MemoryStatusChips'
 import { memoryErrorMessage } from './errorMessage'
-import { formatDateTime } from './format'
+import { formatDateTime, formatShortDateTime } from './format'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 import { useNotification } from '../../hooks/useNotification'
 import { isNotFoundError } from '../../services/api/axios'
@@ -42,6 +45,7 @@ import {
   type PromptRoundDetail,
   type PromptRoundListItem,
   type PromptRoundMemoryItem,
+  type PromptRoundSummaryRef,
 } from '../../services/api/memory'
 import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 
@@ -121,6 +125,67 @@ const SUMMARY_STATE_KEYS: Record<string, string> = {
   outdated: 'promptRounds.detail.summaryOutdated',
   deleted: 'promptRounds.detail.summaryDeleted',
   none: 'promptRounds.detail.summaryNone',
+}
+
+/**
+ * 这一轮注入的那一版摘要
+ *
+ * 以生成时间称呼（「11-11 23:10 生成」），说明它现在还是不是最新一版；那一版还保留着时能
+ * 点开看正文——这就是这一轮 Bot 看到的摘要（截断前）。只留最近几版，更早的只剩版号。
+ */
+function PromptRoundSummary({ summary }: { summary: PromptRoundSummaryRef }) {
+  const { t } = useTranslation('memory')
+  const [open, setOpen] = useState(false)
+  const state = typeof summary.state === 'string' ? summary.state : 'none'
+  const stateText = t(SUMMARY_STATE_KEYS[state] ?? SUMMARY_STATE_KEYS.none)
+  const content = typeof summary.content === 'string' ? summary.content : ''
+
+  if (state === 'none') {
+    return (
+      <Typography variant="body2" color="text.secondary">
+        {stateText}
+      </Typography>
+    )
+  }
+
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+      <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap' }}>
+        <Typography variant="body2" fontWeight={600}>
+          {summary.create_time
+            ? t('promptRounds.detail.summaryGeneratedAt', {
+                time: formatShortDateTime(summary.create_time),
+              })
+            : t('promptRounds.detail.summaryVersionOnly', { version: summary.version ?? '—' })}
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          {stateText}
+        </Typography>
+        {content && (
+          <ActionButton tone="ghost" size="small" onClick={() => setOpen(value => !value)}>
+            {open ? t('promptRounds.detail.hideSummary') : t('promptRounds.detail.showSummary')}
+          </ActionButton>
+        )}
+      </Stack>
+      {open && content && (
+        <Typography
+          variant="body2"
+          sx={{
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            border: 1,
+            borderColor: 'divider',
+            borderRadius: 1,
+            p: 1.25,
+            maxHeight: 320,
+            overflowY: 'auto',
+          }}
+        >
+          {content}
+        </Typography>
+      )}
+    </Box>
+  )
 }
 
 function PromptRoundItems({
@@ -231,13 +296,25 @@ function PromptRoundItems({
           cooldownSkipped: detail.cooldown_skipped,
           blockChars: detail.memory_block_chars,
         })}
-        {' · '}
-        {t(
-          SUMMARY_STATE_KEYS[
-            typeof detail.summary.state === 'string' ? detail.summary.state : 'none'
-          ] ?? SUMMARY_STATE_KEYS.none
-        )}
       </Typography>
+
+      <PromptRoundSummary summary={detail.summary} />
+
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+        <Typography variant="subtitle2" fontWeight={700}>
+          {t('promptRounds.detail.itemsTitle')}
+        </Typography>
+        {detail.memory_judge && (
+          <Typography variant="caption" color="text.secondary">
+            {detail.memory_judge.mode === 'model'
+              ? t('promptRounds.detail.memoryJudgeModel', {
+                  pool: detail.memory_judge.pool,
+                  kept: detail.memory_judge.kept,
+                })
+              : t('promptRounds.detail.memoryJudgeFallback')}
+          </Typography>
+        )}
+      </Box>
 
       <Box sx={{ overflowX: 'auto', width: '100%' }}>
         <Table size="small">
@@ -253,6 +330,13 @@ function PromptRoundItems({
                 {t('promptRounds.detail.status')}
               </TableCell>
               <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                <SimpleTooltip title={t('promptRounds.detail.similarityHint')}>
+                  <Typography variant="body2" component="span" sx={{ fontWeight: 700 }}>
+                    {t('promptRounds.detail.similarity')}
+                  </Typography>
+                </SimpleTooltip>
+              </TableCell>
+              <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
                 {t('promptRounds.detail.chars')}
               </TableCell>
               <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
@@ -266,7 +350,7 @@ function PromptRoundItems({
           <TableBody>
             {detail.memory_items.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6}>
+                <TableCell colSpan={7}>
                   <Typography variant="body2" color="text.secondary">
                     {t('promptRounds.detail.noItems')}
                   </Typography>
@@ -308,6 +392,11 @@ function PromptRoundItems({
                       <PromptRoundStatusChip status={item.status} />
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                      <Typography variant="body2">
+                        {typeof item.score === 'number' ? item.score.toFixed(2) : '—'}
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                       <Typography variant="body2">{item.chars}</Typography>
                     </TableCell>
                     <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
@@ -327,6 +416,8 @@ function PromptRoundItems({
       <PromptRoundWorldbookItems detail={detail} />
 
       <PromptRoundTavernItems items={detail.tavern_items} />
+
+      <PromptRoundStateItems items={detail.state_items} />
 
       {/* 好感块这一轮注入的关系里程碑
           它们本身就是记忆段落，点开用的是与上面记忆条目同一个详情对话框：
@@ -430,6 +521,7 @@ export default function PromptRoundsPanel({
 }: PromptRoundsPanelProps) {
   const { t } = useTranslation('memory')
   const { t: tTavern } = useTranslation('tavern')
+  const { t: tState } = useTranslation('state')
   const queryClient = useQueryClient()
   const { isScopeReady } = useInstanceScope()
   const [internalPage, setInternalPage] = useState(1)
@@ -499,13 +591,26 @@ export default function PromptRoundsPanel({
     {
       key: 'summary',
       header: t('promptRounds.columns.summary'),
+      // 用那一版的生成时间称呼它；那一版已不保留（只留最近几版）时才退回版号
       render: row =>
         row.summary_state === 'injected' ? (
-          <Typography variant="body2">
-            {t('promptRounds.summaryState.injected', {
-              version: row.summary_version ?? '—',
-              chars: row.summary_chars,
-            })}
+          <Typography
+            variant="body2"
+            title={
+              row.summary_version !== null
+                ? t('summaries.dialog.version', { version: row.summary_version })
+                : undefined
+            }
+          >
+            {row.summary_created_at
+              ? t('promptRounds.summaryState.injectedAt', {
+                  time: formatShortDateTime(row.summary_created_at),
+                  chars: row.summary_chars,
+                })
+              : t('promptRounds.summaryState.injectedGone', {
+                  version: row.summary_version ?? '—',
+                  chars: row.summary_chars,
+                })}
           </Typography>
         ) : (
           <Typography variant="body2" color="text.secondary">
@@ -538,10 +643,15 @@ export default function PromptRoundsPanel({
       render: row =>
         row.worldbook_state === 'injected' ? (
           <Typography variant="body2">
-            {t('promptRounds.worldbookState.injected', {
-              count: row.worldbook_count,
-              chars: row.worldbook_chars,
-            })}
+            {typeof row.worldbook_tokens === 'number'
+              ? t('promptRounds.worldbookState.injectedTokens', {
+                  count: row.worldbook_count,
+                  tokens: row.worldbook_tokens,
+                })
+              : t('promptRounds.worldbookState.injected', {
+                  count: row.worldbook_count,
+                  chars: row.worldbook_chars,
+                })}
           </Typography>
         ) : (
           <Typography variant="body2" color="text.secondary">
@@ -566,6 +676,38 @@ export default function PromptRoundsPanel({
             color={summary === tTavern('rounds.summary.none') ? 'text.secondary' : 'text.primary'}
             sx={{
               maxWidth: 280,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {summary}
+          </Typography>
+        )
+      },
+    },
+    {
+      key: 'state',
+      header: tState('promptRound.title'),
+      hideOnMobile: true,
+      render: row => {
+        const summary = summarizeStateItems(row.state_items, tState)
+        // 空对象表示这一轮没有记录，与「记了但没注入」是两件事
+        if (summary === null) {
+          return (
+            <Typography variant="body2" color="text.secondary">
+              —
+            </Typography>
+          )
+        }
+        return (
+          // 纯文本：组名来自模板，不渲染任何 HTML
+          <Typography
+            variant="body2"
+            title={summary}
+            color={summary === tState('summary.injected') ? 'text.secondary' : 'text.primary'}
+            sx={{
+              maxWidth: 220,
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',

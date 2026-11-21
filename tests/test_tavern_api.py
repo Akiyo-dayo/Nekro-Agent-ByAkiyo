@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import pytest
@@ -192,6 +193,103 @@ class TestInspect:
             await DBWbEntry.all().count(),
         )
         assert after == before
+
+    async def test_inspect_explains_name_variables_and_user_density(self, world: dict[str, Any]) -> None:
+        card = _v2_card()
+        card["data"]["description"] = "{{user}}" * 20
+        card["data"]["character_book"] = {
+            "name": "测试书",
+            "entries": [
+                {
+                    "id": 1,
+                    "keys": ["甲"],
+                    "comment": "名字",
+                    "content": "你好，<%= getLocalVar('数据库用户名') %>",
+                },
+            ],
+        }
+
+        report = await tavern.inspect_card_endpoint(
+            file=_upload(card),
+            instance_key="t1a",
+            adapter_key=ADAPTER,
+            _current_user=world["tenant"],
+        )
+
+        assert report.verdict.level == "full"
+        assert report.book.notes["name_var"] == 1
+        name_note = next(note for note in report.notes if note.kind == "name_var")
+        assert "「数据库用户名」→ {{user}}" in name_note.detail
+        density_note = next(note for note in report.notes if note.kind == "user_density")
+        assert "出现了 20 次" in density_note.detail
+        assert all(note.kind != "placeholder_greeting" for note in report.notes)
+
+    async def test_inspect_verdict_state_when_the_book_is_used_only_with_state(
+        self, world: dict[str, Any]
+    ) -> None:
+        card = _v2_card()
+        card["data"]["character_book"] = {
+            "name": "测试书",
+            "entries": [{"id": 1, "keys": ["甲"], "comment": "[mvu_update]规则", "content": "x"}],
+        }
+
+        report = await tavern.inspect_card_endpoint(
+            file=_upload(card),
+            instance_key="t1a",
+            adapter_key=ADAPTER,
+            _current_user=world["tenant"],
+        )
+
+        assert report.verdict.level == "state"
+        assert "角色状态" in report.verdict.text
+
+    async def test_inspect_verdict_partial_for_html_rules(self, world: dict[str, Any]) -> None:
+        card = _v2_card()
+        card["data"]["extensions"] = {
+            "regex_scripts": [
+                {
+                    "scriptName": "状态栏",
+                    "findRegex": "/甲/g",
+                    "replaceString": "<div>甲</div>",
+                    "placement": [2],
+                    "disabled": False,
+                },
+            ],
+        }
+
+        report = await tavern.inspect_card_endpoint(
+            file=_upload(card),
+            instance_key="t1a",
+            adapter_key=ADAPTER,
+            _current_user=world["tenant"],
+        )
+
+        assert report.verdict.level == "partial"
+        assert "输出网页的清理规则 1 条" in report.verdict.text
+
+    async def test_inspect_verdict_ignores_suspected_trap_entries(self, world: dict[str, Any]) -> None:
+        card = _v2_card()
+        card["data"]["character_book"] = {
+            "name": "测试书",
+            "entries": [
+                {
+                    "id": 1,
+                    "keys": ["甲"],
+                    "comment": "普通设定",
+                    "content": "<% if (false) { %>" + "很长的诱饵段落" * 300 + "<% } %>",
+                },
+            ],
+        }
+
+        report = await tavern.inspect_card_endpoint(
+            file=_upload(card),
+            instance_key="t1a",
+            adapter_key=ADAPTER,
+            _current_user=world["tenant"],
+        )
+
+        assert report.book.notes["suspected_trap"] == 1
+        assert report.verdict.level == "full"
 
     async def test_tenant_without_instance_is_rejected(self, world: dict[str, Any]) -> None:
         with pytest.raises(ValidationError):
@@ -482,7 +580,7 @@ class TestRound146ImportPath:
         world: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(config, "WORLDBOOK_MAX_CHARS", 5)
+        monkeypatch.setattr(config, "WORLDBOOK_BUDGET_CAP_TOKENS", 5)
 
         report = await tavern.inspect_card_endpoint(
             file=_upload(_card_with_long_entry()),
@@ -495,8 +593,8 @@ class TestRound146ImportPath:
         hints = [item for item in report.notes if item.kind == "over_budget"]
         assert len(hints) == 1
         assert "1 条" in hints[0].detail
-        assert "WORLDBOOK_MAX_CHARS（5 字）" in hints[0].detail
-        assert "「长条目」20 字" in hints[0].detail
+        assert "每轮世界书预算（5 token" in hints[0].detail
+        assert "「长条目」约" in hints[0].detail and " token" in hints[0].detail
         assert "短条目" not in hints[0].detail
 
     async def test_inspect_uses_the_budget_of_the_target_instance(
@@ -506,11 +604,12 @@ class TestRound146ImportPath:
     ) -> None:
         seen: list[tuple[str, str]] = []
 
-        def fake_budget(adapter_key: str, instance_key: str) -> int:
+        def fake_budget(adapter_key: str, instance_key: str) -> Any:
             seen.append((adapter_key, instance_key))
-            return 1
+            # 一字一 token 的替身，便于手算
+            return SimpleNamespace(budget=1, cap_tokens=0, model_group="stub-group", count=len)
 
-        monkeypatch.setattr(tavern.worldbook_service, "import_budget_chars", fake_budget)
+        monkeypatch.setattr(tavern.worldbook_service, "import_budget", fake_budget)
 
         report = await tavern.inspect_card_endpoint(
             file=_upload(_card_with_long_entry()),
@@ -520,7 +619,7 @@ class TestRound146ImportPath:
         )
 
         assert seen == [(ADAPTER, "t1a")]
-        # 预算 1 字：20 字的长条目超了；1 字的「短」刚好等于预算，不算超。
+        # 预算 1 token（替身一字一 token）：20 字的长条目超了；1 字的「短」刚好等于预算，不算超。
         assert report.book.notes["over_budget"] == 1
 
     async def test_import_report_carries_the_budget_hint(
@@ -528,7 +627,7 @@ class TestRound146ImportPath:
         world: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(config, "WORLDBOOK_MAX_CHARS", 5)
+        monkeypatch.setattr(config, "WORLDBOOK_BUDGET_CAP_TOKENS", 5)
 
         result = await tavern.import_card_endpoint(
             file=_upload(_card_with_long_entry()),

@@ -4,6 +4,8 @@
   "stats": {
     "cost": "Converted cost",
     "tokens": "Total tokens",
+    "inputCacheHitRate": "Input cache hit rate",
+    "cachedTokens": "Cached tokens",
     "records": "Requests",
     "wasted": "Wasted / success rate"
   },
@@ -36,6 +38,8 @@
     "records": "Requests",
     "tokens": "Tokens",
     "input": "Input",
+    "cached": "Cached",
+    "cacheHitRate": "Cache hit rate",
     "output": "Output",
     "cost": "Cost",
     "tenant": "Tenant"

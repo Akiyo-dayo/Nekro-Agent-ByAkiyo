@@ -6,20 +6,21 @@
 空白后非空、关键词去重）也放在这里，让坏输入在构造请求对象时就被挡住，而不是等到写库
 前一刻才报错。
 
-有两处上限留在本模块：`description` 的 2000 字与 `budget_chars` 的 100000 只影响界面
-与预算算术，引擎侧一个字节都不读它们，放进 `types.py` 会让那份常量表看起来像引擎判据。
+有一处上限留在本模块：`description` 的 2000 字只影响界面，引擎侧一个字节都不读它，
+放进 `types.py` 会让那份常量表看起来像引擎判据。
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from nekro_agent.services.worldbook.types import (
     DEPTH_MAX,
     DEPTH_MIN,
+    MAX_BOOK_BUDGET_TOKENS,
     MAX_COMMENT_CHARS,
     MAX_CONTENT_CHARS,
     MAX_KEY_LENGTH,
@@ -31,14 +32,15 @@ from nekro_agent.services.worldbook.types import (
     SCAN_DEPTH_MAX,
     SCAN_DEPTH_MIN,
     TIMED_MAX,
+    ActiveScene,
+    InjectMode,
     Position,
     ScopeKind,
     SelectiveLogic,
 )
 
-# 只给人看的两处上限，理由见模块文档。
+# 只给人看的上限，理由见模块文档。
 MAX_DESCRIPTION_CHARS = 2000
-MAX_BUDGET_CHARS = 100_000
 
 # 「记一笔」的内容上限。比条目正文小得多，理由见 `PersonNoteCreateRequest`。
 PERSON_NOTE_MAX_CHARS = 500
@@ -84,9 +86,20 @@ class BookCreateRequest(BaseModel):
     # 可空：空表示「按作用域类型取默认」，`person` 书 10、其它 4。默认值不在模型层定死，
     # 是因为它取决于 `scope_kind`，而那要等请求构造完才知道。
     scan_depth: Optional[int] = Field(default=None, ge=SCAN_DEPTH_MIN, le=SCAN_DEPTH_MAX)
-    budget_chars: int = Field(default=0, ge=0, le=MAX_BUDGET_CHARS)
+    budget_tokens: int = Field(default=0, ge=0, le=MAX_BOOK_BUDGET_TOKENS)
+    inject_mode: InjectMode = InjectMode.BOTH
+    active_scene: ActiveScene = ActiveScene.BOTH
     case_sensitive: bool = False
     match_whole_words: bool = False
+    scan_names: bool = Field(
+        default=False,
+        description="扫描时每条消息前带上说话人名字（酒馆的 include_names）：Bot 自己的消息用人设名，群友用昵称",
+    )
+    # 语义触发（向量激活）的书级设置；三个数的默认值照酒馆。
+    vector_all: bool = Field(default=False, description="本书全部非常驻条目都参与语义触发")
+    vector_query_messages: int = Field(default=2, ge=1, le=10, description="语义查询取最近几条非空消息")
+    vector_max_entries: int = Field(default=5, ge=1, le=20, description="本书每轮最多语义命中几条")
+    vector_threshold: float = Field(default=0.25, ge=0, le=1, description="语义相似度下限")
 
     @field_validator("name")
     @classmethod
@@ -113,9 +126,19 @@ class BookUpdateRequest(BaseModel):
     description: Optional[str] = Field(default=None, max_length=MAX_DESCRIPTION_CHARS)
     enabled: Optional[bool] = None
     scan_depth: Optional[int] = Field(default=None, ge=SCAN_DEPTH_MIN, le=SCAN_DEPTH_MAX)
-    budget_chars: Optional[int] = Field(default=None, ge=0, le=MAX_BUDGET_CHARS)
+    budget_tokens: Optional[int] = Field(default=None, ge=0, le=MAX_BOOK_BUDGET_TOKENS)
+    inject_mode: Optional[InjectMode] = None
+    active_scene: Optional[ActiveScene] = None
     case_sensitive: Optional[bool] = None
     match_whole_words: Optional[bool] = None
+    scan_names: Optional[bool] = Field(
+        default=None,
+        description="扫描时每条消息前带上说话人名字；None 表示不改",
+    )
+    vector_all: Optional[bool] = None
+    vector_query_messages: Optional[int] = Field(default=None, ge=1, le=10)
+    vector_max_entries: Optional[int] = Field(default=None, ge=1, le=20)
+    vector_threshold: Optional[float] = Field(default=None, ge=0, le=1)
 
     @field_validator("name")
     @classmethod
@@ -142,6 +165,7 @@ class EntryFields(BaseModel):
     use_regex: bool = False
     constant: bool = False
     content: str = Field(default="", max_length=MAX_CONTENT_CHARS)
+    vectorized: bool = Field(default=False, description="这条参与语义触发（向量激活）")
     order: int = Field(default=100, ge=ORDER_MIN, le=ORDER_MAX)
     position: Position = Position.BEFORE_HISTORY
     depth: int = Field(default=4, ge=DEPTH_MIN, le=DEPTH_MAX)
@@ -153,6 +177,10 @@ class EntryFields(BaseModel):
     delay: Optional[int] = Field(default=None, ge=0, le=TIMED_MAX)
     enabled: bool = True
     trusted: Optional[bool] = None
+    ignore_budget: Optional[bool] = Field(
+        default=None,
+        description="命中后不受全局与这本书的预算限制；只对宿主条目生效，租户条目上打开不起作用。None 按 False 处理",
+    )
 
     @field_validator("keys", "secondary_keys")
     @classmethod
@@ -210,7 +238,12 @@ class EntryUpdateRequest(BaseModel):
     cooldown: Optional[int] = Field(default=None, ge=0, le=TIMED_MAX)
     delay: Optional[int] = Field(default=None, ge=0, le=TIMED_MAX)
     enabled: Optional[bool] = None
+    vectorized: Optional[bool] = None
     trusted: Optional[bool] = None
+    ignore_budget: Optional[bool] = Field(
+        default=None,
+        description="命中后不受全局与这本书的预算限制；只对宿主条目生效，租户条目上打开不起作用。None 表示不改",
+    )
 
     @field_validator("keys", "secondary_keys")
     @classmethod
@@ -266,9 +299,19 @@ class BookItem(BaseModel):
     person_account: str = ""
     enabled: bool
     scan_depth: int
-    budget_chars: int
+    budget_tokens: int
+    inject_mode: str
+    active_scene: str
     case_sensitive: bool
     match_whole_words: bool
+    scan_names: bool = Field(
+        default=False,
+        description="扫描时每条消息前带上说话人名字（酒馆的 include_names）",
+    )
+    vector_all: bool = Field(default=False, description="本书全部非常驻条目都参与语义触发")
+    vector_query_messages: int = Field(default=2, description="语义查询取最近几条非空消息")
+    vector_max_entries: int = Field(default=5, description="本书每轮最多语义命中几条")
+    vector_threshold: float = Field(default=0.25, description="语义相似度下限")
     entry_count: int = 0
     quarantined_count: int = 0
     update_time: Optional[datetime] = None
@@ -291,6 +334,9 @@ class BookDetail(BookItem):
     """
 
     ext_keys: list[str] = Field(default_factory=list)
+    # 只读计数：参与语义触发的条目数，以及其中还没有向量的条数。由服务端现算。
+    vector_participating: int = Field(default=0, description="参与语义触发的条目数")
+    vector_pending: int = Field(default=0, description="参与语义触发但还没有向量的条目数")
 
 
 class InvalidKeyItem(BaseModel):
@@ -331,6 +377,11 @@ class EntryItem(BaseModel):
     delay: Optional[int] = None
     enabled: bool
     trusted: bool
+    vectorized: bool = Field(default=False, description="这条参与语义触发（向量激活）")
+    ignore_budget: bool = Field(
+        default=False,
+        description="命中后不受全局与这本书的预算限制；只对宿主条目生效，租户条目上打开不起作用",
+    )
     status: str
     quarantined_at: Optional[datetime] = None
     quarantine_reason: str = ""
@@ -339,10 +390,86 @@ class EntryItem(BaseModel):
     update_time: Optional[datetime] = None
     invalid_keys: list[InvalidKeyItem] = Field(default_factory=list)
     slow_disabled_keys: list[str] = Field(default_factory=list)
+    # 运行时按用途路由的结果（`worldbook.purpose`）：`normal` / `mvu_plot` 照常注入；
+    # `mvu_update` / `initvar` / `state_render` 仅在开启角色状态时使用；`unsupported_template`
+    # 含不支持的模板。由标题与正文现算，不存库。
+    purpose: str = "normal"
+    # 含不支持的模板时的原因，给管理员看。
+    template_note: str = ""
+    suspected_trap: bool = False
+    trap_reason: str = ""
+    # 这次请求的分析预算用完、这一条的用途与防盗标记还没算出来；页面标「分析中」，稍后再取。
+    analysis_pending: bool = False
 
 
 class EntryListResponse(BaseModel):
+    """一页条目；`total` 是（按搜索词过滤后的）总条数"""
+
     items: list[EntryItem]
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+
+
+class WorldbookGraphNode(BaseModel):
+    """世界书图谱的一个节点
+
+    字段与 `MemoryGraphNode` / `AffectionGraphNode` 同形，`memory_type` 取
+    `book` / `entry` / `preset` / `channel` / `person`。节点 ID 由服务端拼：
+    `book-<id>`、`entry-<id>`、`preset-<id>`、`channel-<chat_key>`、`person-<account>`。
+    """
+
+    id: str
+    memory_type: str
+    ref_id: int
+    label: str
+    subtitle: str = ""
+    status: str = "active"
+    cognitive_type: Optional[str] = None
+    weight: float = 0.0
+    size: float = 1.0
+    importance: float = 0.0
+    paragraph_id: Optional[int] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorldbookGraphEdge(BaseModel):
+    """世界书图谱的一条边：`book_entry` / `book_binding` / `key_reference`"""
+
+    id: str
+    source: str
+    target: str
+    edge_type: str
+    label: str = ""
+    weight: float = 0.0
+    strength: float = 0.0
+    status: str = "active"
+    cognitive_type: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorldbookGraphResponse(BaseModel):
+    """世界书图谱的响应
+
+    `entries_total` 是当前条件下应有的条目数，`entries_drawn` 是按注入次数取前
+    `limit` 条之后真正画出来的数量；两者不等就是被 `limit` 截断。`books_truncated` /
+    `entries_truncated` 只表示撞上了服务端 200 本 / 5000 条的扫描上限，
+    `references_truncated` 表示关键词引用没算完（超时或撞上 600 条边上限）。
+    """
+
+    generated_at: datetime
+    nodes: list[WorldbookGraphNode] = Field(default_factory=list)
+    edges: list[WorldbookGraphEdge] = Field(default_factory=list)
+    node_count: int = 0
+    edge_count: int = 0
+    books_total: int = 0
+    books_drawn: int = 0
+    entries_total: int = 0
+    entries_drawn: int = 0
+    rounds_scanned: int = 0
+    books_truncated: bool = False
+    entries_truncated: bool = False
+    references_truncated: bool = False
 
 
 class QuarantineItem(BaseModel):
@@ -491,17 +618,96 @@ class TriggerHitItem(BaseModel):
     comment: str = ""
     reason_kind: str
     matched_key: str = ""
+    # 语义命中的余弦相似度；其余原因为空。
+    score: Optional[float] = None
     position: str
     order: int
     chars: int
+    # 这一轮的系数下的 token 数（预算按它算）；因条数上限没数到的条目为 None
+    tokens: Optional[int] = None
     trusted: bool
+    ignored_budget: bool = Field(
+        default=False,
+        description="这一条是靠「忽略预算」进来的：没有那个开关就会被预算挡掉",
+    )
 
 
 class TriggerDroppedItem(BaseModel):
-    """被预算跳过的条目与原因 `global_chars` / `book_chars` / `max_entries`"""
+    """命中了但没注入的条目与原因
+
+    预算：`global_tokens` / `book_tokens` / `max_entries`；用途与模板（见 `worldbook.purpose`）：
+    `state_only`（仅在开启角色状态时使用）/ `template_unsupported`（含不支持的模板）/
+    `template_error`（模板求值出错）/ `template_empty`（模板算完为空）。用途与模板那几种没数 token。
+    """
 
     entry_id: int
     reason: str
+    tokens: Optional[int] = None
+    # 因预算（`global_tokens` / `book_tokens`）跳过时，在它前面入选、占掉预算的条目 ID（按入选顺序）；
+    # `book_tokens` 只算同一本书的。其它原因为空。
+    ahead: list[int] = Field(default_factory=list)
+
+
+class WorldbookBudgetInfo(BaseModel):
+    """这一轮的世界书预算是怎么算出来的（`services/worldbook/budget.py` 的 `WorldbookBudget`）
+
+    `context_length_set` 为假时上下文长度是默认的 32768（模型组上没填）；`cap_tokens` 为 0 表示不另设上限（只按百分比算，预算仍不超过 65536）；
+    `fallback_context_length` 非 0 表示备用模型组的上下文比主组小，换组重试时世界书可能放不下。
+    `approx_chars` 是预算约合多少中文字，给界面显示用。
+    """
+
+    model_group: str = ""
+    context_length: int = 0
+    context_length_set: bool = False
+    output_reserve: int = 0
+    percent: int = 0
+    cap_tokens: int = 0
+    base: int = 0
+    budget: int = 0
+    factor: float = 1.0
+    factor_source: str = "default"
+    factor_family: str = ""
+    estimator: str = "tiktoken"
+    fallback_model_group: str = ""
+    fallback_context_length: int = 0
+    approx_chars: int = 0
+
+
+class BudgetDroppedItem(BaseModel):
+    """预算体检里一条在「只有常驻条目命中」时被跳过的常驻条目
+
+    `reason` 是 `global_tokens` / `book_tokens` / `max_entries`。只有 `alone_over`（单条就比预算大）为真的
+    才是永远进不来；其余的在关键词条目命中、把前面的常驻条目挤掉以后可能反而放得下。
+    """
+
+    entry_id: int
+    uid: int = 0
+    title: str = ""
+    tokens: int = 0
+    reason: str = ""
+    alone_over: bool = False
+
+
+class BookBudgetCheck(BaseModel):
+    """书的预算体检：把书里启用的常驻条目当作这一轮全都命中，按每轮预算装一遍
+
+    `budget` 为空表示预算读不到（不报体检）；租户看到的 `budget` 里模型组名字是空的。`summary` 是一句
+    给人看的话；前端也可以按字段自己排。`truncated` 为真表示常驻条目太多，只看了编号最小的那一批。
+    `busy` 为真表示这个租户已经有一个体检在算，这次没算（`budget` 为空，`summary` 写着稍后再看）。
+    """
+
+    budget: Optional[WorldbookBudgetInfo] = None
+    book_budget: int = 0
+    max_entries: int = 0
+    constant_count: int = 0
+    constant_tokens: int = 0
+    fit_count: int = 0
+    fit_tokens: int = 0
+    routed_out: int = 0
+    dropped: list[BudgetDroppedItem] = Field(default_factory=list)
+    truncated: bool = False
+    busy: bool = False
+    summary: str = ""
 
 
 class TriggerGroups(BaseModel):
@@ -548,10 +754,14 @@ class TriggerTestResponse(BaseModel):
     timed_ignored: bool = True
     gate_enabled: bool = True
     rendered: TriggerRendered = Field(default_factory=TriggerRendered)
+    budget: Optional[WorldbookBudgetInfo] = None
+    total_tokens: int = 0
 
 
 __all__ = [
-    "MAX_BUDGET_CHARS",
+    "WorldbookBudgetInfo",
+    "BookBudgetCheck",
+    "BudgetDroppedItem",
     "MAX_DESCRIPTION_CHARS",
     "PERSON_NOTE_MAX_CHARS",
     "BookCreateRequest",

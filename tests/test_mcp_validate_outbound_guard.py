@@ -66,21 +66,13 @@ async def test_domain_resolving_inside_is_refused(
     async def fake_getaddrinfo(*_args: Any, **_kwargs: Any) -> List[Any]:
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.7", 80))]
 
-    monkeypatch.setattr("asyncio.get_running_loop", lambda: _FakeLoop(fake_getaddrinfo))
+    monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake_getaddrinfo)
 
     result = await validate_server(None, _http_server("http://internal.example.com/mcp"), restrict_to_public_network=True)
 
     assert result.ok is False
     assert result.error_kind == "url_not_allowed"
     assert no_real_connection == []
-
-
-class _FakeLoop:
-    def __init__(self, getaddrinfo: Any) -> None:
-        self._getaddrinfo = getaddrinfo
-
-    async def getaddrinfo(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._getaddrinfo(*args, **kwargs)
 
 
 async def test_platform_owner_is_not_restricted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -301,10 +293,7 @@ async def test_tenant_cannot_use_the_in_process_shortcut(
     async def resolve_inside(host: str, port: int, **_kwargs: Any) -> List[Any]:
         return [(2, 1, 6, "", ("172.17.0.1", port))]
 
-    class _Loop:
-        getaddrinfo = staticmethod(resolve_inside)
-
-    monkeypatch.setattr("nekro_agent.tools.common_util.asyncio.get_running_loop", lambda: _Loop())
+    monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", resolve_inside)
 
     result = await validate_server(None, server, restrict_to_public_network=True)
 

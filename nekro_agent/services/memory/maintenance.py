@@ -29,6 +29,12 @@ from nekro_agent.services.memory.feature_flags import (
 )
 from nekro_agent.services.memory.prompt_rounds import prune_prompt_rounds
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
+from nekro_agent.services.memory.relation_retention import extend_stable_relation_half_life
+from nekro_agent.services.memory.retention import (
+    AUTO_PRUNE_ACTION,
+    PRUNE_ACTIONS,
+    extend_stable_half_life,
+)
 
 logger = get_sub_logger("memory.maintenance")
 
@@ -55,7 +61,13 @@ def chunked(items: Sequence[int], size: int) -> list[list[int]]:
     return [list(items[start : start + size]) for start in range(0, len(items), size)]
 
 
-async def _prune_paragraphs(workspace_id: int, now_ts: float, now_dt: datetime) -> list[int]:
+async def _prune_paragraphs(
+    workspace_id: int,
+    now_ts: float,
+    now_dt: datetime,
+    *,
+    action: str = AUTO_PRUNE_ACTION,
+) -> list[int]:
     """失活低权重段落，返回被清理的段落 ID。
 
     游标只向前推进，而被清理的行会退出 `is_inactive=False` 过滤条件，
@@ -88,7 +100,7 @@ async def _prune_paragraphs(workspace_id: int, now_ts: float, now_dt: datetime) 
             for chunk in chunked(victims, PRUNE_WRITE_CHUNK_SIZE):
                 await DBMemParagraph.filter(id__in=chunk).update(
                     is_inactive=True,
-                    last_manual_action="prune",
+                    last_manual_action=action,
                     last_manual_action_at=now_dt,
                     update_time=now_dt,
                 )
@@ -192,14 +204,23 @@ async def _prune_orphan_entities(workspace_id: int, now_dt: datetime) -> int:
     return pruned_count
 
 
-async def prune_workspace_memories(workspace_id: int) -> MemoryPruneResult:
-    """清理单个工作区的低价值记忆。"""
+async def prune_workspace_memories(workspace_id: int, *, action: str = AUTO_PRUNE_ACTION) -> MemoryPruneResult:
+    """清理单个工作区的低价值记忆。
+
+    Args:
+        workspace_id: 工作区；0 是域分区。
+        action: 记在被清理段落 `last_manual_action` 上的动作名。维护循环用默认的
+            :data:`AUTO_PRUNE_ACTION`；管理员手动触发的（工作区页、运维命令）传
+            :data:`MANUAL_PRUNE_ACTION`，捞回不认它。
+    """
+    if action not in PRUNE_ACTIONS:
+        raise ValueError(f"未知的清理动作名: {action}")
     ensure_memory_system_enabled(MemoryOperation.PRUNE)
 
     now_ts = time.time()
     now_dt = datetime.now(timezone.utc)
 
-    pruned_paragraph_ids = await _prune_paragraphs(workspace_id, now_ts, now_dt)
+    pruned_paragraph_ids = await _prune_paragraphs(workspace_id, now_ts, now_dt, action=action)
     relations_pruned = await _prune_relations(workspace_id, now_ts, now_dt, set(pruned_paragraph_ids))
     entities_pruned = await _prune_orphan_entities(workspace_id, now_dt)
 
@@ -232,8 +253,20 @@ async def prune_all_workspaces() -> dict[int, MemoryPruneResult]:
     分区再大也不会一次取全量。闸关时分区 0 不是一条有效的记忆归属，行为与今天相同。
     """
     results: dict[int, MemoryPruneResult] = {}
+    # 先把存量稳定类型的半衰期补齐再清理（工作区行与域行都补）：否则还按情景半衰期衰减的
+    # 偏好、事实、决定会在补齐之前被这一轮清掉。条件写在 UPDATE 里，重复执行不改任何行。
+    # 补齐失败时这一轮不清任何段落，宁可多留几个小时，也不按旧半衰期把稳定信息清掉。
+    # 关系同理：来源段落是稳定类型的关系先补长，否则它们按 1 天的旧半衰期在这一轮被清掉。
+    extended = False
+    try:
+        await extend_stable_half_life()
+        await extend_stable_relation_half_life()
+        extended = True
+    except Exception as e:
+        logger.warning(f"补齐存量沉淀记忆半衰期失败，本轮跳过记忆清理: error={e}")
+
     cursor = 0
-    while True:
+    while extended:
         workspace_ids: list[int] = (
             await DBWorkspace.filter(id__gt=cursor).order_by("id").limit(PRUNE_SCAN_PAGE_SIZE).values_list("id", flat=True)
         )
@@ -243,15 +276,15 @@ async def prune_all_workspaces() -> dict[int, MemoryPruneResult]:
 
         for workspace_id in workspace_ids:
             try:
-                results[workspace_id] = await prune_workspace_memories(workspace_id)
+                results[workspace_id] = await prune_workspace_memories(workspace_id, action=AUTO_PRUNE_ACTION)
             except Exception as e:
                 logger.warning(f"工作区记忆清理失败: workspace={workspace_id}, error={e}")
             # 让出事件循环：这条链路是后台维护，不能把主对话饿在后面排队
             await asyncio.sleep(PRUNE_WORKSPACE_INTERVAL_SECONDS)
 
-    if is_domain_scope_enabled():
+    if extended and is_domain_scope_enabled():
         try:
-            results[0] = await prune_workspace_memories(0)
+            results[0] = await prune_workspace_memories(0, action=AUTO_PRUNE_ACTION)
         except Exception as e:
             logger.warning(f"域分区记忆清理失败: workspace=0, error={e}")
         await asyncio.sleep(PRUNE_WORKSPACE_INTERVAL_SECONDS)

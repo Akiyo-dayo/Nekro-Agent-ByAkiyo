@@ -402,6 +402,10 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
             transition: 'all 0.3s ease',
             position: 'relative',
             overflow: 'hidden',
+            // `overflow: hidden` 让 flex 子项的最小高度变成 0：横幅放在定高的 flex 列里、
+            // 下面内容一长，它就被压成半行、文字上下被裁。这里把最小高度钉在内容高度上。
+            // 不用 `flexShrink: 0`：横幅放在横向 flex 行里时，那会让长文字不换行、把行撑破。
+            minHeight: 'min-content',
 
             // 内容文本样式
             '& .MuiAlert-message': {

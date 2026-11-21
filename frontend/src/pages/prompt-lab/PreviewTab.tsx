@@ -1,11 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
   Chip,
   Stack,
+  type SxProps,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
   TextField,
+  type Theme,
   Typography,
+  useMediaQuery,
   useTheme,
 } from '@mui/material'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -13,15 +21,25 @@ import { useTranslation } from 'react-i18next'
 import ActionButton from '../../components/common/ActionButton'
 import FilterSelect from '../../components/common/FilterSelect'
 import QueryErrorState from '../../components/common/QueryErrorState'
+import SegmentedControl from '../../components/common/SegmentedControl'
+import { rpWhereLabelKey } from '../../components/rp-preset/segments'
 import { useWorldbookScopeOptions } from '../../components/worldbook/useWorldbookScopeOptions'
+import { useScrollSpy } from '../../hooks/useScrollSpy'
 import { presetsApi } from '../../services/api/presets'
+import { rpPresetsApi } from '../../services/api/rpPresets'
 import {
   tavernApi,
   type TavernPreviewMessage,
   type TavernPreviewResponse,
+  type TavernRpPresetMeta,
 } from '../../services/api/tavern'
 import type { WorldbookScopeParams } from '../../services/api/worldbook'
-import { CHIP_VARIANTS } from '../../theme/variants'
+import {
+  CHIP_VARIANTS,
+  FLOATING_LABEL_GUTTER,
+  SCROLL_COLUMN_STYLES,
+  UNIFIED_TABLE_STYLES,
+} from '../../theme/variants'
 
 /**
  * 「预览」标签
@@ -61,6 +79,38 @@ function slotOf(
   }
 }
 
+/**
+ * `meta.rp_preset`
+ *
+ * 后端只在真的按预设排布过时给这个键；形状按行取，缺哪项都由空值兜底，避免一次
+ * 字段调整把整张预览卡打成异常。
+ */
+function rpPresetOf(meta: Record<string, unknown>): TavernRpPresetMeta | null {
+  const raw = asRecord(meta.rp_preset)
+  if (!raw) return null
+  const used = Array.isArray(raw.used)
+    ? raw.used.flatMap(item => {
+        const record = asRecord(item)
+        if (!record) return []
+        return [
+          {
+            identifier: typeof record.identifier === 'string' ? record.identifier : '',
+            name: typeof record.name === 'string' ? record.name : '',
+            where: typeof record.where === 'string' ? record.where : '',
+            chars: typeof record.chars === 'number' ? record.chars : 0,
+          },
+        ]
+      })
+    : []
+  return {
+    id: typeof raw.id === 'number' ? raw.id : 0,
+    name: typeof raw.name === 'string' ? raw.name : '',
+    used,
+    prefill_text: typeof raw.prefill_text === 'string' ? raw.prefill_text : '',
+    prefill_sent: raw.prefill_sent === true,
+  }
+}
+
 const SLOT_KEYS = ['post_history', 'auxiliary', 'prefill'] as const
 
 const SLOT_LABEL_KEYS: Record<(typeof SLOT_KEYS)[number], string> = {
@@ -85,6 +135,22 @@ const PREFILL_REASON_KEYS: Record<string, string> = {
   unsupported: 'lab.preview.prefillReason.unsupported',
   model_group_off: 'lab.preview.prefillReason.modelGroupOff',
   unavailable: 'lab.preview.prefillReason.unavailable',
+}
+
+type PreviewSection = 'overview' | 'rp' | 'greeting' | 'slots' | 'messages'
+
+/** 预览结果的锚点：宽屏左侧目录，窄屏顶部一组选项 */
+const PREVIEW_SECTIONS: { key: PreviewSection; labelKey: string }[] = [
+  { key: 'overview', labelKey: 'lab.preview.nav.overview' },
+  { key: 'greeting', labelKey: 'lab.preview.nav.greeting' },
+  { key: 'slots', labelKey: 'lab.preview.nav.slots' },
+  { key: 'messages', labelKey: 'lab.preview.nav.messages' },
+]
+
+/** 按预设排布是概览区里的一张卡，只有后端真的排过时才出现在目录里 */
+const RP_SECTION: { key: PreviewSection; labelKey: string } = {
+  key: 'rp',
+  labelKey: 'lab.preview.nav.rp',
 }
 
 function MessageBlock({
@@ -164,10 +230,31 @@ function MessageBlock({
 
 function PreviewResult({ result }: { result: TavernPreviewResponse }) {
   const theme = useTheme()
+  const isWide = useMediaQuery(theme.breakpoints.up('md'))
   const { t } = useTranslation('tavern')
-  const [greetingOpen, setGreetingOpen] = useState(false)
+  const sectionRefs = useRef<Record<PreviewSection, HTMLDivElement | null>>({
+    overview: null,
+    rp: null,
+    greeting: null,
+    slots: null,
+    messages: null,
+  })
 
   const meta = result.meta
+  const rpPreset = rpPresetOf(meta)
+  const rpInactiveReason =
+    typeof meta.rp_preset_inactive_reason === 'string' ? meta.rp_preset_inactive_reason : ''
+  const sections = rpPreset
+    ? [PREVIEW_SECTIONS[0], RP_SECTION, ...PREVIEW_SECTIONS.slice(1)]
+    : PREVIEW_SECTIONS
+  const sectionKeys = sections.map(section => section.key)
+  const { active: activeSection, lockTo } = useScrollSpy(sectionKeys, key => sectionRefs.current[key])
+  // 宽屏目录与窄屏分段选择共用这一个值；观察器还没跑起来时先按概览高亮
+  const currentSection: PreviewSection = activeSection ?? 'overview'
+  const rpSystemCount = rpPreset?.used.filter(item => item.where === 'system').length ?? 0
+  const rpTailCount = rpPreset?.used.filter(item => item.where === 'tail').length ?? 0
+  const rpDepthCount =
+    rpPreset?.used.filter(item => item.where.startsWith('depth:')).length ?? 0
   const slots = asRecord(meta.slots)
   const slotsEnabled = slots?.enabled === true
   const personaChars = typeof meta.persona_chars === 'number' ? meta.persona_chars : 0
@@ -240,13 +327,82 @@ function PreviewResult({ result }: { result: TavernPreviewResponse }) {
     ? t(prefillReasonKey)
     : result.prefill.reason
 
+  const sectionLabel = (key: PreviewSection) =>
+    t(sections.find(section => section.key === key)?.labelKey ?? key)
+
+  const rpWhereLabel = (where: string) => {
+    const label = rpWhereLabelKey(where)
+    if (!label.key) return where
+    return label.depth === null ? t(label.key) : t(label.key, { depth: label.depth })
+  }
+
+  const goToSection = (key: PreviewSection) => {
+    // 平滑滚动途中会依次经过中间的段落，先把高亮钉在目标项上再滚
+    lockTo(key)
+    sectionRefs.current[key]?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
   return (
-    <Stack spacing={2}>
-      <Alert severity="info">{t('lab.preview.notice')}</Alert>
-      {/* 协议端没连上时后端用占位代替 Bot 自己的账号；不说明的话管理员会以为那就是真值 */}
-      {meta.bot_offline === true ? (
-        <Alert severity="warning">{t('lab.preview.botOffline')}</Alert>
-      ) : null}
+    <Box>
+      {!isWide && (
+        <Box sx={{ mb: 1.5 }}>
+          <SegmentedControl
+            value={currentSection}
+            options={sections.map(section => ({
+              value: section.key,
+              label: t(section.labelKey),
+            }))}
+            onChange={value => goToSection(value as PreviewSection)}
+            fullWidth
+          />
+        </Box>
+      )}
+      <Box sx={{ display: 'flex', gap: 2, alignItems: 'flex-start' }}>
+        {isWide && (
+          <Box
+            component="nav"
+            sx={{ width: 160, flexShrink: 0, position: 'sticky', top: 0 }}
+          >
+            <Stack spacing={0.5}>
+              {sections.map(section => (
+                <ActionButton
+                  key={section.key}
+                  tone={currentSection === section.key ? 'secondary' : 'ghost'}
+                  size="small"
+                  fullWidth
+                  onClick={() => goToSection(section.key)}
+                  sx={{ justifyContent: 'flex-start' }}
+                >
+                  {t(section.labelKey)}
+                </ActionButton>
+              ))}
+            </Stack>
+          </Box>
+        )}
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Stack spacing={2}>
+            <Box
+              ref={node => {
+                sectionRefs.current.overview = node as HTMLDivElement | null
+              }}
+              sx={{ scrollMarginTop: 8 }}
+            >
+              <Typography variant="subtitle2" fontWeight={700}>
+                {sectionLabel('overview')}
+              </Typography>
+              <Stack spacing={1.5} sx={{ mt: 1 }}>
+                <Alert severity="info">{t('lab.preview.notice')}</Alert>
+                {/* 协议端没连上时后端用占位代替 Bot 自己的账号；不说明的话管理员会以为那就是真值 */}
+                {meta.bot_offline === true ? (
+                  <Alert severity="warning">{t('lab.preview.botOffline')}</Alert>
+                ) : null}
+                {rpInactiveReason === 'slots_off' ||
+                rpInactiveReason === 'tavern_off' ||
+                rpInactiveReason === 'unavailable' ? (
+                  <Alert severity="warning">
+                    {t(`lab.preview.rpInactive.${rpInactiveReason}`)}
+                  </Alert>
+                ) : null}
 
       <Box
         sx={{
@@ -279,81 +435,219 @@ function PreviewResult({ result }: { result: TavernPreviewResponse }) {
             depth: atDepth.length,
           })}
         </Typography>
-        {greetingWillSend && (
-          <Box>
-            <Typography
-              variant="body2"
-              color="primary"
-              onClick={() => setGreetingOpen(value => !value)}
-              sx={{ cursor: 'pointer', '&:hover': { textDecoration: 'underline' } }}
+      </Box>
+
+                {rpPreset ? (
+                  <Box
+                    ref={node => {
+                      sectionRefs.current.rp = node as HTMLDivElement | null
+                    }}
+                    sx={{
+                      scrollMarginTop: 8,
+                      p: 1.5,
+                      borderRadius: 1,
+                      border: '1px solid',
+                      borderColor: 'divider',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 1,
+                    }}
+                  >
+                    <Typography variant="body2" fontWeight={700}>
+                      {t('lab.preview.rpTitle', { name: rpPreset.name })}
+                    </Typography>
+                    <Stack
+                      direction="row"
+                      spacing={1.5}
+                      sx={{ flexWrap: 'wrap', rowGap: 0.5 }}
+                    >
+                      <Typography variant="caption" color="text.secondary">
+                        {t('lab.preview.rpStats.system', { count: rpSystemCount })}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {t('lab.preview.rpStats.tail', { count: rpTailCount })}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {t('lab.preview.rpStats.depth', { count: rpDepthCount })}
+                      </Typography>
+                    </Stack>
+
+                    {rpPreset.used.length === 0 ? (
+                      <Typography variant="body2" color="text.secondary">
+                        {t('lab.preview.rpEmpty')}
+                      </Typography>
+                    ) : (
+                      <Box
+                        sx={{
+                          ...(UNIFIED_TABLE_STYLES.embedded as object),
+                          maxHeight: 260,
+                          overflow: 'auto',
+                        }}
+                      >
+                        <Table size="small" stickyHeader>
+                          <TableHead>
+                            <TableRow>
+                              <TableCell sx={UNIFIED_TABLE_STYLES.header}>
+                                {t('lab.preview.rpColumns.name')}
+                              </TableCell>
+                              <TableCell sx={UNIFIED_TABLE_STYLES.header}>
+                                {t('lab.preview.rpColumns.where')}
+                              </TableCell>
+                              <TableCell
+                                sx={UNIFIED_TABLE_STYLES.header}
+                                align="right"
+                              >
+                                {t('lab.preview.rpColumns.chars')}
+                              </TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {rpPreset.used.map((item, index) => (
+                              <TableRow
+                                key={`${item.identifier}:${item.where}:${index}`}
+                                sx={UNIFIED_TABLE_STYLES.row}
+                              >
+                                <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                                  {item.name || item.identifier}
+                                </TableCell>
+                                <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                                  {rpWhereLabel(item.where)}
+                                </TableCell>
+                                <TableCell
+                                  sx={UNIFIED_TABLE_STYLES.cell}
+                                  align="right"
+                                >
+                                  {item.chars.toLocaleString()}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </Box>
+                    )}
+
+                    {rpPreset.prefill_text ? (
+                      <Box>
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          display="block"
+                          sx={{ mb: 0.5 }}
+                        >
+                          {t('lab.preview.rpPrefill')}
+                        </Typography>
+                        <Box
+                          component="pre"
+                          sx={{
+                            m: 0,
+                            p: 1,
+                            borderRadius: 1,
+                            bgcolor: theme.palette.action.hover,
+                            fontFamily: 'monospace',
+                            fontSize: '0.8rem',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            maxHeight: 200,
+                            overflow: 'auto',
+                          }}
+                        >
+                          {rpPreset.prefill_text}
+                        </Box>
+                      </Box>
+                    ) : null}
+                  </Box>
+                ) : null}
+              </Stack>
+            </Box>
+
+            <Box
+              ref={node => {
+                sectionRefs.current.greeting = node as HTMLDivElement | null
+              }}
+              sx={{ scrollMarginTop: 8 }}
             >
-              {t('lab.preview.summaryGreeting')}
-            </Typography>
-            {greetingOpen && (
-              <Box
-                component="pre"
-                sx={{
-                  m: 0,
-                  mt: 0.5,
-                  p: 1,
-                  borderRadius: 1,
-                  bgcolor: theme.palette.action.hover,
-                  fontFamily: 'monospace',
-                  fontSize: '0.8rem',
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-word',
-                  maxHeight: 240,
-                  overflowY: 'auto',
-                }}
-              >
-                {greetingText || t('lab.preview.emptyText')}
-              </Box>
-            )}
-          </Box>
-        )}
-      </Box>
+              <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
+                {sectionLabel('greeting')}
+              </Typography>
+              {greetingWillSend ? (
+                <Box
+                  component="pre"
+                  sx={{
+                    m: 0,
+                    p: 1.5,
+                    borderRadius: 1,
+                    bgcolor: theme.palette.action.hover,
+                    fontFamily: 'monospace',
+                    fontSize: '0.8rem',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    maxHeight: 240,
+                    overflowY: 'auto',
+                  }}
+                >
+                  {greetingText || t('lab.preview.emptyText')}
+                </Box>
+              ) : (
+                <Typography variant="body2" color="text.secondary">
+                  {t('lab.preview.greetingNotSent')}
+                </Typography>
+              )}
+            </Box>
 
-      <Box>
-        <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
-          {slotsEnabled ? t('lab.preview.slotsTitle') : t('lab.preview.slotsGated')}
-        </Typography>
-        <Stack spacing={1.5}>{SLOT_KEYS.map(slotBlock)}</Stack>
-      </Box>
+            <Box
+              ref={node => {
+                sectionRefs.current.slots = node as HTMLDivElement | null
+              }}
+              sx={{ scrollMarginTop: 8 }}
+            >
+              <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
+                {slotsEnabled ? t('lab.preview.slotsTitle') : t('lab.preview.slotsGated')}
+              </Typography>
+              <Stack spacing={1.5}>{SLOT_KEYS.map(slotBlock)}</Stack>
+            </Box>
 
-      <Box>
-        <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
-          {t('lab.preview.messagesTitle')}
-        </Typography>
-        <Stack spacing={1.5}>
-          {result.messages.map((message, index) => (
-            <MessageBlock
-              key={`${message.source}:${index}`}
-              message={message}
-              label={sourceLabel(message, index)}
-            />
-          ))}
-        </Stack>
-      </Box>
+            <Box
+              ref={node => {
+                sectionRefs.current.messages = node as HTMLDivElement | null
+              }}
+              sx={{ scrollMarginTop: 8 }}
+            >
+              <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
+                {t('lab.preview.messagesTitle')}
+              </Typography>
+              <Stack spacing={1.5}>
+                {result.messages.map((message, index) => (
+                  <MessageBlock
+                    key={`${message.source}:${index}`}
+                    message={message}
+                    label={sourceLabel(message, index)}
+                  />
+                ))}
+              </Stack>
+            </Box>
 
-      <Box>
-        <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
-          {t('lab.preview.prefillTitle')}
-        </Typography>
-        <Stack spacing={0.5}>
-          <Typography variant="body2">
-            {t('lab.preview.prefillText')}：
-            {result.prefill.text || t('lab.preview.prefillNone')}
-          </Typography>
-          <Typography variant="body2">
-            {t('lab.preview.prefillWillSend')}：
-            {result.prefill.would_send ? t('lab.preview.yes') : t('lab.preview.no')}
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            {t('lab.preview.prefillReasonLabel')}：{prefillReason}
-          </Typography>
-        </Stack>
+            <Box>
+              <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
+                {t('lab.preview.prefillTitle')}
+              </Typography>
+              <Stack spacing={0.5}>
+                <Typography variant="body2">
+                  {t('lab.preview.prefillText')}：
+                  {result.prefill.text || t('lab.preview.prefillNone')}
+                </Typography>
+                <Typography variant="body2">
+                  {t('lab.preview.prefillWillSend')}：
+                  {result.prefill.would_send ? t('lab.preview.yes') : t('lab.preview.no')}
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {t('lab.preview.prefillReasonLabel')}：{prefillReason}
+                </Typography>
+              </Stack>
+            </Box>
+          </Stack>
+        </Box>
       </Box>
-    </Stack>
+    </Box>
   )
 }
 
@@ -362,6 +656,7 @@ export default function PreviewTab({ scope, isScopeReady }: PromptLabTabProps) {
   const { data: options } = useWorldbookScopeOptions(scope)
   const [chatKey, setChatKey] = useState('')
   const [presetId, setPresetId] = useState('')
+  const [rpPresetId, setRpPresetId] = useState('')
   const [sampleText, setSampleText] = useState('')
 
   const presetsQuery = useQuery({
@@ -376,11 +671,20 @@ export default function PreviewTab({ scope, isScopeReady }: PromptLabTabProps) {
     retry: false,
   })
 
+  const rpPresetsQuery = useQuery({
+    queryKey: ['prompt-lab', 'rp-presets', scope.instance_key],
+    queryFn: () => rpPresetsApi.list({ instance_key: scope.instance_key }),
+    enabled: isScopeReady,
+    retry: false,
+  })
+
   const mutation = useMutation({
     mutationFn: () =>
       tavernApi.preview({
         chat_key: chatKey,
         preset_id: presetId ? Number(presetId) : null,
+        // 不传就是「按频道当前设置」；后端只在显式指定时才报「预设没生效」的原因
+        ...(rpPresetId ? { rp_preset_id: Number(rpPresetId) } : {}),
         sample_text: sampleText.trim() || null,
       }),
   })
@@ -407,16 +711,24 @@ export default function PreviewTab({ scope, isScopeReady }: PromptLabTabProps) {
     [presetsQuery.data?.items, t]
   )
 
+  const rpPresetOptions = useMemo(
+    () => [
+      { value: '', label: t('lab.preview.rpPresetCurrent') },
+      ...(rpPresetsQuery.data?.items ?? []).map(preset => ({
+        value: String(preset.id),
+        label: preset.name,
+      })),
+    ],
+    [rpPresetsQuery.data?.items, t]
+  )
+
   return (
     <Box
-      sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 2,
-        overflowY: 'auto',
-        minHeight: 0,
-        pr: { xs: 0, sm: 0.5 },
-      }}
+      sx={[
+        SCROLL_COLUMN_STYLES,
+        // 第一行就是带浮动标签的下拉：顶端留出标签缩起后的位置，不然被滚动容器裁掉半截
+        { gap: 2, pt: FLOATING_LABEL_GUTTER, pr: { xs: 0, sm: 0.5 } },
+      ] as SxProps<Theme>}
     >
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
         <FilterSelect
@@ -431,6 +743,13 @@ export default function PreviewTab({ scope, isScopeReady }: PromptLabTabProps) {
           value={presetId}
           options={presetOptions}
           onChange={setPresetId}
+          showEmptyOption
+        />
+        <FilterSelect
+          label={t('lab.preview.rpPreset')}
+          value={rpPresetId}
+          options={rpPresetOptions}
+          onChange={setRpPresetId}
           showEmptyOption
         />
       </Stack>

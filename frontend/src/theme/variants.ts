@@ -46,6 +46,50 @@ export const LAYOUT = {
   },
 }
 
+/**
+ * 等宽字体
+ *
+ * 只写一个 `monospace` 时，中文系统的回落字体常是带衬线的宋体系等宽，和界面里的无衬线
+ * 正文放在一起很突兀。配置键名、ID 这类机器文本统一用这一套。
+ */
+export const FONT_MONO =
+  '"JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace'
+
+/** 次要位置上的机器文本（配置键名、内部 ID）：小号、等宽、可断行 */
+export const MONO_CAPTION_STYLES: SxProps<Theme> = {
+  fontFamily: FONT_MONO,
+  fontSize: '0.72rem',
+  lineHeight: 1.5,
+  letterSpacing: 0,
+  color: 'text.secondary',
+  wordBreak: 'break-all',
+}
+
+/**
+ * 定高、纵向滚动的内容列
+ *
+ * 父级定高 + `overflow` 滚动 + flex 列这三样放在一起时，flex 子项默认可以被压扁：
+ * 内容一长，横幅（Alert 的正文自带 `overflow`）只剩半行，表格区再长出第二条滚动条。
+ * 这类容器一律用它，让每个子项按内容定高、整列一起滚动。
+ */
+export const SCROLL_COLUMN_STYLES: SxProps<Theme> = {
+  display: 'flex',
+  flexDirection: 'column',
+  minHeight: 0,
+  overflowY: 'auto',
+  '& > *': {
+    flexShrink: 0,
+  },
+}
+
+/**
+ * 滚动容器顶端留给浮动标签的空间
+ *
+ * 描边输入框的标签缩起后有一半画在框线上方；输入框若是滚动容器的第一行，
+ * 这一半会被容器裁掉。
+ */
+export const FLOATING_LABEL_GUTTER = 1.25
+
 // 卡片组件样式变体
 export const CARD_VARIANTS = {
   default: {
@@ -668,6 +712,73 @@ export const TAB_BAR_VARIANTS = {
   },
 }
 
+/**
+ * 分组分类导航（系统配置页）
+ *
+ * 外框沿用 `PanelTabs` 的容器；条目是轻量的可选块，选中态与 `SegmentedControl` 同一套
+ * 语言：轻底色 + 主色前景，不用粗描边。当前项用 `aria-current="true"` 标记。
+ */
+export const CATEGORY_NAV_VARIANTS = {
+  get panel(): SxProps<Theme> {
+    return TAB_BAR_VARIANTS.panelContainer
+  },
+  get groupTitle(): SxProps<Theme> {
+    return {
+      flexShrink: 0,
+      width: 92,
+      pt: 0.75,
+      fontSize: '0.75rem',
+      fontWeight: 700,
+      lineHeight: 1.4,
+      color: 'text.secondary',
+    }
+  },
+  get item(): SxProps<Theme> {
+    const palette = getCurrentExtendedPalette()
+    const mode = getCurrentThemeMode()
+    return {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: 0.625,
+      minHeight: 30,
+      px: 1.25,
+      py: 0.5,
+      borderRadius: BORDER_RADIUS.DEFAULT,
+      fontSize: '0.84rem',
+      fontWeight: 600,
+      lineHeight: 1.2,
+      whiteSpace: 'nowrap',
+      color: mode === 'light' ? 'rgba(0, 0, 0, 0.68)' : 'rgba(255, 255, 255, 0.82)',
+      transition: 'all 0.18s ease',
+      '& .category-nav-count': {
+        fontSize: '0.72rem',
+        fontWeight: 500,
+        opacity: 0.62,
+      },
+      '& .category-nav-icon': {
+        fontSize: '0.95rem',
+        opacity: 0.7,
+      },
+      '&:hover': {
+        backgroundColor: alpha(palette.primary.main, mode === 'light' ? 0.07 : 0.14),
+        color: mode === 'light' ? 'rgba(0, 0, 0, 0.87)' : 'rgba(255, 255, 255, 0.95)',
+      },
+      '&[aria-current="true"]': {
+        color: palette.primary.main,
+        backgroundColor: alpha(palette.primary.main, mode === 'light' ? 0.12 : 0.2),
+        boxShadow:
+          mode === 'light'
+            ? `0 4px 12px ${alpha(palette.primary.main, 0.12)}`
+            : `0 6px 14px ${alpha(palette.primary.main, 0.18)}`,
+      },
+      '&.Mui-focusVisible': {
+        outline: `2px solid ${alpha(palette.primary.main, 0.5)}`,
+        outlineOffset: 1,
+      },
+    }
+  },
+}
+
 // 输入框样式变体
 export const INPUT_VARIANTS = {
   default: {
@@ -716,17 +827,61 @@ export const BADGE_VARIANTS = {
   },
 }
 
+/**
+ * 图谱画布里的浮层（图例、缩放）：实体纸面、卡片阴影、8px 圆角，不用毛玻璃
+ *
+ * 浮在节点上面的东西要稳，不能随底下的节点颜色变色，所以不做 blur。
+ */
+export const ATLAS_OVERLAY = {
+  get styles(): SxProps<Theme> {
+    const palette = getCurrentExtendedPalette()
+    return {
+      backgroundColor: alpha(palette.background.paper, 0.92),
+      boxShadow: getShadow(UI_STYLES.getShadow('light')),
+      border: `1px solid ${alpha(palette.primary.main, 0.1)}`,
+      borderRadius: BORDER_RADIUS.DEFAULT,
+    }
+  },
+}
+
+/** `CHIP_VARIANTS.getPaletteChip` 认的调色板名 */
+export type ChipPaletteName =
+  | 'default'
+  | 'primary'
+  | 'secondary'
+  | 'success'
+  | 'error'
+  | 'warning'
+  | 'info'
+
 // 状态Chip样式变体 - 提供统一的Chip样式
 export const CHIP_VARIANTS = {
   // 基础Chip样式
+  // 小号原来是 20px / 0.65rem，中文在表格里几乎认不清；22px / 0.72rem 是还能放进紧凑行的最小可读值
   base: (isSmall: boolean = false): SxProps<Theme> => ({
-    height: isSmall ? 20 : 24,
-    fontSize: isSmall ? '0.65rem' : '0.75rem',
+    height: isSmall ? 22 : 24,
+    fontSize: isSmall ? '0.72rem' : '0.75rem',
+    ...(isSmall ? { fontWeight: 500 } : {}),
     minWidth: '52px',
     '& .MuiChip-label': {
-      px: isSmall ? 0.5 : 0.75,
+      px: 0.75,
     },
   }),
+
+  /**
+   * 按调色板名取色的 Chip 样式
+   *
+   * 替代 MUI Chip 的 `color=` 属性（那会绕过主题用 MUI 默认色）；`default` 取次要文字色。
+   */
+  getPaletteChip: (
+    theme: Theme,
+    name: ChipPaletteName,
+    isSmall: boolean = false
+  ): SxProps<Theme> =>
+    CHIP_VARIANTS.getCustomColorChip(
+      name === 'default' ? theme.palette.text.secondary : theme.palette[name].main,
+      isSmall
+    ),
 
   // 基础Chip样式 - 带颜色
   baseWithColor: (isSmall: boolean = false, color: string = ''): SxProps<Theme> => ({
@@ -1018,6 +1173,29 @@ export const UNIFIED_TABLE_STYLES = {
         boxShadow: UI_STYLES.getShadow('medium'),
       },
     }
+  },
+
+  /**
+   * 嵌在页面流里的小表（不撑满剩余高度、随页面一起滚）
+   *
+   * 包在 `<Table>` 外面一层即可：纸面容器 + 表头 / 行 / 单元格的统一样式都从这里来，
+   * 页面里的 `TableCell` 不用逐个再挂 `sx`。表格比容器宽时在容器内横向滚动。
+   */
+  get embedded(): SxProps<Theme> {
+    return {
+      ...(UNIFIED_TABLE_STYLES.paper as object),
+      overflowX: 'auto',
+      ...(UNIFIED_TABLE_STYLES.scrollbar as object),
+      '& .MuiTableHead-root .MuiTableCell-root': {
+        ...(UNIFIED_TABLE_STYLES.header as object),
+        whiteSpace: 'nowrap',
+      },
+      '& .MuiTableBody-root .MuiTableRow-root': UNIFIED_TABLE_STYLES.row as object,
+      '& .MuiTableBody-root .MuiTableCell-root': UNIFIED_TABLE_STYLES.cell as object,
+      '& .MuiTableBody-root .MuiTableRow-root:last-of-type .MuiTableCell-root': {
+        borderBottom: 'none',
+      },
+    } as SxProps<Theme>
   },
 
   // 表格布局容器 - 添加固定高度和滚动布局的容器样式

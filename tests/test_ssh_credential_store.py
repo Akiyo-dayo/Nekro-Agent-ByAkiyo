@@ -1292,6 +1292,10 @@ def test_table_and_column_names_match_the_design() -> None:
         "status",
         "status_reason",
         "note",
+        # 值守模式：行上的模式与所有者写的手册；Bot 追加的经验在另一张表，这里是反向关系
+        "duty_mode",
+        "runbook",
+        "runbook_entries",
         "created_by",
         "updated_by",
         "last_used_at",

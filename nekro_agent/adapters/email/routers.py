@@ -1,4 +1,5 @@
 import hashlib
+import ssl
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -79,6 +80,54 @@ async def require_platform_mailbox_admin(_owner: DBUser = Depends(require_platfo
 # 是另一条审计线（其中 webhook/回调类端点本就必须匿名可达，不能一刀切），
 # 但 email 这一族是**本轮收敛的那份数据的另一条路**，留着等于绕过。
 router = APIRouter(tags=["Adapter:email"], dependencies=[Depends(require_platform_mailbox_admin)])
+
+
+def _find_cert_verification_error(error: BaseException) -> ssl.SSLCertVerificationError | None:
+    """沿着异常本身、`__cause__`、`__context__` 找证书校验错误（最多 5 层）"""
+    current: BaseException | None = error
+    for _ in range(5):
+        if current is None:
+            break
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def describe_test_failure(
+    stage: str,
+    error: BaseException,
+    account: EmailAccount | None = None,
+    host: str = "",
+) -> str:
+    """「测试连接」失败的文案
+
+    证书校验没过时说明白是证书问题。只有开关对这台主机真管用（`EmailAccount.tls_skip_switch_applies`：
+    平台方自己的「自定义」服务器）时才提「不校验服务器证书」；预设服务商、租户填的主机开了也没用，
+    提了只会让管理员白忙，那时只说去查证书。不知道账户或主机时同样不提。
+    """
+    cert_error = _find_cert_verification_error(error)
+    if cert_error is None:
+        return f"{stage}失败: {error!s}"
+    reason = str(getattr(cert_error, "verify_message", "") or "") or str(cert_error)
+    head = f"{stage}失败：服务器证书校验没通过（{reason}）。"
+    if account is not None and host and account.tls_skip_switch_applies(host):
+        return (
+            head + "如果这是内网里用自签证书的邮件服务器，可以在账户的自定义服务器设置里打开「不校验服务器证书」；"
+            "否则请检查证书是否过期、是否和主机名一致"
+        )
+    return head + "请检查服务器证书是否过期、是否和主机名一致；本机缺少根证书或链路被劫持也会这样。这台服务器不能关闭证书校验"
+
+
+def _test_failure_host(client: Any) -> str:
+    """「测试连接」连的那台 IMAP 主机；不是 IMAP 客户端（Gmail API、Graph）或取不到时返回空串"""
+    endpoint = getattr(client, "_imap_endpoint", None)
+    if endpoint is None:
+        return ""
+    try:
+        return str(endpoint()[0])
+    except Exception:
+        return ""
 
 
 def _get_accounts(adapter) -> List[EmailAccount]:
@@ -269,7 +318,7 @@ async def test_email_account(index: int, adapter=Depends(get_email_adapter)):
         message = f"连接成功，已选择邮箱文件夹: {mailbox}"
         logger.info(f"测试邮箱账户连接成功: username={account.USERNAME}, mailbox={mailbox}")
     except Exception as e:
-        message = f"{stage}失败: {e!s}"
+        message = describe_test_failure(stage, e, account, _test_failure_host(client) if client is not None else "")
         logger.exception(
             f"测试邮箱账户连接失败: index={index}, username={account.USERNAME}, provider={account.EMAIL_ACCOUNT}, "
             f"auth_type={account.AUTH_TYPE}, transport_type={account.TRANSPORT_TYPE}, oauth_provider={account.OAUTH_PROVIDER}, "

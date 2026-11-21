@@ -1,4 +1,6 @@
-from typing import Any
+from typing import Any, Optional
+
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 
 def build_model_test_messages(use_system: bool = False) -> list[dict[str, str]]:
@@ -19,7 +21,13 @@ def build_model_test_messages(use_system: bool = False) -> list[dict[str, str]]:
     return messages
 
 
-def build_openai_model_test_params(model_group: Any, stream_mode: bool = False) -> dict[str, Any]:
+def build_openai_model_test_params(
+    model_group: Any,
+    stream_mode: bool = False,
+    *,
+    tenant_egress: Optional[bool] = None,
+) -> dict[str, Any]:
+    """`tenant_egress` 不给时按组判（`is_tenant_owned_group`）；inline 测试这类临时拼的组由调用方给"""
     return {
         "model": model_group.CHAT_MODEL,
         "temperature": model_group.TEMPERATURE,
@@ -32,10 +40,12 @@ def build_openai_model_test_params(model_group: Any, stream_mode: bool = False) 
         "api_key": model_group.API_KEY,
         "stream_mode": stream_mode,
         "proxy_url": model_group.CHAT_PROXY,
+        "api_format": model_group.API_FORMAT,
+        "tenant_egress": is_tenant_owned_group(model_group) if tenant_egress is None else tenant_egress,
     }
 
 
-def build_openai_embedding_test_params(model_group: Any) -> dict[str, Any]:
+def build_openai_embedding_test_params(model_group: Any, *, tenant_egress: Optional[bool] = None) -> dict[str, Any]:
     return {
         "model": model_group.CHAT_MODEL,
         "input": "test",
@@ -43,4 +53,5 @@ def build_openai_embedding_test_params(model_group: Any) -> dict[str, Any]:
         "base_url": model_group.BASE_URL,
         "proxy_url": model_group.CHAT_PROXY,
         "timeout": 30,
+        "tenant_egress": is_tenant_owned_group(model_group) if tenant_egress is None else tenant_egress,
     }

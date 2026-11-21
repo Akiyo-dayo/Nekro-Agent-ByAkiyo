@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from datetime import datetime
+from types import SimpleNamespace
 
+from nekro_agent.services.tavern import runtime as tavern_runtime
 from nekro_agent.services.tavern.macros import MacroContext, expand_macros, sanitize_user_name
 
 
@@ -151,6 +154,73 @@ class TestLengthGuard:
 
         assert result.guarded is True
         assert result.text == text
+
+
+class TestGroupTrimAndExamples:
+    def test_group_is_the_character_name(self) -> None:
+        assert _expand("{{group}}") == "Bot"
+        assert _expand("{{GROUP}}", _ctx(char_name="薄荷")) == "薄荷"
+
+    def test_trim_removes_adjacent_newlines(self) -> None:
+        assert _expand("甲\n\n{{trim}}\n乙") == "甲乙"
+
+    def test_trim_keeps_spaces(self) -> None:
+        assert _expand("甲 {{trim}} 乙") == "甲  乙"
+
+    def test_trim_is_case_insensitive(self) -> None:
+        assert _expand("甲\n{{TRIM}}\n乙") == "甲乙"
+
+    def test_trim_handles_crlf_and_keeps_lone_carriage_return(self) -> None:
+        assert _expand("甲\r\n\r\n{{trim}}\r\n乙") == "甲乙"
+        assert _expand("甲\r{{trim}}乙") == "甲\r乙"
+
+    def test_adjacent_trims_swallow_the_newlines_between_them(self) -> None:
+        assert _expand("甲\n{{trim}}\n\n{{ trim }}\n乙") == "甲乙"
+
+    def test_trim_counts_as_expanded(self) -> None:
+        result = expand_macros("甲\n{{trim}}\n乙\n{{trim}}", _ctx())
+
+        assert result.text == "甲乙"
+        assert result.expanded == 2
+
+    def test_trim_is_linear_on_a_long_run_of_newlines(self) -> None:
+        # 把两侧换行写进正则的写法在这里要十几秒；现在应当瞬间完成。
+        text = "\n" * 40_000 + "甲" + "\n" * 40_000 + "{{trim}}" + "\n" * 40_000 + "乙"
+        started = time.perf_counter()
+
+        result = _expand(text)
+
+        assert result == "\n" * 40_000 + "甲乙"
+        assert time.perf_counter() - started < 2
+
+    def test_mes_examples_raw_returns_the_examples(self) -> None:
+        assert _expand("{{mesExamplesRaw}}", _ctx(examples_raw="{{char}}: 你好")) == "Bot: 你好"
+
+    def test_mes_examples_raw_is_empty_without_examples(self) -> None:
+        assert _expand("{{mesExamplesRaw}}") == ""
+
+
+class TestExamplesRawLookup:
+    def test_none_card_is_empty(self) -> None:
+        assert tavern_runtime._examples_raw(None) == ""  # noqa: SLF001
+
+    def test_source_fields_must_be_a_dict(self) -> None:
+        card = SimpleNamespace(source_fields=["mes_example"])
+
+        assert tavern_runtime._examples_raw(card) == ""  # noqa: SLF001
+
+    def test_card_without_source_fields_is_empty(self) -> None:
+        assert tavern_runtime._examples_raw(SimpleNamespace()) == ""  # noqa: SLF001
+
+    def test_mes_example_must_be_a_string(self) -> None:
+        card = SimpleNamespace(source_fields={"mes_example": 1})
+
+        assert tavern_runtime._examples_raw(card) == ""  # noqa: SLF001
+
+    def test_string_is_returned_verbatim(self) -> None:
+        card = SimpleNamespace(source_fields={"mes_example": "{{char}}: 你好"})
+
+        assert tavern_runtime._examples_raw(card) == "{{char}}: 你好"  # noqa: SLF001
 
 
 class TestSanitizeUserName:

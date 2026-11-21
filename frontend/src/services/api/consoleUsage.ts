@@ -15,12 +15,14 @@ import axios from './axios'
 
 const CONSOLE_USAGE_BASE = '/console/usage'
 
-/** 一组聚合出来的量；四个数值列在每一档里都是同一个口径 */
+/** 一组聚合出来的量；五个数值列在每一档里都是同一个口径 */
 export interface UsageMetrics {
   /** 请求条数（含失败与中断） */
   records: number
   /** 输入 token 合计 */
   token_input: number
+  /** 输入里命中上游缓存的 token 合计 */
+  token_input_cached: number
   /** 输出 token 合计 */
   token_output: number
   /** 上游给出的总 token 合计 */
@@ -76,6 +78,8 @@ export interface UsageRecord {
   model_name: string
   stream_mode: boolean
   token_input: number
+  /** 输入里命中上游缓存的 token 数（上游不回时为 0） */
+  token_input_cached: number
   token_output: number
   token_total: number
   cost: number

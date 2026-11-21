@@ -85,11 +85,11 @@ export const getCurrentAppPath = () => {
   return currentPath || '/'
 }
 
-export const MEMORY_PAGE_TABS = ['items', 'quarantine', 'summaries', 'prompt-rounds'] as const
+export const MEMORY_PAGE_TABS = ['graph', 'items', 'quarantine'] as const
 
 export type MemoryPageTab = (typeof MEMORY_PAGE_TABS)[number]
 
-export const DEFAULT_MEMORY_PAGE_TAB: MemoryPageTab = 'items'
+export const DEFAULT_MEMORY_PAGE_TAB: MemoryPageTab = 'graph'
 
 export const isMemoryPageTab = (value: string | null | undefined): value is MemoryPageTab =>
   value !== undefined && value !== null && MEMORY_PAGE_TABS.includes(value as MemoryPageTab)
@@ -114,7 +114,7 @@ export const memoryPath = (
   return search ? `${base}?${search}` : base
 }
 
-export const WORLDBOOK_PAGE_TABS = ['books', 'quarantine', 'test'] as const
+export const WORLDBOOK_PAGE_TABS = ['books', 'graph', 'quarantine', 'test'] as const
 
 export type WorldbookPageTab = (typeof WORLDBOOK_PAGE_TABS)[number]
 
@@ -161,7 +161,33 @@ export const isMailboxPageTab = (value: string | null | undefined): value is Mai
 /** 邮箱页地址：标签进 path，与世界书页同一形态；不认识的标签由页面重定向 */
 export const mailboxPath = (tab: MailboxPageTab = DEFAULT_MAILBOX_PAGE_TAB) => `/mailbox/${tab}`
 
-export const PROMPT_LAB_PAGE_TABS = ['preview', 'trial', 'audit'] as const
+export const STATE_PAGE_TABS = ['channels', 'people', 'templates'] as const
+
+export type StatePageTab = (typeof STATE_PAGE_TABS)[number]
+
+export const DEFAULT_STATE_PAGE_TAB: StatePageTab = 'channels'
+
+export const isStatePageTab = (value: string | null | undefined): value is StatePageTab =>
+  value !== undefined && value !== null && STATE_PAGE_TABS.includes(value as StatePageTab)
+
+/**
+ * 角色状态页地址
+ *
+ * 标签进 path，与邮箱页同一形态；从好感页跳过来时要带 `person`，所以和世界书页一样
+ * 把调用方给的查询参数拼上（空值不拼）。
+ */
+export const statePath = (tab: StatePageTab = DEFAULT_STATE_PAGE_TAB, query?: Record<string, string>) => {
+  const base = `/state/${tab}`
+  if (!query) return base
+  const params = new URLSearchParams()
+  Object.entries(query).forEach(([key, value]) => {
+    if (value) params.set(key, value)
+  })
+  const search = params.toString()
+  return search ? `${base}?${search}` : base
+}
+
+export const PROMPT_LAB_PAGE_TABS = ['preview', 'trial', 'presets'] as const
 
 export type PromptLabPageTab = (typeof PROMPT_LAB_PAGE_TABS)[number]
 

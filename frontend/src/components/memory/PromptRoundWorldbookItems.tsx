@@ -17,6 +17,8 @@ import { useNavigate } from 'react-router-dom'
 import ActionButton from '../common/ActionButton'
 import { ThemedTooltip } from '../common/ThemedTooltip'
 import { WorldbookTrustChip } from '../worldbook/chips'
+import BudgetExplain from '../worldbook/BudgetExplain'
+import { worldbookDropReasonText } from '../worldbook/display'
 import { memoryErrorMessage } from './errorMessage'
 import { useNotification } from '../../hooks/useNotification'
 import { worldbookBookPath } from '../../router/routes'
@@ -28,6 +30,7 @@ import type {
   PromptRoundDetail,
   PromptRoundWorldbookItem,
 } from '../../services/api/memory'
+import type { WorldbookBudgetInfo } from '../../services/api/worldbook'
 import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 
 /**
@@ -81,6 +84,13 @@ function RoundWorldbookStatusChip({ status }: { status: string }) {
   )
 }
 
+/** 旧行的 `worldbook_budget` 是 `{}`；有 `budget` 才算新行 */
+function hasWorldbookBudget(
+  value: WorldbookBudgetInfo | Record<string, never>
+): value is WorldbookBudgetInfo {
+  return 'budget' in value
+}
+
 export default function PromptRoundWorldbookItems({
   detail,
 }: {
@@ -95,6 +105,9 @@ export default function PromptRoundWorldbookItems({
   const injectedItems = detail.worldbook_items.filter(item => item.type === 'worldbook')
   const droppedItems = detail.worldbook_items.filter(
     item => item.type === 'worldbook_dropped'
+  )
+  const lookupItems = detail.worldbook_items.filter(
+    item => item.type === 'worldbook_lookup'
   )
 
   const actionMutation = useMutation({
@@ -125,8 +138,29 @@ export default function PromptRoundWorldbookItems({
 
   const dropReasonText = (reason: string | undefined) => {
     if (!reason) return '—'
-    return t(`roundDetail.dropReason.${reason}`, { defaultValue: reason })
+    return worldbookDropReasonText(reason, 'roundDetail.dropReason', t)
   }
+
+  /** 新行有 tokens；旧行只有 chars，照旧按字数显示 */
+  const amountCell = (item: PromptRoundWorldbookItem) =>
+    item.tokens !== undefined && item.tokens !== null ? (
+      <Box sx={{ display: 'flex', flexDirection: 'column' }}>
+        <Typography variant="body2">
+          {t('roundDetail.tokenValue', { tokens: item.tokens })}
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          {t('roundDetail.charSuffix', { chars: item.chars })}
+        </Typography>
+      </Box>
+    ) : (
+      <Typography variant="body2">{item.chars}</Typography>
+    )
+
+  const rawWorldbookBudget = detail.worldbook_budget
+  const worldbookBudget =
+    rawWorldbookBudget && hasWorldbookBudget(rawWorldbookBudget)
+      ? rawWorldbookBudget
+      : null
 
   const bookNameCell = (item: PromptRoundWorldbookItem) => {
     const bookId = item.book_id
@@ -198,13 +232,16 @@ export default function PromptRoundWorldbookItems({
         {' · '}
         {t('roundDetail.chars', { chars: detail.worldbook_chars })}
       </Typography>
+      {worldbookBudget && <BudgetExplain budget={worldbookBudget} />}
       {detail.worldbook_state === 'suppressed' && (
         <Typography variant="caption" color="text.secondary">
           {t('roundDetail.suppressedHint')}
         </Typography>
       )}
 
-      {injectedItems.length === 0 && droppedItems.length === 0 ? (
+      {injectedItems.length === 0 &&
+      droppedItems.length === 0 &&
+      lookupItems.length === 0 ? (
         <Typography variant="body2" color="text.secondary">
           {t('roundDetail.empty')}
         </Typography>
@@ -235,7 +272,7 @@ export default function PromptRoundWorldbookItems({
                         {t('roundDetail.columns.status')}
                       </TableCell>
                       <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
-                        {t('roundDetail.columns.chars')}
+                        {t('roundDetail.columns.tokens')}
                       </TableCell>
                       <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
                         {t('roundDetail.columns.renders')}
@@ -255,6 +292,11 @@ export default function PromptRoundWorldbookItems({
                           <Typography variant="body2">
                             {item.comment || `#${item.id}`}
                           </Typography>
+                          {item.reason === 'semantic' && typeof item.score === 'number' && (
+                            <Typography variant="caption" color="text.secondary">
+                              {t('roundDetail.semanticHit', { score: item.score.toFixed(2) })}
+                            </Typography>
+                          )}
                         </TableCell>
                         <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                           <Typography variant="body2">
@@ -268,7 +310,7 @@ export default function PromptRoundWorldbookItems({
                           <RoundWorldbookStatusChip status={item.status} />
                         </TableCell>
                         <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                          <Typography variant="body2">{item.chars}</Typography>
+                          {amountCell(item)}
                         </TableCell>
                         <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                           <Typography variant="body2">
@@ -302,7 +344,7 @@ export default function PromptRoundWorldbookItems({
                         {t('roundDetail.columns.title')}
                       </TableCell>
                       <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
-                        {t('roundDetail.columns.chars')}
+                        {t('roundDetail.columns.tokens')}
                       </TableCell>
                       <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
                         {t('roundDetail.columns.reason')}
@@ -324,14 +366,78 @@ export default function PromptRoundWorldbookItems({
                           <Typography variant="body2">
                             {item.comment || `#${item.id}`}
                           </Typography>
+                          {item.reason === 'semantic' && typeof item.score === 'number' && (
+                            <Typography variant="caption" color="text.secondary">
+                              {t('roundDetail.semanticHit', { score: item.score.toFixed(2) })}
+                            </Typography>
+                          )}
                         </TableCell>
                         <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
-                          <Typography variant="body2">{item.chars}</Typography>
+                          {amountCell(item)}
                         </TableCell>
                         <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                           <Typography variant="body2" color="text.secondary">
                             {dropReasonText(item.reason)}
                           </Typography>
+                        </TableCell>
+                        <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                          <RoundWorldbookStatusChip status={item.status} />
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </Box>
+            </Box>
+          )}
+
+          {lookupItems.length > 0 && (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+              <Typography variant="subtitle2" fontWeight={700}>
+                {t('roundDetail.lookupTitle')}
+              </Typography>
+              <Box sx={{ overflowX: 'auto', width: '100%' }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                        {t('roundDetail.columns.id')}
+                      </TableCell>
+                      <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                        {t('roundDetail.columns.book')}
+                      </TableCell>
+                      <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                        {t('roundDetail.columns.title')}
+                      </TableCell>
+                      <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                        {t('roundDetail.columns.tokens')}
+                      </TableCell>
+                      <TableCell sx={UNIFIED_TABLE_STYLES.header as SxProps<Theme>}>
+                        {t('roundDetail.columns.status')}
+                      </TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {lookupItems.map(item => (
+                      <TableRow key={`worldbook_lookup:${item.id}`}>
+                        <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                          <Typography variant="body2">{item.id}</Typography>
+                        </TableCell>
+                        <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                          {bookNameCell(item)}
+                        </TableCell>
+                        <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                          <Typography variant="body2">
+                            {item.comment || `#${item.id}`}
+                          </Typography>
+                          {item.reason === 'semantic' && typeof item.score === 'number' && (
+                            <Typography variant="caption" color="text.secondary">
+                              {t('roundDetail.semanticHit', { score: item.score.toFixed(2) })}
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
+                          {amountCell(item)}
                         </TableCell>
                         <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                           <RoundWorldbookStatusChip status={item.status} />

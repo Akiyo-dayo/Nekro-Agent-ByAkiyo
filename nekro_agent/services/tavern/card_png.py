@@ -222,7 +222,10 @@ def card_text_from_png(info: PngCardInfo) -> str:
     """
     value = _card_value(info)
     if value is None:
-        raise CardFileRejected("这张 PNG 里没有酒馆人设卡数据")
+        raise CardFileRejected(
+            "这张 PNG 里没有酒馆人设卡数据（常见原因：图片被网站或聊天软件重新压缩过，卡数据丢了；"
+            "请找原始 PNG 或 JSON）",
+        )
     try:
         raw = base64.b64decode(value, validate=True)
         return raw.decode("utf-8")

@@ -43,7 +43,11 @@ import { withDeepLinkInstance } from '../../hooks/useDeepLinkInstance'
 import { useNotification } from '../../hooks/useNotification'
 import DeleteConfirmDialog from './DeleteConfirmDialog'
 import MemoryNotFoundState from './MemoryNotFoundState'
-import { MemoryFlagChips, MemoryStatusChip } from './MemoryStatusChips'
+import {
+  MemoryFlagChips,
+  MemorySensitiveChip,
+  MemoryStatusChip,
+} from './MemoryStatusChips'
 import { memoryErrorMessage } from './errorMessage'
 import { formatDateTime, formatUnixSeconds } from './format'
 
@@ -75,6 +79,7 @@ const READ_ONLY_STATUSES = ['deleted', 'pruned', 'hard_deleted']
 const QUARANTINE_REASON_KEYS: Record<string, string> = {
   manual: 'quarantineReason.manual',
   auto_blocked: 'quarantineReason.auto_blocked',
+  dedup: 'quarantineReason.dedup',
 }
 
 function InfoRow({ label, children }: { label: string; children: ReactNode }) {
@@ -371,7 +376,13 @@ export default function MemoryItemDialog({
           <InfoRow label={t('detail.channel')}>
             {detail.origin_channel_name || detail.origin_chat_key || '—'}
           </InfoRow>
-          <InfoRow label={t('detail.episode')}>{detail.episode?.title || '—'}</InfoRow>
+          <InfoRow label={t('detail.episode')}>
+            {!detail.episode
+              ? '—'
+              : detail.episode.visible === false
+                ? t('groups.hiddenEpisode', { id: detail.episode.id })
+                : detail.episode.title || t('groups.untitledEpisode', { id: detail.episode.id })}
+          </InfoRow>
           <InfoRow label={t('detail.cognitive')}>{cognitiveLabel}</InfoRow>
           <InfoRow label={t('detail.knowledge')}>{knowledgeLabel}</InfoRow>
           <InfoRow label={t('detail.baseWeight')}>
@@ -636,6 +647,7 @@ export default function MemoryItemDialog({
         <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap' }}>
           <MemoryStatusChip status={detail.status} />
           <MemoryFlagChips isFrozen={detail.is_frozen} isProtected={detail.is_protected} />
+          {detail.is_sensitive && <MemorySensitiveChip />}
         </Stack>
         {isEpisode ? renderEpisodeBody() : renderParagraphBody()}
       </Box>

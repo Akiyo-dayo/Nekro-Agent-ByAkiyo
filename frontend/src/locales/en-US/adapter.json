@@ -300,11 +300,17 @@
       "hint": "Which tenant instances' chats may send mail through this mailbox (sending only; its inbox stays hidden). The platform's own instances are not restricted by this setting.",
       "instances": "Listed instances",
       "instancesHint": "Matters for tenant instances only: platform instances can use it either way.",
+      "tenantGroupHint": "Checking a tenant selects the instances it has right now; instances it creates later are not added automatically. Use “All instances” or come back and check them.",
+      "platformGroup": "Platform",
+      "tenantGroupFallback": "Tenant #{{id}}",
+      "selectTenantAria": "Select or clear all instances under {{tenant}}",
+      "noInstances": "No instances available",
+      "unavailableGroup": "Unavailable instances",
       "listedCount": "{{count}} listed instance(s)",
       "options": {
-        "all_instances": "All instances",
+        "all_instances": "All instances (including future ones)",
         "listed": "Listed instances",
-        "none": "Not shared"
+        "none": "Not shared (platform instances only)"
       }
     },
     "transfer": {
@@ -353,6 +359,9 @@
     "enabledYes": "Enabled",
     "enabledNo": "Disabled",
     "sendEnabled": "Allow Sending",
+    "receiveEnabled": "Receiving (check mail)",
+    "receiveEnabledHelp": "When off, this account never connects to IMAP or polls; it is used for sending only",
+    "sendOnly": "Sending only",
     "useProxy": "Use Mail Connection Proxy",
     "defaultSender": "Default Sender",
     "actions": "Actions",
@@ -368,6 +377,8 @@
     "customSmtpPort": "SMTP Port",
     "customSmtpSslPort": "SMTP SSL Port",
     "customSmtpUseSsl": "Prefer SSL for SMTP",
+    "skipTlsVerify": "Skip server certificate verification (self-signed internal certificates only)",
+    "skipTlsVerifyHint": "When enabled, the certificate and hostname are not verified, so anyone on the path can obtain the authorization code. Use it only for internal mail servers with self-signed certificates. If this account is shared with instances for sending, their mail (bodies included) goes over the same connection.",
     "cancel": "Cancel",
     "save": "Save",
     "deleteConfirm": "Delete this email account? This only removes the config entry and will not delete historical emails.",

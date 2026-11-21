@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from tortoise.expressions import Subquery
@@ -18,7 +18,7 @@ from tortoise.queryset import QuerySet
 from tortoise.transactions import in_transaction
 
 from nekro_agent.core.logger import get_sub_logger
-from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+from nekro_agent.models.db_adapter_instance import TOMBSTONE_STATUS, DBAdapterInstance
 from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.models.db_identity import DBIdentityAlias
 from nekro_agent.models.db_mem_paragraph import DBMemParagraph
@@ -32,6 +32,9 @@ logger = get_sub_logger("memory.persons")
 # Bot 自己的发言在消息表里以这个 `sender_id` 记录。它与 `DBChatMessage` 的约定一致，
 # 集中定义在这里，避免沉淀侧与读取侧各写一个字面量。
 BOT_SENDER_ID = "-1"
+# 不当作「本机其他 Bot」的实例状态：墓碑、归档、未认领（与 `services/unclaimed_dispatch.UNCLAIMED_STATUS`
+# 同值；不 import 那个模块，免得记忆层反过来依赖消息分发）
+_NOT_A_KNOWN_BOT_STATUSES = frozenset({TOMBSTONE_STATUS, "archived", "unclaimed"})
 
 # 查私聊对象时向前翻页的大小。绝大多数频道第一页就能命中；分页只是为了跳过没有账号的行。
 _PRIVATE_COUNTERPART_PAGE_SIZE = 256
@@ -62,11 +65,57 @@ async def resolve_bot_account(adapter_key: str, instance_key: str) -> str | None
     return account or None
 
 
-def human_accounts(messages: Sequence[DBChatMessage], *, bot_account: str | None) -> list[str]:
+async def resolve_other_bot_accounts(adapter_key: str, instance_key: str) -> frozenset[str]:
+    """同一适配器下本机**其他** NA 实例的 Bot 账号
+
+    几个实例的 Bot 在同一个群里时，彼此的发言以普通账号入库。把别的 Bot 的人设台词当成
+    「这个群友」的事实记下来、给它建人物事实，是验收里看到的毛病之一。只认本机登记过的
+    实例账号；第三方 Bot 认不出来，由提示词交给模型按「角色扮演台词」判断。
+
+    墓碑、归档与未认领的实例不算：未认领实例是协议端按 `self_id` 自动登记的，谁连上来都会有
+    一行，算进来就能让任意账号被标成〔他 Bot〕、从「涉及的人」里消失。
+    """
+    rows = (
+        await DBAdapterInstance.filter(adapter_key=adapter_key)
+        .exclude(instance_key=instance_key)
+        .exclude(status__in=sorted(_NOT_A_KNOWN_BOT_STATUSES))
+        .values_list("provider_account_id", flat=True)
+    )
+    return frozenset(str(account).strip() for account in rows if account and str(account).strip())
+
+
+def merge_other_bot_accounts(
+    auto_accounts: Collection[str],
+    configured_accounts: Iterable[object],
+    *,
+    bot_account: str | None,
+) -> frozenset[str]:
+    """把自动识别出的其他实例 Bot 账号与频道配置里的第三方 Bot 名单并起来
+
+    配置项来自四层合并后的频道生效配置，可能是任意可迭代值；逐项转成字符串、去空白、
+    去空项，并去掉本 Bot 自己的号——把本 Bot 标成〔他 Bot〕会让它自己的台词从记忆里消失。
+    """
+    accounts = {str(account).strip() for account in auto_accounts if str(account).strip()}
+    for item in configured_accounts:
+        account = str(item).strip()
+        if account:
+            accounts.add(account)
+    if bot_account is not None:
+        # 两个来源都要去：自动识别那一份里万一混进了本 Bot 的号，也不能把自己标成别人。
+        accounts.discard(bot_account)
+    return frozenset(accounts)
+
+
+def human_accounts(
+    messages: Sequence[DBChatMessage],
+    *,
+    bot_account: str | None,
+    other_bots: Collection[str] = (),
+) -> list[str]:
     """按首次出现顺序返回这一批里的非 Bot 账号，已去重
 
-    排除三类行：Bot 自己的发言、没有账号或账号是纯空白的行、账号等于本实例 Bot 自己的行。
-    返回的是账号本身（不是别名解析后的「人」）。
+    排除四类行：Bot 自己的发言、没有账号或账号是纯空白的行、账号等于本实例 Bot 自己的行、
+    本机其他实例的 Bot 账号（`other_bots`）。返回的是账号本身（不是别名解析后的「人」）。
     """
     seen: set[str] = set()
     accounts: list[str] = []
@@ -77,6 +126,8 @@ def human_accounts(messages: Sequence[DBChatMessage], *, bot_account: str | None
         if not account:
             continue
         if bot_account is not None and account == bot_account:
+            continue
+        if account in other_bots:
             continue
         if account in seen:
             continue
@@ -290,9 +341,11 @@ __all__ = [
     "expand_accounts",
     "human_accounts",
     "load_person_accounts",
+    "merge_other_bot_accounts",
     "persons_of_paragraphs",
     "replace_paragraph_persons",
     "reset_member_cache",
     "resolve_bot_account",
+    "resolve_other_bot_accounts",
     "resolve_private_counterpart",
 ]

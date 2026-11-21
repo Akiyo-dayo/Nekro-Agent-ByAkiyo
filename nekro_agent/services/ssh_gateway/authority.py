@@ -70,7 +70,7 @@ from nekro_agent.services.ssh_gateway.constants import is_valid_alias
 from nekro_agent.services.ssh_gateway.dbslot import db_slot
 from nekro_agent.services.ssh_gateway.destination import check_user_destination
 from nekro_agent.services.ssh_gateway.keys import public_key_line
-from nekro_agent.services.ssh_gateway.lease import running_lease
+from nekro_agent.services.ssh_gateway.lease import note_connected, running_lease
 from nekro_agent.services.ssh_gateway.secrets import decrypt_secret
 
 logger = get_sub_logger("ssh_gateway.authority")
@@ -155,6 +155,9 @@ _BANNERS = {
     C.REASON_NO_LEASE: "当前任务没有使用服务器的授权（只有凭据主人本人叫醒的那一轮委托的任务才能用）",
     C.REASON_NOT_COVERED: "本任务的授权不含这台服务器",
     C.REASON_OWNER_CHANGED: "授权依据变了（名单、白名单、实例状态），本任务不能再用",
+    C.REASON_INSTANCE_INACTIVE: "叫醒这个任务的 Bot 已经停用，本任务不能再用服务器",
+    C.REASON_DUTY_REVOKED: "这台服务器不再是值守模式，本任务不能再用",
+    C.REASON_INSTANCE_INELIGIBLE: "叫醒这个任务的 Bot 不再能触发值守，本任务不能再用这台服务器",
     C.REASON_WORKSPACE_NOT_PLATFORM: "这个工作区不再归平台方，平台方的服务器已挂起",
     C.REASON_ROW_INACTIVE: "这条凭据停用了，请平台方或凭据主人处理",
     C.REASON_UNDECRYPTABLE: "这条凭据解不开，请平台方或凭据主人处理",
@@ -446,6 +449,9 @@ async def authorize_connection(
         # 判定与入队之间队列被填满：按"拒绝新连接"处理，绝不悄悄放过一条没有审计的连接
         return _limit_decision(workspace_id, alias=alias)
 
+    # 在租约上记一笔「这一行放行过连接」：值守的事后摘要以它判断值守行真的连过。审计行是异步
+    # 写库的，租约结束时可能还没落库（队列退避、写空超时），不能拿它当发不发摘要的依据
+    note_connected(str(lease.lease_id), int(row.id))
     return Decision(
         ok=True,
         reason="",
@@ -510,11 +516,17 @@ async def recheck_channel(
 
 
 def _config_fingerprint() -> Tuple[Any, ...]:
-    """复核依赖的配置项：任何一项变了就是新的缓存键"""
+    """复核依赖的配置项：任何一项变了就是新的缓存键
+
+    值守的两项也在里面：改默认模式、把实例移出名单都不发凭据变更通知，靠下一拍的周期
+    复核断开，缓存不能把旧结论留到 5 秒以后。
+    """
     return (
         bool(config.SSH_GATEWAY_ENABLED),
         tuple(str(item) for item in (config.SSH_GATEWAY_OWNER_ACCOUNTS or [])),
         tuple(str(item) for item in (config.SSH_GATEWAY_USER_ACCOUNTS or [])),
+        str(config.SSH_GATEWAY_DEFAULT_DUTY_MODE or ""),
+        tuple(str(item) for item in (config.SSH_GATEWAY_DUTY_INSTANCES or [])),
     )
 
 

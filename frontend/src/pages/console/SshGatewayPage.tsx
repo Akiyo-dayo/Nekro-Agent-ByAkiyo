@@ -19,13 +19,16 @@ import {
   CircularProgress,
   Divider,
   Stack,
+  type SxProps,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableRow,
+  type Theme,
   Tooltip,
   Typography,
+  useTheme,
 } from '@mui/material'
 import {
   Refresh as RefreshIcon,
@@ -54,7 +57,7 @@ import {
   type SshCredentialView,
 } from '../../services/api/sshGateway'
 import { workspaceDetailPath } from '../../router/routes'
-import { CARD_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
+import { CARD_VARIANTS, CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 import { formatLastActiveTimeFromInput } from '../../utils/time'
 
 const STATUS_COLORS: Record<string, 'success' | 'default' | 'warning' | 'error'> = {
@@ -72,12 +75,22 @@ const GATEWAY_STATE_COLORS: Record<string, 'success' | 'default' | 'warning' | '
   tripped: 'error',
 }
 
+/** 文字较长、允许折行的标签：高度随内容走 */
+const WRAPPING_CHIP_SX: SxProps<Theme> = {
+  height: 'auto',
+  '& .MuiChip-label': {
+    whiteSpace: 'normal',
+    py: 0.25,
+  },
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
   return String(error ?? '')
 }
 
 export default function SshGatewayPage() {
+  const theme = useTheme()
   const { t } = useTranslation('console-ssh-gateway')
   const navigate = useNavigate()
   const notification = useNotification()
@@ -298,9 +311,11 @@ export default function SshGatewayPage() {
                     <Box sx={{ mt: 0.5 }}>
                       <Chip
                         size="small"
-                        color={
-                          GATEWAY_STATE_COLORS[statusQuery.data.state] ?? 'default'
-                        }
+                        sx={CHIP_VARIANTS.getPaletteChip(
+                          theme,
+                          GATEWAY_STATE_COLORS[statusQuery.data.state] ?? 'default',
+                          true
+                        )}
                         label={t(`status.states.${statusQuery.data.state}`, {
                           defaultValue: statusQuery.data.state,
                         })}
@@ -357,6 +372,28 @@ export default function SshGatewayPage() {
                       {statusQuery.data.running_leases}
                     </Typography>
                   </Box>
+                  <Box>
+                    <Typography variant="caption" color="text.secondary">
+                      {t('status.defaultDutyMode')}
+                    </Typography>
+                    <Typography variant="body2">
+                      {statusQuery.data.default_duty_mode === 'duty'
+                        ? t('status.dutyModes.duty')
+                        : t('status.dutyModes.strict')}
+                    </Typography>
+                  </Box>
+                  <Box>
+                    <Typography variant="caption" color="text.secondary">
+                      {t('status.dutyInstances')}
+                    </Typography>
+                    <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>
+                      {statusQuery.data.duty_instances_closed
+                        ? t('status.dutyInstancesClosed')
+                        : statusQuery.data.duty_instances.length === 0
+                          ? t('status.dutyInstancesAll')
+                          : statusQuery.data.duty_instances.join(', ')}
+                    </Typography>
+                  </Box>
                 </Box>
                 <Divider />
                 <Stack
@@ -410,7 +447,7 @@ export default function SshGatewayPage() {
               </Typography>
             </Box>
           ) : (
-            <Box sx={{ overflowX: 'auto' }}>
+            <Box sx={UNIFIED_TABLE_STYLES.embedded}>
               <Table
                 size="small"
                 sx={UNIFIED_TABLE_STYLES.getTableBase(false, false)}
@@ -476,16 +513,25 @@ export default function SshGatewayPage() {
                               credential.owner_whitelisted === false && (
                                 <Chip
                                   size="small"
-                                  color="warning"
                                   label={t('credentials.ownerNotWhitelisted')}
-                                  sx={{
-                                    height: 'auto',
-                                    '& .MuiChip-label': {
-                                      whiteSpace: 'normal',
-                                      py: 0.25,
-                                    },
-                                  }}
+                                  sx={[
+                                    CHIP_VARIANTS.getPaletteChip(theme, 'warning', true),
+                                    WRAPPING_CHIP_SX,
+                                  ] as SxProps<Theme>}
                                 />
+                              )}
+                            {credential.owner_kind === 'platform' &&
+                              credential.effective_duty_mode === 'duty' && (
+                                <Tooltip title={t('credentials.dutyBadgeHint')}>
+                                  <Chip
+                                    size="small"
+                                    label={t('credentials.dutyBadge')}
+                                    sx={[
+                                      CHIP_VARIANTS.getPaletteChip(theme, 'warning', true),
+                                      WRAPPING_CHIP_SX,
+                                    ] as SxProps<Theme>}
+                                  />
+                                </Tooltip>
                               )}
                           </Stack>
                         </TableCell>
@@ -501,7 +547,11 @@ export default function SshGatewayPage() {
                           <Tooltip title={tooltip} disableHoverListener={!tooltip}>
                             <Chip
                               size="small"
-                              color={STATUS_COLORS[credential.status] ?? 'default'}
+                              sx={CHIP_VARIANTS.getPaletteChip(
+                                theme,
+                                STATUS_COLORS[credential.status] ?? 'default',
+                                true
+                              )}
                               label={t(
                                 `credentials.status.${credential.status}`,
                                 { defaultValue: credential.status }
@@ -513,16 +563,12 @@ export default function SshGatewayPage() {
                           {credential.secret_state === 'undecryptable' ? (
                             <Chip
                               size="small"
-                              color="error"
                               label={t('credentials.secret.undecryptable')}
-                              sx={{
-                                height: 'auto',
-                                maxWidth: 220,
-                                '& .MuiChip-label': {
-                                  whiteSpace: 'normal',
-                                  py: 0.25,
-                                },
-                              }}
+                              sx={[
+                                CHIP_VARIANTS.getPaletteChip(theme, 'error', true),
+                                WRAPPING_CHIP_SX,
+                                { maxWidth: 220 },
+                              ] as SxProps<Theme>}
                             />
                           ) : (
                             <Typography variant="caption" color="text.secondary">
@@ -688,7 +734,7 @@ export default function SshGatewayPage() {
             </Typography>
           ) : (
             <>
-              <Box sx={{ overflowX: 'auto' }}>
+              <Box sx={UNIFIED_TABLE_STYLES.embedded}>
                 <Table
                   size="small"
                   sx={UNIFIED_TABLE_STYLES.getTableBase(false, false)}
@@ -724,7 +770,11 @@ export default function SshGatewayPage() {
                           <TableCell>
                             <Chip
                               size="small"
-                              color={item.allowed ? 'success' : 'error'}
+                              sx={CHIP_VARIANTS.getPaletteChip(
+                                theme,
+                                item.allowed ? 'success' : 'error',
+                                true
+                              )}
                               label={t(
                                 item.allowed
                                   ? 'audit.decision.allowed'

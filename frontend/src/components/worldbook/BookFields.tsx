@@ -1,4 +1,7 @@
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Box,
   FormControlLabel,
   Stack,
@@ -13,8 +16,10 @@ import {
   WORLDBOOK_DESCRIPTION_MAX_LENGTH,
   WORLDBOOK_NAME_MAX_LENGTH,
   WORLDBOOK_SCOPE_KINDS,
+  type WorldbookActiveScene,
   type WorldbookBookDetail,
   type WorldbookChannelOption,
+  type WorldbookInjectMode,
   type WorldbookPresetOption,
   type WorldbookScopeKind,
   type WorldbookScopeParams,
@@ -33,6 +38,8 @@ interface BookFieldsProps {
   channels: WorldbookChannelOption[]
   /** 书设置模式下展示只读的作用域信息 */
   book?: WorldbookBookDetail
+  /** 导入新书的对话框：在开关说明后补一句「与酒馆新装默认一致」 */
+  showScanNamesStDefault?: boolean
 }
 
 /**
@@ -50,6 +57,7 @@ export default function BookFields({
   presets,
   channels,
   book,
+  showScanNamesStDefault = false,
 }: BookFieldsProps) {
   const { t } = useTranslation('worldbook')
   const hasInstance = Boolean(scope.instance_key)
@@ -63,6 +71,18 @@ export default function BookFields({
       disabled: !hasInstance && (kind === 'domain' || kind === 'person'),
     })
   )
+
+  const injectModeOptions: SegmentedControlOption<WorldbookInjectMode>[] = [
+    { value: 'both', label: t('bookForm.injectMode.both') },
+    { value: 'push', label: t('bookForm.injectMode.push') },
+    { value: 'lookup', label: t('bookForm.injectMode.lookup') },
+  ]
+
+  const activeSceneOptions: SegmentedControlOption<WorldbookActiveScene>[] = [
+    { value: 'both', label: t('bookForm.activeScene.both') },
+    { value: 'private', label: t('bookForm.activeScene.private') },
+    { value: 'group', label: t('bookForm.activeScene.group') },
+  ]
 
   const presetOptions = [
     { value: '', label: t('bookForm.presetPlaceholder') },
@@ -208,15 +228,45 @@ export default function BookFields({
         />
         <TextField
           label={t('bookForm.budget')}
-          value={value.budgetChars}
-          onChange={event => update({ budgetChars: event.target.value })}
+          value={value.budgetTokens}
+          onChange={event => update({ budgetTokens: event.target.value })}
           error={Boolean(errors.budget)}
           helperText={errors.budget ? t(errors.budget) : t('bookForm.budgetHelper')}
           type="number"
-          slotProps={{ htmlInput: { min: 0, max: 100000 } }}
+          slotProps={{ htmlInput: { min: 0, max: 65536 } }}
           fullWidth
         />
       </Stack>
+
+      <Box>
+        <Typography variant="body2" fontWeight={600} sx={{ mb: 1 }}>
+          {t('bookForm.injectMode.label')}
+        </Typography>
+        <SegmentedControl
+          value={value.injectMode}
+          options={injectModeOptions}
+          onChange={injectMode => update({ injectMode })}
+          fullWidth
+        />
+        <Typography variant="caption" color="text.secondary">
+          {t('bookForm.injectMode.helper')}
+        </Typography>
+      </Box>
+
+      <Box>
+        <Typography variant="body2" fontWeight={600} sx={{ mb: 1 }}>
+          {t('bookForm.activeScene.label')}
+        </Typography>
+        <SegmentedControl
+          value={value.activeScene}
+          options={activeSceneOptions}
+          onChange={activeScene => update({ activeScene })}
+          fullWidth
+        />
+        <Typography variant="caption" color="text.secondary">
+          {t('bookForm.activeScene.helper')}
+        </Typography>
+      </Box>
 
       <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
         <FormControlLabel
@@ -241,6 +291,93 @@ export default function BookFields({
       <Typography variant="caption" color="text.secondary">
         {t('bookForm.matchWholeWordsHelper')}
       </Typography>
+
+      <Box>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={value.scanNames}
+              onChange={event => update({ scanNames: event.target.checked })}
+            />
+          }
+          label={t('bookForm.scanNames')}
+        />
+        <Typography variant="caption" color="text.secondary" display="block">
+          {t('bookForm.scanNamesHelper')}
+          {showScanNamesStDefault ? ` ${t('bookForm.scanNamesStDefault')}` : ''}
+        </Typography>
+      </Box>
+
+      <Box>
+        <Typography variant="body2" fontWeight={600} sx={{ mb: 1 }}>
+          {t('bookForm.semantic.label')}
+        </Typography>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={value.vectorAll}
+              onChange={event => update({ vectorAll: event.target.checked })}
+            />
+          }
+          label={t('bookForm.semantic.vectorAll')}
+        />
+        <Typography variant="caption" color="text.secondary" display="block">
+          {t('bookForm.semantic.vectorAllHelper')}
+        </Typography>
+        <Accordion disableGutters elevation={0} sx={{ mt: 1 }}>
+          <AccordionSummary sx={{ px: 0 }}>
+            <Typography variant="body2" color="text.secondary">
+              {t('bookForm.semantic.advanced')}
+            </Typography>
+          </AccordionSummary>
+          <AccordionDetails sx={{ px: 0, pt: 0 }}>
+            <Stack spacing={2}>
+              <TextField
+                label={t('bookForm.semantic.queryMessages')}
+                value={value.vectorQueryMessages}
+                onChange={event => update({ vectorQueryMessages: event.target.value })}
+                error={Boolean(errors.vectorQueryMessages)}
+                helperText={
+                  errors.vectorQueryMessages
+                    ? t(errors.vectorQueryMessages)
+                    : t('bookForm.semantic.queryMessagesHelper')
+                }
+                type="number"
+                slotProps={{ htmlInput: { min: 1, max: 10 } }}
+                fullWidth
+              />
+              <TextField
+                label={t('bookForm.semantic.maxEntries')}
+                value={value.vectorMaxEntries}
+                onChange={event => update({ vectorMaxEntries: event.target.value })}
+                error={Boolean(errors.vectorMaxEntries)}
+                helperText={
+                  errors.vectorMaxEntries
+                    ? t(errors.vectorMaxEntries)
+                    : t('bookForm.semantic.maxEntriesHelper')
+                }
+                type="number"
+                slotProps={{ htmlInput: { min: 1, max: 20 } }}
+                fullWidth
+              />
+              <TextField
+                label={t('bookForm.semantic.threshold')}
+                value={value.vectorThreshold}
+                onChange={event => update({ vectorThreshold: event.target.value })}
+                error={Boolean(errors.vectorThreshold)}
+                helperText={
+                  errors.vectorThreshold
+                    ? t(errors.vectorThreshold)
+                    : t('bookForm.semantic.thresholdHelper')
+                }
+                type="number"
+                slotProps={{ htmlInput: { min: 0, max: 1, step: 0.05 } }}
+                fullWidth
+              />
+            </Stack>
+          </AccordionDetails>
+        </Accordion>
+      </Box>
     </Stack>
   )
 }

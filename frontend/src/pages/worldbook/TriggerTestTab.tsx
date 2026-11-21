@@ -21,7 +21,11 @@ import ActionButton from '../../components/common/ActionButton'
 import FilterSelect from '../../components/common/FilterSelect'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import { WorldbookScopeChip, WorldbookTrustChip } from '../../components/worldbook/chips'
-import { worldbookPositionText } from '../../components/worldbook/display'
+import BudgetExplain from '../../components/worldbook/BudgetExplain'
+import {
+  worldbookDropReasonText,
+  worldbookPositionText,
+} from '../../components/worldbook/display'
 import { useWorldbookScopeOptions } from '../../components/worldbook/useWorldbookScopeOptions'
 import WorldbookNotFoundState from '../../components/worldbook/WorldbookNotFoundState'
 import { isNotFoundError } from '../../services/api/axios'
@@ -32,7 +36,7 @@ import {
   type WorldbookTriggerHitItem,
   type WorldbookTriggerTestResponse,
 } from '../../services/api/worldbook'
-import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
+import { CHIP_VARIANTS, SCROLL_COLUMN_STYLES, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 
 /**
  * 「触发测试」标签
@@ -44,6 +48,8 @@ import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../theme/variants'
 // 两张表的最小宽度：窄屏下放不下时横向滚动，而不是把每列挤成一字一行
 const BOOKS_TABLE_MIN_WIDTH = 480
 const HITS_TABLE_MIN_WIDTH = 760
+// 「前面占掉预算的」最多列几个标题，多的写「等 N 条」
+const AHEAD_SHOWN = 5
 
 interface TriggerTestTabProps {
   scope: WorldbookScopeParams
@@ -104,6 +110,24 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
       : t('entryDialog.positionOptions.at_depth')
   }
 
+  /** 因预算被跳过时，前面入选、占掉预算的条目标题；标题从同一次响应的命中列表里找 */
+  const renderAhead = (data: WorldbookTriggerTestResponse, ahead: number[]) => {
+    if (ahead.length === 0) return null
+    const shown = ahead.slice(0, AHEAD_SHOWN)
+    const titles = shown
+      // 没有标题就写编号，与本表标题列、书详情里的写法一致
+      .map(entryId => data.hits.find(hit => hit.entry_id === entryId)?.comment || `#${entryId}`)
+      .join('、')
+    // 「等 N 条」的 N 是总数，不是没列出的条数
+    return (
+      <Typography variant="caption" color="text.secondary" display="block">
+        {ahead.length > shown.length
+          ? t('test.aheadMore', { titles, count: ahead.length })
+          : t('test.ahead', { titles })}
+      </Typography>
+    )
+  }
+
   const renderBlock = (title: string, body: string) => (
     <Box>
       <Typography variant="caption" fontWeight={600} display="block" sx={{ mb: 0.5 }}>
@@ -161,7 +185,7 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
   )
 
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, overflowY: 'auto', minHeight: 0, pb: 1 }}>
+    <Box sx={[SCROLL_COLUMN_STYLES, { gap: 2, pb: 1 }] as SxProps<Theme>}>
       <Box sx={sectionSx}>
         <Stack spacing={2}>
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
@@ -212,6 +236,12 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
 
       {result && (
         <Stack spacing={2}>
+          {result.budget && (
+            <Box sx={sectionSx}>
+              <BudgetExplain budget={result.budget} totalTokens={result.total_tokens} />
+            </Box>
+          )}
+
           {!result.gate_enabled && <Alert severity="warning">{t('test.gateOff')}</Alert>}
 
           <Box>
@@ -276,7 +306,7 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
                     t('test.hitColumns.reason'),
                     t('test.hitColumns.position'),
                     t('test.hitColumns.order'),
-                    t('test.hitColumns.chars'),
+                    t('test.hitColumns.tokens'),
                     t('test.hitColumns.trust'),
                     t('test.hitColumns.result'),
                   ])}
@@ -288,7 +318,19 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
                       return (
                         <TableRow key={hit.entry_id} sx={UNIFIED_TABLE_STYLES.row}>
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
-                            {hit.comment || `#${hit.entry_id}`}
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
+                              <span>{hit.comment || `#${hit.entry_id}`}</span>
+                              {hit.ignored_budget && (
+                                <Chip
+                                  size="small"
+                                  label={t('test.ignoredBudget')}
+                                  sx={CHIP_VARIANTS.getCustomColorChip(
+                                    theme.palette.info.main,
+                                    true
+                                  )}
+                                />
+                              )}
+                            </Box>
                           </TableCell>
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                             {book?.name ?? `#${hit.book_id}`}
@@ -296,13 +338,22 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                             {hit.reason_kind === 'constant'
                               ? t('test.reasonConstant')
-                              : t('test.reasonKey', { key: hit.matched_key })}
+                              : hit.reason_kind === 'semantic'
+                                ? t('test.reasonSemantic', {
+                                    score: hit.score === null ? '—' : hit.score.toFixed(2),
+                                  })
+                                : t('test.reasonKey', { key: hit.matched_key })}
                           </TableCell>
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                             {renderPosition(result, hit)}
                           </TableCell>
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell}>{hit.order}</TableCell>
-                          <TableCell sx={UNIFIED_TABLE_STYLES.cell}>{hit.chars}</TableCell>
+                          <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
+                            {t('test.tokenWithChars', {
+                              tokens: hit.tokens ?? '—',
+                              chars: hit.chars,
+                            })}
+                          </TableCell>
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell}>
                             <WorldbookTrustChip trusted={hit.trusted} />
                           </TableCell>
@@ -317,13 +368,18 @@ export default function TriggerTestTab({ scope, isScopeReady }: TriggerTestTabPr
                                 )}
                               />
                             ) : dropped ? (
-                              <Typography variant="caption" color="text.secondary">
-                                {t('test.dropped', {
-                                  reason: t(`test.dropReason.${dropped.reason}`, {
-                                    defaultValue: dropped.reason,
-                                  }),
-                                })}
-                              </Typography>
+                              <>
+                                <Typography variant="caption" color="text.secondary">
+                                  {t('test.dropped', {
+                                    reason: worldbookDropReasonText(
+                                      dropped.reason,
+                                      'test.dropReason',
+                                      t
+                                    ),
+                                  })}
+                                </Typography>
+                                {renderAhead(result, dropped.ahead)}
+                              </>
                             ) : (
                               <Typography variant="caption" color="text.secondary">
                                 {t('test.notSelected')}

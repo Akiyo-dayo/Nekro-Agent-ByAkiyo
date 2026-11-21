@@ -772,7 +772,7 @@ async def transfer_instance_account_to_platform(
     payload["SEND_SHARE_INSTANCES"] = []
     account = EmailAccount(**payload)
     # 服务器是租户填的（`model_dump()` 不带运行时标记）：记下当时的服务器，平台方改掉它之前，
-    # 客户端照旧只连校验过的地址、拒内网与 Fake-IP 段——域名的 DNS 可能还在租户手里
+    # 客户端照旧只连校验过的地址、拒内网——域名的 DNS 可能还在租户手里
     if runtime.is_tenant_endpoint():
         account.TENANT_SUPPLIED_HOSTS = account.tenant_hosts_marker()
 

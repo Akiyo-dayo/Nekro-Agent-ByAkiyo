@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import pytest
@@ -40,6 +41,11 @@ async def _preset(name: str = "人设") -> DBPreset:
         author="作者",
         owner_instance_key="",
     )
+
+
+def _budget(tokens: int) -> Any:
+    """导入提示用的预算替身：一字一 token，便于手算（真实数法见 `test_worldbook_tokens.py`）"""
+    return SimpleNamespace(budget=tokens, cap_tokens=0, model_group="stub-group", count=len)
 
 
 def _full_entry() -> dict[str, Any]:
@@ -181,7 +187,7 @@ class TestCardEntryToWorld:
         book = {"entries": [{"id": 3, "content": "长" * 10}, {"id": 4, "content": "短"}]}
 
         _ext, _rows, silent = card_book.build_book_rows(book)
-        _ext, _rows, notes = card_book.build_book_rows(book, budget_chars=5)
+        _ext, _rows, notes = card_book.build_book_rows(book, budget=_budget(5))
 
         assert [note.kind for note in silent].count("over_budget") == 0
         assert [(note.entry_key, note.kind) for note in notes if note.kind == "over_budget"] == [("3", "over_budget")]
@@ -229,18 +235,32 @@ class TestWorldEntryToCard:
 
         assert card_book.world_entry_to_card_entry(world, use_regex=False)["position"] == "after_char"
 
+    def test_ignore_budget_round_trips_through_the_extension(self) -> None:
+        """卡内的 `extensions.ignore_budget` ↔ 世界书的 `ignoreBudget`，两个方向都要写回"""
+        world = card_book.card_entry_to_world_entry(_full_entry(), 0)
+        assert world["ignoreBudget"] is True
+
+        back = card_book.world_entry_to_card_entry(world, use_regex=False)
+        assert back["extensions"]["ignore_budget"] is True
+
+        off = card_book.card_entry_to_world_entry({"id": 2, "content": "正文"}, 0)
+        assert off["ignoreBudget"] is False
+        assert card_book.world_entry_to_card_entry(off, use_regex=False)["extensions"]["ignore_budget"] is False
+
 
 class TestCreateCardBook:
     @pytest.mark.asyncio
     async def test_scope_is_preset_and_entries_are_untrusted(self, db: None) -> None:
         preset = await _preset()
+        source = {"name": "卡内书", "scan_depth": 8, "entries": [{"id": 1, "keys": ["甲"], "content": "正文"}]}
 
         book, report = await card_book.create_card_book(
             ("", ""),
             preset.id,
             "卡内书",
-            {"name": "卡内书", "scan_depth": 8, "entries": [{"id": 1, "keys": ["甲"], "content": "正文"}]},
+            source,
             username="platform",
+            prepared=card_book.prepare_card_book(source),
         )
 
         assert book.scope_kind == "preset"
@@ -252,6 +272,32 @@ class TestCreateCardBook:
         assert entries
         assert all(entry.trusted is False for entry in entries)
         assert book.ext["na_card_book"] == {"name": "卡内书", "scan_depth": 8}
+
+    @pytest.mark.asyncio
+    async def test_card_ignore_budget_lands_on_the_world_entry_and_names_are_on(self, db: None) -> None:
+        preset = await _preset()
+        source = {
+            "entries": [
+                {"id": 1, "keys": ["甲"], "content": "必进的正文", "extensions": {"ignore_budget": True}},
+                {"id": 2, "keys": ["乙"], "content": "普通的正文"},
+            ],
+        }
+
+        book, report = await card_book.create_card_book(
+            ("", ""),
+            preset.id,
+            "卡内书",
+            source,
+            username="platform",
+            prepared=card_book.prepare_card_book(source),
+        )
+
+        assert report.created == 2
+        rows = {row.uid: row for row in await DBWbEntry.filter(book_id=book.id)}
+        assert rows[1].ignore_budget is True
+        assert rows[2].ignore_budget is False
+        # 新导入的卡内书与酒馆新装默认一致：扫描时带上说话人名字
+        assert book.scan_names is True
 
     @pytest.mark.asyncio
     async def test_duplicate_uids_are_renumbered(self, db: None) -> None:
@@ -267,6 +313,7 @@ class TestCreateCardBook:
             "卡内书",
             {"entries": entries},
             username="tester",
+            prepared=card_book.prepare_card_book({"entries": entries}),
         )
 
         rows = await DBWbEntry.filter(book_id=book.id).order_by("id")

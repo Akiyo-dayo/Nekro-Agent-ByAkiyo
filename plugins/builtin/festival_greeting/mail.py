@@ -36,6 +36,7 @@ from nekro_agent.services.config_resolver import config_resolver
 from nekro_agent.services.output_filter.engine import filter_text
 from nekro_agent.services.output_filter.service import settings_for_instance
 from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 logger = get_sub_logger("festival_mail")
 
@@ -145,6 +146,8 @@ async def _generate_body(adapter_key: str, instance_key: str, festival_name: str
             base_url=group.BASE_URL,
             api_key=group.API_KEY,
             stream_mode=False,
+            api_format=group.API_FORMAT,
+            tenant_egress=is_tenant_owned_group(group),
         )
     return _parse_generated(response.response_content, festival_name)
 

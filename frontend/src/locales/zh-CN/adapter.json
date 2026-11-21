@@ -300,11 +300,17 @@
       "hint": "决定哪些租户实例的会话能用这个邮箱发信（只能发信，看不到收件箱）；平台方自己的实例不受这一项限制。",
       "instances": "指定的实例",
       "instancesHint": "只对租户实例有意义：平台方实例本来就能用，选不选都一样。",
+      "tenantGroupHint": "按租户勾选只是一次选中它现在名下的实例；租户以后新建的实例不会自动加入，要用『所有实例』或回来再勾",
+      "platformGroup": "平台方",
+      "tenantGroupFallback": "租户 #{{id}}",
+      "selectTenantAria": "全选或取消 {{tenant}} 名下的实例",
+      "noInstances": "暂无可选实例",
+      "unavailableGroup": "不可用实例",
       "listedCount": "指定 {{count}} 个实例",
       "options": {
-        "all_instances": "所有实例",
+        "all_instances": "所有实例（含以后新建的）",
         "listed": "指定实例",
-        "none": "不共享"
+        "none": "不共享（只给平台方自己的实例）"
       }
     },
     "transfer": {
@@ -353,6 +359,9 @@
     "enabledYes": "已启用",
     "enabledNo": "已停用",
     "sendEnabled": "允许发信",
+    "receiveEnabled": "收信（查信）",
+    "receiveEnabledHelp": "关着时不连 IMAP、不轮询，这个邮箱只用来发信",
+    "sendOnly": "仅发信",
     "useProxy": "使用邮箱连接代理",
     "defaultSender": "默认发件人",
     "actions": "操作",
@@ -368,6 +377,8 @@
     "customSmtpPort": "SMTP 端口",
     "customSmtpSslPort": "SMTP SSL 端口",
     "customSmtpUseSsl": "SMTP 优先使用 SSL",
+    "skipTlsVerify": "不校验服务器证书（仅内网自签证书）",
+    "skipTlsVerifyHint": "打开后不校验证书和主机名，链路上的中间人能拿到授权码。只给内网里用自签证书的邮件服务器用。这个账户共享给实例发信时，实例发的信（含正文）也走这条连接。",
     "cancel": "取消",
     "save": "保存",
     "deleteConfirm": "确定要删除这个邮箱账户吗？该操作只会移除配置项，不会删除历史邮件。",

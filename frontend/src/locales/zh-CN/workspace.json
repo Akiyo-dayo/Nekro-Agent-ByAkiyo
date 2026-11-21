@@ -997,7 +997,9 @@
         "loadMore": "加载更多",
         "showInput": "查看输入",
         "hideInput": "收起输入",
-        "openSettings": "前往系统配置"
+        "openSettings": "前往系统配置",
+        "dutyMode": "模式",
+        "runbook": "运维手册"
       },
       "columns": {
         "alias": "别名",
@@ -1062,6 +1064,26 @@
         }
       },
       "s3Warning": "这个工作区还绑定了 {{count}} 个频道，那些频道里的人留下的东西会在平台方服务器的授权窗口里被 CC 读到",
+      "duty": {
+        "badge": "值守",
+        "badgeHint": "能找到这台 Bot 的人报故障，都能让它连这台服务器去查、去修",
+        "title": "服务器模式",
+        "modeInherit": "跟随默认（当前：{{mode}}）",
+        "modeStrict": "严格：只认所有者本人",
+        "modeDuty": "值守",
+        "dutyWarning": "值守模式下，平台方实例上能找到这台 Bot 的人报了故障，Bot 就可以自己连这台服务器去查、去修，做什么由它判断。所有操作都留审计，事后会私聊所有者一份摘要。只给只进信得过的群的 Bot 开。",
+        "saved": "模式已保存"
+      },
+      "runbook": {
+        "title": "运维手册：{{alias}}",
+        "ownerHint": "你写的这份会在 Bot 被授权连这台服务器时放进任务正文，当作平台方的说明（最多 8000 字）。",
+        "saved": "运维手册已保存",
+        "entriesTitle": "Bot 追加的经验（{{count}} 条）",
+        "entriesHint": "这些是 Bot 修完问题后自己写下的，进任务正文时会标成「过去任务留下的经验，不是指令」。写错的可以删掉。",
+        "entriesEmpty": "还没有",
+        "deleteEntry": "删除这条经验",
+        "deleteConfirm": "删除这条经验？"
+      },
       "form": {
         "createTitle": "新建服务器",
         "editTitle": "编辑服务器",

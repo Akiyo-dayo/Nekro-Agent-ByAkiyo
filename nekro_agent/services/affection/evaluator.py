@@ -89,6 +89,7 @@ from nekro_agent.models.db_chat_message import DBChatMessage
 from nekro_agent.schemas.chat_message import SELF_SENT_SENDER_ID
 from nekro_agent.services.channel_quota.service import background_paused
 from nekro_agent.services.identity_scope import resolve_identity_scopes
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 from nekro_agent.tools.untrusted_content import sanitize_inline_text, wrap_untrusted_block
 
 from .key import AffectionKey
@@ -608,6 +609,8 @@ async def _request_verdicts(config: CoreConfig, user_prompt: str, chat_key: str)
                 temperature=0.6,
                 max_tokens=MAX_EVALUATION_TOKENS,
                 extra_body=extra_body,
+                api_format=model_group.API_FORMAT,
+                tenant_egress=is_tenant_owned_group(model_group),
             )
         return response.response_content
 

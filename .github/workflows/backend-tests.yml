@@ -10,11 +10,23 @@ name: Backend Tests
 #
 # 不动 preview.yml / publish.yml：它们管镜像构建与发布，与测试门禁是两件事。
 
+#
+# Dev 的每次推送也跑（所有者 2026-11-12 定）：0.4.6 封版时，四条只在 Linux / UTC / 真 PG 上才出现的
+# 用例问题拖到往 main 的 PR 才暴露；在 Dev 上推送就跑，问题当天就能看到。同一分支连推几次时，
+# 只留最新的一次（concurrency 取消在跑的旧任务），省 Actions 用量。
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
       - main
+  push:
+    branches:
+      - Dev
+
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

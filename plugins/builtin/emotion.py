@@ -87,6 +87,7 @@ from nekro_agent.services.plugin.scope import instance_scope, resolve_chat_plugi
 from nekro_agent.services.usage import LLMUsageContext, LLMUsageScene, usage_scope
 from nekro_agent.tools.common_util import UnsafeDownloadUrlError, copy_to_upload_dir, fetch_url_bytes
 from nekro_agent.tools.path_convertor import convert_filename_to_sandbox_upload_path
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 from nekro_agent.tools.untrusted_content import echo_inline, sanitize_block_text, sanitize_inline_text
 
 plugin = NekroPlugin(
@@ -622,6 +623,7 @@ async def generate_embedding(text: str, max_retries: int = 3) -> List[float]:
                     api_key=model_group.API_KEY,
                     base_url=model_group.BASE_URL,
                     timeout=emotion_config.EMBEDDING_REQUEST_TIMEOUT,
+                    tenant_egress=is_tenant_owned_group(model_group),
                 )
 
             logger.debug(

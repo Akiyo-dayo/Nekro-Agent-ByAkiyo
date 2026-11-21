@@ -19,13 +19,14 @@
   让租户能拿标题正文任意的一条消息去敲它们，等于凭空造出一个进平台方收件端的投递口。
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.schemas.errors import NotFoundError, ValidationError
+from nekro_agent.services import embedding_health
 from nekro_agent.services.console.instance_health import (
     InstanceHealthEventListResponse,
     InstanceHealthListResponse,
@@ -106,6 +107,60 @@ async def get_instance_health_events(
         instance_key=instance_key,
         scope_tenant_id=_scope_tenant_id(_current_user),
     )
+
+
+class EmbeddingHealthItem(BaseModel):
+    """一个模型组的嵌入（向量化）健康状态
+
+    只有类别、HTTP 状态码与异常类名，没有错误原文（原文里常见回显的 Key）。时间是 UTC ISO 串，
+    没发生过为 null。状态只在进程内存里，重启后从头记。
+    """
+
+    model_group: str = Field(description="模型组名")
+    owner: str = Field(description="platform / tenant / unknown（库里查不到了，只有平台方看得到）")
+    uses: List[str] = Field(default_factory=list, description="当前配置里用它的地方：memory / kb")
+    state: str = Field(description="ok（最近一次成功）/ unstable（在失败、还没到长期失败）/ failing（长期失败）")
+    consecutive_failures: int = Field(default=0, description="这一串连续失败的次数")
+    error_kind: str = Field(default="", description="auth / quota / rejected / server / network；没在失败时为空")
+    status_code: Optional[int] = Field(default=None, description="最近一次失败的 HTTP 状态码")
+    error_type: str = Field(default="", description="最近一次失败的异常类名")
+    streak_started_at: Optional[str] = Field(default=None, description="这一串失败的第一次")
+    failing_since: Optional[str] = Field(default=None, description="判为长期失败的时刻")
+    last_failure_at: Optional[str] = Field(default=None, description="最近一次失败")
+    last_success_at: Optional[str] = Field(default=None, description="最近一次成功")
+    input_rejections: int = Field(
+        default=0,
+        description="跟输入有关的拒绝（400 / 413 / 422）本次启动以来的次数；不计入失败串，不触发长期失败",
+    )
+    last_input_rejection_at: Optional[str] = Field(default=None, description="最近一次跟输入有关的拒绝")
+    last_input_status: Optional[int] = Field(default=None, description="最近一次跟输入有关的拒绝的 HTTP 状态码")
+
+
+class EmbeddingHealthResponse(BaseModel):
+    """嵌入健康状态列表（只含本次启动以来调用过的模型组）"""
+
+    items: List[EmbeddingHealthItem] = Field(default_factory=list)
+    missing_vectors: Optional[int] = Field(
+        default=None,
+        description="有效、正文不是空白、却没有向量的记忆段数（全平台，最多缓存一分钟）；只给平台方，"
+        "租户恒为 null；没配记忆嵌入模型组时也为 null",
+    )
+
+
+@router.get("/embedding", summary="获取嵌入（向量化）调用的健康状态")
+@require_role(Role.Admin)
+async def get_embedding_health(
+    _current_user: DBUser = Depends(get_current_active_user),
+) -> EmbeddingHealthResponse:
+    """记忆、知识库用的嵌入模型组此刻是否在长期失败
+
+    平台方看全部模型组与全平台缺向量的记忆段数；租户只看归自己的模型组（平台方的组、别的租户的组
+    都不给），缺向量的段数不给（那是全平台的数）。判据与提醒见 `services/embedding_health.py`。
+    """
+    scope_tenant_id = _scope_tenant_id(_current_user)
+    items = await embedding_health.list_health(scope_tenant_id=scope_tenant_id)
+    missing = await embedding_health.count_missing_vectors() if scope_tenant_id is None else None
+    return EmbeddingHealthResponse(items=[EmbeddingHealthItem(**item) for item in items], missing_vectors=missing)
 
 
 @router.post("/test-notification", summary="发送测试通知")

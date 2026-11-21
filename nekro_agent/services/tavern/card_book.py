@@ -23,14 +23,19 @@ always regex」），但它匹配普通关键词时并不按正则解释。照�
 from __future__ import annotations
 
 import copy
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
+from nekro_agent.core.config import config
 from nekro_agent.models.db_wb_book import DBWbBook
 from nekro_agent.models.db_wb_entry import DBWbEntry
 from nekro_agent.schemas.worldbook import BookCreateRequest, ImportDetailItem, ImportReport
 from nekro_agent.services.tavern.errors import CardFileRejected
+from nekro_agent.services.worldbook import budget_check as wb_budget_check
+from nekro_agent.services.worldbook import purpose as wb_purpose
 from nekro_agent.services.worldbook import service as wb_service
 from nekro_agent.services.worldbook import st_format
+from nekro_agent.services.worldbook import tokens as wb_tokens
+from nekro_agent.services.worldbook.budget import WorldbookBudget
 from nekro_agent.services.worldbook.types import (
     SCAN_DEPTH_MAX,
     SCAN_DEPTH_MIN,
@@ -144,13 +149,16 @@ def book_scan_depth(book: Mapping[str, Any]) -> int:
 def build_book_rows(
     book: Mapping[str, Any],
     *,
-    budget_chars: int = 0,
+    budget: Optional[WorldbookBudget] = None,
+    rewrite_names: bool = True,
 ) -> tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]], list[st_format.ImportNote]]:
     """把一本卡内书拆成书级 `ext`、条目 `(列, ext)` 与导入说明
 
     非对象的条目跳过并记 `skipped`；无效关键词写进条目的 `na_invalid_keys` 并记
-    `invalid_key`。`budget_chars` > 0 时，正文比它长的条目各记一条 `over_budget`，与世界书文件
-    导入用同一个判据 `st_format.budget_notes`。这里只算不写库，导入事务里再逐条 `create`。
+    `invalid_key`。给了 `budget` 时，正文 token 数比每轮预算还多的条目各记一条 `over_budget`，
+    与世界书文件导入用同一个判据 `st_format.budget_notes`。这里只算不写库，导入事务里再逐条 `create`。
+    `rewrite_names` 为假时不把正文里读名字的变量换成宏（导入选项）；卡片检查与导出基线一直用默认值。
+    导入与卡片检查都经 :func:`prepare_card_book` 调它（先在同一个线程里把 token 数进缓存）。
     """
     book_ext = {"na_card_book": copy.deepcopy({key: value for key, value in book.items() if key != "entries"})}
     rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -169,7 +177,7 @@ def build_book_rows(
             st_format.check_entry_limits(world, label=f"卡内知识书第 {index + 1} 条")
         except st_format.WorldFileRejected as exc:
             raise CardFileRejected(str(exc)) from exc
-        columns, entry_notes = st_format.st_entry_to_columns(world)
+        columns, entry_notes = st_format.st_entry_to_columns(world, rewrite_names=rewrite_names)
         notes.extend(entry_notes)
         # 酒馆导出时把所有条目都写成正则，这里一律不按正则解释；原值另存在
         # `na_card_entry` 里，导出时还原。
@@ -195,10 +203,54 @@ def build_book_rows(
     notes.extend(
         st_format.budget_notes(
             ((str(columns.get("uid", "")), columns) for columns, _ext in rows),
-            max_chars=budget_chars,
+            budget=budget,
         ),
     )
+    # 与世界书文件导入同一个判据：哪些条目按用途不进主提示词、哪些含不支持的模板、
+    # 哪些疑似防盗。只是提示，条目照样导入、启用状态不改。
+    keyed = [(str(columns.get("uid", "")), columns) for columns, _ext in rows]
+    template_notes = wb_purpose.template_import_notes(keyed)
+    notes.extend(template_notes)
+    # 预算体检也与世界书文件导入同一个判据；卡内书建出来没有书级预算。
+    check = wb_budget_check.check_import(
+        keyed,
+        budget=budget,
+        max_entries=int(config.WORLDBOOK_MAX_ENTRIES_PER_ROUND),
+        routed_keys=(note.entry_key for note in template_notes if note.kind in wb_budget_check.ROUTED_IMPORT_KINDS),
+    )
+    if check is not None and check.constant_count:
+        notes.append(st_format.ImportNote("", "", "budget_check", check.summary()))
     return book_ext, rows, notes
+
+
+PreparedCardBook = tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]], list[st_format.ImportNote]]
+
+
+def prepare_card_book(
+    book: Mapping[str, Any],
+    *,
+    budget: Optional[WorldbookBudget] = None,
+    rewrite_names: bool = True,
+) -> PreparedCardBook:
+    """数 token、拆条目、分析模板：只读卡片、不碰数据库，在导入 / 卡片检查的执行器线程里跑
+
+    token 数在本线程里数进缓存（不交给默认线程池），再交给 :func:`build_book_rows`。
+    `rewrite_names` 见 :func:`build_book_rows`：导入时可以关掉，卡片检查一直开着。
+    """
+    entries = book.get("entries")
+    if isinstance(entries, list):
+        wb_tokens.prefetch_sync(str(raw.get("content") or "") for raw in entries if isinstance(raw, dict))
+    return build_book_rows(book, budget=budget, rewrite_names=rewrite_names)
+
+
+def prepare_card_book_for_owner(
+    book: Mapping[str, Any],
+    owner: tuple[str, str],
+    *,
+    rewrite_names: bool = True,
+) -> PreparedCardBook:
+    """同 :func:`prepare_card_book`，预算按书的归属实例在本线程里算"""
+    return prepare_card_book(book, budget=wb_service.import_budget(*owner), rewrite_names=rewrite_names)
 
 
 async def create_card_book(
@@ -208,13 +260,17 @@ async def create_card_book(
     book: Mapping[str, Any],
     *,
     username: str,
+    prepared: PreparedCardBook,
 ) -> tuple[DBWbBook, ImportReport]:
     """建一本绑在人设上的世界书并逐条写条目；调用方必须已经开好事务
 
-    条目信任级别恒为假：卡片来自网上，即便导入人是平台方也不能把卡里的文字当成宿主
-    内容。编号撞号时照 `_create_entries` 的规则取书内下一个可用值并记 `renumbered`。
+    `prepared` 是事务之前在导入执行器里算好的 :func:`prepare_card_book_for_owner` 结果：分析要
+    几秒到几十秒，不能在事务里做、占着数据库连接。条目信任级别恒为假：卡片来自网上，即便
+    导入人是平台方也不能把卡里的文字当成宿主内容。编号撞号时照世界书文件导入的规则取书内
+    下一个可用值并记 `renumbered`。
     """
-    book_ext, rows, notes = build_book_rows(book, budget_chars=wb_service.import_budget_chars(*owner))
+    book_ext, rows, notes = prepared
+    notes = list(notes)
     name = (book_name or "").strip() or "知识书"
     name = name[:MAX_BOOK_NAME_CHARS]
     created_book = await wb_service.create_book(
@@ -224,6 +280,8 @@ async def create_card_book(
             preset_id=preset_id,
             name=name,
             scan_depth=book_scan_depth(book),
+            # 卡内知识书与世界书文件导入同一口径：新导入的书默认带说话人名字。
+            scan_names=True,
         ),
         username=username,
     )
@@ -404,6 +462,7 @@ def card_entry_from_row(columns: Mapping[str, Any], ext: Mapping[str, Any]) -> d
         ("scan_depth", "scan_depth", "scanDepth"),
         ("case_sensitive", "case_sensitive", "caseSensitive"),
         ("match_whole_words", "match_whole_words", "matchWholeWords"),
+        ("ignore_budget", "ignore_budget", "ignoreBudget"),
         ("selective_logic", "selectiveLogic", "selectiveLogic"),
         ("sticky", "sticky", "sticky"),
         ("cooldown", "cooldown", "cooldown"),
@@ -454,5 +513,7 @@ __all__ = [
     "card_entry_from_row",
     "card_entry_to_world_entry",
     "create_card_book",
+    "prepare_card_book",
+    "prepare_card_book_for_owner",
     "world_entry_to_card_entry",
 ]

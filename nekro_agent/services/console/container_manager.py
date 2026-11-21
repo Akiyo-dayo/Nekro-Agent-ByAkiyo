@@ -152,9 +152,15 @@ LEGACY_OWNER_TAG_FALLBACK = "default"
 """
 
 CONTAINER_DATA_DIR = "/app/nekro_agent_data"
+CONTAINER_UPLOADS_DIR = f"{CONTAINER_DATA_DIR}/uploads"
 CONTAINER_QQ_STATE_DIR = "/app/.config/QQ"
 CONTAINER_NAPCAT_CONFIG_DIR = "/app/napcat/config"
-"""容器内的三个挂载点。
+"""容器内的挂载点。
+
+`CONTAINER_DATA_DIR` 是协议端眼里 NA 数据目录的位置（配置项 `SANDBOX_ONEBOT_SERVER_MOUNT_DIR`
+的默认值）。NA 交给协议端发送的文件都先放进数据目录下的 `uploads`，所以只把它只读挂到
+`CONTAINER_UPLOADS_DIR`；升级前建的容器读写挂着整个数据目录（包括 CC 工作区），重建一次就换成
+新的挂法。
 
 抽成常量而不是在 `create_container` 里写字面量：接受旧标签时要按**目标路径**把宿主机侧的
 源路径找回来（见 `_bind_source`），两边一旦分叉，判据会静默退化成「永远找不到挂载」，
@@ -988,10 +994,13 @@ async def create_container(
 
         await _ensure_image(docker, image, auto_pull)
 
-        # Docker 的 bind source 必须是绝对路径；开发态 DATA_DIR 是相对路径，这里统一展开
-        data_dir = Path(OsEnv.DATA_DIR).resolve()
+        # Docker 的 bind source 必须是绝对路径；开发态 DATA_DIR 是相对路径，这里统一展开。
+        # 数据目录只挂 `uploads`、只读：协议端只需要读 NA 交给它发送的文件，整个数据目录（CC 工作区、
+        # 插件数据、数据库文件）都不该在它手里。目录先建好，免得 Docker 以 root 建一个 NA 写不进去的
+        uploads_dir = Path(OsEnv.DATA_DIR).resolve() / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
         binds = [
-            f"{data_dir}:{CONTAINER_DATA_DIR}",
+            f"{uploads_dir}:{CONTAINER_UPLOADS_DIR}:ro",
             f"{qq_state_dir.resolve()}:{CONTAINER_QQ_STATE_DIR}",
             f"{config_dir.resolve()}:{CONTAINER_NAPCAT_CONFIG_DIR}",
         ]

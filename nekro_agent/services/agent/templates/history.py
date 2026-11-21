@@ -4,7 +4,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import AbstractSet, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from lunar_python import Lunar
 from pydantic import ValidationError
@@ -22,7 +22,7 @@ from nekro_agent.schemas.chat_message import (
 )
 from nekro_agent.services.affection.suppression import is_narrative_suppressed
 from nekro_agent.services.identity_scope import ChannelLike, resolve_preset_id
-from nekro_agent.services.memory import prompt_rounds
+from nekro_agent.services.memory import prompt_rounds, round_recall
 from nekro_agent.services.memory.channel_summary import get_latest_summary
 from nekro_agent.services.memory.feature_flags import (
     is_domain_scope_enabled,
@@ -50,6 +50,7 @@ from nekro_agent.tools.path_convertor import (
     convert_filename_to_sandbox_upload_path,
     sanitize_chat_key_for_path,
 )
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 from nekro_agent.tools.untrusted_content import sanitize_block_text, wrap_untrusted_block
 
 from ..creator import ContentSegment, OpenAIChatMessage
@@ -58,6 +59,9 @@ from ..upstream_redaction import collect_llm_secret_values, redact_upstream_text
 from .base import PromptTemplate, env, register_template
 
 logger = get_sub_logger("agent_runtime")
+
+# 不是人发的消息：Bot 与系统消息（`"-1"`）、工具结果行（`"-2"`）、同账号其他程序发的（`"-3"`）
+_NON_HUMAN_SENDER_IDS = ("-1", TOOL_RESULT_SENDER_ID, SELF_SENT_SENDER_ID)
 
 
 def _preview_text(value: str, limit: int = 160) -> str:
@@ -291,6 +295,8 @@ async def _build_enhanced_memory_recall_plan(recent_messages: List[DBChatMessage
             temperature=0.2,
             max_tokens=1200,
             extra_body=extra_body,
+            api_format=model_group.API_FORMAT,
+            tenant_egress=is_tenant_owned_group(model_group),
         )
         try:
             with usage_scope(usage_context):
@@ -417,6 +423,8 @@ def _record_memory_state(
     preset_id: Optional[int] = None,
     items: Sequence[tuple[str, int, int]] = (),
     cooldown_skipped: int = 0,
+    scores: Optional[dict[tuple[str, int], float]] = None,
+    judge: Optional[dict[str, Any]] = None,
 ) -> str:
     """记下记忆块状态后原样返回渲染结果，保证采集不改变任何提示词文字。"""
     prompt_rounds.note_memory(
@@ -427,6 +435,8 @@ def _record_memory_state(
         items=items,
         block_chars=len(text),
         cooldown_skipped=cooldown_skipped,
+        scores=scores,
+        judge=judge,
     )
     return text
 
@@ -489,6 +499,7 @@ async def _inject_memory_context(
     one_time_code: str,
     max_memories: int = 8,
     max_length: int | None = None,
+    exclude_keys: Optional[AbstractSet[Tuple[str, int]]] = None,
 ) -> str:
     """注入记忆上下文
 
@@ -501,6 +512,9 @@ async def _inject_memory_context(
         one_time_code: 本轮一次性会话令牌，用于包裹不可信内容
         max_memories: 最大记忆数量
         max_length: 最大字符长度
+        exclude_keys: 本轮已经注入过的记忆键。迭代时的增量渲染传它（可以是空集），只补
+            还没出现过的；第一次渲染与非增量渲染不传（`None`），一条都不排除。增量渲染
+            这次没有可补的条目时不记明细：这一轮的记忆块状态与字数保留第一次渲染的。
 
     Returns:
         记忆上下文字符串
@@ -546,13 +560,14 @@ async def _inject_memory_context(
     try:
         from nekro_agent.services.memory.instance_scope import resolve_memory_scope
         from nekro_agent.services.memory.recall_cooldown import filter_cooled, mark_injected
+        from nekro_agent.services.memory.recall_judge import JUDGE_POOL, judge_candidates
         from nekro_agent.services.memory.retriever import (
             BatchRecallRequest,
             MemoryRecallQuery,
             compile_memories_for_context,
             retrieve_memories_batch,
         )
-        from nekro_agent.services.memory.round_recall import stage_round_recall
+        from nekro_agent.services.memory.round_recall import note_injected, stage_round_recall
 
         # 冷却开着时候选要多取一倍：被冷却掉的位置由后面的候选补上，不然一轮下来块里
         # 会比 max_items 少一截。关掉冷却时条数与改造前逐字相同。
@@ -563,7 +578,26 @@ async def _inject_memory_context(
         # 提示词；人设维则挡住"换了个人设还记得前一个人格的恩怨情仇"。
         scope = await resolve_memory_scope(channel)
 
+        # 闸开时按相似度优先排序、问句放宽冷却旁路（见 `recall_focus`）；闸关逐字走改造前的路径。
+        domain_ranking = is_domain_scope_enabled()
+        # 筛选只在闸开且模型组非空时开；假配置没有这个属性时按关着处理。
+        judge_model_group = (
+            str(getattr(config, "MEMORY_RECALL_JUDGE_MODEL_GROUP", "") or "").strip()
+            if domain_ranking
+            else ""
+        )
+        if judge_model_group:
+            # 筛选开时先放宽候选池，让低于默认注入下限、但仍过检索准入的条目也有机会被留下。
+            retrieval_limit = max(retrieval_limit, JUDGE_POOL)
         recall_plan = await _build_memory_recall_plan(recent_messages)
+        if domain_ranking and recall_plan.queries:
+            from nekro_agent.services.memory.recall_focus import cooldown_bypass_similarity as _bypass_for
+            from nekro_agent.services.memory.recall_focus import is_question
+
+            cooldown_bypass_similarity = _bypass_for(
+                cooldown_bypass_similarity,
+                question=is_question(recall_plan.queries[0].focus_text),
+            )
         if not recall_plan.queries:
             logger.debug(
                 f"跳过记忆注入: 未生成可用检索计划, workspace={workspace_id}, "
@@ -671,33 +705,152 @@ async def _inject_memory_context(
                 if existing is None or memory.effective_weight > existing.effective_weight:
                     deduped_memories[dedupe_key] = memory
 
-        memories = sorted(
-            deduped_memories.values(),
-            key=lambda item: item.effective_weight,
-            reverse=True,
-        )
         cooldown_skipped = 0
-        if cooldown_rounds > 0:
-            # 只在这里冷却：`memory_tools` 的主动搜索走的是另一条链路，不受影响。
-            before_cooldown = len(memories)
-            memories = filter_cooled(
-                (chat_key, scope.preset_id),
-                one_time_code,
-                memories,
-                rounds=cooldown_rounds,
-                bypass_similarity=cooldown_bypass_similarity,
+        judge_detail: Optional[dict[str, Any]] = None
+        if judge_model_group:
+            from nekro_agent.services.memory.recall_focus import rank_for_injection
+
+            # 先只按相似度放宽排一遍、不砍尾巴：交给模型的就是这批候选。
+            wide = rank_for_injection(
+                list(deduped_memories.values()),
+                min_similarity=float(config.MEMORY_RETRIEVAL_MIN_SIMILARITY),
+                relative_band=1.0,
             )
-            cooldown_skipped = max(0, before_cooldown - len(memories))
-        memories = memories[:resolved_max_items]
+            if cooldown_rounds > 0:
+                # 只在这里冷却：`memory_tools` 的主动搜索走的是另一条链路，不受影响。
+                before_cooldown = len(wide)
+                wide = filter_cooled(
+                    (chat_key, scope.preset_id),
+                    one_time_code,
+                    wide,
+                    rounds=cooldown_rounds,
+                    bypass_similarity=cooldown_bypass_similarity,
+                )
+                cooldown_skipped = max(0, before_cooldown - len(wide))
+            if exclude_keys:
+                # 增量渲染只补本轮还没出现过的条目：已经注入过的不再重复进提示词。
+                before_exclude = len(wide)
+                wide = [
+                    memory for memory in wide if (memory.source_type, memory.target_id) not in exclude_keys
+                ]
+                if before_exclude != len(wide):
+                    logger.debug(
+                        f"记忆注入排除本轮已注入条目: workspace={workspace_id}, "
+                        f"excluded={before_exclude - len(wide)}",
+                    )
+            pool = wide[:JUDGE_POOL]
+            # 模型失败时的兜底：默认阈值与相对带，不再过冷却（冷却上面已经过了一遍）。
+            fallback = rank_for_injection(wide)
+            memories = []
+            if pool:
+                verdicts = round_recall.judged_verdicts(one_time_code)
+                undecided = [
+                    memory for memory in pool if (memory.source_type, memory.target_id) not in verdicts
+                ]
+                verdict_indices: list[int] | None = None
+                elapsed_ms = 0.0
+                if undecided:
+                    first_query = recall_plan.queries[0]
+                    conversation = list(first_query.context_texts) or [first_query.focus_text]
+                    focus_text = first_query.focus_text.strip()
+                    if focus_text:
+                        # 规划给的上下文是「焦点句、被引用的那句、再从新到旧」：倒过来让旧的在前，
+                        # 眼下这句放最后一行，模型读到的就是一段顺着时间往下走的对话。
+                        conversation = [line for line in reversed(conversation) if line.strip() != focus_text]
+                        conversation.append(first_query.focus_text)
+                    started_at = time.perf_counter()
+                    verdict_indices = await judge_candidates(
+                        model_group_name=judge_model_group,
+                        conversation=conversation,
+                        candidates=[
+                            (memory.content or memory.summary or "").strip() for memory in undecided
+                        ],
+                        requester=(
+                            getattr(channel, "adapter_key", ""),
+                            getattr(channel, "instance_key", ""),
+                        ),
+                    )
+                    elapsed_ms = (time.perf_counter() - started_at) * 1000
+                    if verdict_indices is not None:
+                        updates = {
+                            (memory.source_type, memory.target_id): index in verdict_indices
+                            for index, memory in enumerate(undecided)
+                        }
+                        verdicts.update(updates)
+                        round_recall.note_judged(one_time_code, updates)
+                if verdict_indices is None and undecided:
+                    # 失败：不写 `note_judged`，本轮按相似度取，下一轮重新问。这一轮早先已经被
+                    # 模型明确筛掉的（增量渲染时才会有）不因为这次失败又回来。
+                    memories = [
+                        memory
+                        for memory in fallback
+                        if verdicts.get((memory.source_type, memory.target_id)) is not False
+                    ][:resolved_max_items]
+                    judge_mode = "fallback"
+                else:
+                    memories = [
+                        memory
+                        for memory in pool
+                        if verdicts.get((memory.source_type, memory.target_id), False)
+                    ][:resolved_max_items]
+                    judge_mode = "model"
+                judge_detail = {
+                    "mode": judge_mode,
+                    "pool": len(pool),
+                    "kept": len(memories),
+                }
+                logger.debug(
+                    f"记忆筛选完成: workspace={workspace_id}, mode={judge_mode}, "
+                    f"candidates={len(pool)}, kept={len(memories)}, elapsed_ms={elapsed_ms:.0f}",
+                )
+        else:
+            if domain_ranking:
+                from nekro_agent.services.memory.recall_focus import rank_for_injection
+
+                memories = rank_for_injection(list(deduped_memories.values()))
+            else:
+                memories = sorted(
+                    deduped_memories.values(),
+                    key=lambda item: item.effective_weight,
+                    reverse=True,
+                )
+            if cooldown_rounds > 0:
+                # 只在这里冷却：`memory_tools` 的主动搜索走的是另一条链路，不受影响。
+                before_cooldown = len(memories)
+                memories = filter_cooled(
+                    (chat_key, scope.preset_id),
+                    one_time_code,
+                    memories,
+                    rounds=cooldown_rounds,
+                    bypass_similarity=cooldown_bypass_similarity,
+                )
+                cooldown_skipped = max(0, before_cooldown - len(memories))
+            if exclude_keys:
+                # 增量渲染只补本轮还没出现过的条目：已经注入过的不再重复进提示词，
+                # 剩下的照常排序、截到条数上限再编排。
+                before_exclude = len(memories)
+                memories = [
+                    memory for memory in memories if (memory.source_type, memory.target_id) not in exclude_keys
+                ]
+                if before_exclude != len(memories):
+                    logger.debug(
+                        f"记忆注入排除本轮已注入条目: workspace={workspace_id}, "
+                        f"excluded={before_exclude - len(memories)}",
+                    )
+            memories = memories[:resolved_max_items]
 
         if not memories:
             logger.debug(f"跳过记忆注入: 检索完成但无可用记忆, workspace={workspace_id}")
+            if exclude_keys is not None:
+                # 增量渲染：没有可补的就不记，免得把第一次渲染记下的「已注入」和字数盖成空。
+                return ""
             return _record_memory_state(
                 one_time_code,
                 state="empty",
                 workspace_id=workspace_id,
                 preset_id=scope.preset_id,
                 cooldown_skipped=cooldown_skipped,
+                judge=judge_detail,
             )
 
         compiled_recall_query = MemoryRecallQuery(
@@ -724,29 +877,47 @@ async def _inject_memory_context(
                 f"跳过记忆注入: 记忆编排结果为空, workspace={workspace_id}, "
                 f"deduped_memories={len(memories)}",
             )
+            if exclude_keys is not None:
+                return ""
             return _record_memory_state(
                 one_time_code,
                 state="empty",
                 workspace_id=workspace_id,
                 preset_id=scope.preset_id,
                 cooldown_skipped=cooldown_skipped,
+                judge=judge_detail,
             )
         logger.debug(
             f"记忆注入完成: workspace={workspace_id}, deduped_memories={len(memories)}, "
             f"context_length={len(memory_context)}",
         )
         # 只记录本轮真正注入了哪些记忆，不在这里写库；主对话成功返回后补记一次强化。
+        # 闸开时只传真正进了文字的那些：字符预算可能把候选整条截掉，它们没进提示词，
+        # 就不该进冷却、也不该在轮末被强化。没有回报任何条目时保持原样（编排替身或旧
+        # 实现可能不填 `included`，此时无从区分「一条都没渲染」与「没有回报」）。
+        staged_memories = memories
+        if domain_ranking and included_items:
+            included_keys = {(source_type, target_id) for source_type, target_id, _chars in included_items}
+            staged_memories = [
+                memory for memory in memories if (memory.source_type, memory.target_id) in included_keys
+            ]
         stage_round_recall(
             one_time_code,
             workspace_id=workspace_id,
             scope=scope,
             query=recall_queries[0].query_text,
-            memories=memories,
+            memories=staged_memories,
         )
         if cooldown_rounds > 0:
             # 编排结果非空才算「真的注入了」；被冷却掉或编排成空串的轮次不记，
             # 否则一段没进提示词的记忆会平白占掉自己的冷却窗口。
-            mark_injected((chat_key, scope.preset_id), one_time_code, memories)
+            mark_injected((chat_key, scope.preset_id), one_time_code, staged_memories)
+        # 记下这一轮已经真正拼进提示词的键，供迭代时的增量渲染排除；第一次渲染也记，
+        # 增量渲染靠它知道哪些不该再出现。用编排结果里实际进文字的条目，不是候选全集。
+        note_injected(
+            one_time_code,
+            [(source_type, target_id) for source_type, target_id, _chars in included_items],
+        )
         # 记忆是从群聊里提炼的，内容由群成员完全控制：用本轮令牌包成不可信块，
         # 块外明文说明这是素材而非指令。
         wrapped = wrap_untrusted_block(
@@ -764,6 +935,12 @@ async def _inject_memory_context(
             preset_id=scope.preset_id,
             items=included_items,
             cooldown_skipped=cooldown_skipped,
+            judge=judge_detail,
+            scores=(
+                {(memory.source_type, memory.target_id): memory.similarity_score for memory in memories}
+                if domain_ranking
+                else None
+            ),
         )
 
     except Exception as e:
@@ -830,6 +1007,12 @@ async def render_history_data(
     dry_run: bool = False,
     extra_history_lines: Optional[List[str]] = None,
     hidden_book_ids: Optional[Set[int]] = None,
+    *,
+    plugin_depth_blocks: Optional[Sequence[Tuple[int, str]]] = None,
+    incremental: bool = False,
+    rp_tail: Optional[str] = None,
+    rp_depth_blocks: Optional[Sequence[Tuple[int, str]]] = None,
+    max_messages: Optional[int] = None,
 ) -> OpenAIChatMessage:
     """渲染历史消息
 
@@ -838,6 +1021,11 @@ async def render_history_data(
     同一份上下文里正文就随迭代次数重复出现；深度块还会因为增量消息很少被挤到最前面，
     位置也不对了。酒馆的深度注入与后置指令同理，只在第一次渲染时出现。
 
+    `incremental=True` 给迭代时的增量渲染用，与 `inject_worldbook=False` 一起传：频道摘要
+    已经在本轮第一次渲染里出现过，不再注入；记忆召回只在这次增量里真的有新的人类消息时才跑，
+    没有就整段跳过（不发规划请求、不检索、不记明细）；跑的时候只注入本轮还没注入过的记忆，
+    已经出现过的由调用方从 `round_recall` 的已注入集合里排除。第一次渲染与非增量渲染不传。
+
     `dry_run=True` 给提示词预览 / 试发用：不写「历史渲染过什么」的运维守卫记录，也不跑
     记忆召回（可能调用检索服务、消耗预算），在记忆块的位置放一段固定占位。摘要仍是只读注入。
 
@@ -845,6 +1033,17 @@ async def render_history_data(
     负责）：它原样成为最后几条消息，深度注入的下标基数包含它。
 
     `hidden_book_ids` 只给预览用：这些书的条目正文换成固定占位（见 `worldbook.render`）。
+
+    `max_messages` 是「被上游按内容拦下后少带内容重发」用的条数上限：在时间窗与
+    `AI_CHAT_CONTEXT_MAX_LENGTH` 截断之后再取最后这么多条；历史图片也只从这几条里取。
+    不传（`None`）时行为逐字不变，0 表示一条历史消息都不带。
+
+    `plugin_depth_blocks` 是插件要求插进聊天记录某个深度的块（已经按本轮令牌包好）。与世界书
+    深度块一样只在第一次渲染时插：`inject_worldbook=False` 的增量渲染不再带。
+    `rp_tail` 是角色扮演预设排在聊天记录之后的文字；`None` 表示这一轮没有启用预设，按原来的
+    后置指令逻辑拼。启用时它已经包含槽位文本（见 `services/tavern/rp_layout.py`），这里只负责
+    包裹，且同样只在第一次渲染时出现。`rp_depth_blocks` 是预设要求按深度插入的块：与插件块
+    同一套规则，同深度时排在酒馆卡深度注入之后、世界书之前。
     """
     if record_sta_timestamp is None:
         record_sta_timestamp = int(time.time() - config.AI_CHAT_CONTEXT_EXPIRE_SECONDS)
@@ -873,6 +1072,10 @@ async def render_history_data(
     recent_chat_messages = [msg for msg in recent_chat_messages if msg not in _to_remove_msgs]
     # 反转列表顺序并确保不超过最大长度
     recent_chat_messages = recent_chat_messages[::-1][-config.AI_CHAT_CONTEXT_MAX_LENGTH :]
+    # 少带内容重发：在时间窗 / 条数截断之后再取最后 `max_messages` 条。放在取图片之前，
+    # 保证历史图片也只来自这几条；后面的字符预算只会再往前裁，不会再把它变多。
+    if max_messages is not None:
+        recent_chat_messages = recent_chat_messages[-max_messages:] if max_messages > 0 else []
 
     # 运维工具：实际渲染进上下文的历史里有名单外的人的发言或推送进来的外部内容时，
     # 本轮不再执行写操作（见 `services/ops_agent/context_guard.py`）。函数内导入：运维模块会拖进
@@ -1010,9 +1213,10 @@ async def render_history_data(
             ),
         )
 
-    # 摘要在记忆块之前注入。闸关时不调用，保证历史提示词逐字不变。
+    # 摘要在记忆块之前注入。闸关时不调用，保证历史提示词逐字不变；迭代时的增量渲染
+    # 也不再注入：摘要只属于本轮第一次渲染的那条历史消息。
     channel_summary_context = ""
-    if is_domain_scope_enabled():
+    if is_domain_scope_enabled() and not incremental:
         channel_summary_context = await _inject_channel_summary(db_chat_channel, one_time_code)
     if channel_summary_context:
         logger.debug(
@@ -1021,16 +1225,28 @@ async def render_history_data(
         )
         openai_chat_message.add(ContentSegment.text_content(channel_summary_context))
 
+    # 增量渲染要不要跑召回，看的是经过上面过滤、真正进这次渲染的消息里有没有人发的。
+    # 工具结果行（这一轮沙盒方法的返回值就落成它）和同账号其他程序发的都不算人，
+    # 见 `_NON_HUMAN_SENDER_IDS`。只有增量渲染需要这个判据：非增量渲染一律照旧跑召回。
+    has_new_human_message = (
+        any(str(msg.sender_id) not in _NON_HUMAN_SENDER_IDS for msg in recent_chat_messages) if incremental else True
+    )
+
     # 注入记忆上下文。预览不跑召回（检索会查库、调嵌入、花预算），在原位置放固定占位，
     # 让预览里记忆块该占的位置仍然可见；真实一轮的注入路径一个字不改。
     if dry_run:
         memory_context = "[记忆召回：预览不执行；这个频道开着记忆时，实际每轮在这里注入召回结果]\n\n"
+    elif incremental and not has_new_human_message:
+        # 这次增量里只有 Bot / 系统推进的消息：没有新的召回需求，整段跳过——不规划、
+        # 不检索、不记明细。
+        memory_context = ""
     else:
         memory_context = await _inject_memory_context(
             workspace_id=db_chat_channel.workspace_id,
             recent_messages=recent_chat_messages,
             channel=db_chat_channel,
             one_time_code=one_time_code,
+            exclude_keys=round_recall.injected_keys(one_time_code) if incremental else None,
         )
     if memory_context:
         logger.debug(f"历史提示词已注入记忆块: workspace={db_chat_channel.workspace_id}, length={len(memory_context)}")
@@ -1056,12 +1272,17 @@ async def render_history_data(
             in_history=True,
             expand=tavern_expand,
             hidden_book_ids=hidden_book_ids,
+            person_labels=worldbook_round.person_labels,
         )
         # 末尾留一个空行，下一段 Recent Messages 不紧贴闭合标签
         openai_chat_message.add(ContentSegment.text_content(block + "\n\n"))
         prompt_rounds.note_worldbook_items(
             one_time_code,
-            wb_render.rendered_items(worldbook_round.groups.before_history, expand=tavern_measure),
+            wb_render.rendered_items(
+                worldbook_round.groups.before_history,
+                expand=tavern_measure,
+                with_reason=True,
+            ),
         )
 
     openai_chat_message.add(
@@ -1096,6 +1317,10 @@ async def render_history_data(
             break
         total_length += prompt_length
     chat_history_prompts = chat_history_prompts[start_idx:]
+    # 少带内容重发：字符预算截断之后仍然只留最后 `max_messages` 条。前面的消息级
+    # 截断已经保证条数不超，这里再按最终提示词兜一次，图片同样只来自那几条。
+    if max_messages is not None:
+        chat_history_prompts = chat_history_prompts[-max_messages:] if max_messages > 0 else []
 
     # 试发 / 预览追加的那一句：放在裁剪之后，深度注入的下标基数把它也算进去。
     if extra_history_lines:
@@ -1115,7 +1340,9 @@ async def render_history_data(
     # 世界书「深度」一组：按 `at_depth` 插进聊天记录。裁剪完再插，深度才有确定的下标基数
     # （深度是相对**最终**发出去的那段历史算的）。
     worldbook_at_depth = worldbook_round.groups.at_depth if worldbook_round is not None else {}
-    if worldbook_at_depth or host_note is not None:
+    extra_depth_blocks = list(plugin_depth_blocks or []) if inject_worldbook else []
+    rp_depth = list(rp_depth_blocks or []) if inject_worldbook else []
+    if worldbook_at_depth or host_note is not None or extra_depth_blocks or rp_depth:
         chat_history_prompts = wb_render.insert_at_depth(
             chat_history_prompts,
             worldbook_at_depth,
@@ -1123,9 +1350,15 @@ async def render_history_data(
             expand=tavern_expand,
             host_note=host_note,
             hidden_book_ids=hidden_book_ids,
+            person_labels=worldbook_round.person_labels if worldbook_round is not None else None,
+            mid_blocks=rp_depth,
+            extra_blocks=extra_depth_blocks,
         )
         for hits in worldbook_at_depth.values():
-            prompt_rounds.note_worldbook_items(one_time_code, wb_render.rendered_items(hits, expand=tavern_measure))
+            prompt_rounds.note_worldbook_items(
+                one_time_code,
+                wb_render.rendered_items(hits, expand=tavern_measure, with_reason=True),
+            )
 
     chat_history_prompt = f"\n<{one_time_code} | message separator>\n".join(chat_history_prompts)
     chat_history_prompt += f"\n<{one_time_code} | message separator>\n"
@@ -1133,10 +1366,18 @@ async def render_history_data(
 
     # 酒馆的后置指令：在整段聊天记录（含最后那个 message separator）之后。只在第一次渲染时
     # 追加，迭代的增量历史不再带一遍——否则同一段指令会随迭代次数重复出现。
-    if tavern_round is not None and tavern_round.post_history:
+    # 启用角色扮演预设时，槽位文本已经并进 `rp_tail`，这里只拼预设那份，不再拼两遍；
+    # 增量渲染不传 `rp_tail`，也不回落到原槽位，避免同一段文字重复出现。
+    rp_active = rp_tail is not None or (tavern_round is not None and tavern_round.rp_preset is not None)
+    post_history_text = ""
+    if rp_active:
+        post_history_text = rp_tail or ""
+    elif tavern_round is not None:
+        post_history_text = tavern_round.post_history
+    if post_history_text:
         post_history_block = (
             f"<{one_time_code} | PostHistoryInstructions source:host>\n"
-            f"{tavern_round.post_history}\n"
+            f"{post_history_text}\n"
             f"<{one_time_code} | /PostHistoryInstructions>"
         )
         openai_chat_message.add(ContentSegment.text_content(post_history_block))

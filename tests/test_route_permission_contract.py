@@ -74,7 +74,7 @@ ROUTER_MODULES: Sequence[str] = (
     "adapters", "affection", "cc_model_presets", "chat_channel", "commands", "common",
     "config", "dashboard", "deployment", "email", "events", "instance_email", "kb_library", "logs", "mcp",
     "memory_admin", "cc_relay",
-    "plugin_editor", "plugin_route_ticket", "plugins", "presets", "resources", "restart", "rpc", "sandbox",
+    "plugin_editor", "plugin_route_ticket", "plugins", "presets", "resources", "restart", "rp_presets", "rpc", "sandbox",
     "skills", "space_cleanup", "ssh_gateway", "timers", "user", "user_manager", "webhook",
     "workspace_kb", "workspaces", "worldbook", "tavern",
     "console.containers", "console.health", "console.identity", "console.instances",
@@ -353,6 +353,9 @@ PLATFORM_ONLY: Set[Tuple[str, str, str]] = {
     # 按组名整体覆盖/删除，不看归属；租户自建组走 `/console/model-groups`
     ("config", "DELETE", "/config/model-groups/{group_name}"),
     ("config", "POST", "/config/model-groups/{group_name}"),
+    # 世界书预算迁移提示的「知道了」：清的是全局配置里的迁移记录（含各租户频道的换算），
+    # 只给平台方；读那一条对租户恒为空，留在默认桶
+    ("config", "POST", "/config/worldbook-budget-notice/ack"),
     # 收件箱不再是平台方专属：`DBEmail` 现在带归属快照（`owner_adapter_key` /
     # `owner_instance_key`，空 = 平台方），四条接口按 `adapter_key` + `instance_key`
     # 收敛到某个实例，越权与不存在同一个 404。它们因此落在默认的租户作用域桶里，
@@ -741,6 +744,8 @@ PROTOCOL_SELF_SERVICE_TENANT_REACHABLE: Set[Tuple[str, str, str]] = {
     # "我的 Bot 现在怎么了"的唯一权威回答，按可见实例过滤后开放
     ("console.health", "GET", "/health/instances"),
     ("console.health", "GET", "/health/events"),
+    # 嵌入长期失败的状态：租户只看归自己的模型组（平台方的、别的租户的组都不给）
+    ("console.health", "GET", "/health/embedding"),
     # 租户给自己实例配的告警 Webhook 得能试发，否则一个静默失效的地址与没配是同一回事
     ("console.health", "POST", "/health/test-notification"),
     # 附带 qbob 的自助运维：读状态（响应不含凭据）、启停与两项开关、重载——与「重启我的 NapCat」同一定位
@@ -1190,6 +1195,8 @@ class TestIssue29ModulesAreAuditedEndpointByEndpoint:
 AFFECTION_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
     ("affection", "GET", "/affection/list"),
     ("affection", "GET", "/affection/summary"),
+    # 关系图：与列表同一套作用域（`resolve_instance_scope` + `_scoped_query`），只读
+    ("affection", "GET", "/affection/graph"),
     # 从里程碑段落反查它属于哪一份好感。不吃 `{record_id}`，但仍然先解析实例作用域、
     # 再用 `_get_visible_record` 判那一行可见，所以与其余条目同档。
     ("affection", "GET", "/affection/milestones/{paragraph_id}/record"),
@@ -1219,6 +1226,33 @@ class TestAffectionConsoleIsAuditedEndpointByEndpoint:
             if not {"resolve_instance_scope", "_get_visible_record"} <= names:
                 missing.append(f"{route.method} {route.path}")
         assert missing == []
+
+    def test_list_like_routes_resolve_the_scope_then_filter_by_it(self, routes: List[RouteFacts]) -> None:
+        """列表、概览、关系图：作用域守卫 + 按作用域换算出来的查询，两步都得在端点里"""
+        missing = []
+        for path in ("/affection/list", "/affection/summary", "/affection/graph"):
+            route = next(route for route in routes if route.path == path and route.method == "GET")
+            if not {"resolve_instance_scope", "_scoped_query"} <= _identifiers(_endpoint_source(route)):
+                missing.append(path)
+        assert missing == []
+
+
+# 世界书图谱与单条读。世界书的读写端点都走 `_resolve_book_scope` / `_load_readable_book`，
+# 它们内部先 `get_tenant_scope`、再 `assert_instance_accessible` / `admin_row_visible`；
+# 这两条是本轮新增的只读端点，单独钉住，免得以后被挪进"租户无关"的桶里。
+WORLDBOOK_READ_TENANT_SCOPED: Set[Tuple[str, str, str]] = {
+    ("worldbook", "GET", "/worldbook/graph"),
+    ("worldbook", "GET", "/worldbook/entries/{entry_id}"),
+}
+
+
+class TestWorldbookReadEndpointsStayTenantScoped:
+    def test_graph_and_entry_read_are_tenant_scoped(self, routes: List[RouteFacts]) -> None:
+        by_key = {_key(route): route for route in routes}
+        for key in sorted(WORLDBOOK_READ_TENANT_SCOPED):
+            assert key in by_key, f"路由不存在或路径变了: {key}"
+            assert _categorize(by_key[key]) == "TENANT_SCOPED", key
+            assert is_tenant_scoped(by_key[key]), f"缺少 Role.Admin 或作用域守卫: {key}"
 
 
 def _endpoint_source(route: RouteFacts) -> str:

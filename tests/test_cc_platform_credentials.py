@@ -8,7 +8,7 @@
 1. `NEKRO_CC_CREDENTIAL_MODE=direct` 时写进 `settings.json` 的真实模型 Key；
 2. 工作区资源（SSH 私钥、口令、令牌），每次向 CC 发请求都会被注入 CC 进程环境；
 3. 全局 MCP 库条目的 `env` / `headers`，写进 `.mcp.json`，工作区列表接口还明文返回；
-4. CC 模型预设 `extra_env` 里键名像凭据的项，写进 CC 用户级设置 `.claude_home/settings.json`
+4. CC 模型预设 `extra_env` 里键名像凭据的项，写进 CC 用户级设置（CC home 里的 `settings.json`）
    （早先写在 `.claude/settings.json`，那份旧文件写设置与启动复核时都会删掉）。
 
 判据收在一处（`services/workspace/credential_policy.py`），本文件钉住它以及四个消费者。
@@ -427,7 +427,7 @@ class TestOnDiskFiles:
         await WorkspaceService.init_workspace_dir(workspace, PRESET)
 
         settings_text = (WorkspaceService.get_workspace_dir(workspace.id) / "settings.json").read_text(encoding="utf-8")
-        claude_path = WorkspaceService.get_workspace_dir(workspace.id) / ".claude_home" / "settings.json"
+        claude_path = WorkspaceService.claude_home(workspace.id).path / "settings.json"
         claude_text = claude_path.read_text(encoding="utf-8")
         for text in (settings_text, claude_text):
             assert PLATFORM_KEY not in text
@@ -455,9 +455,10 @@ class TestOnDiskFiles:
 
         assert not legacy.exists()
         assert not legacy.parent.exists()
-        written = [path for path in ws_dir.rglob("*") if path.is_file()]
+        home = WorkspaceService.claude_home(workspace.id).path
+        written = [path for root in (ws_dir, home) for path in root.rglob("*") if path.is_file()]
         assert all(PLATFORM_KEY not in path.read_text(encoding="utf-8", errors="ignore") for path in written)
-        assert (ws_dir / ".claude_home" / "settings.json").is_file()
+        assert (home / "settings.json").is_file()
 
     async def test_a_platform_workspace_still_gets_both(
         self,
@@ -471,7 +472,7 @@ class TestOnDiskFiles:
         await WorkspaceService.init_workspace_dir(workspace, PRESET)
 
         settings_text = (WorkspaceService.get_workspace_dir(workspace.id) / "settings.json").read_text(encoding="utf-8")
-        claude_path = WorkspaceService.get_workspace_dir(workspace.id) / ".claude_home" / "settings.json"
+        claude_path = WorkspaceService.claude_home(workspace.id).path / "settings.json"
         claude_text = claude_path.read_text(encoding="utf-8")
         assert PLATFORM_KEY in settings_text
         assert PLATFORM_KEY in claude_text
@@ -644,7 +645,7 @@ class TestOwnershipChange:
 
         ws_dir = WorkspaceService.get_workspace_dir(workspace.id)
         mcp_path = ws_dir / "default" / ".mcp.json"
-        claude_path = ws_dir / ".claude_home" / "settings.json"
+        claude_path = WorkspaceService.claude_home(workspace.id).path / "settings.json"
         # 前提：两份文件里确实写出了凭据，而模型 Key 没进容器
         assert "ghp-secret" in mcp_path.read_text(encoding="utf-8")
         assert EXTRA_ENV_SECRET in claude_path.read_text(encoding="utf-8")

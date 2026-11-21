@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Box } from '@mui/material'
 import { useTranslation } from 'react-i18next'
 import SegmentedControl from '../common/SegmentedControl'
@@ -21,17 +21,30 @@ interface ChannelMemoryPanelProps {
   chatKey: string
   adapterKey: string
   instanceKey: string
+  /** 从记忆页旧地址跳过来时先展开哪一块：`summaries` 或 `rounds` */
+  view?: 'summaries' | 'rounds'
 }
 
 type MemoryView = 'promptRounds' | 'summaries'
+
+function toMemoryView(view: ChannelMemoryPanelProps['view']): MemoryView {
+  return view === 'summaries' ? 'summaries' : 'promptRounds'
+}
 
 export default function ChannelMemoryPanel({
   chatKey,
   adapterKey,
   instanceKey,
+  view: initialView,
 }: ChannelMemoryPanelProps) {
   const { t } = useTranslation('memory')
-  const [view, setView] = useState<MemoryView>('promptRounds')
+  const [view, setView] = useState<MemoryView>(() => toMemoryView(initialView))
+
+  // 同一个频道详情里从另一个旧链接进来时，地址里的 view 变了要跟着切
+  useEffect(() => {
+    if (!initialView) return
+    setView(toMemoryView(initialView))
+  }, [initialView])
 
   const scope = useMemo<MemoryScopeParams>(
     () =>

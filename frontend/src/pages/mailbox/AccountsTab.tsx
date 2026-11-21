@@ -10,6 +10,7 @@ import {
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
+import { useNavigate } from 'react-router-dom'
 import AddRoundedIcon from '@mui/icons-material/AddRounded'
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded'
@@ -56,6 +57,7 @@ export default function AccountsTab({ scope }: AccountsTabProps) {
   const notification = useNotification()
   const queryClient = useQueryClient()
   const { isPlatformOwner } = useIdentity()
+  const navigate = useNavigate()
   const scopeKey = scopeKeyOf(scope)
 
   const [dialogAccount, setDialogAccount] = useState<InstanceMailAccount | 'new' | null>(null)
@@ -275,19 +277,47 @@ export default function AccountsTab({ scope }: AccountsTabProps) {
   return (
     <Stack spacing={2}>
       <Paper sx={{ ...CARD_VARIANTS.default.styles, p: 2 }}>
-        <Typography variant="subtitle1" fontWeight={600}>
-          {t('accounts.platformTitle')}
-        </Typography>
-        <Typography variant="caption" color="text.secondary">
-          {t('accounts.platformHint')}
-        </Typography>
+        <Stack direction="row" alignItems="flex-start" justifyContent="space-between" spacing={1}>
+          <Box sx={{ minWidth: 0 }}>
+            <Typography variant="subtitle1" fontWeight={600}>
+              {t('accounts.platformTitle')}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {t('accounts.platformHint')}
+            </Typography>
+          </Box>
+          {isPlatformOwner && (
+            <ActionButton
+              tone="secondary"
+              size="small"
+              onClick={() => navigate('/adapters/email/accounts')}
+            >
+              {t('accounts.managePlatform')}
+            </ActionButton>
+          )}
+        </Stack>
         <Box sx={{ mt: 1.5 }}>
           {platformQuery.error ? (
             <QueryErrorState error={platformQuery.error} onRetry={() => void platformQuery.refetch()} compact />
           ) : (platformQuery.data ?? []).length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
-              {platformQuery.isPending ? t('loading') : t('accounts.platformEmpty')}
-            </Typography>
+            <Stack spacing={1} alignItems="flex-start">
+              <Typography variant="body2" color="text.secondary">
+                {platformQuery.isPending
+                  ? t('loading')
+                  : isPlatformOwner
+                    ? t('accounts.platformEmptyPlatform')
+                    : t('accounts.platformEmpty')}
+              </Typography>
+              {isPlatformOwner && !platformQuery.isPending && (
+                <ActionButton
+                  tone="secondary"
+                  size="small"
+                  onClick={() => navigate('/adapters/email/accounts')}
+                >
+                  {t('accounts.managePlatform')}
+                </ActionButton>
+              )}
+            </Stack>
           ) : (
             <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
               {(platformQuery.data ?? []).map(account => (

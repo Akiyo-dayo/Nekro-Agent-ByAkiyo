@@ -5,11 +5,15 @@
 （或没命中）。刻意不碰数据库、不取配置、不读时间：判据的每一种组合都要能被穷举用例
 钉住，任何一次查库都会把它变成「只能靠集成测试碰运气」的逻辑。
 
-## 为什么扫描文本不含昵称
+## 扫描文本默认不含说话人名字
 
-昵称由群友自己改，拿它触发条目等于让任何人改个名就能召唤设定（甚至把别人写的私密
-设定召唤到一个不相干的群里）。:class:`WindowMessage` 因此根本没有昵称字段——这不是
-「暂时不用」，而是把它挡在类型之外，让「顺手把昵称也拼进去」需要先改类型签名。
+昵称由群友自己改，拿它触发条目等于让任何人改个名就能召唤这本书里的设定。所以默认只扫
+正文。书级开关「扫描时带上说话人名字」（`scan_names`，对应酒馆的 `include_names`）打开
+以后，每条消息写成「名字: 正文」：Bot 自己的消息用这一轮生效的人设名（关键词写成人设名的
+条目，只要 Bot 最近一次发言还在扫描深度内就命中，这是这个开关的主要用途），群友用清洗过
+的昵称。代价是上面那一条：群友昵称里带关键词也会触发，酒馆同样如此。这是管理员按书选的，
+已有的书默认关；能触发的只是这个频道本来就生效的书里的条目，个人书的「在场」判断看的是
+账号（`book_active_for_person`），不受名字影响。
 
 ## 为什么归一化不删空白
 
@@ -42,15 +46,18 @@ class HitReason:
     """为什么命中
 
     Attributes:
-        kind: `constant`（常驻）/ `key`（主关键词命中）/ `sticky`（定时效果保持）。前两种
-            由本模块给出，`sticky` 由定时效果那一层在保持期内替换出来。
-        key: 触发的主关键词原文；常驻与 sticky 条目为空串。
+        kind: `constant`（常驻）/ `key`（主关键词命中）/ `sticky`（定时效果保持）/
+            `semantic`（语义相似度命中）。前两种由本模块给出，`sticky` 由定时效果那一层在
+            保持期内替换出来，`semantic` 由运行时在关键词没命中时补上。
+        key: 触发的主关键词原文；常驻、sticky 与语义命中为空串。
         secondary: 判定次关键词逻辑时命中的次关键词原文，按出现顺序。
+        score: 语义命中的余弦相似度；其余原因为 `None`。
     """
 
     kind: str
     key: str = ""
     secondary: tuple[str, ...] = ()
+    score: float | None = None
 
 
 def _normalize(text: str, case_sensitive: bool) -> str:
@@ -112,12 +119,15 @@ def _strip_invisible(text: str) -> str:
 _invisible = functools.lru_cache(maxsize=8192)(is_invisible_char)
 
 
-def scan_text(window: Sequence[WindowMessage], depth: int) -> str:
+def scan_text(window: Sequence[WindowMessage], depth: int, *, include_names: bool = False) -> str:
     """取窗口里最后 `depth` 条消息的正文，按时间顺序用换行连起来
 
     `window` 按 `id` 升序排：调用方拿到的顺序不一定是时间顺序（倒序取最近 N 条是最
     常见的写法），而「最后 depth 条」必须按时间算。`id` 是自增主键，在同一个频道里
     就是时间顺序。
+
+    `include_names` 为真时每条写成「名字: 正文」（与酒馆 `include_names` 的写法一致）；
+    没有名字的消息（`speaker` 为空）照旧只有正文，不拼一个空名字和冒号。
 
     `depth <= 0` 返回空串：那是「一条都不扫」，不是「扫全部」。
     """
@@ -125,7 +135,11 @@ def scan_text(window: Sequence[WindowMessage], depth: int) -> str:
         return ""
     ordered = sorted(window, key=lambda message: message.id)
     recent = ordered[-depth:]
-    return "\n".join(message.content_text for message in recent)
+    if not include_names:
+        return "\n".join(message.content_text for message in recent)
+    return "\n".join(
+        f"{message.speaker}: {message.content_text}" if message.speaker else message.content_text for message in recent
+    )
 
 
 def _is_ascii_word_char(char: str) -> bool:
@@ -208,7 +222,7 @@ def entry_hit(
         # 忘填关键词的条目变成常驻条目。
         return None
 
-    raw_text = scan_text(window, entry.scan_depth)
+    raw_text = scan_text(window, entry.scan_depth, include_names=entry.scan_names)
     hit_key = ""
     for key in entry.keys:
         if key_hit(key, entry, raw_text, runner):
@@ -221,6 +235,47 @@ def entry_hit(
     if not passed:
         return None
     return HitReason(kind="key", key=hit_key, secondary=secondary)
+
+
+def present_person_accounts(
+    book: MatchBook,
+    window: Sequence[WindowMessage],
+    *,
+    bot_account: str | None,
+    alias_groups: Mapping[str, Iterable[str]],
+) -> tuple[str, ...]:
+    """这本个人书的主人在它自己的扫描窗口里实际发言用的账号，最近一次发言在前
+
+    取法与 :func:`book_active_for_person` 完全同一套：按 `message.id` 排序、只看书自己的
+    `scan_depth`、账号判据走 :func:`nekro_agent.services.memory.persons.human_accounts`
+    （Bot 不算人）。差在输出：这里返回**具体是哪个账号**发的言，而不是「在不在场」。
+
+    一个人可能用主号与副号轮流说话，因此可能返回多个账号；每个账号只出现一次，顺序按它
+    最近一次发言的位置从新到旧。非 `person` 书、或没有 `person_account` 的个人书返回空元组。
+    """
+    if book.scope_kind != "person" or not book.person_account:
+        return ()
+    ordered = sorted(window, key=lambda message: message.id)
+    recent = ordered[-book.scan_depth :]
+    accounts = human_accounts(
+        [_MessageView(message.sender_id, message.platform_userid) for message in recent],
+        bot_account=bot_account,
+    )
+    # 只留「主人自己」的那些账号：窗口里可能有别人，不能把别人的账号标到这本书上。
+    present = [
+        account
+        for account in accounts
+        if account == book.person_account or book.person_account in alias_groups.get(account, ())
+    ]
+    if not present:
+        return ()
+    last_seen: dict[str, int] = {}
+    for index, message in enumerate(recent):
+        account = (message.platform_userid or "").strip()
+        if account in present:
+            last_seen[account] = index
+    # 排序键只取「最近一次发言的位置」；`dict.fromkeys` 先去重，再按位置从新到旧。
+    return tuple(sorted(dict.fromkeys(present), key=lambda account: last_seen[account], reverse=True))
 
 
 def book_active_for_person(
@@ -242,25 +297,22 @@ def book_active_for_person(
     `alias_groups` 是「账号 → 它所属的人的全部账号」的展开结果，调用方一次算好传进来
     （每本书都现查别名表会把这一层变成 N 次查询）。拼错、缺项都按「只有它自己」处理：
     少放行一本书好过多放行一本书。
+
+    在场判据与 :func:`present_person_accounts` 是同一套（后者返回具体账号）；这里只回答
+    「在不在」，两者对同一组输入的结论必须逐例一致。
     """
     if book.scope_kind != "person":
         # 其它类型的书不受「人在不在场」约束；返回 True 而不是抛错，是因为调用方会统一
         # 对所有书调这个函数，按类型提前返回只是它自己的优化。
         return True
-    if not book.person_account:
-        return False
-
-    ordered = sorted(window, key=lambda message: message.id)
-    recent = ordered[-book.scan_depth :]
-    accounts = human_accounts(
-        [_MessageView(message.sender_id, message.platform_userid) for message in recent],
-        bot_account=bot_account,
+    return bool(
+        present_person_accounts(
+            book,
+            window,
+            bot_account=bot_account,
+            alias_groups=alias_groups,
+        ),
     )
-    present: set[str] = set()
-    for account in accounts:
-        present.add(account)
-        present.update(alias_groups.get(account, ()))
-    return book.person_account in present
 
 
 @dataclass(frozen=True)

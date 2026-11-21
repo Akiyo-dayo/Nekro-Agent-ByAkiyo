@@ -7,6 +7,7 @@ import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
 import ActionButton from '../../components/common/ActionButton'
 import InstanceScopeBanner from '../../components/common/InstanceScopeBanner'
 import { PageTabs } from '../../components/common/NekroTabs'
+import DomainSettingsButton from '../../components/settings/DomainSettingsButton'
 import { useInstanceScope } from '../../hooks/useInstanceScope'
 import {
   isWorldbookPageTab,
@@ -16,6 +17,7 @@ import {
 import type { WorldbookScopeParams } from '../../services/api/worldbook'
 import { UNIFIED_TABLE_STYLES } from '../../theme/variants'
 import BooksTab from './BooksTab'
+import GraphTab from './GraphTab'
 import QuarantineTab from './QuarantineTab'
 import TriggerTestTab from './TriggerTestTab'
 import type { WorldbookPageTabDefinition } from './types'
@@ -36,6 +38,13 @@ const WORLDBOOK_PAGE_TAB_DEFS: WorldbookPageTabDefinition[] = [
     labelKey: 'tabs.books',
     render: context => (
       <BooksTab scope={context.scope} isScopeReady={context.isScopeReady} />
+    ),
+  },
+  {
+    key: 'graph',
+    labelKey: 'tabs.graph',
+    render: context => (
+      <GraphTab scope={context.scope} isScopeReady={context.isScopeReady} />
     ),
   },
   {
@@ -137,6 +146,7 @@ export default function WorldbookPage() {
         >
           {tCommon('actions.refresh')}
         </ActionButton>
+        <DomainSettingsButton domain="worldbook" />
       </Box>
 
       <InstanceScopeBanner description={t('scopeBanner')} />

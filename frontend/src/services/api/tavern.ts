@@ -47,11 +47,18 @@ export interface DepthPromptInspect {
   depth: number
 }
 
+/** 规则命中以后怎么替换：按替换文字 / 只留正文 / 整段删掉 */
+export type TavernCleanupOutputMode = 'replace' | 'text' | 'drop'
+
+/** 替换文字带 HTML 时属于哪一类；不带 HTML 是空串 */
+export type TavernCleanupHtmlKind = '' | 'display' | 'external' | 'interactive' | 'remote'
+
 /**
  * 一条清理规则的导入预览
  *
  * `disabled_reason` 是后端判定这条规则默认关着的原因（空串表示默认启用）。它决定开关
  * 能不能被打开：安全类原因即便请求里写了 `true` 也不会生效，见 `CardImportOptions`。
+ * `output_mode` 是启用之后的替换方式，`html_kind` 是替换文字带 HTML 时的类别（只用来显示）。
  */
 export interface CleanupRuleInspect {
   index: number
@@ -60,6 +67,8 @@ export interface CleanupRuleInspect {
   replace: string
   enabled: boolean
   disabled_reason: string
+  output_mode: TavernCleanupOutputMode
+  html_kind: TavernCleanupHtmlKind
 }
 
 /** 卡内知识书的统计；不含条目正文 */
@@ -71,10 +80,29 @@ export interface CardBookInspect {
   notes: Record<string, number>
 }
 
+/**
+ * 这张卡带出来的角色状态模板
+ *
+ * 检查页与结果页共用同一份形状；整个字段可以是 `null`，表示插件没登记、或者卡里没有书。
+ * `status` 只说这一步发生了什么，具体原因在 `note` 里。
+ */
+export interface StateTemplateReport {
+  status: 'preview' | 'generated' | 'exists' | 'inactive' | 'no_initvar' | 'failed'
+  fields: number
+  /** 自动标成私密的字段路径 */
+  private_paths: string[]
+  hidden: number
+  /** 来自几条 [initvar] 条目 */
+  entries: number
+  note: string
+}
+
 /** 上传后的检查报告；只解析，不落库 */
 export interface CardInspectReport {
   spec: string
   source_format: string
+  /** 报告最上面的一句结论；旧响应可能没有 */
+  verdict?: { level: 'full' | 'partial' | 'state'; text: string }
   name: string
   nickname: string
   creator: string
@@ -97,6 +125,10 @@ export interface CardInspectReport {
   unsupported: CardNoteItem[]
   notes: CardNoteItem[]
   target: TargetGates
+  /** 卡片脚本在运行时会下载的世界书；只列出认出的来源，导入与否由管理员另外确认 */
+  remote_books: RemoteBookSource[]
+  /** 这张卡带出来的角色状态模板；插件没登记或卡里没有书时为 null */
+  state_template?: StateTemplateReport | null
 }
 
 /** 导入选项；`rule_enabled` 的键是规则在卡片里的序号 */
@@ -105,6 +137,8 @@ export interface CardImportOptions {
   include_post_history?: boolean
   include_depth_prompt?: boolean
   include_book?: boolean
+  /** 把卡内书里「输出用户 / 角色名字」的变量换成 {{user}} / {{char}}；默认开 */
+  rewrite_name_vars?: boolean
   rule_enabled?: Record<number, boolean>
   greeting_pick?: 'first' | 'random'
   /** 「打开并导入」：导入后把目标实例的高级提示词槽位打开（实例级覆盖，写审计） */
@@ -132,13 +166,80 @@ export interface CardImportResult {
   advanced_slots: AdvancedSlotsOutcome
   advanced_slots_error: string
   advanced_slots_off_channels: SlotsOffChannel[]
+  /** 与检查报告同一份来源清单；结果页据此列出还没导入的远程世界书 */
+  remote_books: RemoteBookSource[]
+  /** 导入时生成的角色状态模板；插件没登记或卡里没有书时为 null */
+  state_template?: StateTemplateReport | null
+}
+
+/**
+ * 一张卡里认出的远程世界书来源
+ *
+ * 这些地址是卡片脚本写死的下载目标：主机与分支都可能变，所以 `version_hint` 只是地址里
+ * 写的那一段，不代表文件里真正的版本。`key` 是我们给的稳定标识，后面几个接口把它放进
+ * 路径，放在这里是为了让前端不必自己按 URL 拼一个。
+ */
+export interface RemoteBookSource {
+  key: string
+  /** 例如 `xxx-worldbook.json` */
+  file_name: string
+  /** 主地址在前、镜像在后 */
+  urls: string[]
+  /** 是哪个（些）卡片脚本要下载它 */
+  scripts: string[]
+  /** 地址里写的分支或版本，例如 `main`、`v0.2.2`；没有为空串 */
+  version_hint: string
+}
+
+/** 已经导入过的那一份；`downloaded_at` 是 ISO 时间，手动上传时 `host` 是空串 */
+export interface RemoteBookImported {
+  book_id: number
+  book_name: string
+  /** 文件里写的版本，可能为空串 */
+  version: string
+  downloaded_at: string | null
+  host: string
+  manual: boolean
+  /** 这本书现在的条目数 */
+  entries: number
+}
+
+export interface RemoteBookView extends RemoteBookSource {
+  imported: RemoteBookImported | null
+}
+
+export interface RemoteBooksResponse {
+  preset_id: number
+  /** 后台配了系统默认代理；为 false 时前端不显示「通过系统代理下载」 */
+  proxy_available: boolean
+  sources: RemoteBookView[]
+}
+
+export interface RemoteBookImportResult {
+  book_id: number
+  book_name: string
+  version: string
+  host: string
+  manual: boolean
+  /** 替换了这个来源已经导入的那本书的全部条目（管理员在书里手改过的条目也被覆盖） */
+  replaced: boolean
+  report: WorldbookImportReport
+}
+
+/** 检查更新的结论；`local_version` / `remote_version` 都可能是空串 */
+export interface RemoteBookCheckResult {
+  status: 'same' | 'newer' | 'changed' | 'not_imported'
+  local_version: string
+  remote_version: string
+  host: string
 }
 
 /**
  * 扩展行里的一条清理规则
  *
  * 后端返回的这条不带 `original`（导出还原用的底稿），所以保存时整条回传不会丢东西；
- * 形状逐字对应后端存的四个字段加两个状态字段。
+ * 形状逐字对应后端存的字段加几个状态字段。`output_mode` 是启用后怎么替换（缺键按
+ * `replace`）；`html_kind` 是后端现算的、只用来显示的类别，保存时传不传都行。
  */
 export interface TavernCleanupRule {
   name: string
@@ -147,6 +248,8 @@ export interface TavernCleanupRule {
   trim: string[]
   enabled: boolean
   disabled_reason: string
+  output_mode: TavernCleanupOutputMode
+  html_kind?: TavernCleanupHtmlKind
 }
 
 /** 人设的酒馆扩展行 */
@@ -209,6 +312,13 @@ export interface TavernPreviewRequest {
   chat_key: string
   /** 留空表示用频道当前人设 */
   preset_id?: number | null
+  /**
+   * 留空表示用频道当前配置选的预设；非空则预览这一份
+   *
+   * 仍要求频道的高级提示词槽位与酒馆兼容运行时都开着，否则后端按没选处理，并在
+   * `meta.rp_preset_inactive_reason` 里给原因。
+   */
+  rp_preset_id?: number | null
   /** 长度上限在路由里判（400 + 中文原因），不在请求模型里 */
   sample_text?: string | null
 }
@@ -232,6 +342,24 @@ export interface TavernPreviewResponse {
   /** 各段元数据（字数、槽位层名、世界书条目引用、开场白），形状随组装层演进 */
   meta: Record<string, unknown>
   greeting: Record<string, unknown>
+}
+
+/** 预设排布里真正产出了文字的一段；`where` 取 `system` / `tail` / `depth:<n>` */
+export interface TavernRpPresetUsed {
+  identifier: string
+  name: string
+  where: string
+  chars: number
+}
+
+/** `meta.rp_preset`：按角色扮演预设排布之后的结果 */
+export interface TavernRpPresetMeta {
+  id: number
+  name: string
+  used: TavernRpPresetUsed[]
+  /** 最后一段 assistant 后置段：这一版只带出预览，不发送 */
+  prefill_text: string
+  prefill_sent?: boolean
 }
 
 export interface TavernTrialRequest {
@@ -292,6 +420,14 @@ export interface TavernScope {
   instance_key?: string
   adapter_key?: string
 }
+
+/**
+ * 远程世界书下载、检查更新、手动上传的等待时限
+ *
+ * 后端每个地址最多 60 秒、整次最多 150 秒（主地址加镜像依次试），这里要比它长，才能拿到后端写的失败原因，
+ * 而不是自己先超时；全局默认的 30 秒不够。
+ */
+const REMOTE_BOOK_TIMEOUT_MS = 180_000
 
 /** 去掉空值；`0`、`false` 都保留 */
 function compact<T extends object>(params: T): Record<string, unknown> {
@@ -440,6 +576,79 @@ export const tavernApi = {
     const response = await axios.get<TavernAuditResponse>('/tavern/audit', {
       params: compact(params),
     })
+    return response.data
+  },
+
+  /** 列出这个人设卡片脚本要下载的世界书，以及已经导入过的那一份；`proxy_available` 只对平台方为真 */
+  listRemoteBooks: async (presetId: number, scope: TavernScope): Promise<RemoteBooksResponse> => {
+    const response = await axios.get<RemoteBooksResponse>(
+      `/tavern/presets/${presetId}/remote-books`,
+      { params: compact(scope) }
+    )
+    return response.data
+  },
+
+  /**
+   * 代卡片脚本下载一本远程世界书并导入人设世界书
+   *
+   * `replace` 为 true 会替换这个来源已经导入的那本书的全部条目（连同管理员手改过的），界面必须先确认。
+   * 同一租户同时只允许一个下载，撞上了返回 409。
+   */
+  downloadRemoteBook: async (
+    presetId: number,
+    key: string,
+    options: { use_proxy: boolean; replace: boolean },
+    scope: TavernScope
+  ): Promise<RemoteBookImportResult> => {
+    const response = await axios.post<RemoteBookImportResult>(
+      `/tavern/presets/${presetId}/remote-books/${encodeURIComponent(key)}/download`,
+      options,
+      { params: compact(scope), timeout: REMOTE_BOOK_TIMEOUT_MS }
+    )
+    return response.data
+  },
+
+  /** 只下载比对版本，不写库；同样受「同时只能有一个下载」限制 */
+  checkRemoteBook: async (
+    presetId: number,
+    key: string,
+    options: { use_proxy: boolean },
+    scope: TavernScope
+  ): Promise<RemoteBookCheckResult> => {
+    const response = await axios.post<RemoteBookCheckResult>(
+      `/tavern/presets/${presetId}/remote-books/${encodeURIComponent(key)}/check`,
+      options,
+      { params: compact(scope), timeout: REMOTE_BOOK_TIMEOUT_MS }
+    )
+    return response.data
+  },
+
+  /**
+   * 手动上传一本世界书代替下载
+   *
+   * 与卡片导入不同，这里的 multipart 只放文件本身，作用域仍走查询参数：后端这个端点
+   * 统一按 query 读归属，两者混用会让租户的上传落到全局视图里。
+   */
+  uploadRemoteBook: async (
+    presetId: number,
+    key: string,
+    file: File,
+    replace: boolean,
+    scope: TavernScope
+  ): Promise<RemoteBookImportResult> => {
+    const formData = new FormData()
+    formData.append('file', file)
+    // 表单字段只能是字符串，后端按 `"true"` / `"false"` 解析
+    formData.append('replace', replace ? 'true' : 'false')
+    const response = await axios.post<RemoteBookImportResult>(
+      `/tavern/presets/${presetId}/remote-books/${encodeURIComponent(key)}/upload`,
+      formData,
+      {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        params: compact(scope),
+        timeout: REMOTE_BOOK_TIMEOUT_MS,
+      }
+    )
     return response.data
   },
 }

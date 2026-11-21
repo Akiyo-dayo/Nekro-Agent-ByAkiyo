@@ -75,6 +75,7 @@ def model(monkeypatch: pytest.MonkeyPatch) -> dict:
         CHAT_MODEL="chat-model",
         BASE_URL="https://api.example.test/v1",
         API_KEY="sk-x",
+        API_FORMAT="openai",
         TOKEN_INPUT_RATE=1.0,
         TOKEN_COMPLETION_RATE=2.0,
         MODEL_PRICE_RATE=1.0,

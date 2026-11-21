@@ -27,6 +27,7 @@ import {
   TextField,
   Theme,
   Typography,
+  useTheme,
 } from '@mui/material'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
@@ -34,7 +35,7 @@ import ActionButton from '../../../components/common/ActionButton'
 import FilterSelect from '../../../components/common/FilterSelect'
 import NekroDialog from '../../../components/common/NekroDialog'
 import { useNotification } from '../../../hooks/useNotification'
-import { UNIFIED_TABLE_STYLES } from '../../../theme/variants'
+import { CHIP_VARIANTS, UNIFIED_TABLE_STYLES } from '../../../theme/variants'
 import { consoleApi, type InstanceInfo } from '../../../services/api/console'
 import CrossTenantSettingsChoice from './CrossTenantSettingsChoice'
 
@@ -50,6 +51,7 @@ export default function InstanceMigrationDialog({
   onClose,
   target,
 }: InstanceMigrationDialogProps) {
+  const theme = useTheme()
   const { t } = useTranslation('console')
   const { t: tCommon } = useTranslation('common')
   const notification = useNotification()
@@ -216,7 +218,7 @@ export default function InstanceMigrationDialog({
                     <Chip
                       key={resource}
                       size="small"
-                      variant="outlined"
+                      sx={CHIP_VARIANTS.getPaletteChip(theme, 'default', true)}
                       label={`${t(`migrationDialog.resource.${resource}`, {
                         defaultValue: resource,
                       })}: ${count}`}
@@ -270,8 +272,11 @@ export default function InstanceMigrationDialog({
                           <TableCell sx={UNIFIED_TABLE_STYLES.cell as SxProps<Theme>}>
                             <Chip
                               size="small"
-                              color={channel.conflict ? 'warning' : 'default'}
-                              variant={channel.conflict ? 'filled' : 'outlined'}
+                              sx={CHIP_VARIANTS.getPaletteChip(
+                                theme,
+                                channel.conflict ? 'warning' : 'default',
+                                true
+                              )}
                               label={
                                 channel.conflict
                                   ? t('migrationDialog.actionMerge')

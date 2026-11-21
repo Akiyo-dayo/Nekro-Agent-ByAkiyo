@@ -89,7 +89,9 @@ services:
     ports:
       - "${NAPCAT_EXPOSE_PORT:-6099}:6099"
     volumes:
-      - ${NEKRO_DATA_DIR}:/app/nekro_agent_data
+      # 只挂数据目录下的 uploads、只读：NA 交给 NapCat 发送的文件都放在那里；整个数据目录
+      # （包括 CC 工作区）不交给它
+      - ${NEKRO_DATA_DIR}/uploads:/app/nekro_agent_data/uploads:ro
       - ${NEKRO_DATA_DIR}/napcat_data/QQ:/app/.config/QQ
       - ${NEKRO_DATA_DIR}/napcat_data/napcat:/app/napcat/config
     networks:

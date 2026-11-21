@@ -2,8 +2,26 @@
   "title": "Memory",
   "subtitle": "Review, filter, and maintain long-term memory in the instance",
   "scopeBanner": "What you can see here follows the current instance. Switching instances changes both the list and the filter options.",
+  "embeddingHealth": {
+    "title": "Embedding calls keep failing: model group {{group}}",
+    "detail": "{{kind}}; {{count}} failures in a row since {{since}}, the latest at {{lastFailure}}.",
+    "lastSuccess": "Last success: {{time}}",
+    "noSuccess": "Last success: none since this start",
+    "impact": "Memories consolidated meanwhile have no vectors, so recall and the near-duplicate check cannot use them; knowledge base search falls back to keywords. Check this model group's API key, quota and network; it recovers by itself once fixed.",
+    "missing": "{{count}} active memories currently have no vector.",
+    "missingOnly": "{{count}} active memories have no vector (most likely consolidated while embedding was failing), so vector recall and the near-duplicate check cannot use them. The super-user command memory_backfill_vectors fills them in.",
+    "kindWithStatus": "{{kind}} (HTTP {{status}})",
+    "kinds": {
+      "auth": "Authentication failed (invalid key or no permission)",
+      "quota": "Out of quota or rate limited",
+      "rejected": "Rejected by the upstream (wrong model name, parameters or address)",
+      "server": "Upstream error or malformed response",
+      "network": "Network failure (cannot connect, timeout or proxy error)"
+    }
+  },
   "tabs": {
-    "items": "Memory items",
+    "list": "List",
+    "graph": "Graph",
     "quarantine": "Quarantine",
     "summaries": "Channel summaries",
     "promptRounds": "Prompt details"
@@ -79,9 +97,13 @@
     "partition": "Partition",
     "domain": "Domain",
     "person": "Person",
-    "personPlaceholder": "Account or name",
+    "personPlaceholder": "Name, call name or account",
     "cognitive": "Cognitive type",
     "knowledge": "Knowledge type",
+    "sensitive": "Sensitive",
+    "sensitiveAll": "All",
+    "sensitiveOnly": "Sensitive only",
+    "sensitiveExclude": "Exclude sensitive",
     "origin": "Source",
     "allOrigins": "All sources",
     "timeFrom": "From",
@@ -91,8 +113,10 @@
     "pageSize": "Page size",
     "pageSizeOption": "{{count}} rows",
     "more": "More filters",
-    "moreWithCount": "More filters · {{count}}",
-    "clear": "Clear filters"
+    "moreWithCount": "More filters ({{count}})",
+    "done": "Done",
+    "clear": "Clear",
+    "chipValue": "{{label}}: {{value}}"
   },
   "columns": {
     "content": "Content",
@@ -164,9 +188,12 @@
     "partial": "Processed {{affected}}; {{failed}} failed and remain in the list.",
     "countChanged": "The count changed. The preview has been refreshed; please confirm again.",
     "selected": "{{count}} selected",
-    "selectedAll": "All {{total}} items matching the filters are selected",
-    "selectAll": "Select all {{total}} items matching the filters",
+    "selectedAll": "All {{total}} matching items selected",
+    "selectAll": "Select all {{total}} matching items",
     "selectOnlyChecked": "Keep only checked rows",
+    "more": "Bulk actions",
+    "hardDeleteInputLabel": "Enter the number of items to delete permanently ({{count}})",
+    "hardDeleteInputHint": "Permanent deletion cannot be undone. Type the previewed count exactly before confirming.",
     "hardDeleteNotes": {
       "chatRecords": "Chat history itself is not deleted; only memory is removed.",
       "summary": "Channel summaries may also cover this content; edit them under Channel summaries if needed.",
@@ -191,7 +218,9 @@
   "quarantineReason": {
     "manual": "Manually quarantined",
     "auto_blocked": "Auto-quarantined after blocked rounds",
-    "unknown": "Other reason"
+    "dedup": "Near-duplicate",
+    "unknown": "Other reason",
+    "hitsTooltip": "Blocked rounds: {{count}}"
   },
   "trace": {
     "button": "Trace original messages",
@@ -200,7 +229,102 @@
   },
   "flags": {
     "frozen": "Frozen",
-    "protected": "Protected"
+    "protected": "Protected",
+    "sensitive": "Sensitive",
+    "sensitiveHint": "A sensitive matter about a specific person; only recalled in the chat it came from"
+  },
+  "persons": {
+    "callName": "Called",
+    "fromAffection": "from the affection record",
+    "more": "+{{count}} more",
+    "optionMeta": "{{count}} items"
+  },
+  "view": {
+    "list": "List",
+    "byPerson": "By person",
+    "byTopic": "By event"
+  },
+  "graph": {
+    "clusters": {
+      "episode": "Events",
+      "episodeCore": "Event core",
+      "semantic": "Semantic",
+      "semanticCore": "Semantic background",
+      "episodic": "Episodic",
+      "episodicCore": "Event fragments",
+      "relation": "Relations",
+      "relationCore": "Related threads",
+      "entity": "Entities",
+      "entityCore": "Participants",
+      "person": "People",
+      "personCore": "People involved"
+    },
+    "toolbar": {
+      "zoom": "Zoom",
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "viewEpisode": "Event view",
+      "viewAtomic": "Atomic view",
+      "densityLow": "Sparse",
+      "densityMedium": "Balanced",
+      "densityHigh": "Dense",
+      "showInactive": "Show inactive"
+    },
+    "focus": {
+      "title": "Focus",
+      "hint": "Drag, swipe with two fingers, or scroll to pan. Hold Ctrl or Command while scrolling to zoom. Density changes labels, how many nodes are drawn, and link detail."
+    },
+    "kind": {
+      "person": "Person"
+    },
+    "entityType": {
+      "person": "Person",
+      "concept": "Concept",
+      "project": "Project",
+      "artifact": "Artifact",
+      "event": "Event"
+    },
+    "stats": {
+      "paragraph": "Paragraphs {{count}}",
+      "episode": "Events {{count}}",
+      "relation": "Relations {{count}}",
+      "entity": "Entities {{count}}",
+      "person": "People {{count}}"
+    },
+    "episodeFallback": "Narrative event",
+    "inactive": "Inactive",
+    "empty": "Nothing to draw yet for the current scope and filters.",
+    "panel": {
+      "title": "Details & actions",
+      "close": "Close",
+      "openFull": "Full details",
+      "noActions": "This kind of memory is view-only here.",
+      "weight": "Current weight",
+      "origin": "Origin",
+      "sourceParagraph": "Source paragraph",
+      "appearances": "Appearances"
+    },
+    "person": {
+      "paragraphCount": "In {{count}} paragraphs",
+      "callName": "Called: {{name}}",
+      "accounts": "Accounts",
+      "note": "The name comes from this person's most recent paragraph. With an instance selected, one person's accounts are merged.",
+      "focus": "Only this person",
+      "showInItems": "View in items"
+    }
+  },
+  "groups": {
+    "personHint": "{{total}} people appear in the memories matching the current filters, most items first; expand one to see their latest items",
+    "topicHint": "The memories matching the current filters fall into {{total}} groups: one per event, items without an event last",
+    "paragraphCount": "{{count}} items",
+    "mergedAccounts": "Merged accounts: {{accounts}}",
+    "looseParagraphs": "Not part of any event",
+    "untitledEpisode": "Event #{{id}} (no title)",
+    "hiddenEpisode": "Event #{{id}} (deleted or out of scope)",
+    "showAllInList": "{{count}} items in total — open them in the list",
+    "emptyPersons": "None of these memories records who was involved.",
+    "episodeFilter": "Only event #{{id}}",
+    "episodeFilterNone": "Only items without an event"
   },
   "errors": {
     "notFoundTitle": "Not found",
@@ -212,9 +336,17 @@
       "preset": "Preset",
       "latest": "Latest version",
       "content": "Content",
-      "versionCount": "Versions",
+      "versionCount": "History",
       "status": "Status",
       "updatedAt": "Updated"
+    },
+    "generatedAt": "Generated {{time}}",
+    "historyCount": "{{count}} older versions",
+    "noHistory": "Only this version",
+    "diff": {
+      "noChanges": "The two versions are the same (whitespace only).",
+      "legendAdded": "Green: added in this version",
+      "legendRemoved": "Red, struck through: in the previous version, removed here"
     },
     "source": {
       "auto": "Automatic",
@@ -238,6 +370,11 @@
       "conflictReplaced": "Your changes were not saved and have been replaced with the latest version",
       "discardedLabel": "What you wrote (discarded, copyable)",
       "historyTitle": "Version history",
+      "historyDrawer": "Version history ({{count}} older)",
+      "latestTitle": "Latest version",
+      "compareWithPrevious": "Compare with the previous version",
+      "hideDiff": "Hide comparison",
+      "diffCaption": "Version of {{previous}} → version of {{latest}}",
       "rollbackPrevious": "Roll back to the previous version",
       "rollbackToVersion": "Roll back to this version",
       "rollbackSuccess": "Rolled back as version {{version}}",
@@ -275,6 +412,7 @@
     },
     "worldbookState": {
       "injected": "{{count}} items · {{chars}} chars",
+      "injectedTokens": "{{count}} items · {{tokens}} tokens",
       "none": "No match",
       "disabled": "Switched off",
       "suppressed": "Blocked last round; reference entries were not injected",
@@ -282,6 +420,8 @@
     },
     "summaryState": {
       "injected": "Version {{version}} · {{chars}} chars",
+      "injectedAt": "Generated {{time}} · {{chars}} chars",
+      "injectedGone": "Version {{version}} (no longer kept) · {{chars}} chars",
       "none": "None",
       "disabled": "Switched off",
       "suppressed": "Not injected this round"
@@ -294,12 +434,20 @@
       "summaryLine": "{{cooldownSkipped}} items skipped by cooldown, memory block {{blockChars}} chars",
       "summaryCurrent": "That summary version is still the latest",
       "summaryOutdated": "That summary version has been updated since",
-      "summaryDeleted": "That summary version is gone",
+      "summaryDeleted": "That version is no longer kept (only the latest few are)",
       "summaryNone": "No summary was injected this round",
+      "summaryGeneratedAt": "Injected summary: generated {{time}}",
+      "summaryVersionOnly": "Injected summary: version {{version}}",
+      "showSummary": "Show this version",
+      "hideSummary": "Hide text",
       "itemsTitle": "Memory items",
       "type": "Type",
       "preview": "Preview",
       "status": "Current status",
+      "similarity": "Similarity",
+      "similarityHint": "Vector similarity between this memory and the conversation excerpt at the time",
+      "memoryJudgeModel": "Model filter: {{pool}} candidates, {{kept}} kept",
+      "memoryJudgeFallback": "Model filter failed; this round fell back to similarity",
       "chars": "Chars",
       "renders": "Renders",
       "actions": "Actions",

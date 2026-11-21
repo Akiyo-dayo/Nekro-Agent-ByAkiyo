@@ -116,16 +116,17 @@ def _instance_key(instance_key: str) -> str:
 class TestDefaultsAndFlags:
     def test_tavern_compatibility_defaults(self) -> None:
         assert CoreConfig.model_fields["TAVERN_COMPAT_ENABLED"].default is True
-        assert CoreConfig.model_fields["PERSONA_GREETING_ENABLED"].default is True
+        assert CoreConfig.model_fields["PERSONA_GREETING_ENABLED"].default is False
         assert CoreConfig.model_fields["TAVERN_TRIAL_DAILY_LIMIT"].default == 100
 
         assert _extra("TAVERN_COMPAT_ENABLED")["i18n_category"] == TAVERN_CATEGORY
         assert _extra("PERSONA_GREETING_ENABLED")["i18n_category"] == TAVERN_CATEGORY
         assert _extra("TAVERN_TRIAL_DAILY_LIMIT")["i18n_category"] == TAVERN_CATEGORY
 
-        # 回滚闸与试发上限是平台方全局项；开场白允许按实例 / 频道关
+        # 回滚闸与试发上限是平台方全局项；开场白已废弃但保留覆盖，旧的覆盖文件照常读得进来
         assert not _extra("TAVERN_COMPAT_ENABLED").get("overridable")
         assert not _extra("TAVERN_TRIAL_DAILY_LIMIT").get("overridable")
+        assert _extra("PERSONA_GREETING_ENABLED")["is_hidden"] is True
         assert _extra("PERSONA_GREETING_ENABLED")["overridable"] is True
         assert not _extra("PERSONA_GREETING_ENABLED").get("tenant_may_only_lower")
 

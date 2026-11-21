@@ -41,6 +41,7 @@ from nekro_agent.models.db_emotion_item import DBEmotionItem
 from nekro_agent.models.db_emotion_set import DBEmotionSet
 from nekro_agent.models.db_emotion_set_assignment import DBEmotionSetAssignment
 from nekro_agent.models.db_exec_code import DBExecCode
+from nekro_agent.models.db_instance_group import SELF_DOMAIN_GROUP_ID
 from nekro_agent.models.db_mem_channel_summary import DBMemChannelSummary
 from nekro_agent.models.db_mem_channel_summary_state import DBMemChannelSummaryState
 from nekro_agent.models.db_mem_entity import DBMemEntity
@@ -51,6 +52,10 @@ from nekro_agent.models.db_mem_relation import DBMemRelation
 from nekro_agent.models.db_plugin_data import DBPluginData
 from nekro_agent.models.db_preset import DBPreset
 from nekro_agent.models.db_recurring_timer_job import DBRecurringTimerJob
+from nekro_agent.models.db_rp_preset import DBRpPreset
+from nekro_agent.models.db_state_channel import DBStateChannel
+from nekro_agent.models.db_state_person import DBStatePerson
+from nekro_agent.models.db_state_snapshot import DBStateSnapshot
 from nekro_agent.models.db_wb_book import DBWbBook
 from nekro_agent.models.db_workspace_comm_log import DBWorkspaceCommLog
 from nekro_agent.models.db_ws_ssh_credential import DBWsSshCredential
@@ -145,6 +150,29 @@ async def migrate_chat_key_references(
             instance_key=instance_key,
         )
         counts["mem_prompt_round"] = await DBMemPromptRound.filter(chat_key=old_chat_key).update(
+            chat_key=new_chat_key,
+            instance_key=instance_key,
+        )
+        # 角色状态的频道行按（频道, 人设）唯一，与摘要暂停行同一口径：新标识下已有同一人设的那一行
+        # 幸存，旧标识下同一人设的行连同它的快照删掉；其余改到新标识上、实例回填。快照按频道标识跟过去
+        # （不跟的话新实例看不到自己频道的历史，旧实例对上却还挂着它们）。个人档案按人存，不随频道变：
+        # 它的快照只是记了「在哪个频道发生的」，实例对是档案自己的域，不能跟着换成新实例——否则跨租户
+        # 迁移后带私密字段的档案快照会挂到目标租户名下，彻底删除旧实例时也会漏掉。
+        state_presets = await _presets_under(DBStateChannel, new_chat_key)
+        if state_presets:
+            dropped_state_ids = list(
+                await DBStateChannel.filter(chat_key=old_chat_key, preset_id__in=state_presets).values_list(
+                    "id",
+                    flat=True,
+                ),
+            )
+            await DBStateSnapshot.filter(target_kind="channel", target_id__in=dropped_state_ids).delete()
+            await DBStateChannel.filter(id__in=dropped_state_ids).delete()
+        counts["state_channel"] = await DBStateChannel.filter(chat_key=old_chat_key).update(
+            chat_key=new_chat_key,
+            instance_key=instance_key,
+        )
+        counts["state_snapshot"] = await DBStateSnapshot.filter(target_kind="channel", chat_key=old_chat_key).update(
             chat_key=new_chat_key,
             instance_key=instance_key,
         )
@@ -576,6 +604,8 @@ INSTANCE_MIGRATION_RESIDUE_REASONS: Dict[str, str] = {
     "合并两份分数怎么算没有唯一正确的口径，不由本操作替用户决定",
     "affection_event": "好感度变化流水随好感度一起留在源实例",
     "announcement_delivery": "公告投递流水是「当时发给了谁」的既成事实，改写它等于篡改审计记录",
+    "state_person": "角色状态的个人档案与好感同一套键（按人存在源实例的域上），理由同好感度",
+    "state_person_snapshot": "个人档案的快照随个人档案一起留在源实例",
 }
 
 
@@ -645,6 +675,7 @@ async def plan_instance_migration(
         "mem_entity": await DBMemEntity.filter(instance_key=source_instance_key).count(),
         "mem_relation": await DBMemRelation.filter(instance_key=source_instance_key).count(),
         "preset": await DBPreset.filter(owner_instance_key=source_instance_key).count(),
+        "rp_preset": await DBRpPreset.filter(owner_instance_key=source_instance_key).count(),
         # 表情：这个实例的收集库与指向它的 `instance` 分配，随实例一起改判。
         # 收集库按（适配器, 实例）归属，整实例迁移后它必须一起过去。
         "emotion_set": await DBEmotionSet.filter(
@@ -662,6 +693,9 @@ async def plan_instance_migration(
             adapter_key=adapter_key,
             instance_key=source_instance_key,
         ).count(),
+        # 角色状态：频道状态与频道快照跟着频道标识走（键名与 `migrate_chat_key_references` 的统计一致）
+        "state_channel": await DBStateChannel.filter(chat_key__in=source_chat_keys).count(),
+        "state_snapshot": await DBStateSnapshot.filter(target_kind="channel", chat_key__in=source_chat_keys).count(),
     }
 
     residues = {
@@ -671,6 +705,16 @@ async def plan_instance_migration(
             instance_key=source_instance_key,
         ).count(),
         "announcement_delivery": await DBAnnouncementDelivery.filter(instance_key=source_instance_key).count(),
+        "state_person": await DBStatePerson.filter(
+            adapter_key=adapter_key,
+            instance_key=source_instance_key,
+            domain_group_id=SELF_DOMAIN_GROUP_ID,
+        ).count(),
+        "state_person_snapshot": await DBStateSnapshot.filter(
+            target_kind="person",
+            adapter_key=adapter_key,
+            instance_key=source_instance_key,
+        ).count(),
     }
 
     # 插件设置与配置覆盖：源实例名下（实例级 + 它的频道）有多少。不进 `counts`，理由同 SSH 凭据
@@ -988,6 +1032,9 @@ async def _migrate_instance_scoped_rows(
         counts["preset"] = await DBPreset.filter(owner_instance_key=source_instance_key).update(
             owner_instance_key=target_instance_key,
         )
+        counts["rp_preset"] = await DBRpPreset.filter(owner_instance_key=source_instance_key).update(
+            owner_instance_key=target_instance_key,
+        )
         # 书按实例对归属。频道书已经在逐个频道的迁移里改过实例，这里接住域书、个人书、
         # 实例的人设书，以及频道行早已不在的频道书——整个实例都改判了，它名下的书必须
         # 一起过去，否则这些书在新实例的域里一条都选不中（等于静默失效）。
@@ -1084,6 +1131,11 @@ async def _migrate_instance_scoped_rows(
         adapter_key,
         source_instance_key,
         target_instance_key,
+    )
+    # SSH 值守的实例名单同理，但目标归租户时摘掉而不改写（值守只认平台方实例；改写成一个
+    # 永远不生效的条目，等这个实例以后划回平台方时值守会悄悄恢复）
+    counts["ssh_duty_instance"] = int(
+        await _rewrite_duty_instance(adapter_key, source_instance_key, target_instance_key),
     )
     # 适配器内存里的「地址 → 归属」表也要跟上（事务已提交）：不刷新的话，重启之前收到的新信
     # 快照会记成源实例，而源实例可能归另一个租户
@@ -1184,6 +1236,16 @@ def _rewrite_platform_share_instance(adapter_key: str, source_instance_key: str,
     )
 
 
+async def _rewrite_duty_instance(adapter_key: str, source_instance_key: str, target_instance_key: str) -> bool:
+    """`SSH_GATEWAY_DUTY_INSTANCES` 里的源实例：目标归平台方就改写成目标，归租户就摘掉"""
+    from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+    from nekro_agent.services.ssh_gateway.duty_instances import rewrite_duty_instances
+
+    target = await DBAdapterInstance.filter(adapter_key=adapter_key, instance_key=target_instance_key).first()
+    target_ref = f"{adapter_key}:{target_instance_key}" if target is not None and target.tenant_id is None else None
+    return rewrite_duty_instances(f"{adapter_key}:{source_instance_key}", target_ref)
+
+
 async def _migrate_instance_emotions(
     adapter_key: str,
     source_instance_key: str,
@@ -1236,6 +1298,7 @@ async def _count_instance_residual(adapter_key: str, source_instance_key: str) -
             instance_key=source_instance_key,
         ).count(),
         "preset": await DBPreset.filter(owner_instance_key=source_instance_key).count(),
+        "rp_preset": await DBRpPreset.filter(owner_instance_key=source_instance_key).count(),
         # 书按（适配器, 实例）归属：这里数的是「迁移之后还有没有书挂在源实例名下」。
         # 正常情况是 0；非 0 说明这本书的归属在迁移前就与频道表对不上，必须报出来。
         "wb_book": await DBWbBook.filter(adapter_key=adapter_key, instance_key=source_instance_key).count(),

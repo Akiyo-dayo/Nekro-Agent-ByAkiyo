@@ -90,7 +90,7 @@ class ImapSmtpOAuth2Client(ImapSmtpPasswordClient):
             with self._new_smtp(smtp_host, port, use_ssl, 60, addresses) as server:
                 server.ehlo()
                 if not use_ssl:
-                    server.starttls()
+                    server.starttls(context=self._tls_context(smtp_host))
                     server.ehlo()
                 auth_code, auth_response = server.auth("XOAUTH2", auth_object)
                 logger.debug(f"SMTP XOAUTH2 认证结果: host={smtp_host}, port={port}, code={auth_code}, response={auth_response!r}")

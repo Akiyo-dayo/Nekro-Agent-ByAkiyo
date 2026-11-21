@@ -997,7 +997,9 @@
         "loadMore": "Load more",
         "showInput": "Show input",
         "hideInput": "Hide input",
-        "openSettings": "Open system settings"
+        "openSettings": "Open system settings",
+        "dutyMode": "Mode",
+        "runbook": "Runbook"
       },
       "columns": {
         "alias": "Alias",
@@ -1062,6 +1064,26 @@
         }
       },
       "s3Warning": "This workspace is also bound to {{count}} channels. Anything people leave in those channels can be read by CC during the authorization window for platform servers.",
+      "duty": {
+        "badge": "Duty",
+        "badgeHint": "Anyone who can reach this bot can have it connect to this server to investigate and fix problems",
+        "title": "Server mode",
+        "modeInherit": "Follow default (currently: {{mode}})",
+        "modeStrict": "Strict: owners only",
+        "modeDuty": "Duty",
+        "dutyWarning": "In duty mode, anyone who reaches this bot on a platform instance and reports a problem can have the bot connect to this server on its own; the bot decides what to do. Everything is audited and the owners get a private summary afterwards. Only enable this for bots that are only in trusted groups.",
+        "saved": "Mode saved"
+      },
+      "runbook": {
+        "title": "Runbook: {{alias}}",
+        "ownerHint": "What you write here goes into the task text whenever the bot is authorized to connect to this server, as instructions from the platform (up to 8,000 characters).",
+        "saved": "Runbook saved",
+        "entriesTitle": "Notes added by the bot ({{count}})",
+        "entriesHint": "The bot wrote these after past tasks. They go into the task text marked as past notes, not instructions. Delete any that are wrong.",
+        "entriesEmpty": "None yet",
+        "deleteEntry": "Delete this note",
+        "deleteConfirm": "Delete this note?"
+      },
       "form": {
         "createTitle": "New server",
         "editTitle": "Edit server",

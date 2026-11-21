@@ -1,0 +1,27 @@
+{
+  "title": "Person",
+  "open": "Open person card",
+  "entry": "Person card",
+  "copyAccount": "Copy account",
+  "accountCopied": "Account copied",
+  "copyFailed": "Copy failed",
+  "retry": "Retry",
+  "error": "Failed to load",
+  "affection": {
+    "title": "Affection",
+    "empty": "No affection record yet",
+    "callName": "Call name: {{name}}",
+    "lastSeen": "Last seen"
+  },
+  "state": {
+    "title": "State profile",
+    "empty": "No state profile",
+    "open": "Go to state page"
+  },
+  "memory": {
+    "title": "Memory",
+    "total": "{{count}} in total",
+    "empty": "This person is not mentioned in memory yet",
+    "viewAll": "View all"
+  }
+}

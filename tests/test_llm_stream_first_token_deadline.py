@@ -134,6 +134,8 @@ async def _call(upstream: LoopbackUpstream, first_token_timeout: int = FIRST_TOK
             stream_mode=True,
             max_wait_time=READ_TIMEOUT,
             first_token_timeout=first_token_timeout,
+            # 本机的假上游当平台方的组用；不说明归属时按租户出站，本机地址会被拒
+            tenant_egress=False,
         ),
         timeout=CASE_GUARD,
     )

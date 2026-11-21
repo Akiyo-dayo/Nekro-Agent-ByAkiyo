@@ -56,6 +56,12 @@ class DBWsSshCredential(Model):
     status = fields.CharField(max_length=16, default="active", description="active / disabled / suspended / auth_failed")
     status_reason = fields.CharField(max_length=64, default="", description="状态原因，如 workspace_not_platform")
     note = fields.TextField(default="", description="给人看的备注，不进任何提示词")
+    duty_mode = fields.CharField(
+        max_length=16,
+        default="",
+        description="值守模式：strict / duty / 空（跟随 SSH_GATEWAY_DEFAULT_DUTY_MODE）；只对 platform 行有意义",
+    )
+    runbook = fields.TextField(default="", description="平台方写的运维手册，拍到租约时进任务正文；只对 platform 行有意义")
     created_by = fields.CharField(max_length=128, default="", description="后台用户名，或 chat:<账号> / import")
     updated_by = fields.CharField(max_length=128, default="", description="最后修改者")
     last_used_at = fields.DatetimeField(null=True, description="最近一次放行的连接")

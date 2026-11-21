@@ -32,6 +32,8 @@ STATUS_MAIL_TOTAL_LIMIT = 20
 # 计数落盘、按墙钟记：进程反复崩溃被拉起时最容易刷信（每次启动各 Bot 一重连就是一轮上线邮件），
 # 只记在内存里的话每重启一次额度就满血。记录最多 `STATUS_MAIL_TOTAL_LIMIT` 条，每发一封原子写回一次
 STATUS_MAIL_STATE_FILE_NAME = "status_mail_rate.json"
+# SMTP 连上就握 TLS 的端口（SMTPS / submissions）
+SMTP_IMPLICIT_TLS_PORT = 465
 # 窗口内已发的 (适配器, Bot ID, 发送时刻)；None 表示本进程还没读过落盘的记录
 _status_mail_log: Optional[List[Tuple[str, str, float]]] = None
 # 被限频挡下时，WARNING 每个 Bot 每个窗口一条，其余记 debug（只是日志，不落盘）；
@@ -78,6 +80,7 @@ def _get_runtime_mail_settings() -> dict:
         else config.MAIL_TARGET
     )
     tenant_host = False
+    validate_certs = True
     if sender_account:
         provider_config = _get_provider_config_for_account(sender_account)
         hostname = str(provider_config.get("smtp_host") or "")
@@ -90,11 +93,16 @@ def _get_runtime_mail_settings() -> dict:
         # 直接按主机名连，没有「只连校验过的地址」那一层。状态邮件是平台方的运维通知，不值得为它再写一套直连，
         # 遇到这种发件邮箱就不发（见 `send_email`）
         tenant_host = sender_account.is_tenant_host(hostname)
+        # 与 IMAP / SMTP 客户端同一判据：租户的账户、预设服务商一律校验；只有平台方自己的自定义服务器
+        # 打开了 `SKIP_TLS_VERIFY` 才不校验
+        validate_certs = sender_account.tls_verify_required(hostname)
     else:
         hostname = config.MAIL_HOSTNAME
         port = int(config.MAIL_PORT)
-        use_tls = False
-        starttls = bool(config.MAIL_STARTTLS)
+        # 已弃用的核心配置 `MAIL_*`：465 是连上就握 TLS 的端口（原来一律当明文连、再看 `MAIL_STARTTLS`，
+        # 在 465 上本来就连不通）；其余端口按 `MAIL_STARTTLS`
+        use_tls = port == SMTP_IMPLICIT_TLS_PORT
+        starttls = not use_tls and bool(config.MAIL_STARTTLS)
 
     return {
         "tenant_host": tenant_host,
@@ -106,6 +114,10 @@ def _get_runtime_mail_settings() -> dict:
         "port": port,
         "use_tls": use_tls,
         "starttls": starttls,
+        "validate_certs": validate_certs,
+        # 既不是 465、也不 STARTTLS，又要登录：账号和授权码会明文过网（`send_email` 遇到就不发）。
+        # 不登录的明文中继（例如本机的邮件服务，账号口令都空）不在此列，那时没有秘密可漏
+        "plaintext_login": not use_tls and not starttls and bool(username or password),
     }
 
 async def send_email(message: EmailMessage) -> None:
@@ -133,6 +145,12 @@ async def send_email(message: EmailMessage) -> None:
             "请在 Email 适配器页换一个发件邮箱，或把它的服务器改成平台方自己的",
         )
         return
+    if settings.get("plaintext_login"):
+        logger.error(
+            "状态邮件没有发出：旧的「邮件通知」配置（MAIL_*）既没开 TLS 加密、端口也不是 465，"
+            "登录时账号和授权码会明文发出去。请打开「邮件通知启用 TLS 加密」，或在 Email 适配器页选一个发件邮箱",
+        )
+        return
     try:
         await send(
             message,
@@ -142,6 +160,7 @@ async def send_email(message: EmailMessage) -> None:
             password=settings["password"],
             use_tls=settings["use_tls"],
             start_tls=settings["starttls"],
+            validate_certs=settings["validate_certs"],
         )
         logger.info("邮件发送成功")
     except Exception as e:

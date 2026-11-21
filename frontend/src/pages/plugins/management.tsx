@@ -170,7 +170,12 @@ function PluginDetails({
   scopeUnavailable,
   onRestoreInherit,
 }: PluginDetailProps) {
-  const [activeTab, setActiveTab] = useState<PluginTabKey>('info')
+  // 角色状态设置抽屉里的「去插件管理」直接落到配置标签：只在首次挂载时读一次，
+  // 之后用户自己切标签不会被 URL 里的 `tab` 拽回去。
+  const [searchParams] = useSearchParams()
+  const [activeTab, setActiveTab] = useState<PluginTabKey>(() =>
+    searchParams.get('tab') === 'config' ? 'config' : 'info'
+  )
   const [webuiLoaded, setWebuiLoaded] = useState(false)
   const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false)
   const [resetDataConfirmOpen, setResetDataConfirmOpen] = useState(false)
@@ -211,8 +216,12 @@ function PluginDetails({
       getConfigList: () => instanceScopeApi.getPluginInstanceConfig(plugin.id, scopeInstanceKey),
       getModelGroups: unifiedConfigApi.getModelGroups,
       getModelTypes: unifiedConfigApi.getModelTypes,
-      batchUpdateConfig: async (_key: string, configs: Record<string, string>) => {
-        await instanceScopeApi.savePluginInstanceConfig(plugin.id, scopeInstanceKey, configs)
+      batchUpdateConfig: async (
+        _key: string,
+        configs: Record<string, string>,
+        base?: Record<string, unknown>
+      ) => {
+        await instanceScopeApi.savePluginInstanceConfig(plugin.id, scopeInstanceKey, configs, base)
       },
       saveConfig: async () => {},
       reloadConfig: async () => {},

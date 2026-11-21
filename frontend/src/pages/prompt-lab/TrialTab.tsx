@@ -18,13 +18,14 @@ import { useTranslation } from 'react-i18next'
 import ActionButton from '../../components/common/ActionButton'
 import FilterSelect from '../../components/common/FilterSelect'
 import QueryErrorState from '../../components/common/QueryErrorState'
+import StatusChip from '../../components/common/StatusChip'
 import { useWorldbookScopeOptions } from '../../components/worldbook/useWorldbookScopeOptions'
 import { useIdentity } from '../../hooks/useIdentity'
 import { TENANT_QUERY_KEYS, tenantApi } from '../../services/api/tenant'
 import { tavernApi, type TavernTrialResponse } from '../../services/api/tavern'
 import type { WorldbookScopeParams } from '../../services/api/worldbook'
 import { stateText } from '../../components/memory/tavernItems'
-import { CHIP_VARIANTS } from '../../theme/variants'
+import { CHIP_VARIANTS, SCROLL_COLUMN_STYLES } from '../../theme/variants'
 
 /**
  * 「试发」标签
@@ -61,24 +62,34 @@ function ResultBlock({ result }: { result: TavernTrialResponse }) {
     overflowX: 'auto',
   }
 
+  const latencyColor =
+    result.latency_ms < 3000
+      ? theme.palette.success.main
+      : result.latency_ms < 10000
+        ? theme.palette.warning.main
+        : theme.palette.error.main
+
   return (
     <Stack spacing={1.5}>
       <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center' }}>
-        <Chip size="small" label={t('lab.trial.model', { model: result.model || '—' })} />
+        <Chip
+          size="small"
+          label={t('lab.trial.model', { model: result.model || '—' })}
+          sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.text.secondary, true)}
+        />
         <Chip
           size="small"
           label={t('lab.trial.modelGroup', { group: result.model_group || '—' })}
+          sx={CHIP_VARIANTS.getCustomColorChip(theme.palette.text.secondary, true)}
         />
-        <Chip size="small" label={t('lab.trial.latency', { ms: result.latency_ms })} />
         <Chip
           size="small"
+          label={t('lab.trial.latency', { ms: result.latency_ms })}
+          sx={CHIP_VARIANTS.getCustomColorChip(latencyColor, true)}
+        />
+        <StatusChip
+          tone={result.prefill_state === 'sent' ? 'active' : 'inactive'}
           label={t('lab.trial.prefill', { state: stateText(result.prefill_state, t) })}
-          sx={CHIP_VARIANTS.getCustomColorChip(
-            result.prefill_state === 'sent'
-              ? theme.palette.success.main
-              : theme.palette.text.secondary,
-            true
-          )}
         />
       </Box>
 
@@ -188,16 +199,7 @@ export default function TrialTab({ scope, isScopeReady }: PromptLabTabProps) {
   const noTenantGroup = isTenantScoped && !groupsQuery.isLoading && tenantGroups.length === 0
 
   return (
-    <Box
-      sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 2,
-        overflowY: 'auto',
-        minHeight: 0,
-        pr: { xs: 0, sm: 0.5 },
-      }}
-    >
+    <Box sx={[SCROLL_COLUMN_STYLES, { gap: 2, pr: { xs: 0, sm: 0.5 } }] as SxProps<Theme>}>
       <Alert severity="info">{t('lab.trial.notice')}</Alert>
 
       {groupsQuery.error ? <QueryErrorState error={groupsQuery.error} compact /> : null}

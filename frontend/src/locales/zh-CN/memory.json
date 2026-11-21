@@ -2,8 +2,26 @@
   "title": "记忆",
   "subtitle": "查看、筛选与维护实例里的长期记忆",
   "scopeBanner": "记忆的可见范围跟随当前实例；切换实例后列表与筛选项会一起变化。",
+  "embeddingHealth": {
+    "title": "嵌入（向量化）持续失败：模型组 {{group}}",
+    "detail": "{{kind}}；从 {{since}} 起连续失败 {{count}} 次，最近一次失败 {{lastFailure}}。",
+    "lastSuccess": "最近一次成功：{{time}}",
+    "noSuccess": "最近一次成功：本次启动以来没有成功过",
+    "impact": "这段时间新沉淀的记忆没有向量，召回与近重复检查用不上它们；知识库检索退回关键词。请检查这个模型组的 API Key、额度与网络，修好以后自动恢复。",
+    "missing": "目前有 {{count}} 段有效的记忆缺向量。",
+    "missingOnly": "有 {{count}} 段有效的记忆没有向量（多半是嵌入失败期间沉淀的），向量召回与近重复检查用不上它们。可用超级用户命令 memory_backfill_vectors 补齐。",
+    "kindWithStatus": "{{kind}}（HTTP {{status}}）",
+    "kinds": {
+      "auth": "鉴权失败（Key 无效或没有权限）",
+      "quota": "额度不足或被限流",
+      "rejected": "请求被上游拒绝（模型名、参数或地址不对）",
+      "server": "上游出错或回包形态不对",
+      "network": "网络不通（连不上、超时或代理出错）"
+    }
+  },
   "tabs": {
-    "items": "记忆条目",
+    "list": "列表",
+    "graph": "图谱",
     "quarantine": "隔离区",
     "summaries": "频道摘要",
     "promptRounds": "提示词明细"
@@ -79,9 +97,13 @@
     "partition": "分区",
     "domain": "域",
     "person": "涉及的人",
-    "personPlaceholder": "账号或名字",
+    "personPlaceholder": "名字、称呼或账号",
     "cognitive": "认知类型",
     "knowledge": "知识类型",
+    "sensitive": "敏感",
+    "sensitiveAll": "全部",
+    "sensitiveOnly": "只看敏感",
+    "sensitiveExclude": "不含敏感",
     "origin": "来源",
     "allOrigins": "全部来源",
     "timeFrom": "起始日期",
@@ -91,8 +113,10 @@
     "pageSize": "每页条数",
     "pageSizeOption": "{{count}} 条",
     "more": "更多筛选",
-    "moreWithCount": "更多筛选 · {{count}}",
-    "clear": "清空筛选"
+    "moreWithCount": "更多筛选 ({{count}})",
+    "done": "完成",
+    "clear": "清空",
+    "chipValue": "{{label}}：{{value}}"
   },
   "columns": {
     "content": "内容",
@@ -164,9 +188,12 @@
     "partial": "完成 {{affected}} 条，{{failed}} 条失败；失败的仍保留在列表里。",
     "countChanged": "条数已经变化，已重新预览，请再确认一次。",
     "selected": "已选 {{count}} 条",
-    "selectedAll": "已选当前筛选的全部 {{total}} 条",
-    "selectAll": "选中当前筛选的全部 {{total}} 条",
+    "selectedAll": "已选全部 {{total}} 条",
+    "selectAll": "选中全部 {{total}} 条",
     "selectOnlyChecked": "只保留已勾选的",
+    "more": "批量操作",
+    "hardDeleteInputLabel": "输入要彻底删除的条数（{{count}} 条）",
+    "hardDeleteInputHint": "彻底删除不可恢复，请把预览里的条数原样输入后再确认。",
     "hardDeleteNotes": {
       "chatRecords": "聊天记录本身不删，这里只删记忆。",
       "summary": "频道摘要可能也概括过这些内容，需要的话去「频道摘要」里编辑。",
@@ -191,7 +218,9 @@
   "quarantineReason": {
     "manual": "手动隔离",
     "auto_blocked": "被拦轮次自动隔离",
-    "unknown": "其他原因"
+    "dedup": "近重复",
+    "unknown": "其他原因",
+    "hitsTooltip": "被拦次数：{{count}}"
   },
   "trace": {
     "button": "追溯原话",
@@ -200,7 +229,102 @@
   },
   "flags": {
     "frozen": "已冻结",
-    "protected": "已保护"
+    "protected": "已保护",
+    "sensitive": "敏感",
+    "sensitiveHint": "关于具体某个人的敏感事，只在它来源的频道里会被想起"
+  },
+  "persons": {
+    "callName": "称呼",
+    "fromAffection": "来自好感记录",
+    "more": "另 {{count}} 人",
+    "optionMeta": "{{count}} 段"
+  },
+  "view": {
+    "list": "平铺",
+    "byPerson": "按人",
+    "byTopic": "按事件"
+  },
+  "graph": {
+    "clusters": {
+      "episode": "事件核",
+      "episodeCore": "事件核心",
+      "semantic": "语义区",
+      "semanticCore": "语义背景",
+      "episodic": "情景区",
+      "episodicCore": "事件片段",
+      "relation": "关系区",
+      "relationCore": "关联线索",
+      "entity": "实体区",
+      "entityCore": "参与实体",
+      "person": "人物区",
+      "personCore": "涉及的人"
+    },
+    "toolbar": {
+      "zoom": "缩放",
+      "zoomIn": "放大",
+      "zoomOut": "缩小",
+      "viewEpisode": "事件视图",
+      "viewAtomic": "原子视图",
+      "densityLow": "低密度",
+      "densityMedium": "信息适中",
+      "densityHigh": "高密度",
+      "showInactive": "显示失活"
+    },
+    "focus": {
+      "title": "当前焦点",
+      "hint": "拖动或用触控板双指、鼠标滚轮平移视图，按住 Ctrl 或 Command 再滚动可缩放。信息密度会同时影响标签、节点数量和关联细节。"
+    },
+    "kind": {
+      "person": "人"
+    },
+    "entityType": {
+      "person": "人物",
+      "concept": "概念",
+      "project": "项目",
+      "artifact": "产物",
+      "event": "事件"
+    },
+    "stats": {
+      "paragraph": "段落 {{count}}",
+      "episode": "事件 {{count}}",
+      "relation": "关系 {{count}}",
+      "entity": "实体 {{count}}",
+      "person": "人 {{count}}"
+    },
+    "episodeFallback": "叙事事件",
+    "inactive": "失活",
+    "empty": "当前范围与筛选下还没有可以画出来的记忆。",
+    "panel": {
+      "title": "详情与干预",
+      "close": "收起",
+      "openFull": "完整详情",
+      "noActions": "这类记忆在这里只能查看。",
+      "weight": "当前权重",
+      "origin": "来源",
+      "sourceParagraph": "来源段落",
+      "appearances": "出现次数"
+    },
+    "person": {
+      "paragraphCount": "涉及 {{count}} 段",
+      "callName": "称呼：{{name}}",
+      "accounts": "账号",
+      "note": "名字取这个人最新一段记忆上的叫法；选了实例时同一个人的几个账号并在一起。",
+      "focus": "只看这个人",
+      "showInItems": "在条目里看"
+    }
+  },
+  "groups": {
+    "personHint": "满足当前筛选的记忆里出现过 {{total}} 个人，按段数排；展开一个人看最近的几段",
+    "topicHint": "满足当前筛选的记忆分在 {{total}} 组里：每个事件一组，没归入事件的放最后",
+    "paragraphCount": "{{count}} 段",
+    "mergedAccounts": "并入的账号：{{accounts}}",
+    "looseParagraphs": "没归入任何事件",
+    "untitledEpisode": "事件 #{{id}}（没有标题）",
+    "hiddenEpisode": "事件 #{{id}}（已删除或不在可见范围）",
+    "showAllInList": "共 {{count}} 段，在列表里看全部",
+    "emptyPersons": "这些记忆都没有记下涉及的人。",
+    "episodeFilter": "只看事件 #{{id}}",
+    "episodeFilterNone": "只看没归入事件的"
   },
   "errors": {
     "notFoundTitle": "未找到",
@@ -210,11 +334,19 @@
     "columns": {
       "channel": "频道",
       "preset": "人设",
-      "latest": "最新版",
+      "latest": "最新一版",
       "content": "内容",
-      "versionCount": "版本数",
+      "versionCount": "历史版本",
       "status": "状态",
       "updatedAt": "更新时间"
+    },
+    "generatedAt": "{{time}} 生成",
+    "historyCount": "另有 {{count}} 个旧版",
+    "noHistory": "只有这一版",
+    "diff": {
+      "noChanges": "两版内容相同（只差空白）。",
+      "legendAdded": "绿色：这一版新加的",
+      "legendRemoved": "红色划线：上一版有、这一版删掉的"
     },
     "source": {
       "auto": "自动",
@@ -238,6 +370,11 @@
       "conflictReplaced": "你的改动没有保存，已替换为最新版本",
       "discardedLabel": "你原来写的内容（已丢弃，可复制）",
       "historyTitle": "历史版本",
+      "historyDrawer": "历史版本（{{count}} 个旧版）",
+      "latestTitle": "最新一版",
+      "compareWithPrevious": "和上一版对比",
+      "hideDiff": "收起对比",
+      "diffCaption": "{{previous}} 那一版 → {{latest}} 这一版",
       "rollbackPrevious": "回滚到上一版",
       "rollbackToVersion": "回滚到这一版",
       "rollbackSuccess": "已回滚，存成了第 {{version}} 版",
@@ -275,6 +412,7 @@
     },
     "worldbookState": {
       "injected": "{{count}} 条 · {{chars}} 字",
+      "injectedTokens": "{{count}} 条 · {{tokens}} token",
       "none": "未命中",
       "disabled": "未开启",
       "suppressed": "上一轮被拦，未注入参考条目",
@@ -282,6 +420,8 @@
     },
     "summaryState": {
       "injected": "第 {{version}} 版 · {{chars}} 字",
+      "injectedAt": "{{time}} 生成 · {{chars}} 字",
+      "injectedGone": "第 {{version}} 版（已不保留）· {{chars}} 字",
       "none": "没有",
       "disabled": "开关关着",
       "suppressed": "本轮不注入"
@@ -294,12 +434,20 @@
       "summaryLine": "冷却跳过 {{cooldownSkipped}} 条、记忆块共 {{blockChars}} 字",
       "summaryCurrent": "摘要那一版仍是最新版",
       "summaryOutdated": "摘要那一版之后又更新过",
-      "summaryDeleted": "摘要那一版已不在",
+      "summaryDeleted": "那一版已不保留（只留最近几版）",
       "summaryNone": "这一轮没有注入摘要",
+      "summaryGeneratedAt": "注入的摘要：{{time}} 生成",
+      "summaryVersionOnly": "注入的摘要：第 {{version}} 版",
+      "showSummary": "看这一版的正文",
+      "hideSummary": "收起正文",
       "itemsTitle": "记忆条目",
       "type": "类型",
       "preview": "预览",
       "status": "当前状态",
+      "similarity": "相似度",
+      "similarityHint": "这条记忆与当时那几句对话的向量相似度",
+      "memoryJudgeModel": "模型筛选：候选 {{pool}} 条，留下 {{kept}} 条",
+      "memoryJudgeFallback": "模型筛选没成功，这一轮按相似度取",
       "chars": "字数",
       "renders": "渲染次数",
       "actions": "操作",

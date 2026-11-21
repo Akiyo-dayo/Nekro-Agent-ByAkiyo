@@ -1,4 +1,13 @@
-import { Box, CircularProgress, List, ListItem, ListItemText, Typography } from '@mui/material'
+import { useEffect, useState } from 'react'
+import {
+  Box,
+  CircularProgress,
+  List,
+  ListItem,
+  ListItemText,
+  TextField,
+  Typography,
+} from '@mui/material'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import ActionButton from '../common/ActionButton'
@@ -51,6 +60,8 @@ export default function BulkActionDialog({
   const notification = useNotification()
   const { t } = useTranslation('memory')
   const { t: tCommon } = useTranslation('common')
+  // 彻底删除要求把数量抄一遍：这是一个不可恢复的动作，不能顺手点确认
+  const [confirmInput, setConfirmInput] = useState('')
 
   const previewQuery = useQuery({
     queryKey: ['memory', 'bulk-preview', action, selection, scope],
@@ -103,12 +114,20 @@ export default function BulkActionDialog({
   const matched = previewQuery.data?.matched ?? 0
   const cascade = previewQuery.data?.cascade ?? null
   const isHardDelete = action === 'hard_delete'
+  const requiresCount = isHardDelete && matched > 0
+  const countMatches = !requiresCount || Number(confirmInput.trim()) === matched
+
+  useEffect(() => {
+    setConfirmInput('')
+  }, [action, matched])
+
   const confirmDisabled =
     executeMutation.isPending ||
     previewQuery.isPending ||
     previewQuery.isFetching ||
     previewQuery.isError ||
-    matched === 0
+    matched === 0 ||
+    !countMatches
 
   const renderBody = () => {
     if (previewQuery.isPending) {
@@ -158,6 +177,19 @@ export default function BulkActionDialog({
               <ListItemText primary={t('bulk.hardDeleteNotes.promptRounds')} />
             </ListItem>
           </List>
+        )}
+        {requiresCount && (
+          <TextField
+            label={t('bulk.hardDeleteInputLabel', { count: matched })}
+            value={confirmInput}
+            onChange={event => setConfirmInput(event.target.value)}
+            type="number"
+            size="small"
+            fullWidth
+            error={confirmInput.trim() !== '' && !countMatches}
+            helperText={t('bulk.hardDeleteInputHint')}
+            inputProps={{ min: 0 }}
+          />
         )}
       </Box>
     )

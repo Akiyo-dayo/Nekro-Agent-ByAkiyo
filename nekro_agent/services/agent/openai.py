@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
 import json
+import math
 import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Set,
     Tuple,
     TypeVar,
     Union,
@@ -30,9 +33,11 @@ from pydantic import BaseModel
 
 from nekro_agent.core import config, logger
 from nekro_agent.schemas.usage import LLMUsageStatus
+from nekro_agent.services import embedding_health
 from nekro_agent.services.usage.context import current_usage_context
 from nekro_agent.services.usage.ledger import compute_token_cost, record_llm_usage
 
+from . import gemini_native
 from .creator import OpenAIChatMessage
 from .upstream_redaction import (
     collect_llm_secret_values,
@@ -133,6 +138,84 @@ def _choice_finish_reason(choice: Any) -> str:
     直接取属性会把一次「本可分类的失败」变成一条 AttributeError。
     """
     return normalize_finish_reason(getattr(choice, "finish_reason", None))
+
+
+_CACHED_INPUT_TOP_LEVEL_FIELDS = (
+    "prompt_cache_hit_tokens",  # DeepSeek
+    "cache_read_input_tokens",  # 转发 Anthropic 的兼容接口
+    "cached_tokens",  # Moonshot 等
+    "cached_content_token_count",  # Gemini 原生（SDK 属性名）
+    "cachedContentTokenCount",  # Gemini 原生（REST 字段名）
+)
+
+
+def _cached_input_tokens(usage: Any) -> Optional[int]:
+    """从上游 `usage` 里取「输入命中缓存的 token 数」，一个都取不到时回 `None`
+
+    各家放这个数字的位置不一样，下面几处都看，取**各处合法值里最大的**：中转站常见
+    `prompt_tokens_details.cached_tokens=0` 同时带 `prompt_cache_hit_tokens=500`，
+    取第一个就会把真实命中记成 0。
+
+    - `prompt_tokens_details.cached_tokens`（OpenAI、Gemini 兼容接口等）
+    - 顶层 `prompt_cache_hit_tokens` / `cache_read_input_tokens` / `cached_tokens` /
+      `cached_content_token_count`（`cachedContentTokenCount`），见
+      :data:`_CACHED_INPUT_TOP_LEVEL_FIELDS`
+
+    `usage` 可能是 openai SDK 的 pydantic 对象（非标准字段落在 `model_extra`），也可能是 dict。
+    合法值是 `int` 或数值为整数的 `float`，且 `>= 0`；`bool`、字符串、负数、NaN 与其他类型都
+    当没有这个字段。
+
+    回 `None` 表示「这份 usage 没说」：流式时调用方据此保留前面块里已经读到的数，
+    不被后面一个只带 token 总数的块清零；非流式按 0 记。
+
+    Anthropic 语义下缓存读取不算在输入 token 里，转发时如果 `prompt_tokens` 只是未命中的
+    部分，这里读到的数会大于它，记账时被夹到等于输入数（命中率显示 100%）。
+
+    整个函数兜底回 `None` 且不打日志：它每次请求都会走，服务商不回这个字段或回了怪东西时
+    既不能报错，也不能刷屏影响记账。
+    """
+    try:
+
+        def _valid(value: Any) -> Optional[int]:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+                return None
+            number = int(value)
+            return number if number >= 0 else None
+
+        def _top_level(name: str) -> Any:
+            if usage is None:
+                return None
+            if isinstance(usage, dict):
+                return usage.get(name)
+            value = getattr(usage, name, None)
+            if value is not None:
+                return value
+            extra = getattr(usage, "model_extra", None)
+            return extra.get(name) if isinstance(extra, dict) else None
+
+        if usage is None:
+            return None
+        candidates: List[int] = []
+        details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else getattr(
+            usage,
+            "prompt_tokens_details",
+            None,
+        )
+        if details is not None:
+            cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+            valid = _valid(cached)
+            if valid is not None:
+                candidates.append(valid)
+
+        for name in _CACHED_INPUT_TOP_LEVEL_FIELDS:
+            valid = _valid(_top_level(name))
+            if valid is not None:
+                candidates.append(valid)
+        return max(candidates) if candidates else None
+    except Exception:  # noqa: BLE001 - 记账不能因为上游字段形状而失败
+        return None
 
 
 class LLMContentBlockedError(EmptyLLMResponseError):
@@ -566,7 +649,7 @@ _HTTP_CLIENT_LIMITS = httpx.Limits(
 )
 
 # 缓存键：(base_url, proxy_url, connect, read, write, pool)
-_HttpClientKey = Tuple[str, str, int, int, int, int]
+_HttpClientKey = Tuple[str, str, int, int, int, int, bool]
 
 
 class _PooledHttpClient(NamedTuple):
@@ -576,11 +659,117 @@ class _PooledHttpClient(NamedTuple):
     loop: asyncio.AbstractEventLoop
 
 
-# 缓存键的每一个分量都来自配置（模型组的 base_url / 代理 / 超时），因此条目数被配置规模
-# 天然限制在很小的范围内，不做容量淘汰：淘汰意味着关闭客户端，而被淘汰的客户端上可能
-# 还有在途请求，关闭它会直接打断这些请求。配置变更后遗留的旧条目只占一个空闲连接池，
-# 其中的连接会在 keepalive_expiry 后自行断开，需要立即回收时调用 reset_http_clients()。
-_http_clients: Dict[_HttpClientKey, _PooledHttpClient] = {}
+# 缓存键的每一个分量都来自模型组（base_url / 代理 / 超时）。多租户下组由租户建、地址由租户填，
+# 拉模型列表的地址甚至直接来自请求体，条目数不再被配置规模天然限住，所以按最近使用淘汰，最多留这么多个
+_HTTP_CLIENT_CACHE_MAX = 64
+_http_clients: "OrderedDict[_HttpClientKey, _PooledHttpClient]" = OrderedDict()
+# 被挤出缓存、还有在途请求的客户端（按 id(client)）。不能立刻关：关掉会把在途请求打断，而流式回复在首个 token
+# 之后没有总时长上限（httpx 的读超时按每次读算），按「各项超时之和」估时长靠不住。所以给在途请求计数
+# （`_TrackedAsyncClient`），等最后一个请求结束（流式的是流被关掉）再关
+_retiring_clients: Dict[int, _PooledHttpClient] = {}
+_closing_tasks: Set["asyncio.Task[None]"] = set()
+# 被挤出时、或最后一个在途请求结束时没有在途请求，也不立刻关：`_get_http_client` 交出客户端之后，调用方
+# （openai SDK）发请求之前还有一段空档（中间有线程切换），这时关掉，那次请求就报「客户端已关闭」。
+# 宽限这么久再看一次在途数，还是 0 才关
+_RETIRE_GRACE_SECONDS = 30.0
+
+
+async def _aclose_quietly(client: httpx.AsyncClient) -> None:
+    with contextlib.suppress(Exception):
+        await client.aclose()
+
+
+class _ReleasingStream(httpx.AsyncByteStream):
+    """响应体关掉时通知一次（流式回复读完、出错或被调用方提前关掉都算）"""
+
+    def __init__(self, inner: httpx.AsyncByteStream, release: Callable[[], None]):
+        self._inner = inner
+        self._release = release
+
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        async for chunk in self._inner:
+            yield chunk
+
+    async def aclose(self) -> None:
+        try:
+            await self._inner.aclose()
+        finally:
+            self._release()
+
+
+class _TrackedAsyncClient(httpx.AsyncClient):
+    """记着在途请求数的客户端：被挤出缓存之后，等它空闲了再关"""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.na_in_flight = 0
+        self.na_retired_on: Optional[asyncio.AbstractEventLoop] = None
+        self.na_close_handle: Optional[asyncio.TimerHandle] = None
+
+    async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        self.na_in_flight += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self.na_in_flight -= 1
+            if self.na_retired_on is not None and self.na_in_flight == 0:
+                _schedule_retired_close(self)
+
+        try:
+            response = await super().send(request, **kwargs)
+        except BaseException:
+            release()
+            raise
+        if response.is_closed:  # 非流式：正文已经读完、响应已关
+            release()
+        else:
+            response.stream = _ReleasingStream(response.stream, release)  # type: ignore[arg-type]
+        return response
+
+
+def _close_retired_client(client: "_TrackedAsyncClient") -> None:
+    loop = client.na_retired_on
+    _retiring_clients.pop(id(client), None)
+    if client.na_close_handle is not None:
+        client.na_close_handle.cancel()
+        client.na_close_handle = None
+    if loop is None or loop.is_closed():
+        return  # 循环已结束，没法在它上面关，交给 GC（与覆盖旧循环条目同一做法）
+    task = loop.create_task(_aclose_quietly(client))
+    _closing_tasks.add(task)
+    task.add_done_callback(_closing_tasks.discard)
+
+
+def _schedule_retired_close(client: "_TrackedAsyncClient") -> None:
+    """宽限 `_RETIRE_GRACE_SECONDS` 再看一次：还是没有在途请求才关；有的话等最后一个结束时再排一次"""
+    loop = client.na_retired_on
+    if loop is None or loop.is_closed():
+        _retiring_clients.pop(id(client), None)
+        return  # 交给 GC
+    if client.na_close_handle is not None:
+        return  # 已经排着了
+
+    def check() -> None:
+        client.na_close_handle = None
+        if client.na_in_flight == 0:
+            _close_retired_client(client)
+
+    client.na_close_handle = loop.call_later(_RETIRE_GRACE_SECONDS, check)
+
+
+def _retire_http_client(key: _HttpClientKey, pooled: _PooledHttpClient) -> None:
+    """被挤出缓存的客户端：等在途请求都结束、再宽限一段（交出了还没发请求的那段空档）之后再关"""
+    client = pooled.client
+    if not isinstance(client, _TrackedAsyncClient):  # pragma: no cover - 缓存里只放 _TrackedAsyncClient
+        return
+    client.na_retired_on = pooled.loop
+    _retiring_clients[id(client)] = pooled
+    if client.na_in_flight == 0:
+        _schedule_retired_close(client)
 
 
 def _create_http_client(
@@ -589,6 +778,8 @@ def _create_http_client(
     write_timeout: int = 3600,
     connect_timeout: int = 10,
     pool_timeout: int = 10,
+    tenant_egress: bool = False,
+    client_class: type = httpx.AsyncClient,
 ) -> httpx.AsyncClient:
     """创建配置好的 httpx.AsyncClient
 
@@ -596,6 +787,9 @@ def _create_http_client(
     - User-Agent 强制设置为 config.OPENAI_CLIENT_USER_AGENT（通过事件钩子防止被覆盖）
     - 代理配置
     - 超时配置
+    - `tenant_egress=True`（租户建的模型组）：走 `tools/tenant_egress.py`——每条连接解析一次、全部结果过校验
+      （拒内网）、直连校验过的地址；组上填的代理同样是租户的，连它时一样处理。
+      平台方的组不变
 
     返回的是一个全新的、调用方自行负责关闭的客户端。需要复用连接池的调用方应改用
     `_get_http_client`。
@@ -616,13 +810,28 @@ def _create_http_client(
     async def enforce_user_agent(request: httpx.Request) -> None:
         request.headers["User-Agent"] = config.OPENAI_CLIENT_USER_AGENT
 
-    return httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=connect_timeout,
-            read=read_timeout,
-            write=write_timeout,
-            pool=pool_timeout,
-        ),
+    timeout = httpx.Timeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=pool_timeout,
+    )
+    if tenant_egress:
+        from nekro_agent.tools.tenant_egress import tenant_http_client
+
+        # 代理语义照旧：组上填了代理就用它（它也是租户填的），没填按环境变量（部署方的）
+        return tenant_http_client(
+            proxy=proxy_url or None,
+            proxy_is_tenant=True,
+            trust_env=True,
+            limits=_HTTP_CLIENT_LIMITS,
+            subject="模型组接口地址",
+            client_class=client_class,
+            timeout=timeout,
+            event_hooks={"request": [enforce_user_agent]},
+        )
+    return client_class(
+        timeout=timeout,
         proxies={"http://": proxy_url, "https://": proxy_url} if proxy_url else None,
         limits=_HTTP_CLIENT_LIMITS,
         event_hooks={"request": [enforce_user_agent]},
@@ -636,6 +845,7 @@ def _get_http_client(
     write_timeout: int = 3600,
     connect_timeout: int = 10,
     pool_timeout: int = 10,
+    tenant_egress: bool = False,
 ) -> httpx.AsyncClient:
     """获取按连接参数分组复用的 httpx.AsyncClient
 
@@ -668,11 +878,14 @@ def _get_http_client(
         read_timeout,
         write_timeout,
         pool_timeout,
+        # 租户的组与平台方的组即使地址相同也不共用连接池：两边连接的建法不一样
+        bool(tenant_egress),
     )
     loop = asyncio.get_running_loop()
 
     pooled = _http_clients.get(key)
     if pooled is not None and pooled.loop is loop and not pooled.client.is_closed:
+        _http_clients.move_to_end(key)
         return pooled.client
 
     client = _create_http_client(
@@ -681,11 +894,17 @@ def _get_http_client(
         write_timeout=write_timeout,
         connect_timeout=connect_timeout,
         pool_timeout=pool_timeout,
+        tenant_egress=tenant_egress,
+        client_class=_TrackedAsyncClient,
     )
     # 从查表到写回之间没有 await，因此对事件循环而言是原子的，无需额外加锁。
     # 若原条目绑定在已结束的事件循环上（例如每个用例自建循环的测试场景），无法在当前循环
     # 安全关闭它，直接覆盖交给 GC
     _http_clients[key] = _PooledHttpClient(client=client, loop=loop)
+    _http_clients.move_to_end(key)
+    while len(_http_clients) > _HTTP_CLIENT_CACHE_MAX:
+        evicted_key, evicted = _http_clients.popitem(last=False)
+        _retire_http_client(evicted_key, evicted)
     logger.debug(f"创建复用 HTTP 客户端: base_url={key[0]} | proxy={'on' if proxy_url else 'off'}")
 
     return client
@@ -699,11 +918,57 @@ async def reset_http_clients() -> None:
     """
     pooled_clients = list(_http_clients.values())
     _http_clients.clear()
+    # 已被挤出缓存、还在等在途请求结束或宽限期过去的也一并关掉
+    for retiring in _retiring_clients.values():
+        handle = getattr(retiring.client, "na_close_handle", None)
+        if handle is not None:
+            handle.cancel()
+            retiring.client.na_close_handle = None  # type: ignore[attr-defined]
+        pooled_clients.append(retiring)
+    _retiring_clients.clear()
     for pooled in pooled_clients:
         with contextlib.suppress(Exception):
             await pooled.client.aclose()
     if pooled_clients:
         logger.debug(f"已关闭 {len(pooled_clients)} 个复用 HTTP 客户端")
+
+
+def _resolve_tenant_egress(tenant_egress: Optional[bool], base_url: Any, api_key: Any, proxy_url: Any) -> bool:
+    """调用方没说明归属时按连接参数判：第三方插件拿租户选的组直接调这些接口时，不能默认按平台方连"""
+    if tenant_egress is not None:
+        return bool(tenant_egress)
+    from nekro_agent.tools.tenant_egress import is_tenant_owned_endpoint
+
+    return is_tenant_owned_endpoint(base_url, api_key, proxy_url)
+
+
+def _same_text(left: Any, right: Any) -> bool:
+    return str(left or "").strip() == str(right or "").strip()
+
+
+def _resolve_is_gemini(api_format: Optional[str], base_url: Any, model: Any, api_key: Any) -> bool:
+    """这次聊天请求走不走 Gemini 原生
+
+    调用方传了 `api_format` 就照它：只有 `gemini`（不分大小写、去空白）走原生，其他任何值都走 OpenAI 兼容。
+
+    没传时（第三方插件直接调本函数，不知道有这个参数）按连接参数找运行时视图里的模型组：
+    地址、模型名、Key 三项都对得上、并且声明了 Gemini 原生的聊天组才走原生，其余一律 OpenAI 兼容。
+    这样插件拿到一个 Gemini 原生的组照常能用；没切格式的组，请求与改造前逐字节相同。
+    """
+    if api_format is not None:
+        return str(api_format).strip().lower() == "gemini"
+    try:
+        groups = list(config.MODEL_GROUPS.values())
+    except Exception:  # noqa: BLE001 - 判不出来就按默认格式
+        return False
+    return any(
+        getattr(group, "API_FORMAT", "openai") == "gemini"
+        and getattr(group, "MODEL_TYPE", "chat") == "chat"
+        and _same_text(group.BASE_URL, base_url)
+        and _same_text(group.CHAT_MODEL, model)
+        and _same_text(group.API_KEY, api_key)
+        for group in groups
+    )
 
 
 def _extract_model_ids(payload: Dict[str, Any]) -> List[str]:
@@ -728,8 +993,15 @@ async def list_openai_models(
     base_url: str,
     api_key: Optional[str] = None,
     proxy_url: Optional[str] = None,
+    tenant_egress: bool,
 ) -> List[str]:
-    """通过服务端真实网络出口拉取 OpenAI 兼容模型列表。"""
+    """通过服务端真实网络出口拉取 OpenAI 兼容模型列表。
+
+    `tenant_egress`：地址是不是租户给的（必填：这个接口直接拿请求体里的地址去连，调用方按当前用户判）。
+
+    用一次性的客户端、用完就关，不进 `_get_http_client` 的缓存：地址直接来自请求体，按地址缓存的话，
+    换着填几十个不同的主机名就能把平台方正在用的客户端挤出缓存。
+    """
 
     normalized_base_url = base_url.strip().rstrip("/")
     models_url = f"{normalized_base_url}/models"
@@ -737,17 +1009,17 @@ async def list_openai_models(
     if api_key and api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
 
-    client = _get_http_client(
-        base_url=normalized_base_url,
+    async with _create_http_client(
         proxy_url=proxy_url,
         read_timeout=60,
         write_timeout=60,
         connect_timeout=10,
         pool_timeout=10,
-    )
-    response = await client.get(models_url, headers=headers)
-    response.raise_for_status()
-    payload = response.json()
+        tenant_egress=tenant_egress,
+    ) as client:
+        response = await client.get(models_url, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
     if not isinstance(payload, dict):
         raise ValueError("模型列表响应格式无效")
     return _extract_model_ids(payload)
@@ -775,10 +1047,24 @@ async def gen_openai_chat_response(
     log_path: Optional[Union[str, Path]] = None,
     error_log_path: Optional[Union[str, Path]] = None,
     log_style: Literal["json", "text", "auto"] = "auto",
+    tenant_egress: Optional[bool] = None,
+    pooled_client: bool = True,
+    api_format: Optional[str] = None,
 ) -> OpenAIResponse:
-    """生成聊天回复内容"""
+    """生成聊天回复内容
+
+    `tenant_egress`：模型组归租户时传 True（`tenant_egress.is_tenant_owned_group(组名)`），连接按租户出站建。
+    本仓库里的调用处都必须显式传（`tests/test_tenant_egress_callsites.py` 钉着）；不传（第三方插件）时按
+    地址、密钥、代理判（`is_tenant_owned_endpoint`），判不出来按租户。
+    `pooled_client=False`：用一次性的客户端、用完就关，不进按地址缓存的连接池（测试连接用：地址可能直接来自
+    请求体，按地址缓存的话换着填主机名就能把平台方的客户端挤出缓存）。
+    """
 
     _start_time: float = time.time()
+
+    # 接口格式：写了 gemini 才走原生分支；openai / "OpenAI " / 任何不认识的值都逐字走原来的
+    # OpenAI 代码，请求参数一个都不变。没传时按连接参数找声明了 Gemini 原生的组（见 `_resolve_is_gemini`）。
+    is_gemini = _resolve_is_gemini(api_format, base_url, model, api_key)
 
     # messages 处理
     messages = [msg.to_dict() if isinstance(msg, OpenAIChatMessage) else msg for msg in messages]
@@ -812,6 +1098,7 @@ async def gen_openai_chat_response(
     thought_chain: str = ""
     token_consumption: int = 0
     token_input: int = 0
+    token_input_cached: int = 0
     token_output: int = 0
     first_token_time: Optional[float] = None
     # 上游给出的收尾原因（已归一化）。流式与非流式各自往这里写一次，
@@ -829,7 +1116,8 @@ async def gen_openai_chat_response(
         return delta
 
     async def _apply_stream_chunk(chunk: ChatCompletionChunk) -> bool:
-        nonlocal output, thought_chain, token_consumption, token_input, token_output, first_token_time, finish_reason
+        nonlocal output, thought_chain, token_consumption, token_input, token_input_cached, token_output, first_token_time
+        nonlocal finish_reason
 
         # finish_reason 只出现在收尾块上，而收尾块的 delta 常常是空的（拒答时更是必然如此）。
         # 所以必须在 `_extract_valid_delta` 那条空 delta 早退**之前**记下来，
@@ -850,6 +1138,9 @@ async def gen_openai_chat_response(
                 token_consumption = chunk.usage.total_tokens
             if chunk.usage.prompt_tokens is not None:
                 token_input = chunk.usage.prompt_tokens
+            chunk_cached = _cached_input_tokens(chunk.usage)
+            if chunk_cached is not None:
+                token_input_cached = chunk_cached
             if chunk.usage.completion_tokens is not None:
                 token_output = chunk.usage.completion_tokens
 
@@ -915,102 +1206,247 @@ async def gen_openai_chat_response(
         return await _before_first_token_deadline(wait_first_chunk())
 
     # http_client 由本模块的连接池持有，因此既不能用 async with 托管它，
-    # 也不能用 async with 托管 AsyncOpenAI —— 后者退出时会连带关闭传入的 http_client
+    # 也不能用 async with 托管 AsyncOpenAI —— 后者退出时会连带关闭传入的 http_client。
+    # 一次性的客户端（`pooled_client=False`）在下面的 finally 里关
+    one_off_client: Optional[httpx.AsyncClient] = None
     try:
         wait_timeout = max_wait_time or 3600
-        http_client = _get_http_client(
-            base_url=base_url,
-            proxy_url=proxy_url,
-            read_timeout=wait_timeout,
-            write_timeout=wait_timeout,
-        )
-        client = AsyncOpenAI(
-            api_key=api_key.strip() if api_key else None,
-            base_url=base_url or _OPENAI_BASE_URL,
-            http_client=http_client,
-            max_retries=0,
-        )
+        if pooled_client:
+            http_client = _get_http_client(
+                base_url=base_url,
+                proxy_url=proxy_url,
+                read_timeout=wait_timeout,
+                write_timeout=wait_timeout,
+                tenant_egress=_resolve_tenant_egress(tenant_egress, base_url, api_key, proxy_url),
+            )
+        else:
+            http_client = one_off_client = _create_http_client(
+                proxy_url=proxy_url,
+                read_timeout=wait_timeout,
+                write_timeout=wait_timeout,
+                tenant_egress=_resolve_tenant_egress(tenant_egress, base_url, api_key, proxy_url),
+            )
+        if is_gemini:
+            gemini_url = gemini_native.gemini_model_endpoint(base_url, model, stream=stream_mode)
+            gemini_request_headers = gemini_native.gemini_headers(api_key)
+            gemini_body = gemini_native.gemini_request_body(
+                messages,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+                stop_words=stop_words,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                extra_body=extra_body,
+            )
+            block_reason = ""
+            if stream_mode:
+                gemini_usage_value = gemini_native.GeminiUsageAccumulator()
+                # 首 Token 时限从**发出请求**算起：进流与拿首个事件共用同一个截止时刻
+                gemini_stream_ctx = http_client.stream(
+                    "POST",
+                    gemini_url,
+                    json=gemini_body,
+                    headers=gemini_request_headers,
+                )
+                gemini_response = await _before_first_token_deadline(gemini_stream_ctx.__aenter__())
+                try:
+                    if gemini_response.is_error:
+                        await gemini_native.raise_gemini_http_error(gemini_response)
+                    gemini_events = gemini_native.iter_gemini_sse_events(gemini_response).__aiter__()
 
-        if stream_mode:
-            res_stream: AsyncStream[ChatCompletionChunk] = await _before_first_token_deadline(
-                client.chat.completions.create(
+                    async def _wait_first_event() -> Dict[str, Any]:
+                        try:
+                            return await gemini_events.__anext__()
+                        except StopAsyncIteration as exc:
+                            # 与 OpenAI 分支同一个判据点：一个事件都没有也算「2xx 但空流」
+                            raise EmptyLLMResponseError(
+                                "流式响应在返回首个数据块前已结束，API 供应商返回了空流",
+                            ) from exc
+
+                    pending_event: Optional[Dict[str, Any]] = await _before_first_token_deadline(_wait_first_event())
+                    while pending_event is not None:
+                        event = pending_event
+                        pending_event = None
+                        gemini_native.raise_gemini_event_error(event)
+                        gemini_usage_value.update(event)
+                        token_consumption = gemini_usage_value.token_total
+                        token_input = gemini_usage_value.token_input
+                        token_input_cached = gemini_usage_value.token_input_cached
+                        token_output = gemini_usage_value.token_output
+                        event_finish_reason = gemini_native.gemini_finish_reason(event)
+                        if event_finish_reason:
+                            finish_reason = event_finish_reason
+                        event_block_reason = gemini_native.gemini_block_reason(event)
+                        if event_block_reason:
+                            block_reason = event_block_reason
+                        event_text, event_thought = gemini_native.gemini_text_and_thought(event)
+                        if (event_text or event_thought) and not first_token_time:
+                            first_token_time = time.time()
+                        if event_thought:
+                            thought_chain += event_thought
+                        if event_text:
+                            output += event_text
+                            if chunk_callback and await chunk_callback(
+                                OpenAIStreamChunk(
+                                    chunk_text=event_text,
+                                    thought_chain=event_thought,
+                                    token_consumption=token_consumption,
+                                    token_input=token_input,
+                                    token_output=token_output,
+                                ),
+                            ):
+                                break
+                        try:
+                            pending_event = await gemini_events.__anext__()
+                        except StopAsyncIteration:
+                            pending_event = None
+                finally:
+                    await gemini_stream_ctx.__aexit__(None, None, None)
+
+                # 闸门顺序与 OpenAI 分支完全一致：先判被拦，再救回纯思考，最后判空
+                if block_reason or finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
+                    finish_reason = block_reason or finish_reason
+                    raise LLMContentBlockedError(finish_reason, stream_mode=True)  # noqa: TRY301
+                output = _salvage_reasoning_only_output(
+                    output,
+                    thought_chain,
+                    model=model,
+                    field_name=thought_chain_field_name,
+                )
+                if not output:
+                    if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
+                        raise LLMMalformedToolCallError(stream_mode=True)  # noqa: TRY301
+                    raise EmptyLLMResponseError("流式响应未返回任何有效内容（正文与思考通道均为空）")  # noqa: TRY301
+            else:
+                gemini_response = await http_client.post(
+                    gemini_url,
+                    json=gemini_body,
+                    headers=gemini_request_headers,
+                )
+                if gemini_response.is_error:
+                    await gemini_native.raise_gemini_http_error(gemini_response)
+                gemini_payload = gemini_response.json()
+                if not isinstance(gemini_payload, dict):
+                    raise ValueError("Gemini 原生响应格式无效")  # noqa: TRY301
+
+                # usage 同样在任何一道闸门之前读出来：被拦与判空的那两类也已经计过费
+                gemini_usage_value = gemini_native.gemini_usage(gemini_payload)
+                token_consumption = gemini_usage_value.token_total or 0
+                token_input = gemini_usage_value.token_input or 0
+                token_input_cached = gemini_usage_value.token_input_cached or 0
+                token_output = gemini_usage_value.token_output or 0
+
+                block_reason = gemini_native.gemini_block_reason(gemini_payload)
+                finish_reason = gemini_native.gemini_finish_reason(gemini_payload)
+                if block_reason or finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
+                    finish_reason = block_reason or finish_reason
+                    raise LLMContentBlockedError(finish_reason, stream_mode=False)  # noqa: TRY301
+
+                gemini_text, gemini_thought = gemini_native.gemini_text_and_thought(gemini_payload)
+                thought_chain = gemini_thought
+                output = _salvage_reasoning_only_output(
+                    gemini_text,
+                    thought_chain,
+                    model=model,
+                    field_name=thought_chain_field_name,
+                )
+                if not output:
+                    if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
+                        raise LLMMalformedToolCallError(stream_mode=False)  # noqa: TRY301
+                    raise EmptyLLMResponseError(
+                        f"非流式响应内容为空，供应商未返回可用消息。原始响应: {gemini_payload}",
+                    )  # noqa: TRY301
+        else:
+            client = AsyncOpenAI(
+                api_key=api_key.strip() if api_key else None,
+                base_url=base_url or _OPENAI_BASE_URL,
+                http_client=http_client,
+                max_retries=0,
+            )
+
+            if stream_mode:
+                res_stream: AsyncStream[ChatCompletionChunk] = await _before_first_token_deadline(
+                    client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        **gen_kwargs,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    ),
+                )
+                # 连接池是共享的，提前 break 时必须显式关闭响应把连接还回池中，
+                # 否则该连接会一直被占用直到超时
+                async with res_stream:
+                    first_chunk = await _get_first_stream_chunk(res_stream)
+                    if first_chunk and not first_token_time:
+                        first_token_time = time.time()
+                    if first_chunk and await _apply_stream_chunk(first_chunk):
+                        pass
+                    else:
+                        async for chunk in res_stream:
+                            if await _apply_stream_chunk(chunk):
+                                break
+                # 判空**之前**先看收尾原因：拦截是上游对整条回复的判决，就算它先吐了半截正文
+                # （OpenAI 的 content_filter 可能在流中途触发），那半截也必然是被截断的，
+                # 送进 `parse_chat_response` 只会得到半个代码块——正是本轮在修的那类地雷。
+                # 宁可归成一次可辨识的失败，也不把截断的残句当成模型的回答。
+                if finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
+                    raise LLMContentBlockedError(finish_reason, stream_mode=True)  # noqa: TRY301
+                output = _salvage_reasoning_only_output(
+                    output,
+                    thought_chain,
+                    model=model,
+                    field_name=thought_chain_field_name,
+                )
+                # 判据从「没收到过任何数据块」改成「最终没有任何可用正文」：
+                # reasoning-only 的流会在读 delta.content **之前**就把 first_token_time 置上，
+                # 旧判据因此恒不成立，`response_content=""` 会一路走到沙盒执行一段空脚本、
+                # 以 NORMAL 退出——Bot 一言不发而日志里连一条 ERROR 都没有。
+                if not output:
+                    # 与拦截相反，这一支只在正文确实为空时才成立：本项目不消费原生工具调用，
+                    # 模型顺带写坏一个 function call 但正文可用时，那份正文照常拿去解析
+                    if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
+                        raise LLMMalformedToolCallError(stream_mode=True)  # noqa: TRY301
+                    raise EmptyLLMResponseError("流式响应未返回任何有效内容（正文与思考通道均为空）")  # noqa: TRY301
+            else:
+                res: ChatCompletion = await client.chat.completions.create(
                     model=model,
                     messages=messages,
                     **gen_kwargs,
-                    stream=True,
-                    stream_options={"include_usage": True},
-                ),
-            )
-            # 连接池是共享的，提前 break 时必须显式关闭响应把连接还回池中，
-            # 否则该连接会一直被占用直到超时
-            async with res_stream:
-                first_chunk = await _get_first_stream_chunk(res_stream)
-                if first_chunk and not first_token_time:
-                    first_token_time = time.time()
-                if first_chunk and await _apply_stream_chunk(first_chunk):
-                    pass
-                else:
-                    async for chunk in res_stream:
-                        if await _apply_stream_chunk(chunk):
-                            break
-            # 判空**之前**先看收尾原因：拦截是上游对整条回复的判决，就算它先吐了半截正文
-            # （OpenAI 的 content_filter 可能在流中途触发），那半截也必然是被截断的，
-            # 送进 `parse_chat_response` 只会得到半个代码块——正是本轮在修的那类地雷。
-            # 宁可归成一次可辨识的失败，也不把截断的残句当成模型的回答。
-            if finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
-                raise LLMContentBlockedError(finish_reason, stream_mode=True)  # noqa: TRY301
-            output = _salvage_reasoning_only_output(
-                output,
-                thought_chain,
-                model=model,
-                field_name=thought_chain_field_name,
-            )
-            # 判据从「没收到过任何数据块」改成「最终没有任何可用正文」：
-            # reasoning-only 的流会在读 delta.content **之前**就把 first_token_time 置上，
-            # 旧判据因此恒不成立，`response_content=""` 会一路走到沙盒执行一段空脚本、
-            # 以 NORMAL 退出——Bot 一言不发而日志里连一条 ERROR 都没有。
-            if not output:
-                # 与拦截相反，这一支只在正文确实为空时才成立：本项目不消费原生工具调用，
-                # 模型顺带写坏一个 function call 但正文可用时，那份正文照常拿去解析
-                if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
-                    raise LLMMalformedToolCallError(stream_mode=True)  # noqa: TRY301
-                raise EmptyLLMResponseError("流式响应未返回任何有效内容（正文与思考通道均为空）")  # noqa: TRY301
-        else:
-            res: ChatCompletion = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **gen_kwargs,
-                stream=False,
-            )
-            # usage 必须在**任何一道闸门之前**读出来。改造前它在函数最末尾，于是
-            # 「被内容策略拦下」「正文为空」这两类响应的 token 数一个都记不到 ——
-            # 而那一类恰恰是**已经计过费**的（见 `EmptyLLMResponseError` 的 docstring：
-            # 实测有中转站在 completion_tokens=0、reasoning_tokens=1116 时照样计费）。
-            # 对成功响应而言这一挪逐字等价：读的是同一个对象的同三个字段。
-            token_consumption = res.usage.total_tokens if res.usage else 0
-            token_input = res.usage.prompt_tokens if res.usage else 0
-            token_output = res.usage.completion_tokens if res.usage else 0
-            if not res.choices or len(res.choices) == 0:
-                raise EmptyLLMResponseError(f"非流式响应没有任何 choices，供应商未返回可用消息。原始响应: {res}")  # noqa: TRY301
+                    stream=False,
+                )
+                # usage 必须在**任何一道闸门之前**读出来。改造前它在函数最末尾，于是
+                # 「被内容策略拦下」「正文为空」这两类响应的 token 数一个都记不到 ——
+                # 而那一类恰恰是**已经计过费**的（见 `EmptyLLMResponseError` 的 docstring：
+                # 实测有中转站在 completion_tokens=0、reasoning_tokens=1116 时照样计费）。
+                # 对成功响应而言这一挪逐字等价：读的是同一个对象的同三个字段。
+                token_consumption = res.usage.total_tokens if res.usage else 0
+                token_input = res.usage.prompt_tokens if res.usage else 0
+                token_input_cached = _cached_input_tokens(res.usage) or 0
+                token_output = res.usage.completion_tokens if res.usage else 0
+                if not res.choices or len(res.choices) == 0:
+                    raise EmptyLLMResponseError(f"非流式响应没有任何 choices，供应商未返回可用消息。原始响应: {res}")  # noqa: TRY301
 
-            # 与流式分支同一套判据（`CONTENT_BLOCKED_FINISH_REASONS` / 判空之前先判拦截）。
-            # 两条分支各判一次是刻意的：现场同一个模型组既可能开流式也可能不开，
-            # 只在一条分支上判等于一半的请求照旧被归成「一个字都没返回」
-            finish_reason = _choice_finish_reason(res.choices[0])
-            if finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
-                raise LLMContentBlockedError(finish_reason, stream_mode=False)  # noqa: TRY301
+                # 与流式分支同一套判据（`CONTENT_BLOCKED_FINISH_REASONS` / 判空之前先判拦截）。
+                # 两条分支各判一次是刻意的：现场同一个模型组既可能开流式也可能不开，
+                # 只在一条分支上判等于一半的请求照旧被归成「一个字都没返回」
+                finish_reason = _choice_finish_reason(res.choices[0])
+                if finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
+                    raise LLMContentBlockedError(finish_reason, stream_mode=False)  # noqa: TRY301
 
-            thought_chain = getattr(res.choices[0].message, thought_chain_field_name, "") or ""
-            output = _salvage_reasoning_only_output(
-                res.choices[0].message.content or "",
-                thought_chain,
-                model=model,
-                field_name=thought_chain_field_name,
-            )
-            if not output:
-                if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
-                    raise LLMMalformedToolCallError(stream_mode=False)  # noqa: TRY301
-                raise EmptyLLMResponseError(f"非流式响应内容为空，供应商未返回可用消息。原始响应: {res}")  # noqa: TRY301
+                thought_chain = getattr(res.choices[0].message, thought_chain_field_name, "") or ""
+                output = _salvage_reasoning_only_output(
+                    res.choices[0].message.content or "",
+                    thought_chain,
+                    model=model,
+                    field_name=thought_chain_field_name,
+                )
+                if not output:
+                    if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
+                        raise LLMMalformedToolCallError(stream_mode=False)  # noqa: TRY301
+                    raise EmptyLLMResponseError(f"非流式响应内容为空，供应商未返回可用消息。原始响应: {res}")  # noqa: TRY301
 
     except asyncio.CancelledError:
         # **`CancelledError` 不是 `Exception`**（3.8 起挂在 `BaseException` 下），下面那条
@@ -1024,6 +1460,7 @@ async def gen_openai_chat_response(
             model_name=model,
             stream_mode=stream_mode,
             token_input=token_input,
+            token_input_cached=token_input_cached,
             token_output=token_output,
             token_total=token_consumption,
             status=LLMUsageStatus.ABORTED,
@@ -1040,6 +1477,7 @@ async def gen_openai_chat_response(
             model_name=model,
             stream_mode=stream_mode,
             token_input=token_input,
+            token_input_cached=token_input_cached,
             token_output=token_output,
             token_total=token_consumption,
             status=LLMUsageStatus.FAILED,
@@ -1077,6 +1515,9 @@ async def gen_openai_chat_response(
                 message_cnt=len(messages) + 1,
             )
         raise
+    finally:
+        if one_off_client is not None:
+            await _aclose_quietly(one_off_client)
 
     # 时间统计
     _end_time: float = time.time()
@@ -1113,6 +1554,7 @@ async def gen_openai_chat_response(
         model_name=model,
         stream_mode=stream_mode,
         token_input=token_input,
+        token_input_cached=token_input_cached,
         token_output=token_output,
         token_total=token_consumption,
         status=LLMUsageStatus.SUCCESS,
@@ -1146,6 +1588,8 @@ async def gen_openai_embeddings(
     proxy_url: Optional[str] = None,
     endpoint: str = "/embeddings",
     timeout: int = 10,
+    tenant_egress: Optional[bool] = None,
+    pooled_client: bool = True,
 ) -> List[float]:
     """生成文本的向量表示
 
@@ -1158,6 +1602,7 @@ async def gen_openai_embeddings(
         proxy_url: 代理地址
         endpoint: API 端点
         timeout: 请求超时时间（秒），默认 10 秒
+        pooled_client: False 时用一次性的客户端、用完就关（见 `gen_openai_chat_response`）
 
     Returns:
         嵌入向量
@@ -1195,12 +1640,23 @@ async def gen_openai_embeddings(
             generation_time_ms=int((time.time() - _start_time) * 1000),
         )
 
-    client = _get_http_client(
-        base_url=base_url,
-        proxy_url=proxy_url,
-        read_timeout=timeout,
-        write_timeout=timeout,
-    )
+    egress = _resolve_tenant_egress(tenant_egress, base_url, api_key, proxy_url)
+    one_off_client: Optional[httpx.AsyncClient] = None
+    if pooled_client:
+        client = _get_http_client(
+            base_url=base_url,
+            proxy_url=proxy_url,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            tenant_egress=egress,
+        )
+    else:
+        client = one_off_client = _create_http_client(
+            proxy_url=proxy_url,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            tenant_egress=egress,
+        )
     payload: dict[str, object] = {"model": model, "input": input}
     if dimensions is not None:
         payload["dimensions"] = dimensions
@@ -1231,8 +1687,14 @@ async def gen_openai_embeddings(
         raise
     except Exception as e:
         _record(LLMUsageStatus.FAILED, type(e).__name__)
+        # 按模型组记成败，长期失败时告警一次（判据与收件人见 `services/embedding_health.py`）
+        embedding_health.note_failure(e)
         raise
+    finally:
+        if one_off_client is not None:
+            await _aclose_quietly(one_off_client)
     _record(LLMUsageStatus.SUCCESS)
+    embedding_health.note_success()
     return vector
 
 
@@ -1250,6 +1712,8 @@ async def gen_openai_chat_stream(
     max_tokens: Optional[int] = None,
     extra_body: Optional[Union[Dict[str, Any], str]] = None,
     top_k: Optional[int] = None,
+    tenant_egress: Optional[bool] = None,
+    api_format: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """简化的OpenAI流式生成器，直接产生文本片段
 
@@ -1331,6 +1795,7 @@ async def gen_openai_chat_stream(
     thought_chain: str = ""
     token_consumption: int = 0
     token_input: int = 0
+    token_input_cached: int = 0
     token_output: int = 0
     finish_reason: str = ""
     # 收尾形态在 `finally` 里定档。默认是 `ABORTED`：消费方提前丢弃生成器时
@@ -1354,6 +1819,7 @@ async def gen_openai_chat_stream(
             model_name=model,
             stream_mode=True,
             token_input=token_input,
+            token_input_cached=token_input_cached,
             token_output=token_output,
             token_total=token_consumption,
             status=status,
@@ -1371,75 +1837,145 @@ async def gen_openai_chat_stream(
             proxy_url=proxy_url,
             read_timeout=300,
             write_timeout=300,
+            tenant_egress=_resolve_tenant_egress(tenant_egress, base_url, api_key, proxy_url),
         )
-        client = AsyncOpenAI(
-            api_key=api_key.strip() if api_key else None,
-            base_url=base_url or _OPENAI_BASE_URL,
-            http_client=http_client,
-            max_retries=0,
-        )
+        is_gemini = _resolve_is_gemini(api_format, base_url, model, api_key)
+        if is_gemini:
+            gemini_url = gemini_native.gemini_model_endpoint(base_url, model, stream=True)
+            gemini_body = gemini_native.gemini_request_body(
+                formatted_messages,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+                stop_words=stop_words,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                extra_body=extra_body,
+            )
+            gemini_usage_value = gemini_native.GeminiUsageAccumulator()
+            block_reason = ""
+            gemini_stream_ctx = http_client.stream(
+                "POST",
+                gemini_url,
+                json=gemini_body,
+                headers=gemini_native.gemini_headers(api_key),
+            )
+            gemini_response = await gemini_stream_ctx.__aenter__()
+            try:
+                if gemini_response.is_error:
+                    await gemini_native.raise_gemini_http_error(gemini_response)
+                async for event in gemini_native.iter_gemini_sse_events(gemini_response):
+                    gemini_native.raise_gemini_event_error(event)
+                    gemini_usage_value.update(event)
+                    token_consumption = gemini_usage_value.token_total
+                    token_input = gemini_usage_value.token_input
+                    token_input_cached = gemini_usage_value.token_input_cached
+                    token_output = gemini_usage_value.token_output
+                    event_finish_reason = gemini_native.gemini_finish_reason(event)
+                    if event_finish_reason:
+                        finish_reason = event_finish_reason
+                    event_block_reason = gemini_native.gemini_block_reason(event)
+                    if event_block_reason:
+                        block_reason = event_block_reason
+                    event_text, event_thought = gemini_native.gemini_text_and_thought(event)
+                    thought_chain += event_thought
+                    if event_text:
+                        output += event_text
+                        yield event_text
+            finally:
+                await gemini_stream_ctx.__aexit__(None, None, None)
 
-        # 创建流式响应。`include_usage` 是本入口能记账的前提：不要它，上游不会在流末尾
-        # 补那个只带 usage 的块，这条链路烧的钱就永远算不出来（与另外两条分支同一个要求）
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=formatted_messages,
-            stream=True,
-            stream_options={"include_usage": True},
-            **gen_kwargs,
-        )
+            # 与 OpenAI 分支同序：先判被拦，再救回纯思考，最后判空
+            if block_reason or finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
+                finish_reason = block_reason or finish_reason
+                raise LLMContentBlockedError(finish_reason, stream_mode=True)  # noqa: TRY301
+            salvaged = _salvage_reasoning_only_output(
+                output,
+                thought_chain,
+                model=model,
+                field_name="reasoning_content",
+            )
+            if salvaged and not output:
+                output = salvaged
+                yield salvaged
+            if not output:
+                if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
+                    raise LLMMalformedToolCallError(stream_mode=True)  # noqa: TRY301
+                raise EmptyLLMResponseError("流式响应未返回任何有效内容（正文与思考通道均为空）")  # noqa: TRY301
+            status = LLMUsageStatus.SUCCESS
+        else:
+            client = AsyncOpenAI(
+                api_key=api_key.strip() if api_key else None,
+                base_url=base_url or _OPENAI_BASE_URL,
+                http_client=http_client,
+                max_retries=0,
+            )
 
-        # 消费方随时可能提前丢弃本生成器，必须确保响应被关闭以把连接还回共享池
-        async with stream:
-            # 直接产生文本片段
-            async for chunk in stream:
-                # `finish_reason` 只出现在收尾块上，而收尾块的 delta 常常是空的
-                # （拒答时更是必然如此）。所以要在下面那条 `if delta.content` 早退
-                # **之前**记下来，否则这条链路永远看不到 `prohibited_content`——
-                # 与 `_apply_stream_chunk` 里逐字同源的一条教训。
-                if chunk.choices:
-                    chunk_finish_reason = _choice_finish_reason(chunk.choices[0])
-                    if chunk_finish_reason:
-                        finish_reason = chunk_finish_reason
-                # 仅带 usage 的收尾块没有 choices，必须在早退之前取
-                if chunk.usage:
-                    if chunk.usage.total_tokens is not None:
-                        token_consumption = chunk.usage.total_tokens
-                    if chunk.usage.prompt_tokens is not None:
-                        token_input = chunk.usage.prompt_tokens
-                    if chunk.usage.completion_tokens is not None:
-                        token_output = chunk.usage.completion_tokens
+            # 创建流式响应。`include_usage` 是本入口能记账的前提：不要它，上游不会在流末尾
+            # 补那个只带 usage 的块，这条链路烧的钱就永远算不出来（与另外两条分支同一个要求）
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=formatted_messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                **gen_kwargs,
+            )
 
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if not delta:
-                    continue
-                thought_chain += getattr(delta, "reasoning_content", "") or ""
-                content = delta.content
-                if content:
-                    output += content
-                    yield content
+            # 消费方随时可能提前丢弃本生成器，必须确保响应被关闭以把连接还回共享池
+            async with stream:
+                # 直接产生文本片段
+                async for chunk in stream:
+                    # `finish_reason` 只出现在收尾块上，而收尾块的 delta 常常是空的
+                    # （拒答时更是必然如此）。所以要在下面那条 `if delta.content` 早退
+                    # **之前**记下来，否则这条链路永远看不到 `prohibited_content`——
+                    # 与 `_apply_stream_chunk` 里逐字同源的一条教训。
+                    if chunk.choices:
+                        chunk_finish_reason = _choice_finish_reason(chunk.choices[0])
+                        if chunk_finish_reason:
+                            finish_reason = chunk_finish_reason
+                    # 仅带 usage 的收尾块没有 choices，必须在早退之前取
+                    if chunk.usage:
+                        if chunk.usage.total_tokens is not None:
+                            token_consumption = chunk.usage.total_tokens
+                        if chunk.usage.prompt_tokens is not None:
+                            token_input = chunk.usage.prompt_tokens
+                        chunk_cached = _cached_input_tokens(chunk.usage)
+                        if chunk_cached is not None:
+                            token_input_cached = chunk_cached
+                        if chunk.usage.completion_tokens is not None:
+                            token_output = chunk.usage.completion_tokens
 
-        # 判空**之前**先看收尾原因：拦截是上游对整条回复的判决，就算它先吐了半截正文，
-        # 那半截也必然是被截断的——与另外两条分支同一顺序、同一个常量集合。
-        if finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
-            raise LLMContentBlockedError(finish_reason, stream_mode=True)  # noqa: TRY301
-        # 正文全空但思考通道有内容：原生思考模型把整段答案走了 reasoning 通道。
-        # 流式没法回溯，只能在流末尾补吐一次；补出来的字符串与非流式分支逐字相同
-        # （同一个 `_salvage_reasoning_only_output`，不是"等价的另一种写法"）。
-        salvaged = _salvage_reasoning_only_output(
-            output,
-            thought_chain,
-            model=model,
-            field_name="reasoning_content",
-        )
-        if salvaged and not output:
-            output = salvaged
-            yield salvaged
-        if not output:
-            if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
-                raise LLMMalformedToolCallError(stream_mode=True)  # noqa: TRY301
-            raise EmptyLLMResponseError("流式响应未返回任何有效内容（正文与思考通道均为空）")  # noqa: TRY301
-        status = LLMUsageStatus.SUCCESS
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if not delta:
+                        continue
+                    thought_chain += getattr(delta, "reasoning_content", "") or ""
+                    content = delta.content
+                    if content:
+                        output += content
+                        yield content
+
+            # 判空**之前**先看收尾原因：拦截是上游对整条回复的判决，就算它先吐了半截正文，
+            # 那半截也必然是被截断的——与另外两条分支同一顺序、同一个常量集合。
+            if finish_reason in CONTENT_BLOCKED_FINISH_REASONS:
+                raise LLMContentBlockedError(finish_reason, stream_mode=True)  # noqa: TRY301
+            # 正文全空但思考通道有内容：原生思考模型把整段答案走了 reasoning 通道。
+            # 流式没法回溯，只能在流末尾补吐一次；补出来的字符串与非流式分支逐字相同
+            # （同一个 `_salvage_reasoning_only_output`，不是"等价的另一种写法"）。
+            salvaged = _salvage_reasoning_only_output(
+                output,
+                thought_chain,
+                model=model,
+                field_name="reasoning_content",
+            )
+            if salvaged and not output:
+                output = salvaged
+                yield salvaged
+            if not output:
+                if finish_reason == MALFORMED_FUNCTION_CALL_FINISH_REASON:
+                    raise LLMMalformedToolCallError(stream_mode=True)  # noqa: TRY301
+                raise EmptyLLMResponseError("流式响应未返回任何有效内容（正文与思考通道均为空）")  # noqa: TRY301
+            status = LLMUsageStatus.SUCCESS
 
     except Exception as e:
         status = LLMUsageStatus.FAILED

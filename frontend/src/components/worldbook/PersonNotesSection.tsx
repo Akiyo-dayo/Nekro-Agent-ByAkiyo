@@ -45,6 +45,9 @@ import { CHIP_VARIANTS } from '../../theme/variants'
 interface PersonNotesSectionProps {
   personAccount: string
   displayName: string
+  /** 指定这一块看哪个实例；不传时跟随顶栏（好感详情里的现状） */
+  instanceKey?: string
+  adapterKey?: string
   /** 跳去世界书页之前先收起好感详情对话框 */
   onCloseDetail: () => void
   /**
@@ -59,6 +62,8 @@ interface PersonNotesSectionProps {
 export default function PersonNotesSection({
   personAccount,
   displayName,
+  instanceKey: instanceKeyProp,
+  adapterKey: adapterKeyProp,
   onCloseDetail,
   description,
 }: PersonNotesSectionProps) {
@@ -73,14 +78,20 @@ export default function PersonNotesSection({
   const [dialogOpen, setDialogOpen] = useState(false)
   const [content, setContent] = useState('')
 
+  // 调用方指定了实例就完全按它来（人物卡从别的页面打开时顶栏未必是同一个实例）；
+  // 没指定时沿用好感详情一直以来的口径：一律取顶栏选中的那个。
+  const hasExplicitScope = Boolean(instanceKeyProp && adapterKeyProp)
   const viewScope = useMemo(
-    () => ({ instance_key: currentInstanceKey ?? undefined, adapter_key: currentInstance?.adapter_key }),
-    [currentInstanceKey, currentInstance?.adapter_key]
+    () =>
+      hasExplicitScope
+        ? { instance_key: instanceKeyProp, adapter_key: adapterKeyProp }
+        : { instance_key: currentInstanceKey ?? undefined, adapter_key: currentInstance?.adapter_key },
+    [hasExplicitScope, instanceKeyProp, adapterKeyProp, currentInstanceKey, currentInstance?.adapter_key]
   )
   const writeScope = useWorldbookWriteScope(viewScope)
   const instanceKey = writeScope.instance_key
   const adapterKey = writeScope.adapter_key
-  const hasInstance = isScopeReady && Boolean(instanceKey)
+  const hasInstance = hasExplicitScope || (isScopeReady && Boolean(instanceKey))
 
   const notesQuery = useQuery({
     queryKey: [

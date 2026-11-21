@@ -226,18 +226,20 @@ class TestCustomHostSpelling:
             resolved.append(args)
             return []
 
-        import asyncio
-
-        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake_getaddrinfo)
 
         with pytest.raises(UnsafeDownloadUrlError, match="主机名不合法"):
             await assert_tenant_host_safe(host, 993, subject="邮箱服务器")
         assert resolved == []
 
     async def test_bracketed_ipv6_loopback_is_refused_as_non_public(self) -> None:
-        """补上方括号之后能正常走到网段判定，而不是在拼 URL 时就解析失败"""
-        with pytest.raises(UnsafeDownloadUrlError, match="非公网"):
+        """补上方括号之后能正常走到网段判定，而不是在拼 URL 时就报「主机名不合法」
+        （租户看到的是统一的那一句：解析不到与指向不允许的地址不分开说）"""
+        from nekro_agent.tools.common_util import tenant_target_unavailable_message
+
+        with pytest.raises(UnsafeDownloadUrlError) as excinfo:
             await assert_tenant_host_safe("[::1]", 993, subject="邮箱服务器")
+        assert str(excinfo.value) == tenant_target_unavailable_message("邮箱服务器")
 
     async def test_loopback_name_is_refused(self) -> None:
         with pytest.raises(UnsafeDownloadUrlError):

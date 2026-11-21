@@ -10,12 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import magic
 
 from nekro_agent.adapters.interface.schemas.extra import PlatformMessageExt
-from nekro_agent.adapters.interface.schemas.platform import (
-    PlatformSendRequest,
-    PlatformSendResponse,
-    PlatformSendSegment,
-    PlatformSendSegmentType,
-)
+from nekro_agent.adapters.interface.schemas.platform import PlatformSendResponse
 from nekro_agent.adapters.utils import adapter_utils
 from nekro_agent.core.logger import get_sub_logger
 from nekro_agent.models.db_adapter_instance import DBAdapterInstance
@@ -60,7 +55,6 @@ from nekro_agent.services.ops_agent.triggers import (
     round_trigger_book,
 )
 from nekro_agent.services.plugin.collector import plugin_collector
-from nekro_agent.services.quota_service import quota_service
 from nekro_agent.services.user.super_users import (
     is_super_user,
     is_trusted_listed_user,
@@ -264,8 +258,8 @@ class MessageService:
             return
 
         # 频道每日额度暂停闸门。定时提醒、插件推送、CC 结果投递等带 `trigger_agent` 的
-        # 推送都直接走到这里（它们不过 `push_human_message` 的额度判定），暂停时内容照常
-        # 落库、但不开回合——否则一个被暂停的频道照样能为每条定时提醒烧一轮模型。
+        # 推送直接走到这里，不经过 `push_human_message` 的入站判定；暂停（含租户自限）时
+        # 内容照常落库、但不开回合——否则一个被暂停的频道照样能为每条定时提醒烧一轮模型。
         if not bypass_channel_quota:
             try:
                 paused = await channel_quota.is_paused(chat_key)
@@ -662,117 +656,37 @@ class MessageService:
             # 配额豁免检查（用户白名单/管理员）
             _is_quota_exempt = await is_quota_exempt(message, config)
 
-            # 频道每日额度（平台方的承诺）与下面的回复配额（租户对自己的群的自限）是**两层**：
-            # 新的一层是平台方给这个频道承诺的用量，旧的一层是租户自己设的「少说话」。
-            # 两层各管各的、都放行才回复：合并成一个判据会让两种口径（回合 vs 消息条数、
-            # 额度时区 vs UTC 零点）互相解释不清，也会改变存量部署的既有行为。
-            # 豁免的人（白名单 / 超级用户）不受这一层约束，但用量照常计入。
+            # 统一闸门：平台方频道额度先判，再判租户自限（AI_CHAT_DAILY_REPLY_LIMIT，
+            # 按回复回合数）。两层都按 CHANNEL_QUOTA_TIMEZONE 的零点换天；豁免的人
+            # （白名单 / 超级用户）不受约束，但用量照常计入。
             if not _is_quota_exempt:
-                # 判定本身出错（库抖动等）按「没暂停」放行，与 `schedule_agent_task` 那道闸同一口径：
-                # 额度判定不能自己变成「群友说一句话、Bot 报一个错」的故障点
-                try:
-                    status = await channel_quota.check_and_alert(db_chat_channel)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"频道额度判定失败，按未暂停处理: chat_key={message.chat_key} | {e}")
-                    status = None
-                if status is not None and status.state == channel_quota.STATE_PAUSED:
+                result = await channel_quota.gate(db_chat_channel)
+                if result.blocked:
+                    if result.reason == "platform" and result.status is not None:
+                        detail = f"{result.status.used}/{result.status.allowed} {result.status.unit}"
+                    elif result.reason == "self_hourly" and result.self_status is not None:
+                        detail = f"{result.self_status.hourly_used}/{result.self_status.hourly_limit}"
+                    elif result.self_status is not None:
+                        detail = f"{result.self_status.used}/{result.self_status.allowed}"
+                    else:
+                        detail = "-"
                     logger.info(
-                        f"频道 {message.chat_key} 今日额度已用完 "
-                        f"({status.used}/{status.allowed} {status.unit})，暂停回复",
+                        f"频道 {message.chat_key} 配额已用完 (reason={result.reason}, {detail})，跳过回复",
                     )
                     if should_notify_quota_exhausted:
-                        # 当天第一次被叫到时提示一次；并发下只有抢到条件更新的那一条会发
-                        await channel_quota.send_pause_notice_once(db_chat_channel, status)
+                        if result.reason == "platform":
+                            if result.status is not None:
+                                await channel_quota.send_pause_notice_once(db_chat_channel, result.status)
+                        elif result.self_status is not None:
+                            await channel_quota.send_self_limit_notice_once(
+                                db_chat_channel,
+                                result.self_status,
+                                result.reason,
+                            )
                     return
 
-            if not _is_quota_exempt:
-                # 配额检查（使用频道级 effective config）
-                effective_config = await db_chat_channel.get_effective_config()
-                daily_limit = effective_config.AI_CHAT_DAILY_REPLY_LIMIT
-                if daily_limit > 0:
-                    boost = quota_service.get_boost(message.chat_key)
-                    effective_limit = daily_limit + boost
-
-                    # 查询今日已回复数
-                    today_start = time.time() - (time.time() % 86400)  # UTC 当天零点
-                    daily_count = (
-                        await DBChatMessage.filter(
-                            chat_key=message.chat_key,
-                            sender_id=-1,
-                            send_timestamp__gte=int(today_start),
-                        )
-                        .exclude(sender_name="SYSTEM")
-                        .count()
-                    )
-
-                    if daily_count >= effective_limit:
-                        logger.info(f"频道 {message.chat_key} 今日配额已用完 ({daily_count}/{effective_limit})，跳过回复")
-                        if not should_notify_quota_exhausted:
-                            return
-                        # 通过适配器发送可见通知
-                        quota_msg = f"今日回复配额已用完 ({daily_count}/{effective_limit})，请明天再试或联系管理员使用 /quota_boost 临时提升配额"
-                        quota_recorded = False
-                        try:
-                            adapter = await adapter_utils.get_adapter_for_chat(message.chat_key)
-                        except AdapterUnavailableError as e:
-                            logger.warning(f"[message_service] 配额通知发送失败，适配器不可用: {e}")
-                        else:
-                            plt_response = await adapter.forward_message(
-                                PlatformSendRequest(
-                                    chat_key=message.chat_key,
-                                    segments=[PlatformSendSegment(type=PlatformSendSegmentType.TEXT, content=quota_msg)],
-                                )
-                            )
-                            quota_recorded = plt_response.recorded
-                        if not quota_recorded:
-                            await self.push_system_message(
-                                chat_key=message.chat_key,
-                                agent_messages=quota_msg,
-                                db_chat_channel=db_chat_channel,
-                            )
-                        return
-
-                    # 每小时限额检查
-                    if effective_config.AI_CHAT_ENABLE_HOURLY_LIMIT:
-                        hourly_limit = quota_service.calculate_hourly_quota(effective_limit)
-                        hour_start = time.time() - (time.time() % 3600)  # 当前小时零分
-                        hourly_count = (
-                            await DBChatMessage.filter(
-                                chat_key=message.chat_key,
-                                sender_id=-1,
-                                send_timestamp__gte=int(hour_start),
-                            )
-                            .exclude(sender_name="SYSTEM")
-                            .count()
-                        )
-
-                        if hourly_count >= hourly_limit:
-                            logger.info(f"频道 {message.chat_key} 本小时配额已用完 ({hourly_count}/{hourly_limit})，跳过回复")
-                            if not should_notify_quota_exhausted:
-                                return
-                            hourly_msg = f"本小时回复配额已用完 ({hourly_count}/{hourly_limit})，请稍后再试"
-                            hourly_recorded = False
-                            try:
-                                adapter = await adapter_utils.get_adapter_for_chat(message.chat_key)
-                            except AdapterUnavailableError as e:
-                                logger.warning(f"[message_service] 小时配额通知发送失败，适配器不可用: {e}")
-                            else:
-                                plt_response = await adapter.forward_message(
-                                    PlatformSendRequest(
-                                        chat_key=message.chat_key,
-                                        segments=[PlatformSendSegment(type=PlatformSendSegmentType.TEXT, content=hourly_msg)],
-                                    )
-                                )
-                                hourly_recorded = plt_response.recorded
-                            if not hourly_recorded:
-                                await self.push_system_message(
-                                    chat_key=message.chat_key,
-                                    agent_messages=hourly_msg,
-                                    db_chat_channel=db_chat_channel,
-                                )
-                            return
-
-            # 本函数已经判过频道额度（上面那一段），豁免的人也要能过，所以让调度跳过它自己的闸门
+            # 本函数已经判过统一闸门（平台额度 + 租户自限），豁免的人也要能过，
+            # 所以让调度跳过它自己的闸门
             await self.schedule_agent_task(
                 message=message,
                 ctx=ctx,
@@ -1232,6 +1146,8 @@ class MessageService:
         if len(result.body) > MAX_TOOL_RESULT_BODY_CHARS:
             # 与 RPC 出口同一条硬底线，见 `MAX_TOOL_RESULT_BODY_CHARS`
             result = replace(result, body=result.body[:MAX_TOOL_RESULT_BODY_CHARS] + TRUNCATION_MARK)
+        if result.history_body is not None and len(result.history_body) > MAX_TOOL_RESULT_BODY_CHARS:
+            result = replace(result, history_body=result.history_body[:MAX_TOOL_RESULT_BODY_CHARS] + TRUNCATION_MARK)
 
         ctx: AgentCtx = await AgentCtx.create_by_chat_key(chat_key=chat_key)
         signal = await plugin_collector.handle_on_system_message(ctx, result.summary)
@@ -1271,10 +1187,14 @@ class MessageService:
         await self._record_untrusted_result(chat_key, db_chat_channel, result)
 
     async def _record_untrusted_result(self, chat_key: str, db_chat_channel: DBChatChannel, result: UntrustedToolResult) -> None:
-        """落库并广播一条不可信结果行（`push_tool_result` 与 `push_untrusted_message` 共用）"""
+        """落库并广播一条不可信结果行（`push_tool_result` 与 `push_untrusted_message` 共用）
+
+        落库与广播的都是 `stored_body`：插件设了 `history_body` 时，完整正文只在本轮交给模型，
+        聊天记录、消息接口与之后轮次的历史里看不到它。
+        """
         segment = ChatMessageSegmentUntrusted(
             type=ChatMessageSegmentType.UNTRUSTED,
-            text=result.body,
+            text=result.stored_body,
             kind=result.kind,
             summary=result.summary,
             attrs=result.attrs,

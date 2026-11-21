@@ -65,6 +65,7 @@ from nekro_agent.services.memory.feature_flags import (
 from nekro_agent.services.memory.instance_scope import MemoryScope
 from nekro_agent.services.memory.maintenance import MemoryPruneResult, prune_workspace_memories
 from nekro_agent.services.memory.qdrant_manager import memory_qdrant_manager
+from nekro_agent.services.memory.retention import MANUAL_PRUNE_ACTION
 from nekro_agent.services.memory.retriever import retrieve_memories
 from nekro_agent.services.memory.semantic_writer import persist_cc_task_memory
 from nekro_agent.services.resources import workspace_resource_service
@@ -87,7 +88,7 @@ from nekro_agent.services.workspace.container import (
     WorkspaceBusyError,
     effective_sandbox_image,
 )
-from nekro_agent.services.workspace.manager import WorkspaceService
+from nekro_agent.services.workspace.manager import StaleHomeError, WorkspaceService
 from nekro_agent.services.workspace.prompt_envelope import CcPromptEnvelope
 from nekro_agent.services.workspace.tenant_scope import (
     accessible_workspace_ids,
@@ -475,6 +476,11 @@ async def create_workspace(
         description=body.description,
         runtime_policy=body.runtime_policy,
     )
+    # 编号可能被复用（数据库重置、导入导出之后）：上一个同号工作区留下的 CC home 先清掉，清不掉就不建
+    try:
+        await WorkspaceService.claim_fresh_home(ws)
+    except StaleHomeError as e:
+        raise OperationFailedError(operation="创建工作区", detail=str(e)) from e
 
     # 自动注入默认技能。
     # 本端点是 `Role.Super`，新建的工作区还没绑定任何频道（归属恒为平台方），
@@ -649,6 +655,7 @@ async def delete_workspace(
     | Docker 网络 | **不动** | 一张网络按归属分组被整组工作区共用，删了会切断别人 |
     | 卷 | 无 | 沙盒只用 bind mount，没有 Docker 卷 |
     | 工作区目录 | **不删**，只记一条 WARNING | 那是用户的工作产物；静默 `rmtree` 不可逆。删文件需要用户在"归档 vs 彻底删除"之间显式确认，这条删除路径里没有这一步 |
+    | CC home（`{工作区根}/.nk-homes/<id>`；还没迁的旧布局是工作区目录里的 `.claude_home`） | **删**，在库里删除提交之后 | 里面是 CC 的会话历史、`.claude.json`、网关私钥，不是用户的工作产物；编号被复用时会被下一个工作区接手（建工作区时也会再清一次）。排在提交之后：事务回滚时工作区还在，home 不能先没了 |
     | 结构化记忆 5 张表 + 向量 | 删 | `memory/reset` 删 5 张，这里改前只删了 4 张（漏 `mem_episode`） |
     | 知识库文档/chunk/引用/资产绑定 + 向量 + 落盘文件 | 删 | 整套都只属于这个工作区 |
     | **资源绑定** | 删 | 悬空绑定本身 |
@@ -763,6 +770,13 @@ async def delete_workspace(
                 data_key="last_cc_task_prompt",
             ).delete()
         await ws.delete()
+
+    # CC home 在提交之后删（见本函数 docstring 的判定表）。删不掉不让删除失败：库里已经没有这个
+    # 工作区了，残留的 home 在同号工作区新建时还会再清一次
+    try:
+        await asyncio.to_thread(WorkspaceService.remove_workspace_home, workspace_id)
+    except Exception as e:
+        logger.warning(f"删除工作区 {workspace_id} 的 CC home 失败（同号工作区新建时会再清）: {type(e).__name__}: {e}")
 
     # 目录不删（见本函数 docstring 的判定表），但要把路径记下来，否则没人找得到它
     orphan_dir = WorkspaceService.get_workspace_dir(workspace_id)
@@ -2527,7 +2541,8 @@ async def prune_memory(
 ) -> MemoryPruneResponse:
     await assert_workspace_accessible(_current_user, workspace_id)
     ensure_memory_system_enabled(MemoryOperation.PRUNE)
-    result: MemoryPruneResult = await prune_workspace_memories(workspace_id)
+    # 管理员手动触发的清理单独记一个动作名，按旧半衰期的一次性捞回不认它
+    result: MemoryPruneResult = await prune_workspace_memories(workspace_id, action=MANUAL_PRUNE_ACTION)
     return MemoryPruneResponse(
         paragraphs_pruned=result.paragraphs_pruned,
         relations_pruned=result.relations_pruned,
@@ -3559,6 +3574,13 @@ async def user_send_to_cc(
                 envelope.ssh_servers = tuple(str(alias) for alias in _aliases)
         except Exception as e:  # noqa: BLE001 - 少一段说明不该让直发失败
             logger.warning(f"读取后台直发的 SSH 授权服务器别名失败（本次不写授权说明）: {e}")
+        if envelope.ssh_servers:
+            try:
+                from nekro_agent.services.ssh_gateway.runbook import render_for_prompt
+
+                envelope.ssh_runbooks = await render_for_prompt(console_lease.credential_ids)
+            except Exception as e:  # noqa: BLE001 - 少一段手册不该让直发失败
+                logger.warning(f"读取后台直发的 SSH 运维手册失败（本次不带手册）: {type(e).__name__}")
 
     delegated_content = envelope.to_prompt()
 

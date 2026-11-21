@@ -135,14 +135,19 @@ def record_failure(
 def release_quarantine(plugin_key: str, *, reason: str) -> bool:
     """手动解除隔离并清空失败计数，返回此前是否处于隔离状态
 
-    插件重载 / 重新启用时调用：用户修好插件后不该还要再等满一个冷却期。
+    插件重载 / 重新启用时调用：用户修好插件后不该还要再等满一个冷却期。单独计数的回调
+    （键是 `插件键#回调名`，见 :func:`call_plugin` 的 `isolation_key`）一并解除。
     """
-    _consecutive_failures.pop(plugin_key, None)
-    entry = _quarantines.pop(plugin_key, None)
-    if entry is None:
-        return False
-    logger.info(f"插件 {plugin_key} 的自动隔离已解除（{reason}）")
-    return True
+    prefix = f"{plugin_key}#"
+    keys = [plugin_key, *(key for key in set(_consecutive_failures) | set(_quarantines) if key.startswith(prefix))]
+    released = False
+    for key in keys:
+        _consecutive_failures.pop(key, None)
+        entry = _quarantines.pop(key, None)
+        if entry is not None:
+            released = True
+            logger.info(f"插件 {key} 的自动隔离已解除（{reason}）")
+    return released
 
 
 def reset_all() -> None:
@@ -184,6 +189,7 @@ async def call_plugin(
     *args: Any,
     default: T,
     timeout: Optional[float] = None,
+    isolation_key: Optional[str] = None,
 ) -> T:
     """带护栏地调用一次插件回调
 
@@ -196,8 +202,11 @@ async def call_plugin(
         func: 插件注册的回调本体
         default: 上述任一情况下的回落值
         timeout: 覆盖全局超时；`None` 取 `PLUGIN_CALL_TIMEOUT_SECONDS`，`<= 0` 表示不限时
+        isolation_key: 失败计数与隔离记在哪个键上；默认是插件键（与其它受护栏回调共用）。传
+            `插件键#回调名` 时这个回调单独计数、单独隔离，它坏了不连带插件的其它回调。
     """
-    if get_quarantine(plugin.key) is not None:
+    key = isolation_key or plugin.key
+    if get_quarantine(key) is not None:
         return default
 
     limit = float(config.PLUGIN_CALL_TIMEOUT_SECONDS) if timeout is None else float(timeout)
@@ -205,24 +214,24 @@ async def call_plugin(
         try:
             result = await asyncio.wait_for(func(*args), timeout=limit) if limit > 0 else await func(*args)
         except asyncio.TimeoutError:
-            _handle_failure(plugin, stage, FAILURE_REASON_TIMEOUT, f"超过 {limit:.1f}s 未返回，已取消本次调用")
+            _handle_failure(plugin, stage, FAILURE_REASON_TIMEOUT, f"超过 {limit:.1f}s 未返回，已取消本次调用", key)
             return default
         except Exception as exc:  # noqa: BLE001 - 护栏的全部意义就是不让插件的异常外泄
-            _handle_failure(plugin, stage, FAILURE_REASON_ERROR, f"{type(exc).__name__}: {exc}")
+            _handle_failure(plugin, stage, FAILURE_REASON_ERROR, f"{type(exc).__name__}: {exc}", key)
             return default
         else:
-            record_success(plugin.key)
+            record_success(key)
             return result
 
 
-def _handle_failure(plugin: "NekroPlugin", stage: str, reason: str, detail: str) -> None:
+def _handle_failure(plugin: "NekroPlugin", stage: str, reason: str, detail: str, key: Optional[str] = None) -> None:
     """记一次失败并在触发阈值时告警
 
     告警同时打在插件子 logger（前端按 plugin_key 过滤得到）和插件系统 logger 上：
     自动隔离必须是用户明确看得见的事件，而不是"功能悄悄消失了"。
     """
     plugin.logger.warning(f"插件 {plugin.name} 的 {stage} 回调失败（{reason}）：{detail}")
-    entry = record_failure(plugin.key, stage, reason, detail)
+    entry = record_failure(key or plugin.key, stage, reason, detail)
     if entry is None:
         return
     message = (

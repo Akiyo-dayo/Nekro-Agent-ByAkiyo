@@ -9,6 +9,7 @@ from nekro_agent.schemas.i18n import i18n_text, t
 from nekro_agent.services.command.base import BaseCommand, CommandMetadata, CommandPermission
 from nekro_agent.services.command.ctl import CmdCtl
 from nekro_agent.services.command.schemas import Arg, CommandExecutionContext, CommandResponse
+from nekro_agent.tools.tenant_egress import is_tenant_owned_group
 
 
 class ExecCommand(BaseCommand):
@@ -384,4 +385,6 @@ def _build_chat_params(model_group: Any, stream_mode: bool) -> dict[str, Any]:
         "api_key": model_group.API_KEY,
         "stream_mode": stream_mode,
         "proxy_url": model_group.CHAT_PROXY,
+        "api_format": model_group.API_FORMAT,
+        "tenant_egress": is_tenant_owned_group(model_group),
     }

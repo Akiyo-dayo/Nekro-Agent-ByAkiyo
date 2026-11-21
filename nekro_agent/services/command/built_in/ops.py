@@ -439,6 +439,56 @@ class MemoryBackfillPayloadCommand(BaseCommand):
         yield CmdCtl.success(f"记忆向量 payload 补齐完成，共处理 {updated} 个点")
 
 
+class MemoryBackfillVectorsCommand(BaseCommand):
+    """给有效但没有向量的记忆段落补上向量"""
+
+    @property
+    def metadata(self) -> CommandMetadata:
+        return CommandMetadata(
+            name="memory_backfill_vectors",
+            aliases=["mem_backfill_vectors"],
+            description="给有效但没有向量的记忆段落补上向量（会调用嵌入模型）",
+            i18n_description=i18n_text(
+                zh_CN="给有效但没有向量的记忆段落补上向量（会调用嵌入模型）",
+                en_US="Embed active memory paragraphs that have no vector yet (calls the embedding model)",
+            ),
+            usage="memory_backfill_vectors [-y]",
+            permission=CommandPermission.SUPER_USER,
+            category="运维",
+            i18n_category=i18n_text(zh_CN="运维", en_US="Operations"),
+            params_schema=self._auto_params_schema(),
+        )
+
+    async def execute(
+        self,
+        context: CommandExecutionContext,
+        args_str: Annotated[str, Arg("参数", positional=True, greedy=True)] = "",
+    ) -> AsyncIterator[CommandResponse]:
+        from nekro_agent.services.memory.vector_backfill import backfill_missing_vectors, count_missing_vectors
+
+        missing = await count_missing_vectors()
+        if "-y" not in args_str:
+            yield CmdCtl.success(f"有效但没有向量的记忆段落: {missing} 段。确认补齐请带 -y（每段调用一次嵌入模型）")
+            return
+        if missing == 0:
+            yield CmdCtl.success("没有需要补向量的记忆段落")
+            return
+        yield CmdCtl.message(f"开始补 {missing} 段记忆的向量，分批限速，可中断、可重复执行...")
+        try:
+            result = await backfill_missing_vectors()
+        except Exception as e:
+            yield CmdCtl.failed(f"补向量失败: {e!s}")
+            return
+        note = "（连续失败，先停下了；嵌入服务恢复后再跑一次）" if result.stopped_early else ""
+        yield CmdCtl.success(
+            f"补向量结束{note}\n"
+            f"补上: {result.written} 段\n"
+            f"失败: {result.failed} 段\n"
+            f"空正文跳过: {result.skipped_empty} 段\n"
+            f"仍缺: {result.remaining} 段",
+        )
+
+
 class MemoryPruneCommand(BaseCommand):
     """清理低价值记忆"""
 
@@ -470,10 +520,11 @@ class MemoryPruneCommand(BaseCommand):
             return
 
         from nekro_agent.services.memory.maintenance import prune_workspace_memories
+        from nekro_agent.services.memory.retention import MANUAL_PRUNE_ACTION
 
         yield CmdCtl.message(f"开始清理工作区 {workspace_id} 的低价值结构化记忆...")
         try:
-            result = await prune_workspace_memories(workspace_id)
+            result = await prune_workspace_memories(workspace_id, action=MANUAL_PRUNE_ACTION)
         except Exception as e:
             yield CmdCtl.failed(f"清理结构化记忆失败: {e!s}")
             return

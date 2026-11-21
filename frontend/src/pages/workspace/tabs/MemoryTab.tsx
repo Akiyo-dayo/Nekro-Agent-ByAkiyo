@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Box,
@@ -50,8 +50,6 @@ import {
   memoryApi,
   MemoryDataResponse,
   MemoryDetailResponse,
-  MemoryGraphEdge,
-  MemoryGraphNode,
   MemoryGraphResponse,
   MemoryListResponse,
   MemoryRebuildStatus,
@@ -62,15 +60,21 @@ import { useNotification } from '../../../hooks/useNotification'
 import { CARD_VARIANTS, CHIP_VARIANTS, SCROLLBAR_VARIANTS } from '../../../theme/variants'
 import ActionButton from '../../../components/common/ActionButton'
 import IconActionButton from '../../../components/common/IconActionButton'
+import AtlasGraph from '../../../components/memory/atlas/AtlasGraph'
+import { buildAtlasLayout } from '../../../components/memory/atlas/layout'
+import { createMemoryAtlasConfig } from '../../../components/memory/atlas/memoryAtlasConfig'
+import { ATLAS_COLORS } from '../../../theme/themeConfig'
+import type { AtlasViewMode, InformationDensity } from '../../../components/memory/atlas/types'
+import { useAtlasViewport } from '../../../components/memory/atlas/useAtlasViewport'
+
+// 画布与布局在 components/memory/atlas/ 里（后台记忆页的图谱也用它）；这份配置画出来与拆分前一样
+const MEMORY_ATLAS_CONFIG = createMemoryAtlasConfig({ showAxes: true })
 
 type MemoryTypeFilter = 'all' | 'paragraph' | 'entity' | 'relation' | 'episode'
 type MemoryStatusFilter = 'all' | 'active' | 'inactive'
 type MemoryCognitiveTypeFilter = 'all' | 'episodic' | 'semantic'
 type MemorySortBy = 'event_time' | 'update_time' | 'create_time' | 'effective_weight'
 type MemorySortOrder = 'asc' | 'desc'
-type ClusterKind = 'semantic' | 'episodic' | 'relation' | 'entity' | 'episode'
-type InformationDensity = 'low' | 'medium' | 'high'
-type AtlasViewMode = 'episode' | 'atomic'
 
 type MemorySelection = {
   memory_type: 'paragraph' | 'entity' | 'relation' | 'episode'
@@ -93,43 +97,6 @@ type EpisodeParagraph = {
   episode_phase?: string
   knowledge_type?: string
   event_time?: string | null
-}
-
-type AtlasNode = MemoryGraphNode & {
-  cluster: ClusterKind
-  x: number
-  y: number
-  size: number
-  opacity: number
-  fill: string
-  glow: string
-  labelVisible: boolean
-}
-
-const BASE_CLUSTER_META: Record<ClusterKind, { title: string; accent: string; center: { x: number; y: number } }> = {
-  episode: { title: '事件核', accent: '#4da3ff', center: { x: 0, y: 0 } },
-  semantic: { title: '语义区', accent: '#2e7d5a', center: { x: -280, y: -180 } },
-  episodic: { title: '情景区', accent: '#d77e2c', center: { x: -280, y: 180 } },
-  relation: { title: '关系区', accent: '#3568d4', center: { x: 280, y: -180 } },
-  entity: { title: '实体区', accent: '#8a5bd2', center: { x: 280, y: 180 } },
-}
-
-function getClusterMeta(viewMode: AtlasViewMode): Record<ClusterKind, { title: string; accent: string; center: { x: number; y: number } }> {
-  if (viewMode === 'episode') {
-    return {
-      episode: { title: '事件核心', accent: '#4da3ff', center: { x: 0, y: 0 } },
-      semantic: { title: '语义背景', accent: '#2e7d5a', center: { x: -310, y: -190 } },
-      episodic: { title: '事件片段', accent: '#d77e2c', center: { x: -310, y: 190 } },
-      relation: { title: '关联线索', accent: '#3568d4', center: { x: 310, y: -190 } },
-      entity: { title: '参与实体', accent: '#8a5bd2', center: { x: 310, y: 190 } },
-    }
-  }
-  return BASE_CLUSTER_META
-}
-
-const WORLD_BOUNDS = {
-  width: 1200,
-  height: 760,
 }
 
 function formatDateTime(value: string | number | null | undefined): string {
@@ -198,53 +165,13 @@ function isEpisodeParagraph(value: unknown): value is EpisodeParagraph {
   return isRecord(value) && (typeof value.id === 'number' || typeof value.id === 'string')
 }
 
-function getNodeColor(theme: Theme, node: MemoryGraphNode) {
-  if (node.memory_type === 'paragraph') {
-    if (node.cognitive_type === 'semantic') {
-      return {
-        fill: alpha(theme.palette.success.main, 0.16),
-        glow: alpha(theme.palette.success.main, 0.42),
-      }
-    }
-    return {
-      fill: alpha(theme.palette.warning.main, 0.17),
-      glow: alpha(theme.palette.warning.main, 0.46),
-    }
-  }
-  if (node.memory_type === 'relation') {
-    return {
-      fill: alpha(BASE_CLUSTER_META.relation.accent, 0.16),
-      glow: alpha(BASE_CLUSTER_META.relation.accent, 0.42),
-    }
-  }
-  if (node.memory_type === 'episode') {
-    return {
-      fill: alpha(theme.palette.info.main, 0.18),
-      glow: alpha(theme.palette.info.main, 0.42),
-    }
-  }
-  return {
-    fill: alpha(theme.palette.secondary.main, 0.16),
-    glow: alpha(theme.palette.secondary.main, 0.38),
-  }
-}
-
 function getMemoryTypeAccent(theme: Theme, memoryType: 'paragraph' | 'entity' | 'relation' | 'episode', cognitiveType?: string | null) {
-  if (memoryType === 'episode') return theme.palette.info.main
-  if (memoryType === 'relation') return BASE_CLUSTER_META.relation.accent
-  if (memoryType === 'entity') return BASE_CLUSTER_META.entity.accent
-  if (cognitiveType === 'semantic') return BASE_CLUSTER_META.semantic.accent
-  if (cognitiveType === 'episodic') return BASE_CLUSTER_META.episodic.accent
+  if (memoryType === 'episode') return ATLAS_COLORS.core
+  if (memoryType === 'relation') return ATLAS_COLORS.relation
+  if (memoryType === 'entity') return ATLAS_COLORS.entity
+  if (cognitiveType === 'semantic') return ATLAS_COLORS.semantic
+  if (cognitiveType === 'episodic') return ATLAS_COLORS.episodic
   return theme.palette.primary.main
-}
-
-function resolveCluster(node: MemoryGraphNode): ClusterKind {
-  if (node.memory_type === 'episode') return 'episode'
-  if (node.memory_type === 'paragraph') {
-    return node.cognitive_type === 'semantic' ? 'semantic' : 'episodic'
-  }
-  if (node.memory_type === 'relation') return 'relation'
-  return 'entity'
 }
 
 function getDetailFields(data: Record<string, unknown>): Array<{ key: string; label: string; wide?: boolean }> {
@@ -278,296 +205,6 @@ function getDetailFields(data: Record<string, unknown>): Array<{ key: string; la
   return fields.filter(field => field.key in data)
 }
 
-function hashSeed(input: string): number {
-  let hash = 2166136261
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i)
-    hash = Math.imul(hash, 16777619)
-  }
-  return hash >>> 0
-}
-
-function seededUnit(seed: number): number {
-  const x = Math.sin(seed * 12.9898) * 43758.5453
-  return x - Math.floor(x)
-}
-
-function positionInRandomEllipseBand(
-  key: string,
-  cluster: Exclude<ClusterKind, 'episode' | 'relation'>,
-  occupied: Array<{ x: number; y: number }>,
-) {
-  const seedBase = hashSeed(`${cluster}:${key}`)
-  const bandByCluster: Record<Exclude<ClusterKind, 'episode' | 'relation'>, { inner: number; outer: number; stretchY: number; biasX: number; biasY: number }> = {
-    episodic: { inner: 180, outer: 420, stretchY: 0.86, biasX: -18, biasY: 10 },
-    entity: { inner: 210, outer: 470, stretchY: 0.8, biasX: 22, biasY: -8 },
-    semantic: { inner: 250, outer: 520, stretchY: 0.72, biasX: 0, biasY: -34 },
-  }
-  const band = bandByCluster[cluster]
-
-  let best = { x: 0, y: 0, score: -1 }
-  for (let attempt = 0; attempt < 14; attempt += 1) {
-    const a = seededUnit(seedBase + attempt * 17)
-    const b = seededUnit(seedBase + attempt * 31)
-    const radius = band.inner + (band.outer - band.inner) * Math.pow(a, 0.82)
-    const angle = b * Math.PI * 2
-    const x = Math.cos(angle) * radius + band.biasX
-    const y = Math.sin(angle) * radius * band.stretchY + band.biasY
-
-    let nearest = Infinity
-    for (const point of occupied) {
-      const dx = x - point.x
-      const dy = y - point.y
-      const dist = Math.sqrt(dx * dx + dy * dy)
-      nearest = Math.min(nearest, dist)
-    }
-
-    const centerDistance = Math.sqrt(x * x + y * y)
-    const score = Math.min(nearest, 140) + centerDistance * 0.08
-    if (score > best.score) {
-      best = { x, y, score }
-    }
-  }
-  return { x: best.x, y: best.y }
-}
-
-function positionInCenterCloud(
-  key: string,
-  occupied: Array<{ x: number; y: number }>,
-) {
-  const seedBase = hashSeed(`episode:${key}`)
-  let best = { x: 0, y: 0, score: -1 }
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    const a = seededUnit(seedBase + attempt * 13)
-    const b = seededUnit(seedBase + attempt * 29)
-    const radius = 28 + 150 * Math.pow(a, 0.9)
-    const angle = b * Math.PI * 2
-    const x = Math.cos(angle) * radius
-    const y = Math.sin(angle) * radius * 0.76
-
-    let nearest = Infinity
-    for (const point of occupied) {
-      const dx = x - point.x
-      const dy = y - point.y
-      const dist = Math.sqrt(dx * dx + dy * dy)
-      nearest = Math.min(nearest, dist)
-    }
-
-    const centerBias = Math.max(0, 180 - Math.sqrt(x * x + y * y))
-    const score = Math.min(nearest, 120) + centerBias * 0.12
-    if (score > best.score) {
-      best = { x, y, score }
-    }
-  }
-  return { x: best.x, y: best.y }
-}
-
-function buildAtlasNodes(
-  theme: Theme,
-  graph: MemoryGraphResponse | undefined,
-  zoom: number,
-  informationDensity: InformationDensity,
-  viewMode: AtlasViewMode,
-): {
-  nodes: AtlasNode[]
-  hiddenCounts: Record<ClusterKind, number>
-} {
-  const emptyCounts = { episode: 0, semantic: 0, episodic: 0, relation: 0, entity: 0 }
-  if (!graph) return { nodes: [], hiddenCounts: emptyCounts }
-
-  const grouped: Record<ClusterKind, MemoryGraphNode[]> = {
-    episode: [],
-    semantic: [],
-    episodic: [],
-    relation: [],
-    entity: [],
-  }
-
-  const episodeParagraphIds = new Set<number>()
-  const episodeEntityIds = new Set<number>()
-  graph.edges.forEach(edge => {
-    if (edge.edge_type === 'episode_paragraph') {
-      const targetId = Number(edge.target.replace('paragraph-', ''))
-      if (!Number.isNaN(targetId)) episodeParagraphIds.add(targetId)
-    }
-    if (edge.edge_type === 'episode_entity') {
-      const targetId = Number(edge.target.replace('entity-', ''))
-      if (!Number.isNaN(targetId)) episodeEntityIds.add(targetId)
-    }
-  })
-
-  const relationSeen = new Set<string>()
-  graph.nodes.forEach(node => {
-    if (node.memory_type === 'relation') {
-      const relationKey = `${node.label}|${node.subtitle}`
-      if (relationSeen.has(relationKey)) {
-        return
-      }
-      relationSeen.add(relationKey)
-    }
-    if (viewMode === 'episode') {
-      if (node.memory_type === 'relation') {
-        return
-      }
-      if (node.memory_type === 'entity' && node.ref_id && !episodeEntityIds.has(node.ref_id)) {
-        return
-      }
-      if (node.memory_type === 'paragraph' && node.cognitive_type !== 'semantic' && node.ref_id && !episodeParagraphIds.has(node.ref_id)) {
-        return
-      }
-    }
-    grouped[resolveCluster(node)].push(node)
-  })
-
-  const limitMap: Record<InformationDensity, Record<ClusterKind, number>> = viewMode === 'episode'
-    ? {
-        low: { episode: 7, semantic: 10, episodic: 12, relation: 12, entity: 12 },
-        medium: { episode: 10, semantic: 14, episodic: 16, relation: 16, entity: 16 },
-        high: { episode: 12, semantic: 16, episodic: 18, relation: 20, entity: 20 },
-      }
-    : {
-        low: { episode: 8, semantic: 12, episodic: 14, relation: 16, entity: 16 },
-        medium: { episode: 12, semantic: 16, episodic: 18, relation: 24, entity: 24 },
-        high: { episode: 16, semantic: 22, episodic: 24, relation: 32, entity: 32 },
-      }
-  const zoomExpansion = zoom >= 1.35 ? 2 : zoom >= 1.12 ? 1 : 0
-  const baseLimits = limitMap[informationDensity]
-  const limits: Record<ClusterKind, number> = {
-    episode: baseLimits.episode + zoomExpansion,
-    semantic: baseLimits.semantic + zoomExpansion,
-    episodic: baseLimits.episodic + zoomExpansion * 2,
-    relation: baseLimits.relation + zoomExpansion * 2,
-    entity: baseLimits.entity + zoomExpansion * 2,
-  }
-
-  const nodes: AtlasNode[] = []
-  const hiddenCounts = { ...emptyCounts }
-  const golden = Math.PI * (3 - Math.sqrt(5))
-  const labelThresholdMap: Record<InformationDensity, { entity: number; other: number; zoom: number }> = {
-    low: { entity: 2, other: 3, zoom: 1.08 },
-    medium: { entity: 4, other: 5, zoom: 1.0 },
-    high: { entity: 8, other: 10, zoom: 0.92 },
-  }
-  const baseLabelThreshold = labelThresholdMap[informationDensity]
-  const labelThreshold = {
-    entity: baseLabelThreshold.entity + (zoom >= 1.32 ? 4 : zoom >= 1.12 ? 2 : 0),
-    other: baseLabelThreshold.other + (zoom >= 1.32 ? 5 : zoom >= 1.12 ? 2 : 0),
-    zoom: baseLabelThreshold.zoom,
-  }
-  const clusterMeta = getClusterMeta(viewMode)
-
-  if (viewMode === 'episode') {
-    const episodeNodes = [...grouped.episode]
-      .sort((a, b) => b.importance - a.importance)
-      .slice(0, limits.episode)
-    hiddenCounts.episode = Math.max(0, grouped.episode.length - episodeNodes.length)
-
-    const mixedOuterNodes = (['episodic', 'entity', 'semantic'] as const).flatMap(cluster => {
-      const sorted = [...grouped[cluster]].sort((a, b) => b.importance - a.importance)
-      const visible = sorted.slice(0, limits[cluster])
-      hiddenCounts[cluster] = Math.max(0, sorted.length - visible.length)
-      return visible.map(node => ({ node, cluster }))
-    })
-
-    const occupiedEpisodePositions: Array<{ x: number; y: number }> = []
-    episodeNodes.forEach((node, index) => {
-      let x = 0
-      let y = 0
-      if (!(episodeNodes.length === 1 && index === 0)) {
-        const pos = positionInCenterCloud(String(node.id ?? `episode-${index}`), occupiedEpisodePositions)
-        x = pos.x
-        y = pos.y
-      }
-      occupiedEpisodePositions.push({ x, y })
-      const palette = getNodeColor(theme, node)
-      const importance = Math.max(0.1, node.importance)
-      const size = Math.min(15, 8.8 + importance * 1.45)
-      const opacity = Math.min(0.95, 0.45 + importance * 0.25)
-      nodes.push({
-        ...node,
-        cluster: 'episode',
-        x,
-        y,
-        size,
-        opacity,
-        fill: palette.fill,
-        glow: palette.glow,
-        labelVisible: true,
-      })
-    })
-
-    const occupiedOuterPositions: Array<{ x: number; y: number }> = [...occupiedEpisodePositions]
-
-    mixedOuterNodes.forEach(({ node, cluster }, index) => {
-      const pos = positionInRandomEllipseBand(String(node.id ?? `${cluster}-${index}`), cluster as Exclude<ClusterKind, 'episode' | 'relation'>, occupiedOuterPositions)
-      occupiedOuterPositions.push(pos)
-      const palette = getNodeColor(theme, node)
-      const importance = Math.max(0.1, node.importance)
-      const size = Math.min(
-        cluster === 'entity' ? 13 : 15,
-        cluster === 'entity' ? 7 : 8.5 + importance * 1.8,
-      )
-      const opacity = Math.min(0.92, 0.42 + importance * 0.22)
-      nodes.push({
-        ...node,
-        cluster,
-        x: pos.x,
-        y: pos.y,
-        size,
-        opacity,
-        fill: palette.fill,
-        glow: palette.glow,
-        labelVisible:
-          zoom >= labelThreshold.zoom ||
-          index < (cluster === 'entity' ? labelThreshold.entity : labelThreshold.other),
-      })
-    })
-
-    return { nodes, hiddenCounts }
-  }
-
-  ;(['episode', 'semantic', 'episodic', 'relation', 'entity'] as const).forEach(cluster => {
-    const meta = clusterMeta[cluster]
-    const sorted = [...grouped[cluster]].sort((a, b) => b.importance - a.importance)
-    const visible = sorted.slice(0, limits[cluster])
-    hiddenCounts[cluster] = Math.max(0, sorted.length - visible.length)
-
-    visible.forEach((node, index) => {
-      let x = 0
-      let y = 0
-
-      const angle = index * golden
-      const ring =
-        cluster === 'episode'
-          ? 22 + Math.sqrt(index + 1) * 48
-          : 48 + Math.sqrt(index + 1) * (cluster === 'entity' ? 30 : 28)
-      x = meta.center.x + Math.cos(angle) * ring
-      y = meta.center.y + Math.sin(angle) * ring * (cluster === 'episode' ? 0.48 : 0.72)
-
-      const palette = getNodeColor(theme, node)
-      const importance = Math.max(0.1, node.importance)
-      const size = Math.min(
-        cluster === 'episode' ? 15 : cluster === 'entity' ? 13 : 15,
-        cluster === 'episode' ? 8.8 + importance * 1.45 : cluster === 'entity' ? 7 : 8.5 + importance * 1.8,
-      )
-      const opacity = Math.min(0.95, 0.45 + importance * 0.25)
-      nodes.push({
-        ...node,
-        cluster,
-        x,
-        y,
-        size,
-        opacity,
-        fill: palette.fill,
-        glow: palette.glow,
-        labelVisible: cluster === 'episode' || zoom >= labelThreshold.zoom || index < (cluster === 'entity' ? labelThreshold.entity : labelThreshold.other),
-      })
-    })
-  })
-
-  return { nodes, hiddenCounts }
-}
-
 function StatChip({ label, color }: { label: string; color: string }) {
   return <Chip size="small" label={label} sx={CHIP_VARIANTS.getCustomColorChip(color, true)} />
 }
@@ -582,12 +219,10 @@ export default function MemoryTab({ workspace }: { workspace: WorkspaceDetail })
   const memorySystemDisabled = !workspace.memory_system_enabled
   const mobileOverlayTop = memorySystemDisabled ? 260 : 178
   const [viewMode, setViewMode] = useState<AtlasViewMode>('episode')
-  const clusterMeta = useMemo(() => getClusterMeta(viewMode), [viewMode])
 
   const [graphIncludeInactive, setGraphIncludeInactive] = useState(false)
-  const [zoom, setZoom] = useState(1)
-  const [pan, setPan] = useState({ x: 0, y: 0 })
-  const [isDragging, setIsDragging] = useState(false)
+  const viewport = useAtlasViewport()
+  const { zoom, updateZoom } = viewport
   const [browserOpen, setBrowserOpen] = useState(false)
   const [selection, setSelection] = useState<MemorySelection | null>(null)
   const [memoryType, setMemoryType] = useState<MemoryTypeFilter>('all')
@@ -805,46 +440,12 @@ export default function MemoryTab({ workspace }: { workspace: WorkspaceDetail })
     onError: () => notification.error('删除记忆失败'),
   })
 
-  const atlas = useMemo(() => buildAtlasNodes(theme, memoryGraph, zoom, informationDensity, viewMode), [theme, memoryGraph, zoom, informationDensity, viewMode])
+  const atlas = useMemo(
+    () => buildAtlasLayout(theme, memoryGraph, zoom, informationDensity, viewMode, MEMORY_ATLAS_CONFIG),
+    [theme, memoryGraph, zoom, informationDensity, viewMode],
+  )
   const detailFields = useMemo(() => getDetailFields((memoryDetail?.data ?? {}) as Record<string, unknown>), [memoryDetail])
   const selectedNodeId = selection ? `${selection.memory_type}-${selection.id}` : null
-  const highlightedEdges = useMemo(() => {
-    if (!memoryGraph || !selectedNodeId) return [] as MemoryGraphEdge[]
-    return memoryGraph.edges.filter(edge => edge.source === selectedNodeId || edge.target === selectedNodeId)
-  }, [memoryGraph, selectedNodeId])
-  const selectedEpisodeRelatedNodeIds = useMemo(() => {
-    const ids = new Set<string>()
-    if (!memoryGraph || viewMode !== 'episode' || selection?.memory_type !== 'episode') return ids
-    const episodeNodeId = `episode-${selection.id}`
-    ids.add(episodeNodeId)
-    memoryGraph.edges.forEach(edge => {
-      if (edge.source === episodeNodeId || edge.target === episodeNodeId) {
-        ids.add(edge.source)
-        ids.add(edge.target)
-      }
-    })
-    return ids
-  }, [memoryGraph, selection, viewMode])
-  const ambientEpisodeEdges = useMemo(() => {
-    if (!memoryGraph || viewMode !== 'episode') return [] as MemoryGraphEdge[]
-    const edges = memoryGraph.edges.filter(edge => edge.edge_type === 'episode_paragraph' || edge.edge_type === 'episode_entity')
-    if (selection?.memory_type !== 'episode') return edges
-    const episodeNodeId = `episode-${selection.id}`
-    return edges.filter(edge => edge.source === episodeNodeId || edge.target === episodeNodeId)
-  }, [memoryGraph, selection, viewMode])
-  const detailIntensity =
-    (informationDensity === 'high' ? 1 : informationDensity === 'medium' ? 0.75 : 0.55) +
-    (zoom >= 1.28 ? 0.18 : zoom >= 1.08 ? 0.08 : 0)
-  const zoomDetailLevel = zoom >= 1.32 ? 'high' : zoom >= 1.06 ? 'medium' : 'low'
-  const highlightedNodeIds = useMemo(() => {
-    const ids = new Set<string>()
-    if (selectedNodeId) ids.add(selectedNodeId)
-    highlightedEdges.forEach(edge => {
-      ids.add(edge.source)
-      ids.add(edge.target)
-    })
-    return ids
-  }, [highlightedEdges, selectedNodeId])
 
   const visibleListItems = useMemo(() => {
     const q = searchText.trim().toLowerCase()
@@ -939,157 +540,6 @@ export default function MemoryTab({ workspace }: { workspace: WorkspaceDetail })
       setDismissedRebuildJobId(null)
     }
   }, [dismissedRebuildJobId, rebuildStatus?.is_running, rebuildStatus?.job_id])
-
-  useEffect(() => {
-    if (!selectedAtlasNode) return
-    if (selectedAtlasNode.memory_type !== 'episode') return
-    panRef.current = {
-      x: -selectedAtlasNode.x * 0.32,
-      y: -selectedAtlasNode.y * 0.32,
-    }
-    zoomRef.current = Math.max(zoomRef.current, 1.08)
-    commitViewport()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedAtlasNode])
-
-  const graphViewportRef = useRef<HTMLDivElement | null>(null)
-  const sceneRef = useRef<HTMLDivElement | null>(null)
-  const panRef = useRef(pan)
-  const zoomRef = useRef(zoom)
-  const frameRef = useRef<number | null>(null)
-  const viewportSyncTimerRef = useRef<number | null>(null)
-  const dragRef = useRef({ active: false, x: 0, y: 0 })
-
-  useEffect(() => {
-    panRef.current = pan
-  }, [pan])
-
-  useEffect(() => {
-    zoomRef.current = zoom
-  }, [zoom])
-
-  useEffect(
-    () => () => {
-      if (frameRef.current !== null) {
-        cancelAnimationFrame(frameRef.current)
-      }
-      if (viewportSyncTimerRef.current !== null) {
-        window.clearTimeout(viewportSyncTimerRef.current)
-      }
-    },
-    [],
-  )
-
-  useEffect(() => {
-    const element = graphViewportRef.current
-    if (!element) return
-
-    const handleNativeWheel = (event: globalThis.WheelEvent) => {
-      if (!element.contains(event.target as Node)) return
-      event.preventDefault()
-      event.stopPropagation()
-      if (event.ctrlKey || event.metaKey) {
-        updateZoom(zoomRef.current - event.deltaY * 0.004)
-        return
-      }
-      const deltaX = event.shiftKey && Math.abs(event.deltaX) < 1 ? event.deltaY : event.deltaX
-      applyPanDelta(-deltaX * 0.85, -event.deltaY * 0.85)
-    }
-
-    const preventGesture = (event: Event) => {
-      event.preventDefault()
-    }
-
-    element.addEventListener('wheel', handleNativeWheel, { passive: false })
-    element.addEventListener('gesturestart', preventGesture)
-    element.addEventListener('gesturechange', preventGesture)
-    element.addEventListener('gestureend', preventGesture)
-    return () => {
-      element.removeEventListener('wheel', handleNativeWheel)
-      element.removeEventListener('gesturestart', preventGesture)
-      element.removeEventListener('gesturechange', preventGesture)
-      element.removeEventListener('gestureend', preventGesture)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  const syncViewportState = () => {
-    setPan({ ...panRef.current })
-    setZoom(zoomRef.current)
-  }
-
-  const scheduleViewportStateSync = () => {
-    if (viewportSyncTimerRef.current !== null) {
-      window.clearTimeout(viewportSyncTimerRef.current)
-    }
-    viewportSyncTimerRef.current = window.setTimeout(() => {
-      viewportSyncTimerRef.current = null
-      syncViewportState()
-    }, 80)
-  }
-
-  const applySceneTransform = () => {
-    if (!sceneRef.current) return
-    const pixelRatio = window.devicePixelRatio || 1
-    const alignedX = Math.round(panRef.current.x * pixelRatio) / pixelRatio
-    const alignedY = Math.round(panRef.current.y * pixelRatio) / pixelRatio
-    sceneRef.current.style.transform = `translate(${alignedX}px, ${alignedY}px) scale(${zoomRef.current})`
-  }
-
-  const commitViewport = () => {
-    if (frameRef.current !== null) return
-    frameRef.current = requestAnimationFrame(() => {
-      frameRef.current = null
-      applySceneTransform()
-    })
-    scheduleViewportStateSync()
-  }
-
-  const updateZoom = (nextZoom: number) => {
-    zoomRef.current = Math.max(0.72, Math.min(1.65, Number(nextZoom.toFixed(2))))
-    commitViewport()
-  }
-
-  const applyPanDelta = (deltaX: number, deltaY: number) => {
-    panRef.current = {
-      x: panRef.current.x + deltaX,
-      y: panRef.current.y + deltaY,
-    }
-    commitViewport()
-  }
-
-  const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return
-    event.preventDefault()
-    if (selection) {
-      setSelection(null)
-    }
-    dragRef.current = { active: true, x: event.clientX, y: event.clientY }
-    setIsDragging(true)
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-
-  const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current.active) return
-    const deltaX = event.clientX - dragRef.current.x
-    const deltaY = event.clientY - dragRef.current.y
-    dragRef.current = { active: true, x: event.clientX, y: event.clientY }
-    applyPanDelta(deltaX, deltaY)
-  }
-
-  const handlePointerUp = (event: PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current.active) return
-    dragRef.current.active = false
-    setIsDragging(false)
-    syncViewportState()
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId)
-    }
-  }
-
-  useEffect(() => {
-    applySceneTransform()
-  }, [])
 
   return (
     <Box
@@ -1603,328 +1053,34 @@ export default function MemoryTab({ workspace }: { workspace: WorkspaceDetail })
           )}
         </AnimatePresence>
 
-        <Box
-          ref={graphViewportRef}
-          sx={{
-            position: 'absolute',
-            inset: 0,
-            top: { xs: `${mobileOverlayTop}px`, sm: 0 },
-            overflow: 'hidden',
-            overscrollBehavior: 'contain',
-            overscrollBehaviorX: 'contain',
-            touchAction: 'none',
-            cursor: isDragging ? 'grabbing' : 'grab',
-            userSelect: 'none',
-            WebkitUserSelect: 'none',
-            WebkitUserDrag: 'none',
-          }}
-          onDragStart={event => event.preventDefault()}
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerUp}
-          onPointerLeave={handlePointerUp}
-        >
-          {memoryGraphLoading ? (
-            <Box sx={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <CircularProgress />
-            </Box>
-          ) : !atlas.nodes.length ? (
-            <Box sx={{ p: 6 }}>
-              <Alert severity="info">当前还没有足够的图谱数据可供展示。</Alert>
-            </Box>
-          ) : (
-            <Box
-              ref={sceneRef}
-              sx={{
-                position: 'absolute',
-                inset: 0,
-                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-                transformOrigin: 'center center',
-              }}
-            >
-              <Box
-                sx={{
-                  position: 'absolute',
-                  left: '50%',
-                  top: '50%',
-                  width: WORLD_BOUNDS.width,
-                  height: WORLD_BOUNDS.height,
-                  transform: 'translate(-50%, -50%)',
-                }}
-              >
-                <Box
-                  sx={{
-                    position: 'absolute',
-                    inset: 0,
-                    borderRadius: 5,
-                    background: `
-                      linear-gradient(90deg, transparent calc(50% - 1px), ${alpha(theme.palette.primary.main, 0.18)} calc(50% - 1px), ${alpha(theme.palette.primary.main, 0.18)} calc(50% + 1px), transparent calc(50% + 1px)),
-                      linear-gradient(180deg, transparent calc(50% - 1px), ${alpha(theme.palette.primary.main, 0.18)} calc(50% - 1px), ${alpha(theme.palette.primary.main, 0.18)} calc(50% + 1px), transparent calc(50% + 1px)),
-                      linear-gradient(90deg, ${alpha(theme.palette.text.secondary, 0.04)} 1px, transparent 1px),
-                      linear-gradient(180deg, ${alpha(theme.palette.text.secondary, 0.04)} 1px, transparent 1px)
-                    `,
-                    backgroundSize: '100% 100%, 100% 100%, 64px 64px, 64px 64px',
-                    boxShadow: `inset 0 0 0 1px ${alpha(theme.palette.primary.main, 0.08)}`,
-                  }}
-                />
-                <Typography
-                  variant="caption"
-                  sx={{
-                    position: 'absolute',
-                    right: 16,
-                    top: 'calc(50% + 10px)',
-                    color: alpha(theme.palette.text.secondary, 0.55),
-                    letterSpacing: 2,
-                  }}
-                >
-                  X
-                </Typography>
-                <Typography
-                  variant="caption"
-                  sx={{
-                    position: 'absolute',
-                    left: 'calc(50% + 10px)',
-                    top: 16,
-                    color: alpha(theme.palette.text.secondary, 0.55),
-                    letterSpacing: 2,
-                  }}
-                >
-                  Y
-                </Typography>
-                <svg
-                  width={WORLD_BOUNDS.width}
-                  height={WORLD_BOUNDS.height}
-                  viewBox={`0 0 ${WORLD_BOUNDS.width} ${WORLD_BOUNDS.height}`}
-                  style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'visible' }}
-                >
-                  <defs>
-                    {ambientEpisodeEdges.map(edge => {
-                      const source = atlas.nodes.find(node => node.id === edge.source)
-                      const target = atlas.nodes.find(node => node.id === edge.target)
-                      if (!source || !target) return null
-                      return (
-                        <line
-                          key={`ambient-${edge.id}`}
-                          x1={WORLD_BOUNDS.width / 2 + source.x}
-                          y1={WORLD_BOUNDS.height / 2 + source.y}
-                          x2={WORLD_BOUNDS.width / 2 + target.x}
-                          y2={WORLD_BOUNDS.height / 2 + target.y}
-                          stroke={alpha(clusterMeta.episode.accent, zoomDetailLevel === 'high' ? 0.22 : zoomDetailLevel === 'medium' ? 0.14 : 0.08)}
-                          strokeWidth={(edge.edge_type === 'episode_paragraph' ? 1.5 : 1.15) * (zoomDetailLevel === 'high' ? 1 : zoomDetailLevel === 'medium' ? 0.8 : 0.65)}
-                          strokeDasharray={edge.edge_type === 'episode_entity' ? '6 7' : undefined}
-                        />
-                      )
-                    })}
-                    {highlightedEdges.map(edge => {
-                      const source = atlas.nodes.find(node => node.id === edge.source)
-                      const target = atlas.nodes.find(node => node.id === edge.target)
-                      if (!source || !target) return null
-                      return (
-                        <linearGradient
-                          key={`gradient-${edge.id}`}
-                          id={`memory-edge-gradient-${edge.id}`}
-                          gradientUnits="userSpaceOnUse"
-                          x1={WORLD_BOUNDS.width / 2 + source.x}
-                          y1={WORLD_BOUNDS.height / 2 + source.y}
-                          x2={WORLD_BOUNDS.width / 2 + target.x}
-                          y2={WORLD_BOUNDS.height / 2 + target.y}
-                        >
-                          <stop offset="0%" stopColor={source.glow} stopOpacity={0.2 + detailIntensity * 0.3} />
-                          <stop offset="100%" stopColor={target.glow} stopOpacity={0.2 + detailIntensity * 0.3} />
-                        </linearGradient>
-                      )
-                    })}
-                  </defs>
-                  {highlightedEdges.map(edge => {
-                    const source = atlas.nodes.find(node => node.id === edge.source)
-                    const target = atlas.nodes.find(node => node.id === edge.target)
-                    if (!source || !target) return null
-                    return (
-                      <line
-                        key={edge.id}
-                        x1={WORLD_BOUNDS.width / 2 + source.x}
-                        y1={WORLD_BOUNDS.height / 2 + source.y}
-                        x2={WORLD_BOUNDS.width / 2 + target.x}
-                        y2={WORLD_BOUNDS.height / 2 + target.y}
-                        stroke={`url(#memory-edge-gradient-${edge.id})`}
-                        strokeWidth={(edge.edge_type === 'relation_paragraph' ? 1.8 : 1.2) * detailIntensity}
-                        strokeDasharray={edge.edge_type === 'paragraph_entity' ? '5 5' : undefined}
-                      />
-                    )
-                  })}
-                </svg>
-                {(['episode', 'semantic', 'episodic', 'relation', 'entity'] as const).map(cluster => {
-                  if (viewMode === 'episode') return null
-                  const meta = clusterMeta[cluster]
-                  if (!atlas.nodes.some(node => node.cluster === cluster)) return null
-                  return (
-                    <Typography
-                      key={`${cluster}-label`}
-                      variant="overline"
-                      sx={{
-                        position: 'absolute',
-                        left: `calc(50% + ${meta.center.x}px)`,
-                        top: `calc(50% + ${meta.center.y}px)`,
-                        transform: 'translate(-50%, -50%)',
-                        letterSpacing: 2,
-                        color: alpha(meta.accent, zoomDetailLevel === 'high' ? 0.78 : zoomDetailLevel === 'medium' ? 0.66 : 0.52),
-                        fontWeight: 800,
-                        pointerEvents: 'none',
-                      }}
-                    >
-                      {meta.title}
-                    </Typography>
-                  )
-                })}
-                {atlas.nodes.map(node => {
-                  const selected = selection && node.id === `${selection.memory_type}-${selection.id}`
-                  const related = highlightedNodeIds.has(node.id)
-                  const episodeScoped =
-                    viewMode === 'episode' && selection?.memory_type === 'episode'
-                      ? selectedEpisodeRelatedNodeIds.has(node.id)
-                      : true
-                  const isEpisode = node.memory_type === 'episode'
-                  const visualScale = 1 / zoom
-                  const showTitle = node.labelVisible || selected || zoomDetailLevel !== 'low'
-                  const showSubtitle = selected || (zoomDetailLevel === 'high' && (isEpisode || node.memory_type !== 'entity'))
-                  return (
-                    <Box
-                      key={node.id}
-                      sx={{
-                        position: 'absolute',
-                        left: `calc(50% + ${node.x}px)`,
-                        top: `calc(50% + ${node.y}px)`,
-                        width: 0,
-                        height: 0,
-                        transform: 'translate(-50%, -50%)',
-                        zIndex: selected ? 3 : 1,
-                        opacity: selectedNodeId
-                          ? related
-                            ? node.opacity
-                            : Math.max(
-                                viewMode === 'episode' && selection?.memory_type === 'episode' && !episodeScoped ? 0.06 : 0.1,
-                                node.opacity *
-                                  (viewMode === 'episode' && selection?.memory_type === 'episode' && !episodeScoped
-                                    ? 0.12
-                                    : 0.18 + detailIntensity * 0.14),
-                              )
-                          : node.opacity,
-                        }}
-                      >
-                      <Box
-                        onPointerDown={event => {
-                          event.preventDefault()
-                          event.stopPropagation()
-                        }}
-                        onClick={event => {
-                          event.stopPropagation()
-                          setSelection({
-                            memory_type: node.memory_type,
-                            id: node.ref_id,
-                            title: node.label,
-                            subtitle: node.subtitle,
-                            cognitive_type: node.cognitive_type,
-                            status: node.status,
-                          })
-                        }}
-                        sx={{
-                          position: 'relative',
-                        width: isEpisode ? Math.max(104, node.size * 8.2) : Math.max(78, node.size * 9.2),
-                          px: isEpisode ? 0.8 : 0.9,
-                          py: isEpisode ? 0.72 : 0.78,
-                          borderRadius: isEpisode ? 3 : 999,
-                          cursor: 'pointer',
-                          userSelect: 'none',
-                          WebkitUserSelect: 'none',
-                          WebkitUserDrag: 'none',
-                          transform: `translate(-50%, -50%) scale(${visualScale})`,
-                          transformOrigin: 'center center',
-                          bgcolor: isEpisode ? alpha(theme.palette.background.paper, 0.92) : node.fill,
-                          background: isEpisode
-                            ? `linear-gradient(135deg, ${alpha(node.glow, 0.18)}, ${alpha(theme.palette.background.paper, 0.96)})`
-                            : undefined,
-                          border: '1px solid',
-                          borderColor: selected ? node.glow : related ? alpha(node.glow, 0.42) : alpha(node.glow, isEpisode ? 0.3 : 0.18),
-                          boxShadow: selected
-                            ? `0 0 0 1px ${alpha(node.glow, 0.32)}, 0 12px 24px ${alpha(node.glow, 0.2)}`
-                            : related
-                              ? `0 6px 16px ${alpha(node.glow, 0.12)}`
-                              : `0 3px 10px ${alpha(node.glow, isEpisode ? 0.1 : 0.05)}`,
-                          transition: 'transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease, opacity 0.14s ease',
-                          WebkitFontSmoothing: 'antialiased',
-                          MozOsxFontSmoothing: 'grayscale',
-                          '&:hover': {
-                            transform: `translate(-50%, -50%) scale(${visualScale}) translateY(-2px)`,
-                            boxShadow: `0 8px 18px ${alpha(node.glow, isEpisode ? 0.18 : 0.12)}`,
-                          },
-                        }}
-                      >
-                        {isEpisode && (
-                          <>
-                            <Box
-                              sx={{
-                                position: 'absolute',
-                                inset: -9,
-                                borderRadius: 5,
-                                border: '1px solid',
-                                borderColor: alpha(node.glow, selected ? 0.28 : 0.14),
-                                pointerEvents: 'none',
-                              }}
-                            />
-                            <Box
-                              sx={{
-                                position: 'absolute',
-                                inset: -18,
-                                borderRadius: 6,
-                                background: `radial-gradient(circle, ${alpha(node.glow, 0.16)} 0%, transparent 72%)`,
-                                pointerEvents: 'none',
-                              }}
-                            />
-                          </>
-                        )}
-                        <Stack direction="row" spacing={0.9} alignItems="center" sx={{ position: 'relative' }}>
-                          <Box
-                            sx={{
-                              width: Math.max(isEpisode ? 14 : 10, node.size),
-                              height: Math.max(isEpisode ? 14 : 10, node.size),
-                              borderRadius: '50%',
-                              flexShrink: 0,
-                              bgcolor: node.glow,
-                              boxShadow: `0 0 8px ${alpha(node.glow, 0.18)}`,
-                            }}
-                          />
-                          {showTitle && (
-                            <Stack spacing={isEpisode ? 0.2 : 0}>
-                              <Stack direction="row" spacing={0.5} alignItems="center">
-                              <Typography
-                                variant="caption"
-                                sx={{
-                                  color: 'text.primary',
-                                  fontWeight: selected ? 800 : 700,
-                                    fontSize: isEpisode ? '0.84rem' : node.size > 12 ? '0.78rem' : '0.72rem',
-                                    lineHeight: 1.1,
-                                  }}
-                              >
-                                {truncateLabel(node.label, isEpisode ? (zoomDetailLevel === 'high' ? 24 : 18) : node.size > 12 ? 14 : 10)}
-                              </Typography>
-                              </Stack>
-                              {showSubtitle && (
-                                <Typography variant="caption" sx={{ color: 'text.secondary', fontSize: isEpisode ? '0.67rem' : '0.64rem', lineHeight: 1.1 }}>
-                                  {truncateLabel(node.subtitle || (isEpisode ? '叙事事件' : formatEnumValue('memory_type', node.memory_type)), isEpisode ? 28 : 18)}
-                                </Typography>
-                              )}
-                            </Stack>
-                          )}
-                        </Stack>
-                      </Box>
-                    </Box>
-                  )
-                })}
-              </Box>
-            </Box>
-          )}
-        </Box>
+        <AtlasGraph
+          viewport={viewport}
+          layout={atlas}
+          edges={memoryGraph?.edges ?? []}
+          config={MEMORY_ATLAS_CONFIG}
+          viewMode={viewMode}
+          informationDensity={informationDensity}
+          selectedNodeId={selectedNodeId}
+          selectedIsCore={selection?.memory_type === 'episode'}
+          onSelect={node =>
+            setSelection(
+              node
+                ? {
+                    memory_type: node.memory_type,
+                    id: node.ref_id,
+                    title: node.label,
+                    subtitle: node.subtitle,
+                    cognitive_type: node.cognitive_type,
+                    status: node.status,
+                  }
+                : null,
+            )
+          }
+          loading={memoryGraphLoading}
+          empty={<Alert severity="info">当前还没有足够的图谱数据可供展示。</Alert>}
+          top={{ xs: `${mobileOverlayTop}px`, sm: 0 }}
+          fallbackSubtitle={node => (node.memory_type === 'episode' ? '叙事事件' : formatEnumValue('memory_type', node.memory_type))}
+        />
 
         <Card
           sx={{
@@ -1981,9 +1137,9 @@ export default function MemoryTab({ workspace }: { workspace: WorkspaceDetail })
           }}
         >
           <StatChip label={`段落 ${memoryData?.stats.paragraph_count ?? 0}`} color={theme.palette.warning.main} />
-          <StatChip label={`事件 ${episodeCount}`} color={theme.palette.info.main} />
-          <StatChip label={`关系 ${memoryData?.stats.relation_count ?? 0}`} color={clusterMeta.relation.accent} />
-          <StatChip label={`实体 ${memoryData?.stats.entity_count ?? 0}`} color={theme.palette.secondary.main} />
+          <StatChip label={`事件 ${episodeCount}`} color={ATLAS_COLORS.core} />
+          <StatChip label={`关系 ${memoryData?.stats.relation_count ?? 0}`} color={ATLAS_COLORS.relation} />
+          <StatChip label={`实体 ${memoryData?.stats.entity_count ?? 0}`} color={ATLAS_COLORS.entity} />
         </Stack>
 
         <AnimatePresence>

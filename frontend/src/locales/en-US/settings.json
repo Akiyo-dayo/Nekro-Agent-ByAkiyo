@@ -7,6 +7,23 @@
     "spaceCleanup": "Space Cleanup"
   },
   "system": {
+    "searchLabel": "Search settings",
+    "searchPlaceholder": "Name, key or description, across all categories",
+    "groups": {
+      "runtime": "Basics & runtime",
+      "conversation": "Chat & models",
+      "quota": "Quota & filtering",
+      "extension": "Plugins & sandbox",
+      "ops": "Ops & notifications",
+      "data": "Data & storage",
+      "domains": "Feature pages",
+      "other": "Other"
+    },
+    "nav": {
+      "label": "Setting categories",
+      "searching": "Search results (all categories)",
+      "domainHint": "Edit under Settings on the {{page}} page"
+    },
     "emptyMessage": "No system configurations available",
     "otherCategory": "Other"
   },
@@ -58,6 +75,11 @@
       "prefillModeOff": "Off (default)",
       "prefillModeAssistant": "Trailing assistant message (Anthropic native, OpenRouter, etc.)",
       "prefillModeDeepseek": "DeepSeek prefix completion (set the API base URL to DeepSeek's beta endpoint)",
+      "apiFormat": "API format",
+      "apiFormatOpenai": "OpenAI compatible",
+      "apiFormatGemini": "Gemini native",
+      "contextLength": "Context length (tokens)",
+      "tokenCountFactor": "Token factor",
       "temperature": "Temperature",
       "topP": "Top P",
       "presencePenalty": "Presence Penalty",
@@ -75,6 +97,12 @@
       "vision": "Enable model vision capability. Turn on only for models that really accept image input; enabling it on a text-only model makes every round fail upstream.",
       "cot": "Enable NA-provided Chain of Thought. Disable if model supports native CoT.",
       "prefillMode": "Turn this on only when the service really treats a trailing assistant message as the start of the reply. If the provider rejects it, the prefill is removed and the request retried once, and this group stops sending prefill for a while.",
+      "apiFormat": "With Gemini native, enter the API base URL up to the version, e.g. https://generativelanguage.googleapis.com/v1beta; native parameters such as thinking budget and safety thresholds go in the extra request body's generationConfig / safetySettings.",
+      "contextLength": "Enter this model's real context window. The per-round worldbook budget is a percentage of it; 0 means unset and is estimated at 32768. A larger value injects more worldbook content and costs more",
+      "tokenCountFactor": "How many or how few tokens this model's tokenizer produces compared with o200k_base; 0 means infer from the model name (DeepSeek 0.80, Gemini 0.89, Qwen 0.90, Claude 1.29, etc.)",
+      "budgetEstimate": "With the global settings, the worldbook is capped at about {{budget}} tokens per round (about {{approx}} chars)",
+      "budgetEstimateAutoFactor": "(token factor inferred from the model name)",
+      "smallContext": "The context length is only {{contextLength}}, no more than the worldbook output reserve of {{outputReserve}}: with this group the worldbook budget is 1 token per round, so no entry can be injected. This field is a token count; enter 0 if unsure (estimated at 32768)",
       "advanced": "Advanced Options",
       "expandAdvanced": "Expand Advanced Options ▶",
       "collapseAdvanced": "Collapse Advanced Options ▼",
@@ -250,6 +278,11 @@
       "shared": "Shared with tenants",
       "private": "Platform only"
     }
+  },
+  "worldbookBudgetNotice": {
+    "title": "Worldbook budgets are now measured in tokens",
+    "hint": "To switch to SillyTavern's defaults: set the context percentage to 25 and the token cap to 0",
+    "ack": "Got it"
   },
   "theme": {
     "title": "Theme",

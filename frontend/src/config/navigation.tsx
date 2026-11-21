@@ -14,6 +14,7 @@ import {
   Psychology as PsychologyIcon,
   MenuBook as MenuBookIcon,
   MailOutline as MailOutlineIcon,
+  AssignmentInd as AssignmentIndIcon,
   AccountCircle as AccountCircleIcon,
   CloudDownload as CloudDownloadIcon,
   Palette as PaletteIcon,
@@ -29,7 +30,6 @@ import {
   Speed as SpeedIcon,
   Security as SecurityIcon,
   History as HistoryIcon,
-  Paid as PaidIcon,
   Science as ScienceIcon,
   VpnKey as VpnKeyIcon,
 } from '@mui/icons-material'
@@ -217,7 +217,9 @@ export const isPlatformOnlyPath = (pathname: string): boolean =>
  * ⚠️ **这不是权限边界**，只是别把人送进一页必然 403 的界面。真正的边界永远在服务端。
  */
 export const TENANT_ADMIN_ONLY_PATHS = [
-  // 总后台：概览 / 实例列表 / 实例详情 / 新建向导 / 配额 / 身份与域 / 模型组。
+  // 总后台：概览 / 实例列表 / 实例详情 / 新建向导 / 额度与用量 / 身份与域 / 模型组。
+  // 额度与用量在菜单里只有一格，但三条标签路径都能直接敲 URL 进来，所以三条都保留：
+  // `/console/quota`（实例自限）、`/console/channel-quota`（频道额度）、`/console/usage`（用量与费用）。
   // `/console/team` 刻意不在此列，所以这里逐条写而不是写 `/console`
   '/console/instances',
   '/console/quota',
@@ -237,6 +239,8 @@ export const TENANT_ADMIN_ONLY_PATHS = [
   '/memory',
   '/worldbook',
   '/mailbox',
+  // 角色状态：插件路由按实例收敛，只读成员同样够不着
+  '/state',
   '/prompt-lab',
   '/presets',
   '/plugins',
@@ -383,34 +387,16 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         visibility: 'tenantSelfService',
       },
       {
-        // **不是** platformOnly：租户管理员也要能管自己实例的配额，页面数据由后端按租户作用域收敛。
-        // 但整族端点都是 `Role.Admin`，只读成员进来是一页 403，所以走 tenantAdminOnly 这一档。
-        path: '/console/quota',
-        text: t('menu.consoleQuota'),
-        translationKey: 'menu.consoleQuota',
-        icon: <SpeedIcon />,
-        parent: 'console',
-        visibility: 'tenantAdminOnly',
-      },
-      {
-        // 频道额度：平台方给每个群 / 私聊承诺的每日额度。**不是** platformOnly，租户也要看得到
-        // 自己名下频道的用量与剩余，可见范围由后端按租户作用域收敛；整族端点都是 `Role.Admin`，
-        // 只读成员进来是一页 403，所以与配额同档走 tenantAdminOnly。
+        // 额度与用量：一个菜单项，三个标签由路径决定——频道额度、实例自限、用量与费用。
+        // 菜单格落在默认标签 `/console/channel-quota` 上；另外两条路径照旧可达，
+        // 页面标题与菜单选中态都归到这一格。
+        // **不是** platformOnly：租户管理员也要能看自己名下实例与频道的额度、用量与费用，
+        // 页面数据由后端按租户作用域收敛；但整族端点都是 `Role.Admin`，
+        // 只读成员进来是一页 403，所以走 tenantAdminOnly 这一档。
         path: '/console/channel-quota',
-        text: t('menu.consoleChannelQuota'),
-        translationKey: 'menu.consoleChannelQuota',
-        icon: <ListAltIcon />,
-        parent: 'console',
-        visibility: 'tenantAdminOnly',
-      },
-      {
-        // 用量与费用：定制版客户要看得到自己烧了多少 token、折算多少钱，所以**不是** platformOnly；
-        // 可见范围由后端按租户作用域收敛。整族端点都是 `Role.Admin`，只读成员进来是一页 403，
-        // 因此与配额同档走 tenantAdminOnly。
-        path: '/console/usage',
-        text: t('menu.consoleUsage'),
-        translationKey: 'menu.consoleUsage',
-        icon: <PaidIcon />,
+        text: t('menu.consoleQuotaHub'),
+        translationKey: 'menu.consoleQuotaHub',
+        icon: <SpeedIcon />,
         parent: 'console',
         visibility: 'tenantAdminOnly',
       },
@@ -424,38 +410,11 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         parent: 'console',
         visibility: 'tenantAdminOnly',
       },
-      {
-        // 宿主级的 iptables 隔离规则运维：规则不属于任何租户，后端两个端点都是 Role.Super
-        path: '/console/network-rules',
-        text: t('menu.consoleNetworkRules'),
-        translationKey: 'menu.consoleNetworkRules',
-        icon: <SecurityIcon />,
-        parent: 'console',
-        visibility: 'platformOnly',
-      },
-      {
-        // 运维审计：行里可能带着租户会话与平台方实例，后端整条路由只给平台方
-        path: '/console/ops-audit',
-        text: t('menu.consoleOpsAudit'),
-        translationKey: 'menu.consoleOpsAudit',
-        icon: <HistoryIcon />,
-        parent: 'console',
-        visibility: 'platformOnly',
-      },
-      {
-        // SSH 网关：状态、全部凭据、存量导入与全局审计都只给平台方
-        path: '/console/ssh-gateway',
-        text: t('menu.consoleSshGateway'),
-        translationKey: 'menu.consoleSshGateway',
-        icon: <VpnKeyIcon />,
-        parent: 'console',
-        visibility: 'platformOnly',
-      },
     ],
   },
   {
-    // 整组对只读成员不出现：`routers/chat_channel.py` 与 `routers/affection.py`
-    // 每一条读接口都是 `@require_role(Role.Admin)`，一格都点不动。
+    // 整组对只读成员不出现：`routers/chat_channel.py` 每一条读接口都是
+    // `@require_role(Role.Admin)`，一格都点不动。
     // 组上标一次比逐格标少一份漏登记的机会，子项仍各自标一次，让两份契约测试收得到
     key: 'chatManagement',
     text: t('menu.chatManagement'),
@@ -493,32 +452,6 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         visibility: 'tenantAdminOnly',
       },
       {
-        path: '/affection',
-        text: t('menu.affection'),
-        translationKey: 'menu.affection',
-        icon: <FavoriteIcon />,
-        parent: 'chatManagement',
-        visibility: 'tenantAdminOnly',
-      },
-      {
-        // 记忆管理：`routers/memory_admin.py` 全族 `Role.Admin`
-        path: '/memory',
-        text: t('menu.memory'),
-        translationKey: 'menu.memory',
-        icon: <PsychologyIcon />,
-        parent: 'chatManagement',
-        visibility: 'tenantAdminOnly',
-      },
-      {
-        // 世界书管理：`routers/worldbook.py` 全族 `Role.Admin`
-        path: '/worldbook',
-        text: t('menu.worldbook'),
-        translationKey: 'menu.worldbook',
-        icon: <MenuBookIcon />,
-        parent: 'chatManagement',
-        visibility: 'tenantAdminOnly',
-      },
-      {
         // 邮箱：`routers/instance_email.py` 全族 `Role.Admin`，按实例收敛
         path: '/mailbox',
         text: t('menu.mailbox'),
@@ -527,13 +460,68 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         parent: 'chatManagement',
         visibility: 'tenantAdminOnly',
       },
+    ],
+  },
+  {
+    // 角色相关页面独立成组：整组与每个子项都只给租户管理员与平台方。
+    // 组上标一次、子项各标一次，两份契约测试都收得到。
+    key: 'roleplay',
+    text: t('menu.roleplay'),
+    translationKey: 'menu.roleplay',
+    icon: <FaceIcon />,
+    visibility: 'tenantAdminOnly',
+    children: [
+      {
+        // `routers/presets.py` 全族 `Role.Admin`
+        path: '/presets',
+        text: t('menu.presets'),
+        translationKey: 'menu.presets',
+        icon: <FaceIcon />,
+        parent: 'roleplay',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 世界书管理：`routers/worldbook.py` 全族 `Role.Admin`
+        path: '/worldbook',
+        text: t('menu.worldbook'),
+        translationKey: 'menu.worldbook',
+        icon: <MenuBookIcon />,
+        parent: 'roleplay',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 记忆管理：`routers/memory_admin.py` 全族 `Role.Admin`
+        path: '/memory',
+        text: t('menu.memory'),
+        translationKey: 'menu.memory',
+        icon: <PsychologyIcon />,
+        parent: 'roleplay',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        path: '/affection',
+        text: t('menu.affection'),
+        translationKey: 'menu.affection',
+        icon: <FavoriteIcon />,
+        parent: 'roleplay',
+        visibility: 'tenantAdminOnly',
+      },
+      {
+        // 角色状态：插件路由整族按实例收敛，与邮箱同档（只读成员够不着）
+        path: '/state',
+        text: t('menu.state'),
+        translationKey: 'menu.state',
+        icon: <AssignmentIndIcon />,
+        parent: 'roleplay',
+        visibility: 'tenantAdminOnly',
+      },
       {
         // 提示词预览：`routers/tavern.py` 整族 `Role.Admin`
         path: '/prompt-lab',
         text: t('menu.promptLab'),
         translationKey: 'menu.promptLab',
         icon: <ScienceIcon />,
-        parent: 'chatManagement',
+        parent: 'roleplay',
         visibility: 'tenantAdminOnly',
       },
     ],
@@ -544,14 +532,6 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
     translationKey: 'menu.userManager',
     icon: <GroupIcon />,
     visibility: 'platformOnly',
-  },
-  {
-    // `routers/presets.py` 全族 `Role.Admin`
-    path: '/presets',
-    text: t('menu.presets'),
-    translationKey: 'menu.presets',
-    icon: <FaceIcon />,
-    visibility: 'tenantAdminOnly',
   },
   {
     // 插件管理是 `Role.Admin`，插件编辑器是 `Role.Super`（下面单独标 platformOnly）；
@@ -634,28 +614,83 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
     ],
   },
   {
-    // 宿主级的运行日志：`routers/logs.py` 四个端点**全是** `Role.Super`
-    // （日志里混着全部租户的会话、上游报错与凭据脱敏前的上下文）。
-    // 此前对租户管理员也画着，点进去是一页 403 —— 那是「点不动的按钮」的整页版
-    path: '/logs',
-    text: t('menu.logs'),
-    translationKey: 'menu.logs',
-    icon: <TerminalIcon />,
-    visibility: 'platformOnly',
-  },
-  {
-    // 同上：`routers/sandbox.py` 四个端点全是 `Role.Super`，沙盒日志是宿主级资源
-    path: '/sandbox-logs',
-    text: t('menu.sandboxLogs'),
-    translationKey: 'menu.sandboxLogs',
-    icon: <CodeIcon />,
-    visibility: 'platformOnly',
-  },
-  {
     path: '/adapters',
     text: t('menu.adapters'),
     translationKey: 'menu.adapters',
     icon: <HubIcon />,
+  },
+  {
+    // 平台方专属的运维入口：日志、沙盒、审计、网络规则、SSH 网关与空间清理。
+    // 整组与每个子项都标平台方，两份契约测试都收得到。
+    key: 'ops',
+    text: t('menu.ops'),
+    translationKey: 'menu.ops',
+    icon: <TerminalIcon />,
+    visibility: 'platformOnly',
+    children: [
+      {
+        // 宿主级的运行日志：`routers/logs.py` 四个端点**全是** `Role.Super`
+        // （日志里混着全部租户的会话、上游报错与凭据脱敏前的上下文）。
+        path: '/logs',
+        text: t('menu.logs'),
+        translationKey: 'menu.logs',
+        icon: <TerminalIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+      {
+        // 同上：`routers/sandbox.py` 四个端点全是 `Role.Super`，沙盒日志是宿主级资源
+        path: '/sandbox-logs',
+        text: t('menu.sandboxLogs'),
+        translationKey: 'menu.sandboxLogs',
+        icon: <CodeIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+      {
+        // 运维审计：行里可能带着租户会话与平台方实例，后端整条路由只给平台方
+        path: '/console/ops-audit',
+        text: t('menu.consoleOpsAudit'),
+        translationKey: 'menu.consoleOpsAudit',
+        icon: <HistoryIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+      {
+        // 宿主级的 iptables 隔离规则运维：规则不属于任何租户，后端两个端点都是 Role.Super
+        path: '/console/network-rules',
+        text: t('menu.consoleNetworkRules'),
+        translationKey: 'menu.consoleNetworkRules',
+        icon: <SecurityIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+      {
+        // SSH 网关：状态、全部凭据、存量导入与全局审计都只给平台方
+        path: '/console/ssh-gateway',
+        text: t('menu.consoleSshGateway'),
+        translationKey: 'menu.consoleSshGateway',
+        icon: <VpnKeyIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+      {
+        path: '/settings/deployment',
+        text: t('menu.deployment'),
+        translationKey: 'menu.deployment',
+        icon: <SystemUpdateAltIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+      {
+        path: '/settings/space-cleanup',
+        text: t('menu.spaceCleanup'),
+        translationKey: 'menu.spaceCleanup',
+        icon: <CleaningServicesIcon />,
+        parent: 'ops',
+        visibility: 'platformOnly',
+      },
+    ],
   },
   {
     key: 'settings',
@@ -676,14 +711,6 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         icon: <TuneIcon />,
         parent: 'settings',
         visibility: 'instanceConfigOverrides',
-      },
-      {
-        path: '/settings/deployment',
-        text: t('menu.deployment'),
-        translationKey: 'menu.deployment',
-        icon: <SystemUpdateAltIcon />,
-        parent: 'settings',
-        visibility: 'platformOnly',
       },
       {
         // 与 /console/model-groups 是同一个页面组件；租户走那个入口，平台方走这个
@@ -708,14 +735,6 @@ export const getPageConfigs = (): (PageConfig | MenuGroup)[] => [
         translationKey: 'menu.theme',
         icon: <PaletteIcon />,
         parent: 'settings',
-      },
-      {
-        path: '/settings/space-cleanup',
-        text: t('menu.spaceCleanup'),
-        translationKey: 'menu.spaceCleanup',
-        icon: <CleaningServicesIcon />,
-        parent: 'settings',
-        visibility: 'platformOnly',
       },
     ],
   },
@@ -772,6 +791,18 @@ export const getCurrentPageFromConfigs = (pathname: string) => {
     const page = getPageConfigs().flatMap(config =>
       'children' in config ? config.children : [config]
     ).find(item => 'path' in item && (item as PageConfig).path === '/chat-channel/management')
+    if (page) return page
+  }
+  // 额度与用量的三个标签共用一格菜单：`/console/quota` 与 `/console/usage` 已经没有
+  // 自己的菜单项，但仍要沿用 `/console/channel-quota` 那一格的页面标题与图标。
+  if (
+    ['/console/quota', '/console/usage'].some(
+      prefix => pathname === prefix || pathname.startsWith(`${prefix}/`)
+    )
+  ) {
+    const page = getPageConfigs()
+      .flatMap(config => ('children' in config ? config.children : [config]))
+      .find(item => 'path' in item && (item as PageConfig).path === '/console/channel-quota')
     if (page) return page
   }
   // 扁平化所有页面配置

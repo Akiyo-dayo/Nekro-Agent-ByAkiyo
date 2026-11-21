@@ -22,10 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import weakref
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Iterable, Optional
 
+from tortoise import Tortoise
 from tortoise.expressions import F, Q, Subquery
 from tortoise.functions import Count
 from tortoise.transactions import in_transaction
@@ -37,7 +42,7 @@ from nekro_agent.models.db_preset import GLOBAL_PRESET_OWNER, DBPreset
 from nekro_agent.models.db_user import DBUser
 from nekro_agent.models.db_wb_book import DBWbBook
 from nekro_agent.models.db_wb_entry import DBWbEntry
-from nekro_agent.schemas.errors import ValidationError
+from nekro_agent.schemas.errors import NotFoundError, ValidationError
 from nekro_agent.schemas.worldbook import (
     BookCreateRequest,
     BookUpdateRequest,
@@ -51,7 +56,12 @@ from nekro_agent.services.memory.instance_scope import AdminFilter, AdminMemoryS
 from nekro_agent.services.memory.scope_condition import MemTable
 from nekro_agent.services.user.tenant_perm import accessible_instance_refs, get_tenant_scope
 
-from . import safe_regex, st_format
+from . import budget_check as wb_budget_check
+from . import purpose as wb_purpose
+from . import safe_regex, st_format, vectors
+from . import tokens as wb_tokens
+from . import unsupported as wb_unsupported
+from .budget import WorldbookBudget, ignore_budget_cap, resolve_budget
 from .types import (
     DEFAULT_BOOK_SCAN_DEPTH,
     DEFAULT_PERSON_BOOK_SCAN_DEPTH,
@@ -123,6 +133,8 @@ _ENTRY_COLUMNS = (
     "cooldown",
     "delay",
     "enabled",
+    "ignore_budget",
+    "vectorized",
 )
 
 
@@ -413,9 +425,16 @@ async def create_book(
         person_account=person_account,
         enabled=req.enabled,
         scan_depth=_scan_depth_for(req),
-        budget_chars=req.budget_chars,
+        budget_tokens=req.budget_tokens,
+        inject_mode=req.inject_mode.value,
+        active_scene=req.active_scene.value,
         case_sensitive=req.case_sensitive,
         match_whole_words=req.match_whole_words,
+        scan_names=req.scan_names,
+        vector_all=req.vector_all,
+        vector_query_messages=req.vector_query_messages,
+        vector_max_entries=req.vector_max_entries,
+        vector_threshold=req.vector_threshold,
         created_by=username,
         updated_by=username,
     )
@@ -435,16 +454,34 @@ async def update_book(book: DBWbBook, req: BookUpdateRequest, *, username: str) 
         changes["enabled"] = req.enabled
     if req.scan_depth is not None:
         changes["scan_depth"] = req.scan_depth
-    if req.budget_chars is not None:
-        changes["budget_chars"] = req.budget_chars
+    if req.budget_tokens is not None:
+        changes["budget_tokens"] = req.budget_tokens
+    if req.inject_mode is not None:
+        changes["inject_mode"] = req.inject_mode.value
+    if req.active_scene is not None:
+        changes["active_scene"] = req.active_scene.value
     if req.case_sensitive is not None:
         changes["case_sensitive"] = req.case_sensitive
     if req.match_whole_words is not None:
         changes["match_whole_words"] = req.match_whole_words
+    if req.scan_names is not None:
+        changes["scan_names"] = req.scan_names
+    vector_all_turned_on = bool(req.vector_all) and not bool(book.vector_all)
+    if req.vector_all is not None:
+        changes["vector_all"] = req.vector_all
+    if req.vector_query_messages is not None:
+        changes["vector_query_messages"] = req.vector_query_messages
+    if req.vector_max_entries is not None:
+        changes["vector_max_entries"] = req.vector_max_entries
+    if req.vector_threshold is not None:
+        changes["vector_threshold"] = req.vector_threshold
     if not changes:
         return book
     changes["updated_by"] = username
     await book.update_from_dict(changes).save()
+    if vector_all_turned_on:
+        # 从关到开：条目的 `vector_hash` 本来就是空的，看护循环会补；这里只叫醒它。
+        vectors.kick()
     return book
 
 
@@ -455,16 +492,103 @@ async def delete_book(book: DBWbBook) -> int:
     条目由外键的 `CASCADE` 删除，不在这里再写一遍批量删除。
     """
     entry_ids = [int(entry_id) for entry_id in await DBWbEntry.filter(book_id=book.id).values_list("id", flat=True)]
+    book_id = book.id
     await book.delete()
     # 与删单条一样清熔断表：外键级联删掉的条目不经过 `delete_entry`。
     for entry_id in entry_ids:
         safe_regex.forget_entry(entry_id)
+    # 向量点不参与数据库事务，删完再清；失败只记 WARNING，孤儿点检索时会与数据库候选取交集。
+    await vectors.delete_entries(entry_ids)
+    await vectors.delete_books([book_id])
     return len(entry_ids)
 
 
 async def list_entries(book: DBWbBook) -> list[DBWbEntry]:
     """一本书的条目：权重大的在前，同权重按创建顺序"""
     return list(await DBWbEntry.filter(book_id=book.id).order_by("-order", "id"))
+
+
+async def list_entries_page(
+    book: DBWbBook,
+    *,
+    page: int,
+    page_size: int,
+    query: str = "",
+) -> tuple[list[DBWbEntry], int]:
+    """书详情的一页条目与总数；顺序同 :func:`list_entries`
+
+    搜索词对标题、正文与主 / 次关键词生效，全在数据库里按不分大小写的包含查（关键词逐个数组元素
+    比，不把整列 JSON 当文本比，免得撞上转义或跨元素误配），排序、分页也在数据库里做，Python
+    这边只拿一页的行。没有搜索词时同样只读这一页。
+    """
+    base = DBWbEntry.filter(book_id=book.id)
+    offset = (page - 1) * page_size
+    needle = query.strip()
+    if not needle:
+        total = await base.count()
+        rows = await base.order_by("-order", "id").offset(offset).limit(page_size)
+        return list(rows), total
+    page_ids, total = await _search_entry_ids(int(book.id), needle, offset=offset, limit=page_size)
+    rows_by_id = {row.id: row for row in await DBWbEntry.filter(id__in=page_ids)}
+    return [rows_by_id[entry_id] for entry_id in page_ids if entry_id in rows_by_id], total
+
+
+def _like_pattern(needle: str) -> str:
+    """包含查的 LIKE 模式；`\\`、`%`、`_` 按字面匹配（配 `ESCAPE '\\'`）"""
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+# 一个关键词列（JSON 数组）里有没有元素包含搜索词。列不是数组时不匹配：取数组元素的函数
+# 遇到别的类型会报错，所以先判类型（`CASE` 保证先判后取）。
+_PG_KEY_MATCH = (
+    "CASE WHEN jsonb_typeof(\"{col}\") = 'array' THEN EXISTS ("
+    "SELECT 1 FROM jsonb_array_elements_text(\"{col}\") AS k(v) WHERE k.v ILIKE $2 ESCAPE '\\'"
+    ") ELSE FALSE END"
+)
+_SQLITE_KEY_MATCH = (
+    "CASE WHEN json_valid(\"{col}\") THEN CASE WHEN json_type(\"{col}\") = 'array' THEN EXISTS ("
+    "SELECT 1 FROM json_each(\"{col}\") WHERE json_each.value LIKE ?2 ESCAPE '\\'"
+    ") ELSE 0 END ELSE 0 END"
+)
+
+
+async def _search_entry_ids(book_id: int, needle: str, *, offset: int, limit: int) -> tuple[list[int], int]:
+    """按搜索词查一本书里匹配的条目 ID（一页）与总数"""
+    conn = Tortoise.get_connection("default")
+    dialect = conn.capabilities.dialect
+    pattern = _like_pattern(needle)
+    if dialect == "postgres":
+        text_match = "\"comment\" ILIKE $2 ESCAPE '\\' OR \"content\" ILIKE $2 ESCAPE '\\'"
+        key_match = _PG_KEY_MATCH
+        page_tail = "LIMIT $3 OFFSET $4"
+    elif dialect == "sqlite":
+        # SQLite 的 LIKE 只对 ASCII 不分大小写；中文没有大小写，影响不大。
+        text_match = "\"comment\" LIKE ?2 ESCAPE '\\' OR \"content\" LIKE ?2 ESCAPE '\\'"
+        key_match = _SQLITE_KEY_MATCH
+        page_tail = "LIMIT ?3 OFFSET ?4"
+    else:
+        # 只支持上面两种库；别的库退回只查标题与正文。
+        query = DBWbEntry.filter(book_id=book_id).filter(Q(comment__icontains=needle) | Q(content__icontains=needle))
+        total = await query.count()
+        ids = await query.order_by("-order", "id").offset(offset).limit(limit).values_list("id", flat=True)
+        return [int(entry_id) for entry_id in ids], total
+    first = "$1" if dialect == "postgres" else "?1"
+    where = (
+        f'"book_id" = {first} AND ({text_match} OR {key_match.format(col="keys")} '
+        f'OR {key_match.format(col="secondary_keys")})'
+    )
+    # 一遍查出这一页与总数（窗口函数在分页之前算）；只有这一页是空的（翻过了末页）才另数一次。
+    rows = await conn.execute_query_dict(
+        f'SELECT "id", COUNT(*) OVER () AS "n" FROM "wb_entry" WHERE {where} ORDER BY "order" DESC, "id" ASC {page_tail}',
+        [book_id, pattern, limit, offset],
+    )
+    if rows:
+        return [int(row["id"]) for row in rows], int(rows[0]["n"])
+    if offset == 0:
+        return [], 0
+    count_rows = await conn.execute_query_dict(f'SELECT COUNT(*) AS "n" FROM "wb_entry" WHERE {where}', [book_id, pattern])
+    return [], int(count_rows[0]["n"]) if count_rows else 0
 
 
 async def next_uid(book: DBWbBook) -> int:
@@ -513,7 +637,7 @@ async def create_entry(
     """
     _validate_keys(req.keys, req.secondary_keys, use_regex=req.use_regex)
     uid = await next_uid(book)
-    return await DBWbEntry.create(
+    entry = await DBWbEntry.create(
         book=book,
         uid=uid,
         comment=req.comment,
@@ -534,9 +658,15 @@ async def create_entry(
         delay=req.delay,
         enabled=req.enabled,
         trusted=is_platform,
+        ignore_budget=bool(req.ignore_budget),
+        vectorized=req.vectorized,
+        vector_hash="",
         created_by=username,
         updated_by=username,
     )
+    if vectors.participates(entry, book):
+        vectors.kick()
+    return entry
 
 
 async def update_entry(
@@ -575,6 +705,8 @@ async def update_entry(
         "cooldown",
         "delay",
         "enabled",
+        "ignore_budget",
+        "vectorized",
     ):
         value = getattr(req, field)
         if value is None:
@@ -604,8 +736,17 @@ async def update_entry(
     changes["ext"] = ext
     changes["updated_by"] = username
 
+    # 正文变了就把旧向量作废：`vector_hash` 清空后，看护循环会按新正文重算，在那之前
+    # 这条不会参与语义命中（候选要求哈希非空），旧向量不会被当成新正文用。
+    old_content = entry.content
+    if "content" in changes and changes["content"] != old_content:
+        changes["vector_hash"] = ""
+
     await entry.update_from_dict(changes).save()
     safe_regex.forget_entry(entry.id)
+    book = await DBWbBook.get_or_none(id=entry.book_id)
+    if book is not None and vectors.participates(entry, book):
+        vectors.kick()
     return entry
 
 
@@ -654,6 +795,7 @@ async def delete_entry(entry: DBWbEntry) -> None:
     entry_id = entry.id
     await entry.delete()
     safe_regex.forget_entry(entry_id)
+    await vectors.delete_entries([entry_id])
 
 
 async def list_quarantine(
@@ -684,72 +826,179 @@ def entry_columns(entry: DBWbEntry) -> dict[str, Any]:
     return {column: getattr(entry, column) for column in _ENTRY_COLUMNS}
 
 
-def import_budget_chars(adapter_key: str, instance_key: str) -> int:
-    """导入提示用的每轮正文预算：这个实例的生效值，没有实例时用全局值
+def import_budget(adapter_key: str, instance_key: str) -> Optional[WorldbookBudget]:
+    """导入提示用的每轮世界书预算：按这个实例的生效配置（主模型组、百分比、上限）算，没有归属时用全局
 
     频道还能再往下调，但导入时不知道书会在哪些频道生效；按实例这一层提示，与管理员在
-    「系统配置 → 世界书」里看到的数一致。读不到就不提示（返回 0），提示不该让导入失败。
-    世界书文件导入与酒馆卡的检查、导入共用这一处。
+    「系统配置 → 世界书」里看到的数一致。读不到就不提示（返回 None），提示不该让导入失败。
+    世界书文件导入与酒馆卡的检查、导入、书详情的预算体检共用这一处。异步入口应先
+    `await tokens.ensure_loaded_async()`。
+
+    只有归属完全为空（平台方给全局人设建的书）才用全局配置：有适配器、没有实例标识的老数据（频道书跟着
+    频道走，老频道可能没有实例标识）照样按适配器层算，不能跳过适配器的覆盖直接拿全局的。
     """
     try:
-        effective = (
-            config_resolver.get_instance_effective_config(adapter_key, instance_key) if instance_key else config
-        )
-        return int(getattr(effective, "WORLDBOOK_MAX_CHARS", 0) or 0)
+        if adapter_key or instance_key:
+            effective = config_resolver.get_instance_effective_config(adapter_key, instance_key)
+        else:
+            effective = config
+        return resolve_budget(effective)
     except Exception:  # noqa: BLE001 - 只是提示，读配置失败不影响导入
-        return 0
+        return None
 
 
-def _import_budget_chars(book: DBWbBook) -> int:
-    """这本书归属实例的导入提示预算，见 :func:`import_budget_chars`"""
-    return import_budget_chars(book.adapter_key, book.instance_key)
+# 书详情的预算体检最多看多少条启用的常驻条目；更多的按编号截断（几千条常驻的书本来就进不来几条）。
+MAX_BUDGET_CHECK_ENTRIES = 5000
+# 每个租户（平台方算一个）同一时间只算一个体检，忙的时候直接回「忙」、不排队：一个租户连开几本大书，
+# 不该让别的租户的小书在后面等。全进程另有一个总上限（同一个事件循环里最多这么多个同时读库与数 token，
+# 其余的排队，队列长度不超过租户数）；数 token 走自己的单线程执行器，不占默认线程池（`to_thread` 是全进程
+# 共用的，几十个书详情页同时打开会把别的 `to_thread` 堵在后面）。
+MAX_CONCURRENT_BUDGET_CHECKS = 2
+_budget_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wb-budget-check")
+_budget_check_slots: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+_budget_check_running: set[str] = set()
+# 体检只读这几列：`ext` 里装着原始酒馆条目（正文还要再存一遍），几千条一起读太贵。`ignore_budget`
+# 这类以后加的列在模型上有就带上，`entry_to_match` 读不到的按默认值。
+_BUDGET_CHECK_FIELDS = (
+    "id",
+    "book_id",
+    "uid",
+    "comment",
+    "content",
+    "constant",
+    "enabled",
+    "status",
+    "order",
+    "position",
+    "depth",
+    "update_time",
+    "trusted",
+    "ignore_budget",
+)
 
 
-async def _create_entries(
-    book: DBWbBook,
-    parsed: st_format.ParsedWorld,
-    *,
-    is_platform: bool,
-    username: str,
-    is_new_book: bool,
-) -> ImportReport:
-    """把解析好的文件写进一本书；调用方必须已经开好事务
+@dataclass(frozen=True)
+class BookBudgetCheckResult:
+    """书详情的预算体检
 
-    条目按批 `bulk_create`：几千条逐条 `create` 在 PostgreSQL 上每条一个往返，一份几 MB 的书
-    要导几十秒，请求早就超时了。整批仍在调用方的同一个事务里，失败照样一条不留。
+    Attributes:
+        budget: 用来算的预算；读不到时为 `None`（这时其余各项都是空的）。
+        check: 体检结果；预算读不到或正忙时为 `None`。
+        truncated: 常驻条目太多，只看了编号最小的一批。
+        busy: 这个租户已经有一个体检在算，这次没算。
     """
-    notes: list[st_format.ImportNote] = []
-    existing = {int(uid) for uid in await DBWbEntry.filter(book_id=book.id).values_list("uid", flat=True)}
-    used = set(existing)
-    next_number = max(existing) + 1 if existing else 0
-    created = 0
-    pending: list[DBWbEntry] = []
-    mapped: list[tuple[str, dict[str, Any]]] = []
 
+    budget: Optional[WorldbookBudget] = None
+    check: Optional[wb_budget_check.BudgetCheck] = None
+    truncated: bool = False
+    busy: bool = False
+
+
+def _budget_check_slot() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    slot = _budget_check_slots.get(loop)
+    if slot is None:
+        slot = asyncio.Semaphore(MAX_CONCURRENT_BUDGET_CHECKS)
+        _budget_check_slots[loop] = slot
+    return slot
+
+
+def _budget_check_route(entry: Any) -> Optional[str]:
+    """体检里这条按用途不进主提示词吗：先按标题判，再查模板分析的缓存（不在这里新做分析）"""
+    return wb_purpose.quick_route(str(entry.comment or ""), str(entry.content or "")) or wb_purpose.known_route(entry)
+
+
+async def book_budget_check(book: DBWbBook, *, tenant_key: str) -> BookBudgetCheckResult:
+    """书详情的预算体检；`tenant_key` 与导入、卡片检查同一个口径（`purpose.tenant_slot_key`）
+
+    预算按书的归属实例算，与导入提示同一个口径（频道还能再往下调，书详情不知道书会在哪些频道生效）。
+    这个租户已经有一个在算就回「忙」；读库只取要用的列，数 token 与入选在体检自己的执行器里跑。
+    """
+    if tenant_key in _budget_check_running:
+        return BookBudgetCheckResult(busy=True)
+    _budget_check_running.add(tenant_key)
+    try:
+        await wb_tokens.ensure_loaded_async()
+        budget = import_budget(book.adapter_key, book.instance_key)
+        if budget is None:
+            return BookBudgetCheckResult()
+        async with _budget_check_slot():
+            values = (
+                await DBWbEntry.filter(book_id=book.id, constant=True, enabled=True, status=EntryStatus.ACTIVE.value)
+                .order_by("id")
+                .limit(MAX_BUDGET_CHECK_ENTRIES + 1)
+                .values(*_BUDGET_CHECK_FIELDS)
+            )
+            truncated = len(values) > MAX_BUDGET_CHECK_ENTRIES
+            rows = [SimpleNamespace(**row) for row in values[:MAX_BUDGET_CHECK_ENTRIES]]
+            check = await asyncio.get_running_loop().run_in_executor(
+                _budget_check_executor,
+                functools.partial(
+                    wb_budget_check.check_constants,
+                    rows,
+                    book,
+                    budget=budget.budget,
+                    max_entries=int(config.WORLDBOOK_MAX_ENTRIES_PER_ROUND),
+                    count=budget.count,
+                    route=_budget_check_route,
+                    exempt_cap=ignore_budget_cap(budget),
+                ),
+            )
+        return BookBudgetCheckResult(budget=budget, check=check, truncated=truncated)
+    finally:
+        _budget_check_running.discard(tenant_key)
+
+
+@dataclass
+class _PreparedEntry:
+    """一条解析好的条目；`columns` 为 `None` 表示这一条被跳过（只留说明）"""
+
+    entry_key: str
+    columns: Optional[dict[str, Any]]
+    ext: Optional[dict[str, Any]]
+    notes_before: list[st_format.ImportNote]
+    notes_after: list[st_format.ImportNote]
+
+
+@dataclass
+class _PreparedImport:
+    entries: list[_PreparedEntry]
+    # 整份文件的说明（超出每轮预算、模板用途与疑似防盗），排在逐条说明之后
+    tail_notes: list[st_format.ImportNote]
+
+
+def _prepare_import(
+    parsed: st_format.ParsedWorld,
+    budget_owner: tuple[str, str],
+    book_budget: int = 0,
+    rewrite_names: bool = True,
+    *,
+    entries_trusted: bool = False,
+) -> _PreparedImport:
+    """解析、校验、数 token、分析模板：只读输入、不碰数据库，在导入执行器的线程里跑
+
+    放在开事务之前做：一份 32 MB 的书分析要几十秒，期间不能占着数据库连接。整份文件的说明依次是：
+    单条超预算、模板用途与疑似防盗、预算体检（`budget_check`，书级预算用 `book_budget`）、
+    不生效清单（`unsupported`，与人设卡导入共用同一个判据）。
+
+    `rewrite_names` 为假时条目正文里读名字的变量原样导入（导入对话框的开关）；远程世界书
+    代下与更新不传这个参数，保持默认的「换」。`entries_trusted` 是这批条目写进库时会不会按宿主
+    内容注入（与 `_write_entries` 同一个判据），预算体检据此判「忽略预算」生不生效。
+    """
+    items: list[_PreparedEntry] = []
+    mapped: list[tuple[str, dict[str, Any]]] = []
     for entry_key, raw in parsed.entries:
         if not isinstance(raw, dict):
             # 酒馆的 `entries` 是对象，值却可能是任何东西（手工拼过的文件）。整条跳过并
             # 记一条明细，比让 `st_entry_to_columns` 抛异常更接近管理员的预期。
-            notes.append(st_format.ImportNote(entry_key, "", "skipped", "条目不是一个对象，已跳过"))
+            skipped = st_format.ImportNote(entry_key, "", "skipped", "条目不是一个对象，已跳过")
+            items.append(_PreparedEntry(entry_key, None, None, [skipped], []))
             continue
 
-        columns, entry_notes = st_format.st_entry_to_columns(raw)
-        notes.extend(entry_notes)
-
-        uid = columns.get("uid")
-        if uid is None or uid in used:
-            while next_number in used:
-                next_number += 1
-            new_uid = next_number
-            next_number += 1
-            detail = f"原编号缺失，改为 {new_uid}" if uid is None else f"原编号 {uid} 与书内已有编号冲突，改为 {new_uid}"
-            notes.append(st_format.ImportNote(entry_key, "uid", "renumbered", detail))
-            columns["uid"] = new_uid
-            uid = new_uid
-        used.add(int(uid))
-
+        columns, entry_notes = st_format.st_entry_to_columns(raw, rewrite_names=rewrite_names)
         # 原始条目整份进 `ext`：导出时以它为底还原，酒馆新增的字段就不会在往返里丢掉。
         ext = copy.deepcopy(raw)
+        after: list[st_format.ImportNote] = []
         invalid = st_format.validate_entry_regexes(columns)
         if invalid:
             # 导入不因为坏正则整份失败：文件是别人给的，管理员此刻改不了它。坏关键词留在
@@ -760,31 +1009,105 @@ async def _create_entries(
             main_keys = set(columns.get("keys") or [])
             for item in invalid:
                 field = "key" if item["key"] in main_keys else "keysecondary"
-                notes.append(
-                    st_format.ImportNote(entry_key, field, "invalid_key", f"{item['key']}：{item['reason']}"),
-                )
+                after.append(st_format.ImportNote(entry_key, field, "invalid_key", f"{item['key']}：{item['reason']}"))
+        items.append(_PreparedEntry(entry_key, columns, ext, list(entry_notes), after))
+        mapped.append((entry_key, columns))
 
+    # token 数在本线程里数进缓存（不交给默认线程池），再逐条比预算。
+    wb_tokens.prefetch_sync(str(columns.get("content") or "") for _key, columns in mapped)
+    budget = import_budget(*budget_owner)
+    tail = list(st_format.budget_notes(mapped, budget=budget))
+    template_notes = wb_purpose.template_import_notes(mapped)
+    tail.extend(template_notes)
+    vectorized_count = sum(1 for _key, columns in mapped if bool(columns.get("vectorized")))
+    if vectorized_count:
+        # 向量在后台生成；在那之前这些条目只按关键词触发，管理员需要知道「为什么刚导入没生效」。
+        tail.append(
+            st_format.ImportNote(
+                "",
+                "vectorized",
+                "vector_pending",
+                f"{vectorized_count} 条标了向量激活，导入后会在后台生成向量，生成前这些条目只按关键词触发",
+            ),
+        )
+    check = wb_budget_check.check_import(
+        mapped,
+        budget=budget,
+        max_entries=int(config.WORLDBOOK_MAX_ENTRIES_PER_ROUND),
+        routed_keys=(note.entry_key for note in template_notes if note.kind in wb_budget_check.ROUTED_IMPORT_KINDS),
+        book_budget=book_budget,
+        trusted=entries_trusted,
+    )
+    if check is not None and check.constant_count:
+        tail.append(st_format.ImportNote("", "", "budget_check", "这本书" + check.summary()))
+    raw_entries = [raw for _key, raw in parsed.entries if isinstance(raw, dict)]
+    for item in wb_unsupported.unsupported_items(entries=raw_entries):
+        tail.append(st_format.ImportNote("", item.field, "unsupported", item.detail))
+    return _PreparedImport(items, tail)
+
+
+async def _write_entries(
+    book: DBWbBook,
+    prepared: _PreparedImport,
+    *,
+    is_platform: bool,
+    username: str,
+    is_new_book: bool,
+    book_ext: dict[str, Any],
+    trusted: Optional[bool] = None,
+) -> ImportReport:
+    """把分析好的条目写进一本书；调用方必须已经开好事务。这里只做编号与写库
+
+    条目按批 `bulk_create`：几千条逐条 `create` 在 PostgreSQL 上每条一个往返，一份几 MB 的书
+    要导几十秒，请求早就超时了。整批仍在调用方的同一个事务里，失败照样一条不留。条目的信任级别
+    默认按导入人（平台方可信）；`trusted` 给了就用它（来自网上的文件，平台方导入也不可信）。
+    """
+    entry_trusted = is_platform if trusted is None else trusted
+    notes: list[st_format.ImportNote] = []
+    existing = {int(uid) for uid in await DBWbEntry.filter(book_id=book.id).values_list("uid", flat=True)}
+    used = set(existing)
+    next_number = max(existing) + 1 if existing else 0
+    created = 0
+    pending: list[DBWbEntry] = []
+
+    for item in prepared.entries:
+        notes.extend(item.notes_before)
+        columns = item.columns
+        if columns is None:
+            continue
+        uid = columns.get("uid")
+        if uid is None or uid in used:
+            # 书里已有的最大编号贴着 32 位上限时，从 0 起找空号（一本书最多几万条，总找得到）
+            while next_number in used or next_number > st_format.UID_MAX:
+                next_number = 0 if next_number > st_format.UID_MAX else next_number + 1
+            new_uid = next_number
+            next_number += 1
+            detail = f"原编号缺失，改为 {new_uid}" if uid is None else f"原编号 {uid} 与书内已有编号冲突，改为 {new_uid}"
+            notes.append(st_format.ImportNote(item.entry_key, "uid", "renumbered", detail))
+            columns["uid"] = new_uid
+            uid = new_uid
+        used.add(int(uid))
+        notes.extend(item.notes_after)
         pending.append(
             DBWbEntry(
                 book=book,
-                trusted=is_platform,
+                trusted=entry_trusted,
                 status=EntryStatus.ACTIVE.value,
-                ext=ext,
+                ext=item.ext,
                 created_by=username,
                 updated_by=username,
                 **columns,
             ),
         )
-        mapped.append((entry_key, columns))
         created += 1
 
     if pending:
         await DBWbEntry.bulk_create(pending, batch_size=IMPORT_BATCH_SIZE)
-    notes.extend(st_format.budget_notes(mapped, max_chars=_import_budget_chars(book)))
+    notes.extend(prepared.tail_notes)
 
     if is_new_book:
         # 只有新建的书才写书级 `ext`：追加导入时覆盖它，会把这本书原有的酒馆字段冲掉。
-        book.ext = copy.deepcopy(parsed.book_ext)
+        book.ext = copy.deepcopy(book_ext)
         book.updated_by = username
         await book.save()
 
@@ -805,21 +1128,39 @@ async def import_world(
     *,
     is_platform: bool,
     username: str,
+    tenant_key: str,
     is_new_book: bool = False,
+    rewrite_names: bool = True,
 ) -> ImportReport:
     """追加导入到已有书
 
-    整本放在一个事务里：一次导入要么整份进库，要么一条都不进。中途失败留下半本书，管理
-    员既看不出缺了哪些条目，再导一次还会因为编号冲突而全部重编号。
+    先在导入执行器里解析、分析（每个租户同一时间一个，不占数据库连接），再把写库放在一个
+    事务里：一次导入要么整份进库，要么一条都不进。中途失败留下半本书，管理员既看不出缺了
+    哪些条目，再导一次还会因为编号冲突而全部重编号。
+
+    `rewrite_names` 为假时正文里读名字的变量原样导入（导入对话框的开关）。
     """
+    prepared = await wb_purpose.run_import_analysis(
+        _prepare_import,
+        parsed,
+        (book.adapter_key, book.instance_key),
+        int(book.budget_tokens or 0),
+        rewrite_names,
+        tenant_key=tenant_key,
+        entries_trusted=is_platform,
+    )
     async with in_transaction():
-        return await _create_entries(
+        report = await _write_entries(
             book,
-            parsed,
+            prepared,
             is_platform=is_platform,
             username=username,
             is_new_book=is_new_book,
+            book_ext=parsed.book_ext,
         )
+    # 导入进来的条目可能有 `vectorized`（以前只留在 `ext` 里），提交后叫醒看护循环补向量。
+    vectors.kick()
+    return report
 
 
 async def import_new_book(
@@ -829,28 +1170,100 @@ async def import_new_book(
     *,
     is_platform: bool,
     username: str,
+    tenant_key: str,
+    trusted: Optional[bool] = None,
+    rewrite_names: bool = True,
 ) -> ImportReport:
-    """建书并导入，整笔放在一个事务里
+    """建书并导入：先分析（事务之外），再把建书与写条目放在同一个事务里
 
     建书与写条目必须同一个事务：分开的话导入失败会留下一本空书，而管理页上「导入失败」
-    与「多了一本空书」这两件事同时发生，管理员只能手工删掉它。
+    与「多了一本空书」这两件事同时发生，管理员只能手工删掉它。`trusted` 见 `_write_entries`；
+    `rewrite_names` 见 `_prepare_import`。
     """
+    prepared = await wb_purpose.run_import_analysis(
+        _prepare_import,
+        parsed,
+        owner,
+        int(req.budget_tokens or 0),
+        rewrite_names,
+        tenant_key=tenant_key,
+        entries_trusted=is_platform if trusted is None else trusted,
+    )
     async with in_transaction():
         book = await create_book(owner, req, username=username)
-        return await _create_entries(
+        report = await _write_entries(
             book,
-            parsed,
+            prepared,
             is_platform=is_platform,
             username=username,
             is_new_book=True,
+            book_ext=parsed.book_ext,
+            trusted=trusted,
         )
+    vectors.kick()
+    return report
+
+
+async def replace_book_entries(
+    book_id: int,
+    parsed: st_format.ParsedWorld,
+    *,
+    is_platform: bool,
+    username: str,
+    tenant_key: str,
+    trusted: Optional[bool] = None,
+) -> ImportReport:
+    """用一份文件替换一本书的全部条目（远程世界书「更新到新版本」）
+
+    分析在事务之外；删旧条目与写新条目在同一个事务里，失败时旧条目原样留着。书在事务里按编号重新取
+    （调用方手里的对象可能是下载之前取的，期间书可能被改名、改设置或删掉）：书的名字、启用、预算这些
+    设置不动，只写书级 `ext`（换成新文件的）与修改人；书已经删掉就 404。
+    """
+    book = await DBWbBook.get_or_none(id=book_id)
+    if book is None:
+        raise NotFoundError(resource="世界书")
+    prepared = await wb_purpose.run_import_analysis(
+        _prepare_import,
+        parsed,
+        (book.adapter_key, book.instance_key),
+        int(book.budget_tokens or 0),
+        tenant_key=tenant_key,
+        entries_trusted=is_platform if trusted is None else trusted,
+    )
+    async with in_transaction():
+        current = await DBWbBook.get_or_none(id=book_id)
+        if current is None:
+            raise NotFoundError(resource="世界书")
+        old_ids = [int(entry_id) for entry_id in await DBWbEntry.filter(book_id=book_id).values_list("id", flat=True)]
+        await DBWbEntry.filter(book_id=book_id).delete()
+        report = await _write_entries(
+            current,
+            prepared,
+            is_platform=is_platform,
+            username=username,
+            is_new_book=False,
+            book_ext=parsed.book_ext,
+            trusted=trusted,
+        )
+        current.ext = copy.deepcopy(parsed.book_ext)
+        current.updated_by = username
+        await current.save(update_fields=["ext", "updated_by", "update_time"])
+    # 与删书一样清熔断表（不清的话，新条目拿到同一个主键会继承「运行过慢已停用」）；放在提交之后
+    for entry_id in old_ids:
+        safe_regex.forget_entry(entry_id)
+    # 旧条目的向量点删掉；新条目的由看护循环补。两件事都在提交之后做。
+    await vectors.delete_entries(old_ids)
+    vectors.kick()
+    return report
 
 
 async def export_book(book: DBWbBook) -> dict[str, Any]:
     """导出成酒馆世界书格式
 
     以每条自己的 `ext` 为底还原：导出必须能一字不差地还回用户导进来的那份文件，否则
-    「导出备份一下再导入」这条路会悄悄丢字段。
+    「导出备份一下再导入」这条路会悄悄丢字段。条目的「忽略预算」写成酒馆的 `ignoreBudget`；
+    书的「扫描时带上说话人名字」（`scan_names`）在酒馆文件里没有对应字段（酒馆的
+    `include_names` 是全局设置，不随书走），因此不导出，导入回来时按新书的默认值处理。
     """
     entries = await list_entries(book)
     return st_format.export_world(
@@ -1175,6 +1588,7 @@ __all__ = [
     "next_uid",
     "person_display_name",
     "record_blocked_round",
+    "replace_book_entries",
     "update_book",
     "update_entry",
 ]

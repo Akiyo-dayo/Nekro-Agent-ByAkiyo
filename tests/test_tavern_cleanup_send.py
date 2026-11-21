@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import datetime as dt
 import random
+import re
+import string
 import time
 from collections import Counter
 from types import SimpleNamespace
@@ -232,6 +234,285 @@ async def _user_message(chat_key: str, nickname: str) -> None:
         ext_data="",
         send_timestamp=1,
     )
+
+
+VARIABLE_BLOCK = (
+    "<UpdateVariable>\n<Analysis>time advanced; mood up</Analysis>\n"
+    '<JSONPatch>[{"op": "replace", "path": "/时间", "value": "傍晚"}]</JSONPatch>\n</UpdateVariable>'
+)
+
+
+class TestStripVariableMarkup:
+    def test_paired_block_and_placeholder(self) -> None:
+        text = f"她点了点头。\n\n{VARIABLE_BLOCK}\n\n<StatusPlaceHolderImpl/>"
+        assert cleanup_runtime.strip_variable_markup(text) == "她点了点头。"
+
+    def test_case_and_variants(self) -> None:
+        text = "正文<updatevariable>x</UPDATEVARIABLE><JsonPatch>[]</JsonPatch><status_current_variable>y</status_current_variable>"
+        assert cleanup_runtime.strip_variable_markup(text) == "正文"
+        assert cleanup_runtime.strip_variable_markup("甲<VariableUpdate>_.set('a', 1)</VariableUpdate>乙") == "甲乙"
+
+    def test_unclosed_block_is_cut_to_the_end_only_for_card_presets(self) -> None:
+        text = "回复到这里。\n<UpdateVariable>\n<Analysis>写到一半被截断"
+        assert cleanup_runtime.strip_variable_markup(text, card_mode=True) == "回复到这里。"
+        assert cleanup_runtime.strip_variable_markup(text) is text
+
+    def test_nested_blocks_close_on_the_outer_tag(self) -> None:
+        text = "前<UpdateVariable><JSONPatch>[]</JSONPatch>尾巴</UpdateVariable>后"
+        assert cleanup_runtime.strip_variable_markup(text) == "前后"
+        same = "前<UpdateVariable>x<UpdateVariable>y</UpdateVariable>还在块里</UpdateVariable>后"
+        assert cleanup_runtime.strip_variable_markup(same) == "前后"
+
+    def test_closing_tags_pair_by_normalized_name(self) -> None:
+        assert cleanup_runtime.strip_variable_markup("前<JSONPatch>x</json_patch>后") == "前后"
+        assert cleanup_runtime.strip_variable_markup("前<Json_Patch>x</JSONPATCH>后") == "前后"
+
+    def test_stray_closing_tags_are_removed(self) -> None:
+        assert cleanup_runtime.strip_variable_markup("正文</UpdateVariable>结尾") == "正文结尾"
+
+    def test_self_closing_tags(self) -> None:
+        jsx = "use <JsonPatch op={x} /> in React, then call save()"
+        # 非卡片人设：普通对话里的 JSX 原样保留，后半条也不会被截掉
+        assert cleanup_runtime.strip_variable_markup(jsx) is jsx
+        assert cleanup_runtime.strip_variable_markup(jsx, card_mode=True) == "use  in React, then call save()"
+        assert cleanup_runtime.strip_variable_markup("前<UpdateVariable/>后", card_mode=True) == "前后"
+
+    def test_attribute_length_boundary(self) -> None:
+        limit = cleanup_runtime.MAX_TAG_ATTR_CHARS
+        fits = f"前<UpdateVariable {'a' * (limit - 1)}>秘密</UpdateVariable>后"
+        assert cleanup_runtime.strip_variable_markup(fits) == "前后"
+        # 属性超过上限的开始标签收不了尾，仍按开始标签算：整块连同正文去掉，不会漏出半个标签
+        too_long = f"前<UpdateVariable {'a' * limit}>秘密</UpdateVariable>后"
+        assert cleanup_runtime.strip_variable_markup(too_long) == "前后"
+
+    def test_pathological_text_stays_linear(self) -> None:
+        for text in ("<UpdateVariable" * 60_000, "<UpdateVariable>" * 60_000, "<JSONPatch>x</JSONPatch>" * 40_000):
+            for card_mode in (False, True):
+                # 量本进程的 CPU 时间而不是墙上时间：整包并行、机器忙时墙上时间会被别的进程拖长。
+                # 退化成平方级时这里是几分钟的量级，门限放宽到 10 秒照样拦得住。
+                started = time.process_time()
+                cleanup_runtime.strip_variable_markup("开头" + text, card_mode=card_mode)
+                assert time.process_time() - started < 10
+        unclosed = "开头" + "<UpdateVariable>" * 1000
+        assert cleanup_runtime.strip_variable_markup(unclosed, card_mode=True) == "开头"
+        assert cleanup_runtime.strip_variable_markup(unclosed) is unclosed
+
+    def test_unrelated_text_is_the_same_object(self) -> None:
+        for text in ("普通回复", "a < b 而且 <b>加粗</b>", "<Update> 这个通用标签不剥"):
+            assert cleanup_runtime.strip_variable_markup(text) is text
+
+    def test_unicode_case_folding_lookalikes_are_not_tag_names(self) -> None:
+        # Python 的 Unicode 忽略大小写会让 U+017F 配上 s、开尔文符号 U+212A 配上 k（还有 İ、ı 配 i）；
+        # 酒馆那边的正则（JS 不带 u 的 /i）不认这些。标签名只按 ASCII 忽略大小写。
+        any_letter = re.compile("[a-z]", re.IGNORECASE)
+        lookalikes = {
+            char: next(letter for letter in string.ascii_lowercase if re.fullmatch(letter, char, re.IGNORECASE))
+            for char in map(chr, range(0x80, 0x10000))
+            if any_letter.fullmatch(char)
+        }
+        assert lookalikes[chr(0x17F)] == "s" and lookalikes[chr(0x212A)] == "k"
+        names = ("UpdateVariable", "VariableUpdate", "JSONPatch", "JSON_Patch", "status_current_variable")
+        cases = 0
+        for char, letter in lookalikes.items():
+            for name in (*names, "StatusPlaceHolderImpl"):
+                at = name.lower().find(letter)
+                if at < 0:
+                    continue
+                fake = name[:at] + char + name[at + 1 :]
+                text = f"前<{fake}/>后" if name == "StatusPlaceHolderImpl" else f"前<{fake}>秘密</{fake}>后"
+                for card_mode in (False, True):
+                    assert cleanup_runtime.strip_variable_markup(text, card_mode=card_mode) is text, (char, name)
+                cases += 1
+        assert cases >= 10
+        # 名字里的 s 换成 U+017F 的开始标签不再算变量标签：卡片人设里也不会从它起截到末尾
+        # （落单的结束标签照旧去掉）
+        long_s = chr(0x17F)
+        assert cleanup_runtime.strip_variable_markup(f"前<J{long_s}ONPatch>x</JSONPatch>后", card_mode=True) == (
+            f"前<J{long_s}ONPatch>x后"
+        )
+
+
+class TestBuiltinStripOnSend:
+    async def test_strips_without_any_card_rules(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+        adapter = _CaptureAdapter()
+
+        await _send(adapter, f"好的，这就出发。\n{VARIABLE_BLOCK}", ctx=SimpleNamespace(adapter=adapter))
+
+        assert adapter.requests[0].segments[0].content == "好的，这就出发。"
+        assert _recorder.calls[0]["args"][1][0].content == "好的，这就出发。"
+
+    async def test_strip_runs_before_card_rules(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+        # 卡片规则把「Analysis」换掉：剥离在前，规则根本看不到变量块，结果里不该残留标签。
+        _install_rules(monkeypatch, _rule_set([_rule("/Analysis/g", "分析")]))
+        adapter = _CaptureAdapter()
+
+        await _send(adapter, f"正文 Analysis\n{VARIABLE_BLOCK}", ctx=SimpleNamespace(adapter=adapter))
+
+        assert adapter.requests[0].segments[0].content == "正文 分析"
+
+    @pytest.mark.parametrize(("card_preset", "expected"), [(False, None), (True, "回复到这里。")])
+    async def test_unclosed_block_is_cut_only_for_card_presets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+        card_preset: bool,
+        expected: Optional[str],
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+        lookups: list[str] = []
+
+        async def _is_card(chat_key: str) -> bool:
+            lookups.append(chat_key)
+            return card_preset
+
+        monkeypatch.setattr(ucs_mod, "is_card_preset_chat", _is_card)
+        adapter = _CaptureAdapter()
+        text = "回复到这里。\n<UpdateVariable>\n<Analysis>写到一半被截断"
+
+        await _send(adapter, text, ctx=SimpleNamespace(adapter=adapter))
+
+        assert adapter.requests[0].segments[0].content == (expected if expected is not None else text)
+        assert lookups == [CHAT_KEY]
+
+    async def test_card_lookup_is_skipped_when_nothing_is_left(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+
+        async def _forbidden(_chat_key: str) -> bool:
+            raise AssertionError("成对的块剥完就没剩标签了，不该查人设")
+
+        monkeypatch.setattr(ucs_mod, "is_card_preset_chat", _forbidden)
+        adapter = _CaptureAdapter()
+
+        await _send(adapter, f"好的。\n{VARIABLE_BLOCK}", ctx=SimpleNamespace(adapter=adapter))
+
+        assert adapter.requests[0].segments[0].content == "好的。"
+
+    async def test_rollback_switch_off_keeps_text_verbatim(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", False)
+        adapter = _CaptureAdapter()
+        text = f"正文\n{VARIABLE_BLOCK}"
+
+        await _send(adapter, text, ctx=SimpleNamespace(adapter=adapter))
+
+        assert adapter.requests[0].segments[0].content == text
+
+    @pytest.mark.parametrize("card_preset", [False, True])
+    async def test_display_tags_become_text_only_for_card_presets(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+        card_preset: bool,
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+        lookups: list[str] = []
+
+        async def _is_card(chat_key: str) -> bool:
+            lookups.append(chat_key)
+            return card_preset
+
+        monkeypatch.setattr(ucs_mod, "is_card_preset_chat", _is_card)
+        adapter = _CaptureAdapter()
+        text = '<font color="#f66">红字</font>开头<br>第二行'
+
+        await _send(adapter, text, ctx=SimpleNamespace(adapter=adapter))
+
+        expected = "红字开头\n第二行" if card_preset else text
+        assert adapter.requests[0].segments[0].content == expected
+        assert _recorder.calls[0]["args"][1][0].content == expected
+        assert lookups == [CHAT_KEY]
+
+    async def test_text_only_rule_runs_before_display_tags(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+
+        async def _is_card(_chat_key: str) -> bool:
+            return True
+
+        monkeypatch.setattr(ucs_mod, "is_card_preset_chat", _is_card)
+        rule = {**_rule(r"/<watch>([\s\S]*?)<\/watch>/g", '<div class="bubble">注视中……$1</div>'), "output_mode": "text"}
+        _install_rules(monkeypatch, _rule_set([rule]))
+        adapter = _CaptureAdapter()
+
+        await _send(adapter, "前文<watch><b>远处的钟响了</b></watch>", ctx=SimpleNamespace(adapter=adapter))
+
+        # 规则只留分组里的正文（替换文字里的「注视中……」不要），分组里的 <b> 再由转纯文本去掉
+        assert adapter.requests[0].segments[0].content == "前文远处的钟响了"
+
+    async def test_plain_text_never_looks_up_the_preset(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+
+        async def _forbidden(_chat_key: str) -> bool:
+            raise AssertionError("没有标签就不该查人设")
+
+        monkeypatch.setattr(ucs_mod, "is_card_preset_chat", _forbidden)
+        adapter = _CaptureAdapter()
+
+        await _send(adapter, "a < b，普通回复", ctx=SimpleNamespace(adapter=adapter))
+
+        assert adapter.requests[0].segments[0].content == "a < b，普通回复"
+
+    async def test_without_ctx_is_verbatim(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        use_settings,
+        _recorder: _Recorder,
+    ) -> None:
+        use_settings(None)
+        _install_rules(monkeypatch, None)
+        monkeypatch.setattr(config, "TAVERN_COMPAT_ENABLED", True)
+        adapter = _CaptureAdapter()
+        text = f"后台手动发\n{VARIABLE_BLOCK}"
+
+        await _send(adapter, text, ctx=None)
+
+        assert adapter.requests[0].segments[0].content == text
 
 
 class TestSendPath:
@@ -623,3 +904,38 @@ class TestMacrosAndCache:
 
         assert await cleanup_runtime.apply_cleanup(CHAT_KEY, "原样 bad", rules) == "原样 bad"
         assert "原样 bad" not in caplog.text
+
+
+class TestStripLeftovers:
+    """剥离不留半个标签，一个没闭合的开始标签也不挡后面的块"""
+
+    def test_opening_tag_with_lt_in_attributes(self) -> None:
+        text = "hi <UpdateVariable a='<'>secret</UpdateVariable> bye"
+        assert cleanup_runtime.strip_variable_markup(text) == "hi  bye"
+
+    def test_unclosed_tag_does_not_stop_later_blocks(self) -> None:
+        text = "a <JSONPatch> b <UpdateVariable>secret</UpdateVariable> c"
+        assert cleanup_runtime.strip_variable_markup(text) == "a <JSONPatch> b  c"
+        assert cleanup_runtime.strip_variable_markup(text, card_mode=True) == "a"
+
+    def test_unclosed_tag_inside_a_removed_block_does_not_truncate(self) -> None:
+        text = "前<UpdateVariable><JSONPatch>没闭合</UpdateVariable>后面的正文"
+        assert cleanup_runtime.strip_variable_markup(text, card_mode=True) == "前后面的正文"
+
+    def test_overlapping_blocks(self) -> None:
+        text = "hi <UpdateVariable><JSONPatch>x</UpdateVariable>tail</JSONPatch> bye"
+        assert cleanup_runtime.strip_variable_markup(text) == "hi  bye"
+
+
+class TestCardPresetLookup:
+    async def test_card_spec_is_required(self, db: None) -> None:
+        native = await _preset("原生")
+        await _channel(preset_id=native.id)
+        await _card(native, [], prefill="只加了一段预填")
+        assert await cleanup_runtime.is_card_preset_chat(CHAT_KEY) is False
+
+    async def test_imported_card(self, db: None) -> None:
+        imported = await _preset("导入的卡")
+        await _channel(preset_id=imported.id)
+        await _card(imported, [], card_spec="v3")
+        assert await cleanup_runtime.is_card_preset_chat(CHAT_KEY) is True

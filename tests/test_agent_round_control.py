@@ -504,7 +504,7 @@ class _Harness:
         monkeypatch.setattr(
             round_prompt_module,
             "render_plugins_prompt",
-            _async_value(SimpleNamespace(system_prompt="", runtime_prompt="")),
+            _async_value(SimpleNamespace(system_prompt="", runtime_prompt="", depth_blocks=[])),
         )
         monkeypatch.setattr(round_prompt_module, "render_affection_prompt", _async_value(""))
         monkeypatch.setattr(round_prompt_module, "schedule_affection_evaluation", lambda *_a, **_k: None)

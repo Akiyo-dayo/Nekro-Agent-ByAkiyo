@@ -529,18 +529,23 @@ class TestRefMarkerDrivesEverything:
     def test_no_other_ownership_constrained_reference_is_overridable(self) -> None:
         """绊线：别的"受归属约束的资源"（人设 / 邮箱账户 / ……）一旦变成可覆盖字段，这里变红
 
-        目前 `AI_CHAT_DEFAULT_PRESET_ID`（`ref_presets`）与邮箱账户引用都**不可覆盖**，
+        `AI_CHAT_DEFAULT_PRESET_ID`（`ref_presets`）与邮箱账户引用都**不可覆盖**，
         租户写不到它们（`system` / `adapter_*` / `plugin_*` 对租户一律 403），
         因此不需要第二道闸门。哪天有人给它们标上 `overridable=True`，这条用例会先红——
         那时要做的是给对应资源接一道同形的判定，而不是把这条用例改掉。
+
+        `PROMPT_RP_PRESET_ID`（`ref_rp_presets`）是已经接好判定的例外：三条写路径都经过
+        `config._assert_rp_preset_reference`，租户只能选全局的或自己实例的预设；对应用例在
+        `tests/test_rp_preset_api.py::TestConfigReference`。
         """
+        allowed = (["ref_model_groups"], ["ref_rp_presets"])
         offenders = []
         for name, field in CoreConfig.model_fields.items():
             extra = field.json_schema_extra if isinstance(field.json_schema_extra, dict) else {}
             if not extra.get("overridable"):
                 continue
             refs = sorted(key for key, value in extra.items() if key.startswith("ref_") and value)
-            if refs and refs != ["ref_model_groups"]:
+            if refs and refs not in allowed:
                 offenders.append((name, refs))
         assert offenders == []
 

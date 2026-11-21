@@ -198,7 +198,7 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, calls: dict[str, int], *, me
     async def plugins(*_args: Any, **kwargs: Any) -> Any:
         calls["plugins"] += 1
         calls["call_inject"] = kwargs.get("call_inject")
-        return SimpleNamespace(system_prompt="插件静态", runtime_prompt="")
+        return SimpleNamespace(system_prompt="插件静态", runtime_prompt="", depth_blocks=[])
 
     async def active(**_kwargs: Any) -> list[Any]:
         return []

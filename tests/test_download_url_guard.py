@@ -12,7 +12,6 @@
 全部用例使用 IP 字面量，`getaddrinfo` 不会发起 DNS 查询，测试可离线运行。
 """
 
-import asyncio
 import socket
 from typing import Any, Dict, List
 
@@ -27,6 +26,7 @@ from nekro_agent.tools.common_util import (
     assert_download_url_safe,
     assert_tenant_endpoint_url_safe,
     parse_extra_allowed_networks,
+    tenant_target_unavailable_message,
 )
 
 
@@ -126,12 +126,21 @@ class TestProxyFakeIpNetworks:
                     await assert_download_url_safe(url)
 
     async def test_fake_ip_also_allowed_for_tenant_endpoints(self) -> None:
-        """租户接口地址同样走代理，判据必须一致；该路径依然不认 ALLOW_PRIVATE_NETWORK_DOWNLOAD"""
+        """租户接口地址与下载同一份放行网段：Fake-IP 默认放行（开着透明代理的部署照常能用），
+        真实内网照拒；该路径依然不认 ALLOW_PRIVATE_NETWORK_DOWNLOAD"""
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", DEFAULT_EXTRA_ALLOWED_NETWORKS)
+            mp.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", True)
             await assert_tenant_endpoint_url_safe("https://198.18.4.49/v1")
             with pytest.raises(UnsafeDownloadUrlError):
                 await assert_tenant_endpoint_url_safe("http://127.0.0.1:8021/api/config")
+
+    async def test_fake_ip_can_be_locked_down_for_tenant_endpoints_too(self) -> None:
+        """把 Fake-IP 段从放行网段里删掉，租户接口地址与下载一起拒"""
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
+            with pytest.raises(UnsafeDownloadUrlError):
+                await assert_tenant_endpoint_url_safe("https://198.18.4.49/v1")
 
     async def test_narrow_internal_allowlist_is_supported(self) -> None:
         """比 ALLOW_PRIVATE_NETWORK_DOWNLOAD 更细的粒度：只放行协议端那一台内网机器"""
@@ -144,7 +153,7 @@ class TestProxyFakeIpNetworks:
 
 
 def _fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> List[str]:
-    """让当前事件循环的 getaddrinfo 按 zone 回答，记下被查的主机名；不在 zone 里的一律解析失败（不发真实 DNS 查询）"""
+    """让出站解析按 zone 回答，记下被查的主机名；不在 zone 里的一律解析失败（不发真实 DNS 查询）"""
     looked_up: List[str] = []
 
     async def fake(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
@@ -154,7 +163,7 @@ def _fake_dns(monkeypatch: pytest.MonkeyPatch, zone: Dict[str, str]) -> List[str
             raise socket.gaierror(socket.EAI_NONAME, "not in fake zone")
         return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (zone[name], port))]
 
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake)
+    monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake)
     return looked_up
 
 
@@ -191,8 +200,10 @@ class TestResolvesTheHostHttpxConnectsTo:
         """httpx 放行、getaddrinfo 编码时抛 UnicodeError（不会发出查询）：要落成守卫的异常，而不是一个调用方没预料到的 UnicodeError"""
         with pytest.raises(UnresolvableDownloadHostError):
             await assert_download_url_safe(url)
-        with pytest.raises(UnresolvableDownloadHostError):
+        # 租户这一侧不分「解析不到」与「指向不允许的地址」（同一句话，免得成了查 DNS 的工具）
+        with pytest.raises(UnsafeDownloadUrlError) as excinfo:
             await assert_tenant_endpoint_url_safe(url)
+        assert str(excinfo.value) == tenant_target_unavailable_message("接口地址")
 
     @pytest.mark.parametrize("url", ["http://[::1", "http://8.8.8.8/\x00", " file:///etc/passwd"])
     async def test_a_url_httpx_cannot_use_is_refused(self, url: str) -> None:

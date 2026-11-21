@@ -38,6 +38,11 @@ from .scope import is_enabled_in_any_scope, plugin_effective_with_instance, reso
 
 logger = get_sub_logger("plugin_system")
 
+# 回合收尾回调的后台任务。用集合持有强引用，避免任务在完成前被回收。
+_ROUND_FINISHED_TASKS: Set["asyncio.Task[None]"] = set()
+# 回合收尾回调最多等这么久（全局插件超时更短时取它）：回调应当快速返回，长活自己另起任务。
+ROUND_FINISHED_MAX_SECONDS = 30.0
+
 
 def _hook_chat_key(ctx: AgentCtx) -> str:
     """取消息钩子要判定的频道标识
@@ -1039,6 +1044,59 @@ class PluginCollector:
         for plugin in self.loaded_plugins.values():
             if plugin.is_enabled and plugin_effective_with_instance(plugin.key, instance_key, chat_key) and plugin.on_reset_method:
                 await call_plugin(plugin, "on_channel_reset", plugin.on_reset_method, ctx.model_copy(), default=None)
+
+    def schedule_round_finished(self, ctx: AgentCtx, outcome: str) -> None:
+        """一轮对话收尾时，给挂了收尾回调的插件各排一个后台任务；不等结果
+
+        调用方在回合收尾的 `finally` 里：这里只建任务，任何异常都吞掉、只记一条日志，
+        不能让插件拖住或打断那一轮的收尾。哪些插件在这个频道生效、调用本身的超时与故障统计
+        都在后台任务里做（`call_plugin`）。
+        """
+        try:
+            if not any(plugin.on_round_finished_method for plugin in self.loaded_plugins.values()):
+                return
+            task = asyncio.create_task(self._run_round_finished(ctx.model_copy(), str(outcome)))
+            _ROUND_FINISHED_TASKS.add(task)
+            task.add_done_callback(_ROUND_FINISHED_TASKS.discard)
+        except Exception as e:  # noqa: BLE001 - 收尾路径上不能抛
+            logger.debug(f"排回合收尾回调失败（已忽略）: {e}")
+
+    async def _run_round_finished(self, ctx: AgentCtx, outcome: str) -> None:
+        try:
+            chat_key = _hook_chat_key(ctx)
+            instance_key = await resolve_chat_plugin_instance(chat_key)
+            targets = [
+                plugin
+                for plugin in list(self.loaded_plugins.values())
+                if plugin.on_round_finished_method
+                and plugin.is_enabled
+                and plugin_effective_with_instance(plugin.key, instance_key, chat_key)
+            ]
+        except Exception as e:  # noqa: BLE001 - 后台任务，判不出就整体跳过
+            logger.debug(f"回合收尾回调判定插件失败（已跳过）: {e}")
+            return
+        # 各插件互不等待：一个插件卡到超时，不拖慢别的插件。收尾回调单独计数、单独隔离（键是
+        # `插件键#on_round_finished`）：它坏了不连带插件的提示注入等回调；超时取全局插件超时，
+        # 全局设成不限时（<= 0）时也封顶，免得每轮积压一个不结束的任务。
+        configured = float(config.PLUGIN_CALL_TIMEOUT_SECONDS)
+        limit = configured if 0 < configured <= ROUND_FINISHED_MAX_SECONDS else ROUND_FINISHED_MAX_SECONDS
+        await asyncio.gather(
+            *(
+                call_plugin(
+                    plugin,
+                    "on_round_finished",
+                    plugin.on_round_finished_method,
+                    ctx.model_copy(),
+                    outcome,
+                    default=None,
+                    timeout=limit,
+                    isolation_key=f"{plugin.key}#on_round_finished",
+                )
+                for plugin in targets
+                if plugin.on_round_finished_method is not None
+            ),
+            return_exceptions=True,
+        )
 
     async def cleanup_all_plugins(self) -> None:
         """清理所有插件资源

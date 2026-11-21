@@ -27,7 +27,6 @@ import socket
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
-import httpx
 import pytest
 
 from nekro_agent.adapters.email.clients import imap_smtp_password as client_module
@@ -87,9 +86,19 @@ class FakeIMAP:
     peer = PUBLIC_IP
     instances: List["FakeIMAP"] = []
 
-    def __init__(self, host: str, port: int, addresses: Any = None, timeout: Any = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        addresses: Any = None,
+        timeout: Any = None,
+        ssl_context: Any = None,
+        context: Any = None,
+    ) -> None:
         self.host = host
         self.addresses = tuple(addresses) if addresses is not None else None
+        self.ssl_context = ssl_context
+        self.context = context
         self.sock = _Sock(FakeIMAP.peer)
         self.logged_in = False
         self.search_reply = b"1 2 3"
@@ -124,15 +133,25 @@ class FakeSMTP:
     peer = PUBLIC_IP
     instances: List["FakeSMTP"] = []
 
-    def __init__(self, host: str, port: int, addresses: Any = None, timeout: Any = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        addresses: Any = None,
+        timeout: Any = None,
+        ssl_context: Any = None,
+        context: Any = None,
+    ) -> None:
         self.host = host
         self.port = port
         self.addresses = tuple(addresses) if addresses is not None else None
+        self.ssl_context = ssl_context
+        self.context = context
         self.sock = _Sock(FakeSMTP.peer)
         self.calls: List[str] = []
         FakeSMTP.instances.append(self)
 
-    def starttls(self) -> None:
+    def starttls(self, context: Any = None) -> None:
         self.calls.append("starttls")
 
     def login(self, _user: str, _password: str) -> None:
@@ -417,34 +436,37 @@ class TestOwnerTableFollowsAMigration:
 
 
 class TestRemoteImagePeer:
-    """`fetch_url_bytes` 以实际连上的地址为准（发请求前那次解析之后可以被 DNS 重绑）"""
+    """`fetch_url_bytes` 建连接那一步（`download_http_transport`）按实际对端核对"""
 
     @staticmethod
     def _install(monkeypatch: pytest.MonkeyPatch, peer: Any) -> None:
-        loop = asyncio.get_running_loop()
-        real = loop.getaddrinfo
+        import httpcore
+
+        from tests.test_tenant_egress import FakeBackend
+
+        monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        real = common_util._system_getaddrinfo  # noqa: SLF001
 
         async def fake_dns(host: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
             name = host.decode("ascii") if isinstance(host, bytes) else host
             if name == "img.example.test":
                 return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (PUBLIC_IP, port))]
-            return await real(host, port, *args, **kwargs)
+            return await real(host, port)
 
-        monkeypatch.setattr(loop, "getaddrinfo", fake_dns)
+        monkeypatch.setattr("nekro_agent.tools.common_util._system_getaddrinfo", fake_dns)
 
-        class _Stream:
-            def get_extra_info(self, name: str) -> Any:
-                return (peer, 80) if name == "server_addr" and peer else None
+        class _Backend(FakeBackend):
+            async def connect_tcp(self, host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+                stream = await super().connect_tcp(host, port, *args, **kwargs)
+                if peer is None:
+                    stream.get_extra_info = lambda _name: None  # 取不到对端
+                return stream
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, stream=httpx.ByteStream(b"\x89PNG"), extensions={"network_stream": _Stream()})
-
-        real_client = httpx.AsyncClient
-
-        def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-            return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
-
-        monkeypatch.setattr(common_util.httpx, "AsyncClient", factory)
+        backend = _Backend(responses=[[b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\x89PNG"]])
+        backend.peer_override = peer
+        monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
 
     async def test_a_rebound_private_peer_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._install(monkeypatch, PRIVATE_IP)

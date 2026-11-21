@@ -193,6 +193,13 @@
     "invalidJson": "Invalid JSON",
     "addItem": "Add {{name}}",
     "selectPreset": "Select Preset",
+    "selectRpPreset": "Select a roleplay preset",
+    "rpPresetNone": "Not used",
+    "rpPresetGlobalSuffix": "· Global",
+    "rpPresetMissing": "The selected preset no longer exists",
+    "rpPresetMissingValue": "Missing preset #{{id}}",
+    "rpPresetsLoadFailed": "Could not load the preset list. Enter the preset ID directly",
+    "rpPresetsLoadFailedWithReason": "Could not load the preset list: {{reason}}. You can enter the preset ID directly",
     "addNewItem": "Add new {{name}}",
     "modelTypes": {
       "chat": "Chat",
@@ -201,6 +208,7 @@
     },
     "newItemPlaceholder": "Enter key name and press Enter",
     "headerEnableOverride": "Enable Override",
+    "headerOverrideShort": "Override",
     "headerConfigItem": "Config Item",
     "headerAttribute": "Attribute",
     "headerCategory": "Category",
@@ -211,6 +219,8 @@
     "resetConfig": "Reset Config",
     "saveSuccess": "All changes saved and exported to config file",
     "reloadSuccess": "Config reloaded",
+    "staleWrite": "These settings were changed elsewhere after you opened the page, so nothing was saved: {{keys}}. They now show the current values; make your change again. Your other edits are kept and can be saved again",
+    "staleWriteSeparator": ", ",
     "restartSent": "System restart request sent, please wait...",
     "restartFailed": "Failed to restart system, check connection",
     "currentModelGroupMissing": "Selected model group not found",
@@ -229,7 +239,11 @@
     "overridable": "Overridable",
     "platformOnly": "Platform only",
     "tenantMayOnlyLower": "Can only be lowered",
+    "globalOnly": "Global only",
+    "inheritedFromGlobal": "Inherited from global",
+    "overridableHint": "Can be overridden per instance/channel",
     "cannotDisable": "This item cannot be disabled individually",
+    "noCap": "No extra cap (percent only, at most 65536)",
     "jumpToPresetManager": "Jump to preset manager",
     "restartWarning": "WebUI will be unavailable during restart. If it does not recover for a long time, please check NekroAgent container logs.",
     "restartConfirm": "System restart required for changes to take effect. Proceed? This may take about a minute.",
@@ -252,6 +266,15 @@
       "模型配置": "Model Configuration",
       "系统": "System"
     }
+  },
+  "worldbookBudget": {
+    "preview": "With model group {{modelGroup}} (context {{contextLength}}{{contextNote}}), the worldbook is limited to about {{budget}} tokens per round, roughly {{approx}} characters",
+    "contextUnset": ", not set, estimated at {{defaultContext}}",
+    "charsEstimator": "(tokenizer not loaded; estimated by characters)",
+    "fallback": "The fallback model group {{modelGroup}} only has a context of {{contextLength}}; the worldbook may not fit if the request is retried with it",
+    "inheritedPercent": "Inherited: {{percent}}%",
+    "inheritedCap": "Inherited: cap {{cap}} tokens",
+    "inheritedUnlimited": "Inherited: no extra cap (percent only, at most 65536 tokens)"
   },
   "restartCapability": {
     "checking": "Checking whether this deployment can be restarted…",

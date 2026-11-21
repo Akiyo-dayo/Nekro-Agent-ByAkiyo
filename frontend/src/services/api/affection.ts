@@ -176,12 +176,78 @@ export interface AffectionSummary {
   top_score: number
 }
 
+/** 关系图里「人」节点身上的一份好感（这个人在某个人设下的那一行） */
+export interface AffectionGraphRecord {
+  record_id: number
+  preset_id: number
+  preset_name: string
+  score: number
+  stage: AffectionStageValue
+  stage_label: string
+  call_name: string
+  state_text: string
+  interaction_count: number
+  last_interact_at: string | null
+  last_chat_key: string
+  in_use_channels: number
+  milestone_count: number
+}
+
+/**
+ * 关系图节点：`memory_type` 是节点种类（preset / person / milestone / channel）
+ *
+ * 与记忆图谱的节点同形，两张图共用一个画布。各种类的 `metadata` 内容不同，读取时逐项核对类型。
+ */
+export interface AffectionGraphNode {
+  id: string
+  memory_type: string
+  ref_id: number
+  label: string
+  subtitle: string
+  status: string
+  cognitive_type: string | null
+  weight: number
+  size: number
+  importance: number
+  paragraph_id: number | null
+  metadata: Record<string, unknown>
+}
+
+/** 关系图的边：affection（人 → 人设，就是那一份好感）、milestone、last_seen */
+export interface AffectionGraphEdge {
+  id: string
+  source: string
+  target: string
+  edge_type: string
+  label: string
+  weight: number
+  strength: number
+  status: string
+  cognitive_type: string | null
+  metadata: Record<string, unknown>
+}
+
+export interface AffectionGraphResponse {
+  generated_at: string
+  /** 满足筛选的份数 / 画进图里的份数 / 合并后休眠、没画的份数 */
+  total: number
+  drawn: number
+  skipped_merged: number
+  node_count: number
+  edge_count: number
+  nodes: AffectionGraphNode[]
+  edges: AffectionGraphEdge[]
+  stages: AffectionStageInfo[]
+}
+
 export const affectionApi = {
   getList: async (
     params: {
       page: number
       page_size: number
       search?: string
+      /** 按人精确筛；副账号由服务端解析成主账号 */
+      person?: string
       stage?: AffectionStageValue
       sort_by?: AffectionSortBy
     } & InstanceScopeParam
@@ -190,9 +256,26 @@ export const affectionApi = {
     return response.data
   },
 
-  getSummary: async (instanceKey?: string): Promise<AffectionSummary> => {
+  /** 关系图（只读）：人设在中间，人、关系里程碑、频道围在外面；搜索与阶段筛选同列表 */
+  getGraph: async (
+    params: { search?: string; stage?: AffectionStageValue; limit?: number } & InstanceScopeParam
+  ): Promise<AffectionGraphResponse> => {
+    const response = await axios.get<AffectionGraphResponse>('/affection/graph', { params })
+    return response.data
+  },
+
+  /**
+   * 概览：总数、各阶段人数与最高分
+   *
+   * `search` 与列表同一口径（昵称或账号里含关键词），阶段筛选不参与 —— 概览本身就要
+   * 按阶段分组，按阶段再筛一次只会剩下一个非零项。
+   */
+  getSummary: async (instanceKey?: string, search?: string): Promise<AffectionSummary> => {
     const response = await axios.get<AffectionSummary>('/affection/summary', {
-      params: { instance_key: instanceKey || undefined },
+      params: {
+        instance_key: instanceKey || undefined,
+        search: search?.trim() || undefined,
+      },
     })
     return response.data
   },

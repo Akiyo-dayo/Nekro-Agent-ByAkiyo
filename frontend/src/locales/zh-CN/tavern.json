@@ -59,6 +59,8 @@
     "bookDecorated": "带装饰器 {{n}} 条",
     "bookNotes": "解析说明",
     "includeBook": "导入卡内知识书",
+    "rewriteNameVars": "把读名字的变量换成 {{userMacro}} / {{charMacro}}",
+    "rewriteNameVarsHint": "卡里用变量放用户名、角色名时，NA 取不到值，换成宏才能显示名字；只换输出名字的写法，导入说明里会列出换了哪些",
     "bookGateOn": "频道开了世界书才会生效（本实例当前已开）",
     "bookGateOff": "频道开了世界书才会生效（本实例当前未开）",
     "bookReferenceHint": "导入的条目一律当参考资料，平台方可在世界书页逐条升级",
@@ -71,6 +73,18 @@
     "ruleReplace": "替换",
     "ruleEnabled": "启用",
     "ruleDisabledReason": "默认关闭的原因",
+    "ruleOutputMode": {
+      "replace": "按替换文字",
+      "text": "只留正文",
+      "drop": "整段删掉"
+    },
+    "htmlKindHint": "替换文字是网页代码，QQ 显示不了，NA 不渲染它；建议用只留正文或整段删掉",
+    "htmlKindReveal": {
+      "display": "纯展示",
+      "external": "依赖外部资源",
+      "interactive": "交互程序",
+      "remote": "远端代码或改世界书"
+    },
     "unsupported": "这张卡里平台用不上的部分",
     "notes": "解析说明",
     "gates": "目标实例的闸",
@@ -95,7 +109,9 @@
     "slotsResultEnabled": "已为本实例打开高级提示词槽位，后置指令会发送。",
     "slotsResultAlready": "本实例的高级提示词槽位已经开着，没有改动。",
     "slotsResultFailed": "已导入，但槽位没打开：{{reason}}",
-    "slotsResultChannelsOff": "下面这些频道单独把槽位关着，仍然不发送："
+    "slotsResultChannelsOff": "下面这些频道单独把槽位关着，仍然不发送：",
+    "remoteBooks": "卡片脚本要下载的世界书",
+    "remoteBooksHint": "导入人设后可以在这里或人设页下载。"
   },
   "export": {
     "open": "导出",
@@ -114,7 +130,7 @@
       "depth_limited": "只对指定深度以上的消息生效；平台只清理刚发出的这一条，这条默认关闭",
       "invalid_regex": "正则语法不合法，执行不了，这条默认关闭",
       "unsafe_regex": "正则有让服务卡住的风险，安全检查没过，这条默认关闭",
-      "html_output": "替换文字里带 HTML 标签；QQ 显示不了状态栏，需要的话可以在这里打开"
+      "html_output": "替换文字里带 HTML 标签，按只留正文启用以后过不了保存校验，所以停用了；可以改掉标签后再启用"
     }
   },
   "extension": {
@@ -185,7 +201,7 @@
       "pick": "挑选方式",
       "pickFirst": "第一条",
       "pickRandom": "随机一条",
-      "hint": "频道切到这个人设或执行 /reset 之后，下一次被叫到时先发一条开场白，再照常回复；群聊有群聊专用的就用群聊专用的。"
+      "hint": "开场白不再发进聊天，只随卡片保存，导出时原样带回。"
     },
     "slots": {
       "postHistory": "后置指令",
@@ -207,6 +223,26 @@
       "replace": "替换",
       "trim": "去除串",
       "enabled": "启用",
+      "outputMode": "处理方式",
+      "outputModeOption": {
+        "replace": "按替换文字",
+        "text": "只留正文",
+        "drop": "整段删掉"
+      },
+      "outputModeHint": {
+        "replace": "命中时换成替换文字（原来的行为）",
+        "text": "只保留分组里的文字，HTML 和固定文字都不要",
+        "drop": "命中的部分全部去掉"
+      },
+      "htmlKind": {
+        "display": "纯展示",
+        "external": "依赖外部资源",
+        "interactive": "交互程序",
+        "remote": "远端代码或改世界书"
+      },
+      "htmlKindHint": "替换文字是网页代码，QQ 显示不了，NA 不渲染它；建议用只留正文或整段删掉",
+      "reimportNote": "HTML 规则在这里的启用状态和处理方式只管 NA 怎么发，不写进导出的卡；重新导入会恢复卡里的启用状态和默认处理方式",
+      "htmlEnableHint": "这条规则的替换文字是网页代码：这里的开关与处理方式只管 NA 怎么发，不写进导出的卡，重新导入会恢复成卡里的样子",
       "status": "状态",
       "add": "添加规则",
       "remove": "删除规则",
@@ -220,6 +256,45 @@
       "slowDisabled": "已停用（太慢）",
       "slowDisabledHint": "本进程里这条规则累计超时 3 次，已暂停使用；保存一次规则表后重新计数"
     }
+  },
+  "remoteBooks": {
+    "title": "远程世界书",
+    "intro": "卡片里的脚本会在酒馆运行时下载这些世界书；NA 不执行脚本，由你确认后代为下载，作为这个人设的参考资料导入（条目不当成可信内容）。不会自动更新。",
+    "proxy": "通过系统代理下载",
+    "fileName": "文件名",
+    "host": "主地址主机",
+    "versionHint": "版本提示",
+    "status": "状态",
+    "actions": "操作",
+    "scripts": "来源脚本",
+    "pointsTo": "地址指向 {{hint}}",
+    "mirrors": "另有 {{n}} 个镜像",
+    "notImported": "未导入",
+    "versionLine": "版本 {{version}}",
+    "noVersion": "未写版本",
+    "entries": "{{n}} 条",
+    "fromHost": "来自 {{host}}",
+    "manualSource": "手动上传",
+    "downloadedAt": "下载于 {{time}}",
+    "download": "下载并导入",
+    "check": "检查更新",
+    "update": "更新到新版本",
+    "upload": "手动上传",
+    "retry": "重试",
+    "checkSame": "已是最新",
+    "checkNewer": "有新版本：{{remote}}（当前 {{local}}）",
+    "checkChanged": "内容有变化（版本号相同）",
+    "checkNotImported": "这本还没有导入，刷新后可以重新下载",
+    "importedDone": "已导入《{{name}}》，{{n}} 条",
+    "updatedDone": "已更新《{{name}}》，{{n}} 条",
+    "notesHint": "导入说明 {{n}} 条，可在世界书页查看",
+    "downloadFailed": "下载远程世界书失败",
+    "checkFailed": "检查更新失败",
+    "uploadFailed": "上传世界书失败",
+    "confirmTitle": "替换这本书",
+    "confirmBody": "会用新版本替换这本书的全部条目，你在这本书里手改过的条目会被覆盖。",
+    "confirmReplace": "替换",
+    "cancel": "取消"
   },
   "rounds": {
     "title": "人设卡与槽位",
@@ -277,13 +352,27 @@
     "tabs": {
       "preview": "预览",
       "trial": "试发",
+      "presets": "预设",
       "audit": "变更记录"
     },
+    "menu": {
+      "changeLog": "变更记录"
+    },
     "preview": {
+      "nav": {
+        "overview": "概览",
+        "rp": "预设排布",
+        "greeting": "开场白",
+        "slots": "槽位",
+        "messages": "消息"
+      },
+      "greetingNotSent": "这次预览不会发送开场白",
       "channel": "频道",
       "channelPlaceholder": "请选择频道",
       "preset": "人设",
       "presetCurrent": "频道当前人设",
+      "rpPreset": "试看预设",
+      "rpPresetCurrent": "按频道当前设置",
       "sample": "示例消息",
       "samplePlaceholder": "可选，填一句会作为聊天记录最后一条参与预览",
       "sampleHelper": "可选，最多 {{max}} 字（{{count}}/{{max}}）",
@@ -292,6 +381,29 @@
       "notice": "预览不跑记忆召回、不调插件的动态注入，这两处用占位表示；不调模型、不写任何记录。",
       "botOffline": "这个频道的 Bot 当前不在线，提示词里 Bot 自己的平台账号用占位表示；其余内容与实际一致。",
       "presetOverrideNote": "换人设预览：人设正文、高级槽位、开场白、深度注入与人设世界书按所选人设；频道摘要与好感块仍按频道当前人设（它们跟着人设的记忆分区走，预览不切换分区）。",
+      "rpTitle": "按预设排布：{{name}}",
+      "rpStats": {
+        "system": "系统提示词 {{count}} 段",
+        "tail": "聊天记录后 {{count}} 段",
+        "depth": "深度注入 {{count}} 段"
+      },
+      "rpColumns": {
+        "name": "名称",
+        "where": "落在哪",
+        "chars": "字数"
+      },
+      "rpWhere": {
+        "system": "系统提示词",
+        "tail": "聊天记录后",
+        "depth": "深度 {{depth}}"
+      },
+      "rpEmpty": "这份预设没有产出任何段落",
+      "rpPrefill": "预填：这一版不发送",
+      "rpInactive": {
+        "slots_off": "这个频道没有打开『启用高级提示词槽位』，预设不会生效",
+        "tavern_off": "这个频道的人设没有走酒馆兼容运行时，预设不会生效",
+        "unavailable": "这个频道选的预设已经不存在，或不属于这个实例，预设不会生效"
+      },
       "summarySlots": "高级槽位",
       "slotsOn": "开",
       "slotsOff": "关",
@@ -351,6 +463,103 @@
       "codeEmpty": "回复里没有代码块",
       "usage": "用量：输入 {{input}} / 输出 {{output}} / 合计 {{total}} token"
     },
+    "presets": {
+      "import": "导入预设",
+      "emptyTitle": "还没有预设。导入一份 SillyTavern 的对话补全预设（.json）",
+      "globalReadOnly": "全局预设对实例只读",
+      "segmentsCount": "启用 {{enabled}} / 共 {{total}}",
+      "columns": {
+        "name": "名称",
+        "segments": "段落",
+        "owner": "归属",
+        "updatedAt": "更新时间"
+      },
+      "owner": {
+        "global": "全局",
+        "instance": "本实例"
+      },
+      "actions": {
+        "export": "导出",
+        "delete": "删除"
+      },
+      "importDialog": {
+        "title": "导入预设",
+        "chooseFile": "选择文件",
+        "fileHint": "只收 .json，单个文件最大 {{max}} MiB",
+        "jsonOnly": "只支持 .json 文件",
+        "noFile": "请先选择预设文件",
+        "inspecting": "正在解析…",
+        "name": "名称",
+        "nameRequired": "名称不能为空",
+        "notesTitle": "说明",
+        "notesEmpty": "没有额外的说明",
+        "summaryTitle": "段落摘要",
+        "back": "上一步",
+        "submit": "导入",
+        "importing": "导入中…",
+        "success": "已导入预设"
+      },
+      "deleteDialog": {
+        "title": "删除预设",
+        "body": "删除「{{name}}」？正在用它的频道会回到不用预设的样子。",
+        "confirm": "删除",
+        "deleted": "已删除预设",
+        "referencedHint": "仍有 {{count}} 处配置选用了这个预设：{{names}}。删除后这些地方会按没选预设处理。",
+        "referenceJoin": "、",
+        "referenceMore": "等",
+        "referenceLayer": {
+          "system": "全局配置",
+          "adapter": "适配器 {{label}}",
+          "instance": "实例 {{label}}",
+          "channel": "频道 {{label}}"
+        }
+      },
+      "detail": {
+        "name": "名称",
+        "nameRequired": "名称不能为空",
+        "notice": "要让某个实例或频道用上它：在本页右上角『设置』里把『角色扮演预设』选成它，并打开『启用高级提示词槽位』。",
+        "report": "导入报告（{{count}} 条）",
+        "reportEmpty": "没有额外的说明",
+        "search": "搜索段落",
+        "searchPlaceholder": "按名称过滤",
+        "onlyEnabled": "只看已启用",
+        "shown": "显示 {{shown}} / {{total}} 段",
+        "noMatch": "没有匹配的段落",
+        "columns": {
+          "name": "名称",
+          "role": "角色",
+          "position": "位置",
+          "chars": "字数",
+          "enabled": "是否启用"
+        },
+        "enabledYes": "已启用",
+        "enabledNo": "未启用",
+        "position": {
+          "before": "聊天记录前",
+          "after": "聊天记录后",
+          "depth": "深度 {{depth}}"
+        },
+        "marker": {
+          "chatHistory": "—— 聊天记录 ——",
+          "fillPrefix": "由 NA 填入",
+          "fills": {
+            "charDescription": "角色描述",
+            "charPersonality": "性格",
+            "scenario": "场景",
+            "dialogueExamples": "示例对话",
+            "worldInfo": "世界书",
+            "chatHistory": "聊天记录"
+          }
+        },
+        "emptyContent": "这一段没有正文",
+        "toggleSegment": "启用「{{name}}」",
+        "unsaved": "{{count}} 处未保存",
+        "discard": "放弃",
+        "save": "保存",
+        "saving": "保存中…",
+        "saved": "预设已保存"
+      }
+    },
     "audit": {
       "columns": {
         "time": "时间",
@@ -367,6 +576,7 @@
       "targetPreset": "人设 {{id}}",
       "field": {
         "advancedSlots": "高级槽位开关",
+        "stablePrefixOrder": "提示词稳定前缀顺序",
         "postHistory": "后置指令",
         "auxiliary": "辅助提示词",
         "prefill": "预填",

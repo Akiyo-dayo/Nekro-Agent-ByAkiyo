@@ -1,15 +1,19 @@
 import asyncio
 import base64
+import concurrent.futures
 import difflib
+import functools
 import hashlib
 import ipaddress
 import mimetypes
 import random
 import re
 import socket
+import threading
+import weakref
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 from urllib.parse import urljoin
 
 import aiofiles
@@ -54,11 +58,13 @@ _DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
 # 198.18.0.0/15 是 RFC 2544 的基准测试保留段（Clash 默认的 198.18.0.1/16 也在其中），
 # Shadowrocket / Clash 等把它当 Fake-IP 池用：DNS 返回这一段里的一个假地址，连接被代理接管、
 # 按**原域名**转发出去。也就是说这个 IP 根本不代表一台主机。放进威胁模型看：
-#   1. 部署方没开代理时，RFC 2544 规定这一段不得出现在公网，连过去只会超时 —— 攻击者拿不到
-#      任何信息增量，和现在被拒绝的结果没有区别；
-#   2. 部署方开了代理时，流量由代理按域名转发，探测不到部署方内网的任何服务。
-# 两种情况下它都不在本防护要防的范围内，所以默认把它从"内网"里摘出来，让开了代理的普通部署
-# 开箱可用。真正的威胁面（回环 / RFC1918 / 链路本地 / CGNAT / 组播 等）一律仍然拒绝。
+#   1. 部署方没开代理时，RFC 2544 规定这一段不得出现在公网，连过去只会超时；
+#   2. 部署方开了代理时，流量由代理按**域名**再解析一次、转发出去——**这一步并不安全**：控制那个域名
+#      DNS 的人可以让代理替 NA 连进部署方的内网，NA 连上之后核对对端也只看得到那个假地址。
+# 这个默认放行让开着代理的部署能照常下载聊天里的图片，也照常用租户自填的出站地址（模型组、webhook、MCP、
+# 自填邮箱，`tools/tenant_egress.py`）：两类出站用的是同一份放行网段，都不额外拦这一段。代价是这类部署上
+# 那条「代理按域名再解析」的路仍然开着，内网安全靠代理自己的规则（运维文档 §1.7）。置空本配置就两类都拒。
+# 真正的威胁面（回环 / RFC1918 / 链路本地 / CGNAT / 组播等）一律仍然拒绝。
 #
 # 顺带说明两个不需要特殊处理的网段：28.0.0.0/8 已分配给 DoD，是公网地址，`is_global` 本来就
 # 放行；100.64.0.0/10（CGNAT，Tailscale 也用它）仍被拒绝 —— 它确实可能对应部署方网络里的真实
@@ -76,12 +82,6 @@ _DENIED_IPV6_NETWORKS: Tuple[ipaddress.IPv6Network, ...] = tuple(
     ipaddress.IPv6Network(entry)
     for entry in ("::/96", "::ffff:0:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "fec0::/10")
 )
-
-# 透明代理的 Fake-IP 段（见 DEFAULT_EXTRA_ALLOWED_NETWORKS 的说明）。下载素材默认放行它，但**租户自填的
-# 邮件服务器**不行：连到这一段时对端永远是那个假地址，代理再按域名自己去解析——租户控制那个域名的 DNS，
-# 就能让代理替 NA 连进内网，连接后的对端核对也只看得到假地址。所以租户这一侧对它一律拒绝，
-# 不管 DOWNLOAD_EXTRA_ALLOWED_NETWORKS 里写没写它。平台方账户不受影响
-_FAKE_IP_NETWORKS: Tuple[ipaddress.IPv4Network, ...] = (ipaddress.IPv4Network("198.18.0.0/15"),)
 
 
 class UnsafeDownloadUrlError(ValueError):
@@ -115,13 +115,13 @@ def parse_extra_allowed_networks(raw: str) -> Tuple[_IPNetwork, ...]:
         except ValueError:
             logger.warning(f"DOWNLOAD_EXTRA_ALLOWED_NETWORKS 含非法网段，已忽略: {entry!r}")
             continue
-        # 写进这里的网段等于部署方声明"它不是我的内网"，因此对下载与租户提交的接口地址一并生效。
+        # 写进这里的网段等于部署方声明"它不是我的内网"，对下载素材与租户填的出站地址一并生效。
         # 覆盖到真实内网时不拦（细粒度放行单台内网机器是合理用法，比开 ALLOW_PRIVATE_NETWORK_DOWNLOAD
         # 放开整个内网更安全），但必须告警，避免有人误以为这只是个"兼容代理"的无害开关。
         if not network.is_global:
             logger.warning(
                 f"DOWNLOAD_EXTRA_ALLOWED_NETWORKS 放行了非公网网段 {network}，"
-                f"该网段内的地址将对下载链接与租户接口地址一并开放，请确认这是预期行为",
+                f"聊天消息里的下载链接与租户填的出站地址指向该网段时都会被放行，请确认这是预期行为",
             )
         networks.append(network)
     return tuple(networks)
@@ -142,19 +142,17 @@ def _is_denied_ipv6_form(ip: _IPAddress) -> bool:
     return ip.version == 6 and any(ip in network for network in _DENIED_IPV6_NETWORKS)
 
 
-def _is_allowed_target_ip(ip: _IPAddress, *, exclude_fake_ip: bool = False) -> bool:
-    """判断出站目标 IP 是否允许访问
+def _is_allowed_target_ip(ip: _IPAddress) -> bool:
+    """判断出站目标 IP 是否允许访问（下载素材与租户填的出站地址同一份判据）
 
-    `exclude_fake_ip=True`（租户自填的邮件服务器）：只认真正的公网地址——198.18.0.0/15 一律拒绝，
-    `DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 里的非公网网段也**不认**：那些网段多半是部署方的透明代理 / TUN
-    地址池或内网，连过去之后由代理按域名再解析，等于把「连到哪里」交给了租户的 DNS。
-    落在公网段里的假地址池（有的代理用 28.0.0.0/8 这类段）从地址上认不出来：开着 Fake-IP / TUN 透明代理
-    的部署，实例自填邮箱仍不安全（运维文档 §1.7 写明）。
+    公网地址放行，`DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 里的网段也放行（默认是透明代理的 Fake-IP 段，见
+    `DEFAULT_EXTRA_ALLOWED_NETWORKS`）。开着 Fake-IP / TUN 透明代理的部署上，连过去之后由代理按域名再解析，
+    「连到哪里」交给了代理与那个域名的 DNS，内网安全靠代理自己的规则（运维文档 §1.7 写明）。
+
+    组播与未指定地址一律拒绝：Python 3.11 里有一部分 IPv4 与 IPv6 组播段的 `is_global` 为真。
     """
-    if exclude_fake_ip:
-        if any(ip.version == network.version and ip in network for network in _FAKE_IP_NETWORKS):
-            return False
-        return ip.is_global and not _is_denied_ipv6_form(ip)
+    if ip.is_multicast or ip.is_unspecified:
+        return False
     if ip.is_global and not _is_denied_ipv6_form(ip):
         return True
     return any(ip.version == network.version and ip in network for network in parse_extra_allowed_networks(OsEnv.DOWNLOAD_EXTRA_ALLOWED_NETWORKS))
@@ -201,12 +199,90 @@ async def _assert_url_targets_public_network(url: str, subject: str) -> None:
     await _resolve_checked_targets(host, port, subject)
 
 
+# 这里的主机名解析（租户填的地址、聊天里的下载链接，主机名由外人决定）在**自己的线程池**里跑，不用事件循环的默认
+# 线程池：被黑洞的域名会让 `getaddrinfo` 卡到系统解析器超时，在默认线程池里卡住的线程会把别处的 `to_thread`、
+# 平台方 httpx / anyio 自己的解析一起拖住（2 核机器默认只有 6 个工作线程）。这个池子最多这么多个线程，
+# 卡满了只影响这两类出站。
+_RESOLVER_WORKERS = 16
+_resolver_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_resolver_pool_lock = threading.Lock()
+# 同一个（主机名, 端口）同时只查一次：后来的调用方等正在查的那一次（每个事件循环一张表）
+_inflight_lookups: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[Tuple[str, int], _SharedLookup]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+class _SharedLookup:
+    __slots__ = ("task", "waiters")
+
+    def __init__(self, task: "asyncio.Future[list]"):
+        self.task = task
+        self.waiters = 0
+
+
+def _resolver_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _resolver_pool
+    with _resolver_pool_lock:
+        if _resolver_pool is None:
+            _resolver_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_RESOLVER_WORKERS,
+                thread_name_prefix="na-egress-dns",
+            )
+        return _resolver_pool
+
+
+async def _system_getaddrinfo(host: str, port: int) -> list:
+    """真正查 DNS 的唯一一处：在自己的线程池里跑 `socket.getaddrinfo`（用例打桩这里或 `socket.getaddrinfo`）"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _resolver_executor(),
+        functools.partial(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM),
+    )
+
+
+async def _getaddrinfo_shared(host: str, port: int) -> list:
+    """解析主机名；同一（主机名, 端口）正在查时等那一次的结果
+
+    调用方超时或被取消时只撤自己这一层等待；所有人都不等了，就把这次查询撤掉——还没排上线程的从线程池队列里
+    拿掉，已经在跑的线程停不下来，跑完结果丢掉。所以被放弃的查询不会在队列里越积越多。
+    """
+    loop = asyncio.get_running_loop()
+    table = _inflight_lookups.get(loop)
+    if table is None:
+        table = {}
+        _inflight_lookups[loop] = table
+    key = (host, int(port))
+    lookup = table.get(key)
+    if lookup is None or lookup.task.done():
+        task = asyncio.ensure_future(_system_getaddrinfo(host, int(port)))
+        lookup = _SharedLookup(task)
+        table[key] = lookup
+
+        def _forget(done: "asyncio.Future[list]", lookup: _SharedLookup = lookup) -> None:
+            if table.get(key) is lookup:
+                del table[key]
+            if not done.cancelled():
+                done.exception()  # 没人等时也取走异常，免得「从未被取走」的告警
+
+        task.add_done_callback(_forget)
+    lookup.waiters += 1
+    try:
+        return await asyncio.shield(lookup.task)
+    finally:
+        lookup.waiters -= 1
+        if lookup.waiters == 0 and not lookup.task.done():
+            # 先从表里摘掉再取消：`cancel()` 之后任务还要过一两轮事件循环才真正结束，这期间新来的调用方要是复用它，
+            # `shield` 会把这次取消原样转给一个毫不相干的调用方（凭空一个 CancelledError，`except Exception` 接不住，
+            # 对话或后台循环会被当成「被取消」静默中止）。摘掉以后新来的人另起一次查询
+            if table.get(key) is lookup:
+                del table[key]
+            lookup.task.cancel()
+
+
 async def _resolve_checked_targets(
     host: str,
     port: int,
     subject: str,
-    *,
-    exclude_fake_ip: bool = False,
 ) -> Tuple[_IPAddress, ...]:
     """解析一次主机名，逐个校验**全部**结果，返回去重后的地址（按解析顺序）
 
@@ -218,7 +294,7 @@ async def _resolve_checked_targets(
         UnsafeDownloadUrlError: 任何一个结果不允许访问
     """
     try:
-        addr_infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addr_infos = await _getaddrinfo_shared(host, port)
     except (socket.gaierror, UnicodeError) as e:
         # UnicodeError：httpx 放行、但 getaddrinfo 的 idna 编码拒绝的主机名（空标签 `a..b`、超过 63 字符的标签），没有发出查询
         raise UnresolvableDownloadHostError(f"{subject}主机名解析失败: {host}") from e
@@ -226,16 +302,14 @@ async def _resolve_checked_targets(
     resolved: list[_IPAddress] = []
     for addr_info in addr_infos:
         ip = _normalize_ip(addr_info[4][0])
-        if not _is_allowed_target_ip(ip, exclude_fake_ip=exclude_fake_ip):
+        if not _is_allowed_target_ip(ip):
             # 调用方普遍以 debug 级别吞掉下载异常，这里主动升级日志级别，
             # 既保证安全事件可见，也避免正常部署被拦截时无从排查
-            hint = (
-                "（租户自填的服务器不接受透明代理的 Fake-IP 段）"
-                if exclude_fake_ip and any(ip.version == n.version and ip in n for n in _FAKE_IP_NETWORKS)
-                else "（若这是透明代理的 Fake-IP，请把对应网段写入 NEKRO_DOWNLOAD_EXTRA_ALLOWED_NETWORKS）"
-            )
+            hint = "（若这是透明代理的 Fake-IP，请把对应网段写入 NEKRO_DOWNLOAD_EXTRA_ALLOWED_NETWORKS）"
             logger.warning(f"拒绝指向非公网地址的{subject}: {host} -> {ip}{hint}")
-            raise UnsafeDownloadUrlError(f"{subject}指向非公网地址: {host} -> {ip}")
+            # 异常文字不带解析出的地址：它可能一路回到发起者眼前（租户拉模型列表时填 `http://postgres:5432`
+            # 就能拿回容器地址），地址只进上面那行日志
+            raise UnsafeDownloadUrlError(f"{subject}指向非公网地址: {host}")
         if ip not in resolved:
             resolved.append(ip)
     return tuple(resolved)
@@ -278,7 +352,7 @@ def assert_connected_peer_safe(peer_ip: Optional[str]) -> None:
         raise UnsafeDownloadUrlError("下载连接的对端不是公网地址")
 
 
-def assert_tenant_connected_peer_safe(peer_ip: Optional[str], *, exclude_fake_ip: bool = False) -> None:
+def assert_tenant_connected_peer_safe(peer_ip: Optional[str]) -> None:
     """校验租户发起的连接的实际对端 IP
 
     与 `assert_connected_peer_safe` 的差别同 `assert_tenant_endpoint_url_safe` 与
@@ -286,8 +360,7 @@ def assert_tenant_connected_peer_safe(peer_ip: Optional[str], *, exclude_fake_ip
     对自己「允许从内网拉素材」的授权，把它顺延成「允许租户连内网」就是越权通道。
 
     `DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 仍然生效（判据沿用 `_is_allowed_target_ip`）：它显式
-    声明的是「这些非内网网段算安全」，与部署方是否允许内网下载是两件事。`exclude_fake_ip=True`
-    时 Fake-IP 段一律拒绝（租户自填的邮件服务器，见 `_FAKE_IP_NETWORKS`）。
+    声明的是「这些网段不是我的内网」，与部署方是否允许内网下载是两件事。
 
     报错文案**不带地址**：它可能一路回到租户眼前，带上地址就等于告诉租户「NA 连上了内网的哪台机器」。
     地址只进日志。
@@ -299,25 +372,65 @@ def assert_tenant_connected_peer_safe(peer_ip: Optional[str], *, exclude_fake_ip
         ip = _normalize_ip(peer_ip or "")
     except ValueError as e:
         raise UnsafeDownloadUrlError("无法确认连接的对端地址") from e
-    if not _is_allowed_target_ip(ip, exclude_fake_ip=exclude_fake_ip):
+    if not _is_allowed_target_ip(ip):
         logger.warning(f"拒绝连接到非公网对端的租户出站连接: {ip}")
         raise UnsafeDownloadUrlError("连接的对端不是公网地址")
 
 
-async def assert_tenant_endpoint_url_safe(url: str) -> None:
+def tenant_target_unavailable_message(subject: str) -> str:
+    """租户能看到的那一句：「解析不到」与「指向不允许的地址」说成同一句
+
+    分开说就等于给租户一个查 NA 所在网络 DNS 的工具：填 `http://postgres:5432`，两种回答就告诉了他这个名字
+    在 NA 的网络里存不存在。具体是哪一种、解析出了什么地址，只进日志。
+    """
+    return f"{subject}不可用：解析不到这个主机名，或它指向不允许访问的地址"
+
+
+async def resolve_tenant_targets(
+    host: str,
+    port: int,
+    subject: str,
+) -> Tuple[_IPAddress, ...]:
+    """租户填的出站目标：解析一次、按租户判据校验全部结果，返回校验过的地址（至少一个）
+
+    判据就是 `_resolve_checked_targets`，与下载素材同一份：拒内网，认 `DOWNLOAD_EXTRA_ALLOWED_NETWORKS`
+    （默认放行透明代理的 Fake-IP 段）；与下载不同的只有一处：`ALLOW_PRIVATE_NETWORK_DOWNLOAD` 不管用。
+    被拒时报 `tenant_target_unavailable_message` 那一句，异常**不带异常链**（`__cause__` / `__context__` 都是空的）：
+    有的调用方会把整条链翻出来给人看（MCP 校验的 `_find_unsafe_url_error`）。
+
+    Raises:
+        UnsafeDownloadUrlError: 解析失败或任何一个结果不允许访问（同一句话）
+    """
+    reason = ""
+    try:
+        ips = await _resolve_checked_targets(host, int(port), subject)
+    except UnsafeDownloadUrlError as e:  # 含 UnresolvableDownloadHostError
+        reason = str(e)
+        ips = ()
+    if not ips:
+        logger.warning(f"拒绝租户出站目标（{subject}）: {reason or f'{host} 没有解析结果'}")
+        # 在 except 块外面抛：异常链上什么都不挂
+        raise UnsafeDownloadUrlError(tenant_target_unavailable_message(subject))
+    return ips
+
+
+async def assert_tenant_endpoint_url_safe(url: str, *, subject: str = "接口地址") -> None:
     """校验租户提交的出站接口地址
 
     租户能填任意 `base_url`，等于拿到"从 NA 服务器发起出站请求"的能力：填
     `http://127.0.0.1:8021/api/...` 就能用 NA 自己的网络身份打内网。因此租户侧一律强制公网校验。
 
-    与 `assert_download_url_safe` 的差别只有一处：**不认 `ALLOW_PRIVATE_NETWORK_DOWNLOAD`**。
-    那个开关的语义是"本部署允许从内网拉取素材"，是部署方对自己的授权；把它顺延成
-    "允许租户打内网"会让一个运维便利开关变成越权通道。
+    与 `assert_download_url_safe` 的差别：**不认 `ALLOW_PRIVATE_NETWORK_DOWNLOAD`**（那个开关的语义是
+    "本部署允许从内网拉取素材"，是部署方对自己的授权；把它顺延成"允许租户打内网"会让一个运维便利开关
+    变成越权通道）。`DOWNLOAD_EXTRA_ALLOWED_NETWORKS` 照认（默认放行 Fake-IP 段）。判据与真正建连接时
+    （`tools/tenant_egress.py`）同一份，保存时放行、用的时候却连不上的情况不会出现。
+    解析失败与指向不允许的地址报同一句话（见 `tenant_target_unavailable_message`）。
 
     Raises:
-        UnsafeDownloadUrlError: 协议不被允许、主机无法解析或指向非公网地址
+        UnsafeDownloadUrlError: 协议不被允许、缺主机名，或解析不到 / 指向不允许访问的地址
     """
-    await _assert_url_targets_public_network(url, "接口地址")
+    _scheme, host, port = _split_outbound_url(url, subject)
+    await resolve_tenant_targets(host, port, subject)
 
 
 async def assert_tenant_host_safe(
@@ -325,7 +438,6 @@ async def assert_tenant_host_safe(
     port: int,
     *,
     subject: str = "接口地址",
-    exclude_fake_ip: bool = False,
 ) -> None:
     """按「主机名 + 端口」做与 `assert_tenant_endpoint_url_safe` 完全相同的公网校验
 
@@ -335,7 +447,7 @@ async def assert_tenant_host_safe(
     Raises:
         UnsafeDownloadUrlError: 主机无法解析或指向非公网地址，或主机名不合法
     """
-    await resolve_tenant_host(host, port, subject=subject, exclude_fake_ip=exclude_fake_ip)
+    await resolve_tenant_host(host, port, subject=subject)
 
 
 async def resolve_tenant_host(
@@ -343,7 +455,6 @@ async def resolve_tenant_host(
     port: int,
     *,
     subject: str = "接口地址",
-    exclude_fake_ip: bool = False,
 ) -> Tuple[str, ...]:
     """校验租户填的「主机名 + 端口」，返回**校验过的**地址（按解析顺序，至少一个）
 
@@ -362,7 +473,6 @@ async def resolve_tenant_host(
         host: 主机名或 `[IPv6]`
         port: 端口
         subject: 出现在报错文案里的主体名
-        exclude_fake_ip: Fake-IP 段也拒绝（租户自填的邮件服务器，见 `_FAKE_IP_NETWORKS`）
 
     Raises:
         UnsafeDownloadUrlError: 主机无法解析或指向非公网地址，或主机名不合法
@@ -385,14 +495,7 @@ async def resolve_tenant_host(
     if not raw_host:
         raise UnsafeDownloadUrlError(f"{subject}缺少主机名")
     # IPv6 字面量在 `raw_host` 里不带方括号，getaddrinfo 正要这个形态
-    ips = await _resolve_checked_targets(
-        raw_host.decode("ascii"),
-        int(port),
-        subject,
-        exclude_fake_ip=exclude_fake_ip,
-    )
-    if not ips:
-        raise UnresolvableDownloadHostError(f"{subject}主机名解析失败")
+    ips = await resolve_tenant_targets(raw_host.decode("ascii"), int(port), subject)
     return tuple(str(ip) for ip in ips)
 
 
@@ -410,7 +513,7 @@ _BARE_HOST_PATTERN = re.compile(r"\[[0-9A-Fa-f:.]+\]|[^\s/@#?\\:\[\]]+")
 #
 # 升版只改这一处（`tests/test_fork_version_and_registry.py` 钉住它与 CHANGELOG 标题、publish.yml 读取方式一致）：
 # `.github/workflows/publish.yml` 从这一行读出版本号作为 GHCR 镜像 tag，并要求触发发布的 git tag 与它一致（标签写法见 publish.yml）。
-FORK_VERSION = "0.4.6"
+FORK_VERSION = "0.4.7"
 FORK_AUTHOR = "Akiyo_dayo"
 
 # 本分支代码所基于的上游 NekroAgent 发布版，只用于署名「基于 NekroAgent 某版本」。
@@ -498,22 +601,29 @@ def compare_semver(a: str, b: str) -> int:
     return 0
 
 
+async def _assert_download_hop_safe(url: str, *, tenant: bool) -> None:
+    """一跳的预检：下载素材用下载的判据；租户触发的下载用租户的判据（不认 `ALLOW_PRIVATE_NETWORK_DOWNLOAD`）"""
+    if tenant:
+        await assert_tenant_endpoint_url_safe(url, subject="下载链接")
+    else:
+        await assert_download_url_safe(url)
+
+
 async def _fetch_following_redirects(
     client: httpx.AsyncClient,
     url: str,
     *,
     max_bytes: Optional[int] = None,
-    check_peer: bool = False,
-    pin_addresses: bool = False,
+    tenant: bool = False,
 ) -> bytes:
     """GET 下载正文，手动跟随跳转
 
-    `pin_addresses=True`（含首跳）：每一跳只解析一次、校验全部结果，请求直接发给校验过的那个地址
-    （见 `_pinned_download_request`），不让 httpx 再解析一遍——否则 DNS 重绑之后 NA 会真的连上内网的
-    某个端口，哪怕随后的对端核对把它断开，「连上了没有」本身已经能拿来探测内网。
+    `client` 的传输层应是 `tenant_egress.download_http_transport()`：每一跳建连接时解析一次、按下载判据校验、
+    直连校验过的地址并核对对端，DNS 重绑之后 NA 也连不进内网。
 
     `url` 必须已经过 `assert_download_url_safe`（`download_file` 在重试逻辑之外校验首跳）。之后每一跳的目标
     都在发请求之前重新校验：跳转目标由对方服务器决定，跟随而不校验等于让首跳的公网地址替内网地址背书。
+    `tenant=True` 时首跳与每一跳都按租户的判据（见 `_assert_download_hop_safe`），传输层也要是租户口径的。
     跳转响应的正文不读；只有最终那一跳的正文按大小上限边读边计数。上限默认 `MAX_DOWNLOAD_SIZE_BYTES`
     （调用时才读，测试改这个模块常量照样生效）；调用方可以传更小的 `max_bytes`。
 
@@ -533,12 +643,9 @@ async def _fetch_following_redirects(
     for redirects_followed in range(MAX_DOWNLOAD_REDIRECTS + 1):
         try:
             async with asyncio.timeout_at(deadline):
-                if pin_addresses:
-                    request = await _pinned_download_request(client, current)
-                else:
-                    if redirects_followed:
-                        await assert_download_url_safe(current)
-                    request = client.build_request("GET", current, headers=_DOWNLOAD_REQUEST_HEADERS)
+                if redirects_followed:
+                    await _assert_download_hop_safe(current, tenant=tenant)
+                request = client.build_request("GET", current, headers=_DOWNLOAD_REQUEST_HEADERS)
                 response = await client.send(request, stream=True)
         except httpx.InvalidURL as e:
             # httpx 不跟跳转也会按 Location 预先构造下一跳（`response.next_request`，不发出去），`javascript:alert(1)`
@@ -546,10 +653,6 @@ async def _fetch_following_redirects(
             # RemoteProtocolError，和真正的协议错误分不开，照普通失败处理（会重试，同样什么都没发出去）
             raise UnsafeDownloadUrlError("下载链接或跳转目标不是合法的 URL") from e
         try:
-            if check_peer:
-                # 发请求前那次校验解析一次、httpx 连接时再解析一次，DNS 重绑就发生在两次之间：
-                # 以实际连上的地址为准（`check_peer` 由不走代理的调用方打开，见 `fetch_url_bytes`）
-                assert_connected_peer_safe(_response_peer_ip(response))
             if response.status_code not in _DOWNLOAD_REDIRECT_STATUS:
                 response.raise_for_status()
                 if response.headers.get("content-encoding", "").strip().lower() not in ("", "identity"):
@@ -581,11 +684,19 @@ async def _fetch_following_redirects(
     raise UnsafeDownloadUrlError(f"下载链接跳转超过 {MAX_DOWNLOAD_REDIRECTS} 次")
 
 
-async def fetch_url_bytes(url: str, *, max_bytes: Optional[int] = None, timeout: Optional[float] = None) -> bytes:
+async def fetch_url_bytes(
+    url: str,
+    *,
+    max_bytes: Optional[int] = None,
+    timeout: Optional[float] = None,
+    proxy: Optional[str] = None,
+    tenant: bool = False,
+) -> bytes:
     """把一个外部链接的正文读进内存（不落盘），与 `download_file` 同一套守卫
 
     给「拿到字节自己处理」的调用方用（例如表情收集：先算内容哈希再决定存不存）：首跳过
     `assert_download_url_safe`（拒回环 / 私有 / 链路本地等地址，按解析出的 IP 判），跳转逐跳复检，
+    建连接时固定校验过的地址并核对对端（`download_http_transport`，环境代理照用），
     只收未压缩正文，边读边按 `max_bytes`（默认 `MAX_DOWNLOAD_SIZE_BYTES`）计数。不重试：调用方多半
     在一次模型调用里，失败直接交回比静默重试三次更好。
 
@@ -593,46 +704,30 @@ async def fetch_url_bytes(url: str, *, max_bytes: Optional[int] = None, timeout:
         url: 外部链接（http / https）
         max_bytes: 正文大小上限；不传用全局上限
         timeout: 客户端每次读的超时（秒）；不传用 `DOWNLOAD_TIMEOUT_SECONDS`
+        proxy: 部署方配的 HTTP(S) 代理（不读环境变量，见 `download_http_transport`）；不传照旧
+        tenant: 下载是租户触发的：首跳、每一跳与建连接都按租户的判据（不认 `ALLOW_PRIVATE_NETWORK_DOWNLOAD`，
+            环境变量里的 SOCKS 代理直接拒），见 `tenant_egress.download_http_transport`
 
     Raises:
         UnsafeDownloadUrlError: 链接或跳转目标被拒、正文带压缩编码、超过大小上限等
-        httpx.HTTPError: 网络错误或最终响应不是 2xx
+        httpx.HTTPError: 网络错误或最终响应不是 2xx；`proxy` 不是 HTTP(S) 代理时是 `httpx.ProxyError`
     """
+    # 局部导入：tenant_egress 在模块级依赖本模块
+    from nekro_agent.tools.tenant_egress import download_http_transport
+
     client_timeout = DOWNLOAD_TIMEOUT_SECONDS if timeout is None else timeout
-    # `trust_env=False`：走环境代理时对端是代理，核对实际对端就没有意义了（与 video.py 同一做法）。
-    # 首跳的校验在 `_fetch_following_redirects` 里与连接共用一次解析（`pin_addresses`）
-    async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=False, trust_env=False) as client:
-        return await _fetch_following_redirects(client, url, max_bytes=max_bytes, check_peer=True, pin_addresses=True)
-
-
-async def _pinned_download_request(client: httpx.AsyncClient, url: str) -> httpx.Request:
-    """为 `url` 造一个直接发往**校验过的地址**的请求
-
-    解析一次、校验全部结果（与 `assert_download_url_safe` 同一套判据），URL 的主机换成第一个地址；
-    `Host` 头与 TLS 的 SNI / 证书主机名仍是原主机名（httpcore 的 `sni_hostname` 请求扩展），
-    所以对方看到的请求、证书校验都与直接按主机名请求一样。
-    部署方开了 `ALLOW_PRIVATE_NETWORK_DOWNLOAD` 时不做解析与换址，照原样请求。
-
-    Raises:
-        UnsafeDownloadUrlError: 链接不合法、协议不被允许、主机解析失败或指向非公网地址
-    """
-    scheme, host, port = _split_outbound_url(url, "下载链接")
-    if OsEnv.ALLOW_PRIVATE_NETWORK_DOWNLOAD:
-        return client.build_request("GET", url, headers=_DOWNLOAD_REQUEST_HEADERS)
-    ips = await _resolve_checked_targets(host, port, "下载链接")
-    if not ips:
-        raise UnresolvableDownloadHostError("下载链接主机名解析失败")
-    target = httpx.URL(url)
-    headers = {**_DOWNLOAD_REQUEST_HEADERS, "Host": target.netloc.decode("ascii")}
-    extensions = {"sni_hostname": host} if scheme == "https" else {}
-    return client.build_request("GET", target.copy_with(host=str(ips[0])), headers=headers, extensions=extensions)
-
-
-def _response_peer_ip(response: httpx.Response) -> Optional[str]:
-    """这一跳实际连上的对端 IP（取不到返回 None，由 `assert_connected_peer_safe` 按拒绝处理）"""
-    stream = response.extensions.get("network_stream")
-    address = stream.get_extra_info("server_addr") if stream is not None else None
-    return str(address[0]) if address else None
+    # 与 `download_file` 同一做法：首跳先预检（给出明确的拒绝，协议不对也在这里拦），建连接那一步由
+    # `download_http_transport` 再解析一次、按同一判据校验、直连校验过的地址并核对对端。环境代理由传输层处理
+    # （经 HTTP(S) 代理时 `CONNECT` 校验过的地址，部署方开了 `EGRESS_ENV_PROXY_RESOLVES_HOSTNAME` 时发主机名），
+    # 所以客户端自己 `trust_env=False`
+    await _assert_download_hop_safe(url, tenant=tenant)
+    async with httpx.AsyncClient(
+        timeout=client_timeout,
+        follow_redirects=False,
+        transport=download_http_transport(proxy=proxy, tenant=tenant),
+        trust_env=False,
+    ) as client:
+        return await _fetch_following_redirects(client, url, max_bytes=max_bytes, tenant=tenant)
 
 
 def _upload_save_path(file_name: str, from_chat_key: str) -> Path:
@@ -666,13 +761,24 @@ async def download_file(
         Tuple[str, str]: 文件路径, 文件名
     """
 
+    # 局部导入：tenant_egress 在模块级依赖本模块
+    from nekro_agent.tools.tenant_egress import download_http_transport
+
     # 校验失败属于确定性拒绝，重试不会有不同结果，因此放在重试逻辑之外直接抛出。
     # 这里只校验首跳，跳转目标在 _fetch_following_redirects 里逐跳校验（同样抛 UnsafeDownloadUrlError，不重试）
     await assert_download_url_safe(url)
 
     try:
-        # follow_redirects=False：交给 httpx 跟跳转，跳转目标就不会再过上面的校验
-        async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=False) as client:
+        # follow_redirects=False：交给 httpx 跟跳转，跳转目标就不会再过上面的校验。
+        # 建连接那一步（`download_http_transport`）再解析一次、按同一判据校验、直接连校验过的地址并核对对端：
+        # 上面那次校验与 httpx 连接时各解析一次，两次之间可以被 DNS 重绑。环境变量代理照用（由传输层处理，
+        # 经代理时 `CONNECT <校验过的地址>`），所以客户端自己 `trust_env=False`
+        async with httpx.AsyncClient(
+            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            transport=download_http_transport(),
+            trust_env=False,
+        ) as client:
             content = await _fetch_following_redirects(client, url)
             if not use_suffix:
                 mime = magic.from_buffer(content, mime=True)

@@ -1,0 +1,76 @@
+{
+  "button": "Settings",
+  "close": "Close",
+  "title": {
+    "memory": "Memory Settings",
+    "affection": "Affection Settings",
+    "worldbook": "Worldbook Settings",
+    "state": "Character State Settings",
+    "promptLab": "Prompt Settings",
+    "presets": "Preset Settings"
+  },
+  "page": {
+    "memory": "Memory",
+    "affection": "Affection",
+    "worldbook": "Worldbook",
+    "state": "Character State",
+    "promptLab": "Prompt Lab",
+    "presets": "Presets"
+  },
+  "layer": {
+    "label": "Layer",
+    "global": "Global",
+    "instance": "Instance: {{name}}",
+    "instanceOnly": "Instance",
+    "instanceMissing": "Instance: not selected"
+  },
+  "common": "Common",
+  "advancedSection": "Advanced ({{count}})",
+  "searchPlaceholder": "Search settings",
+  "empty": "No settings",
+  "loading": "Loading…",
+  "unsaved": "{{count}} unsaved",
+  "discard": "Discard",
+  "save": "Save",
+  "restartHint": "Some changed items need a restart; they will take effect after the next restart",
+  "unsavedHint": "These changes are not saved yet",
+  "unsavedLeaveConfirm": "There are unsaved settings in the drawer. Leave anyway?",
+  "statePlugin": {
+    "hint": "More character state plugin settings",
+    "action": "Open plugin management"
+  },
+  "system": {
+    "moved": "These settings have moved to the {{page}} page",
+    "go": "Go"
+  },
+  "advancedGroups": {
+    "other": "Other",
+    "memory": {
+      "retention": "Retention & cleanup",
+      "injection": "Injection & recall",
+      "retrieval": "Retrieval ranking",
+      "consolidation": "Consolidation",
+      "episode": "Episode aggregation",
+      "scheduler": "Scheduling & recovery"
+    },
+    "affection": {
+      "prompt": "Prompt & pacing",
+      "budget": "Values & gains",
+      "milestone": "Milestones"
+    },
+    "worldbook": {
+      "lookup": "Lookup",
+      "maintenance": "Maintenance"
+    },
+    "state": {
+      "block": "State block",
+      "image": "State image"
+    },
+    "promptLab": {
+      "slots": "Slot content"
+    },
+    "presets": {
+      "runtime": "Runtime"
+    }
+  }
+}

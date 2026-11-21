@@ -9,8 +9,8 @@
 
 ## Fake-IP 段与 IPv4-translated
 
-下载素材默认放行 198.18.0.0/15（透明代理的 Fake-IP），租户自填的邮件服务器不行：连到那一段时对端永远是假地址，
-代理再按域名自己解析，重绑照样能进内网。`::ffff:0:7f00:1` 在 3.11 里 `is_global` 为真，整段拒绝。
+租户自填的邮件服务器与下载素材用同一份放行网段：默认放行 198.18.0.0/15（透明代理的 Fake-IP），从放行网段里
+删掉就一起拒；真实内网照拒。`::ffff:0:7f00:1` 在 3.11 里 `is_global` 为真，整段拒绝。
 
 ## 其余
 
@@ -148,13 +148,24 @@ class Dialled:
     peer = PUBLIC_IP
     instances: List["Dialled"] = []
 
-    def __init__(self, host: str, port: int, *args: Any, timeout: Any = None, connect_host: str = "") -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *args: Any,
+        timeout: Any = None,
+        connect_host: str = "",
+        ssl_context: Any = None,
+        context: Any = None,
+    ) -> None:
         self.host = host
         self.port = port
         addresses = args[0] if args and isinstance(args[0], (list, tuple)) else None
         self.addresses = tuple(addresses) if addresses is not None else None
         self.proxy_url = args[0] if args and isinstance(args[0], str) else ""
         self.connect_host = connect_host
+        self.ssl_context = ssl_context
+        self.context = context
         self.sock = _Sock(Dialled.peer)
         self.calls: List[str] = []
         Dialled.instances.append(self)
@@ -175,7 +186,7 @@ class Dialled:
         self.calls.append("auth")
         return (235, b"")
 
-    def starttls(self) -> None:
+    def starttls(self, context: Any = None) -> None:
         self.calls.append("starttls")
 
     def send_message(self, _message: Any) -> None:
@@ -236,7 +247,7 @@ class TestTheTenantServerIsResolvedOnceAndDialledByAddress:
         assert dialled.cls.instances[0].addresses == (PUBLIC_IP,)
         assert dialled.dns.lookups["imap.example.test"] == 1
 
-    @pytest.mark.parametrize("answer", [[PRIVATE_IP], [PUBLIC_IP, PRIVATE_IP], [FAKE_IP]])
+    @pytest.mark.parametrize("answer", [[PRIVATE_IP], [PUBLIC_IP, PRIVATE_IP]])
     async def test_a_bad_answer_is_refused_before_anything_is_dialled(self, dialled: SimpleNamespace, answer: List[str]) -> None:
         dialled.dns.answer("imap.example.test", answer)
 
@@ -373,39 +384,42 @@ class TestTheRealPinnedClassesDialTheAddress:
 
 
 class TestFakeIpAndTranslatedAddresses:
-    async def test_fake_ip_is_refused_for_a_tenant_mail_server(self, dns: FakeDNS) -> None:
+    async def test_fake_ip_is_allowed_for_a_tenant_mail_server_by_default(self, dns: FakeDNS, monkeypatch: pytest.MonkeyPatch) -> None:
+        """与下载同一份放行网段：开着透明代理的部署上，租户自填的邮件服务器照常能用"""
+        monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", DEFAULT_EXTRA_ALLOWED_NETWORKS)
+        dns.answer("imap.example.test", [FAKE_IP])
+
+        await mail.assert_custom_mail_host_allowed("imap.example.test", 993)
+        common_util.assert_tenant_connected_peer_safe(FAKE_IP)
+
+    async def test_fake_ip_is_refused_for_a_tenant_mail_server_once_removed(self, dns: FakeDNS, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", "")
         dns.answer("imap.example.test", [FAKE_IP])
 
         with pytest.raises(ValueError, match=mail.CUSTOM_HOST_UNAVAILABLE):
             await mail.assert_custom_mail_host_allowed("imap.example.test", 993)
+        with pytest.raises(UnsafeDownloadUrlError):
+            common_util.assert_tenant_connected_peer_safe(FAKE_IP)
 
     async def test_fake_ip_stays_allowed_for_downloads(self) -> None:
         await common_util.assert_download_url_safe(f"https://{FAKE_IP}/a.png")
 
-    def test_the_tenant_peer_check_can_exclude_fake_ip(self) -> None:
-        common_util.assert_tenant_connected_peer_safe(FAKE_IP)
-        with pytest.raises(UnsafeDownloadUrlError):
-            common_util.assert_tenant_connected_peer_safe(FAKE_IP, exclude_fake_ip=True)
-
-    @pytest.mark.parametrize("extra", ["{cgnat}", "{fake},{cgnat}"])
-    async def test_extra_allowed_networks_do_not_open_a_tenant_mail_server(
-        self,
-        dns: FakeDNS,
-        monkeypatch: pytest.MonkeyPatch,
-        extra: str,
-    ) -> None:
-        """部署方额外放行的非公网网段（多半是代理地址池或内网）对租户自填的邮件服务器不算数；下载素材照旧"""
+    async def test_extra_allowed_networks_apply_to_a_tenant_mail_server_too(self, dns: FakeDNS, monkeypatch: pytest.MonkeyPatch) -> None:
+        """部署方额外放行的网段对下载与租户自填的邮件服务器一并生效（同一份配置）"""
         cgnat_ip = ".".join(("100", "64", "0", "7"))
-        networks = extra.format(cgnat=".".join(("100", "64", "0", "0")) + "/10", fake=DEFAULT_EXTRA_ALLOWED_NETWORKS)
-        monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", networks)
         dns.answer("imap.example.test", [cgnat_ip])
 
-        await common_util.assert_download_url_safe(f"https://{cgnat_ip}/a.png")
-        common_util.assert_tenant_connected_peer_safe(cgnat_ip)
+        monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", DEFAULT_EXTRA_ALLOWED_NETWORKS)
         with pytest.raises(ValueError, match=mail.CUSTOM_HOST_UNAVAILABLE):
             await mail.assert_custom_mail_host_allowed("imap.example.test", 993)
         with pytest.raises(UnsafeDownloadUrlError):
-            common_util.assert_tenant_connected_peer_safe(cgnat_ip, exclude_fake_ip=True)
+            common_util.assert_tenant_connected_peer_safe(cgnat_ip)
+
+        networks = ",".join((DEFAULT_EXTRA_ALLOWED_NETWORKS, ".".join(("100", "64", "0", "0")) + "/10"))
+        monkeypatch.setattr(OsEnv, "DOWNLOAD_EXTRA_ALLOWED_NETWORKS", networks)
+        await common_util.assert_download_url_safe(f"https://{cgnat_ip}/a.png")
+        await mail.assert_custom_mail_host_allowed("imap.example.test", 993)
+        common_util.assert_tenant_connected_peer_safe(cgnat_ip)
 
     def test_the_peer_check_message_carries_no_address(self) -> None:
         with pytest.raises(UnsafeDownloadUrlError) as excinfo:
@@ -465,46 +479,49 @@ class TestFailuresReadTheSame:
 
 
 class TestTheRemoteImageGoesToTheCheckedAddress:
+    """`fetch_url_bytes`（表情收集等）建连接时连校验过的地址：与 `download_file` 同一个传输层"""
+
     @staticmethod
-    def _install(monkeypatch: pytest.MonkeyPatch) -> List[httpx.Request]:
-        seen: List[httpx.Request] = []
+    def _install(monkeypatch: pytest.MonkeyPatch) -> Any:
+        import httpcore
 
-        class _Stream:
-            def get_extra_info(self, name: str) -> Any:
-                return (PUBLIC_IP, 443) if name == "server_addr" else None
+        from tests.test_tenant_egress import FakeBackend
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(request)
-            return httpx.Response(200, stream=httpx.ByteStream(b"\x89PNG"), extensions={"network_stream": _Stream()})
+        monkeypatch.setattr(OsEnv, "ALLOW_PRIVATE_NETWORK_DOWNLOAD", False)
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        backend = FakeBackend(responses=[[b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n\x89PNG"]])
+        monkeypatch.setattr(httpcore, "AnyIOBackend", lambda: backend)
+        return backend
 
-        real_client = httpx.AsyncClient
-
-        def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-            return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
-
-        monkeypatch.setattr(common_util.httpx, "AsyncClient", factory)
-        return seen
-
-    async def test_the_request_is_sent_to_the_address_with_the_original_host(self, monkeypatch: pytest.MonkeyPatch, dns: FakeDNS) -> None:
-        seen = self._install(monkeypatch)
-        dns.answer("img.example.test", [PUBLIC_IP], [PRIVATE_IP])
+    async def test_the_connection_goes_to_the_checked_address_with_the_original_host(self, monkeypatch: pytest.MonkeyPatch, dns: FakeDNS) -> None:
+        backend = self._install(monkeypatch)
+        dns.answer("img.example.test", [PUBLIC_IP])
 
         assert await common_util.fetch_url_bytes("https://img.example.test/a.png") == b"\x89PNG"
 
-        request = seen[0]
-        assert request.url.host == PUBLIC_IP
-        assert request.headers["host"] == "img.example.test"
-        assert request.extensions.get("sni_hostname") == "img.example.test"
-        assert dns.lookups == {"img.example.test": 1}
+        assert backend.dials == [(PUBLIC_IP, 443)]
+        assert backend.tls_hostnames == ["img.example.test"]
+        assert "Host: img.example.test\r\n" in backend.request_text()
+
+    async def test_an_answer_rebound_after_the_check_is_never_dialled(self, monkeypatch: pytest.MonkeyPatch, dns: FakeDNS) -> None:
+        """预检时是公网、建连接时改口成内网：建连接那一步按同一判据再查一次，一次都不连"""
+        backend = self._install(monkeypatch)
+        dns.answer("img.example.test", [PUBLIC_IP], [PRIVATE_IP])
+
+        with pytest.raises(UnsafeDownloadUrlError):
+            await common_util.fetch_url_bytes("https://img.example.test/a.png")
+
+        assert backend.dials == []
 
     async def test_a_private_answer_is_never_requested(self, monkeypatch: pytest.MonkeyPatch, dns: FakeDNS) -> None:
-        seen = self._install(monkeypatch)
+        backend = self._install(monkeypatch)
         dns.answer("img.example.test", [PRIVATE_IP])
 
         with pytest.raises(UnsafeDownloadUrlError):
             await common_util.fetch_url_bytes("https://img.example.test/a.png")
 
-        assert seen == []
+        assert backend.dials == []
 
 
 class TestTheAccountReferenceKeyDoesNotRotate:

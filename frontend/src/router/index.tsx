@@ -140,22 +140,23 @@ const router = createHashRouter([
             element: lazyLoad(() => import('../pages/console/TenantTeamPage')),
           },
           {
-            // 租户也要能管自己实例的配额，这里不做平台方限定；可见范围由后端按租户作用域收敛
+            // 额度与用量 → 实例自限标签。三条路径渲染同一个页壳，标签由路径决定。
+            // 租户也要能管自己实例的自限，这里不做平台方限定；可见范围由后端按租户作用域收敛。
             path: 'quota',
-            element: lazyLoad(() => import('../pages/console/InstanceQuotaPage')),
+            element: lazyLoad(() => import('../pages/console/QuotaHubPage')),
           },
           {
-            // 用量与费用（token 账本 + 折算费用）。**不做平台方限定**：定制版客户要看得到
-            // 自己烧了多少，可见范围由后端按租户作用域收敛（越权 404）。形态对照 `/console/quota`。
+            // 额度与用量 → 用量与费用标签。**不做平台方限定**：定制版客户要看得到
+            // 自己烧了多少，可见范围由后端按租户作用域收敛（越权 404）。
             path: 'usage',
-            element: lazyLoad(() => import('../pages/console/UsagePage')),
+            element: lazyLoad(() => import('../pages/console/QuotaHubPage')),
           },
           {
-            // 频道额度（平台方给每个群 / 私聊的每日额度）。**不做平台方限定**：租户要看得到
-            // 自己名下频道的用量与剩余，可见范围由后端按租户作用域收敛（越权 404）；
-            // 整族端点都是 `Role.Admin`，只读成员由菜单与兜底清单拦住。形态对照 `usage`。
+            // 额度与用量 → 频道额度标签，也是这个页壳的默认标签。**不做平台方限定**：
+            // 租户要看得到自己名下频道的用量与剩余，可见范围由后端按租户作用域收敛（越权 404）；
+            // 整族端点都是 `Role.Admin`，只读成员由菜单与兜底清单拦住。
             path: 'channel-quota',
-            element: lazyLoad(() => import('../pages/console/ChannelQuotaPage')),
+            element: lazyLoad(() => import('../pages/console/QuotaHubPage')),
           },
           {
             // 身份与域（记忆域配置 + 账号合并 + 人设孤儿数据）。
@@ -222,7 +223,7 @@ const router = createHashRouter([
         children: [
           {
             index: true,
-            element: <Navigate to="items" replace />,
+            element: <Navigate to="graph" replace />,
           },
           {
             path: ':tab',
@@ -271,8 +272,33 @@ const router = createHashRouter([
             element: <Navigate to="preview" replace />,
           },
           {
+            // 审计标签已收进页头「⋯ → 变更记录」；旧地址跳到预览并自动开抽屉
+            path: 'audit',
+            element: <Navigate to="/prompt-lab/preview?log=1" replace />,
+          },
+          {
+            // 预览 / 试发 / 预设三个标签都由这一条动态段接住；标签白名单在页面里判断
             path: ':tab',
             element: lazyLoad(() => import('../pages/prompt-lab')),
+          },
+        ],
+      },
+      {
+        // 角色状态页的标签进 path；页面自己把非法标签回落到默认标签
+        path: 'state',
+        children: [
+          {
+            index: true,
+            element: <Navigate to="channels" replace />,
+          },
+          {
+            // 审计标签已收进页头「⋯ → 变更记录」；旧地址跳到频道状态并自动开抽屉
+            path: 'audit',
+            element: <Navigate to="/state/channels?log=1" replace />,
+          },
+          {
+            path: ':tab',
+            element: lazyLoad(() => import('../pages/state')),
           },
         ],
       },

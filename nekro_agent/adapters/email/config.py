@@ -14,6 +14,9 @@ class EmailAccount(BaseModel):
     # （见 `is_tenant_host()`）。私有属性不进 `model_dump()`：实例自有账户每次从表里现转，不需要落盘；
     # 转回平台方之后靠下面的 `TENANT_SUPPLIED_HOSTS` 记住这件事
     _tenant_endpoint: bool = PrivateAttr(default=False)
+    # 不落盘的运行时标记：实例自有的账户（每次从账户表现转的运行时账户）为真。这类账户是租户的，
+    # 连邮件服务器一律校验证书与主机名，没有开关（见 `tls_verify_required()`）
+    _instance_owned: bool = PrivateAttr(default=False)
 
     DISPLAY_NAME: str = Field(
         default="",
@@ -116,6 +119,25 @@ class EmailAccount(BaseModel):
             i18n_description=i18n_text(
                 zh_CN="仅当邮箱提供商为'自定义'时生效，是否优先使用 SSL 连接 SMTP",
                 en_US="Only takes effect when the email provider is set to Custom. Controls whether SSL should be preferred for SMTP connections.",
+            ),
+        ).model_dump(),
+    )
+    SKIP_TLS_VERIFY: bool = Field(
+        default=False,
+        title="不校验服务器证书",
+        description="仅当邮箱提供商为'自定义'、账户归平台方时生效。打开后连这台邮件服务器不校验证书和主机名，链路上的中间人能拿到授权码；只给内网里用自签证书的邮件服务器用。这个账户经「共享发信」给实例用时，实例发的信（含正文）也走这条不校验的连接。实例自有邮箱、从实例转回且服务器没改过的账户始终校验",
+        json_schema_extra=ExtraField(
+            i18n_category=i18n_text(zh_CN="账户配置", en_US="Account Settings"),
+            i18n_title=i18n_text(zh_CN="不校验服务器证书", en_US="Skip Server Certificate Verification"),
+            i18n_description=i18n_text(
+                zh_CN="仅当邮箱提供商为'自定义'、账户归平台方时生效。打开后连这台邮件服务器不校验证书和主机名，链路上的中间人能拿到授权码；只给内网里用自签证书的邮件服务器用。这个账户经「共享发信」给实例用时，实例发的信（含正文）也走这条不校验的连接。实例自有邮箱、从实例转回且服务器没改过的账户始终校验",
+                en_US=(
+                    "Only takes effect when the email provider is set to Custom and the account belongs to the platform. "
+                    "When enabled, the certificate and hostname of this mail server are not verified, so anyone on the path "
+                    "can obtain the authorization code. Use it only for internal mail servers with self-signed certificates. "
+                    "If this account is shared with instances for sending, the mail they send (bodies included) goes over the same unverified connection. "
+                    "Instance-owned mailboxes and accounts moved back from an instance whose servers were not changed are always verified."
+                ),
             ),
         ).model_dump(),
     )
@@ -313,7 +335,7 @@ class EmailAccount(BaseModel):
         """要连的这台主机是不是**租户填的**
 
         两种来源：实例自有账户的运行时标记（`_tenant_endpoint`，整个账户都是租户的），或转回平台方时记下的
-        主机（`TENANT_SUPPLIED_HOSTS`，按主机判）。是的话客户端只解析一次主机名、拒 Fake-IP 段、直接连校验过的
+        主机（`TENANT_SUPPLIED_HOSTS`，按主机判）。是的话客户端只解析一次主机名、拒内网、直接连校验过的
         地址，连上之后登录之前再核对一次对端。
         """
         if self._tenant_endpoint:
@@ -327,6 +349,21 @@ class EmailAccount(BaseModel):
     def is_tenant_endpoint(self) -> bool:
         """这个账户的两台主机里有没有租户填的（转回平台方、状态邮件等按整个账户判的地方用）"""
         return self.is_tenant_host(self.CUSTOM_IMAP_HOST) or self.is_tenant_host(self.CUSTOM_SMTP_HOST)
+
+    def tls_skip_switch_applies(self, host: str) -> bool:
+        """`SKIP_TLS_VERIFY` 对这台主机管不管用
+
+        只对平台方自己的「自定义」服务器管用。租户的账户（实例自有账户 `_instance_owned`，或要连的这台主机
+        是租户填的 `is_tenant_host`）和预设服务商（QQ、163、Gmail……）不管开关怎么设都校验。
+        后台「测试连接」也用它判断该不该提示打开开关。
+        """
+        if self._instance_owned or self.is_tenant_host(host):
+            return False
+        return self.EMAIL_ACCOUNT == "自定义"
+
+    def tls_verify_required(self, host: str) -> bool:
+        """连这台主机时要不要校验服务器证书：只有开关管用（`tls_skip_switch_applies`）并且打开了才不校验"""
+        return not (self.tls_skip_switch_applies(host) and self.SKIP_TLS_VERIFY)
 
 
 def normalize_mail_host(host: object) -> str:

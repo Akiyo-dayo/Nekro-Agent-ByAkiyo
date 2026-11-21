@@ -1,6 +1,5 @@
 """内置命令 - 配额类: quota, quota_boost, quota_reset, quota_set, quota_whitelist"""
 
-import time
 from typing import Annotated
 
 from nekro_agent.schemas.i18n import i18n_text, t
@@ -26,24 +25,21 @@ class QuotaCommand(BaseCommand):
     async def execute(self, context: CommandExecutionContext) -> CommandResponse:
         from nekro_agent.models.db_chat_channel import DBChatChannel
         from nekro_agent.models.db_chat_message import DBChatMessage
-        from nekro_agent.services.quota_service import quota_service
+        from nekro_agent.services import channel_quota
+        from nekro_agent.services.channel_quota import evaluate_self_limit
 
         db_chat_channel = await DBChatChannel.get_channel(chat_key=context.chat_key)
         effective_config = await db_chat_channel.get_effective_config()
-        daily_limit = effective_config.AI_CHAT_DAILY_REPLY_LIMIT
+        self_status = await evaluate_self_limit(db_chat_channel)
+        platform_status = await channel_quota.evaluate(db_chat_channel)
 
-        boost = quota_service.get_boost(context.chat_key)
-        effective_limit = daily_limit + boost
+        # 「今日」与额度同一个时区的零点起算，和上面的已用回合数是同一天
+        import datetime
 
-        today_start = time.time() - (time.time() % 86400)
-        daily_bot_count = (
-            await DBChatMessage.filter(
-                chat_key=context.chat_key,
-                sender_id=-1,
-                send_timestamp__gte=int(today_start),
-            )
-            .exclude(sender_name="SYSTEM")
-            .count()
+        from nekro_agent.services.channel_quota.counter import resolve_timezone
+
+        today_start = (
+            datetime.datetime.now(resolve_timezone()).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         )
         daily_total_count = await DBChatMessage.filter(
             chat_key=context.chat_key,
@@ -59,44 +55,37 @@ class QuotaCommand(BaseCommand):
         title = t(zh_CN="[频道配额状态]", en_US="[Channel Quota Status]")
         lines = [f"{title} {context.chat_key}", ""]
 
-        quota_section = t(zh_CN="===== 每日回复配额 =====", en_US="===== Daily Reply Quota =====")
+        quota_section = t(zh_CN="===== 每日回复配额（自限） =====", en_US="===== Daily Reply Quota (Self Limit) =====")
         lines.append(quota_section)
-        bot_reply_label = t(zh_CN="今日 Bot 回复", en_US="Today bot replies")
+        used_label = t(zh_CN="今日已用", en_US="Used today")
         total_msg_label = t(zh_CN="今日总消息数", en_US="Today total messages")
-        lines.append(f"{bot_reply_label}: {daily_bot_count}")
+        lines.append(f"{used_label}: {self_status.used}")
         lines.append(f"{total_msg_label}: {daily_total_count}")
 
-        if effective_limit <= 0:
+        if self_status.limit <= 0:
             limit_label = t(zh_CN="配置限额", en_US="Configured limit")
             unlimited = t(zh_CN="无限制", en_US="Unlimited")
             lines.append(f"{limit_label}: {unlimited}")
         else:
             limit_label = t(zh_CN="配置限额", en_US="Configured limit")
-            lines.append(f"{limit_label}: {daily_limit}")
-            if boost > 0:
+            lines.append(f"{limit_label}: {self_status.limit}")
+            if self_status.boost > 0:
                 boost_label = t(zh_CN="临时提升", en_US="Temporary boost")
                 effective_label = t(zh_CN="有效限额", en_US="Effective limit")
-                lines.append(f"{boost_label}: +{boost}")
-                lines.append(f"{effective_label}: {effective_limit}")
+                lines.append(f"{boost_label}: +{self_status.boost}")
+                lines.append(f"{effective_label}: {self_status.allowed}")
             remaining_label = t(zh_CN="今日剩余", en_US="Today remaining")
-            lines.append(f"{remaining_label}: {max(0, effective_limit - daily_bot_count)}")
+            lines.append(f"{remaining_label}: {max(0, self_status.allowed - self_status.used)}")
 
-            if effective_config.AI_CHAT_ENABLE_HOURLY_LIMIT:
-                hourly_limit = quota_service.calculate_hourly_quota(effective_limit)
-                hour_start = time.time() - (time.time() % 3600)
-                hourly_count = (
-                    await DBChatMessage.filter(
-                        chat_key=context.chat_key,
-                        sender_id=-1,
-                        send_timestamp__gte=int(hour_start),
-                    )
-                    .exclude(sender_name="SYSTEM")
-                    .count()
-                )
+            if self_status.hourly_enabled:
                 hourly_label = t(zh_CN="小时限额", en_US="Hourly limit")
                 hourly_used = t(zh_CN="本小时已用", en_US="Used this hour")
-                lines.append(f"{hourly_label}: {hourly_limit}")
-                lines.append(f"{hourly_used}: {hourly_count}")
+                lines.append(f"{hourly_label}: {self_status.hourly_limit}")
+                lines.append(f"{hourly_used}: {self_status.hourly_used}")
+
+        if platform_status.state != channel_quota.STATE_DISABLED:
+            platform_label = t(zh_CN="平台额度", en_US="Platform quota")
+            lines.append(f"{platform_label}: {platform_status.used}/{platform_status.allowed} {platform_status.unit}")
 
         lines.append("")
         ctx_section = t(zh_CN="===== 会话上下文 =====", en_US="===== Session Context =====")

@@ -1,4 +1,5 @@
 import json
+import math
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
@@ -28,6 +29,7 @@ from nekro_agent.schemas.errors import (
 )
 from nekro_agent.schemas.tenant import CREDENTIAL_MASK
 from nekro_agent.services.config_service import ConfigService
+from nekro_agent.services.config_write_guard import assert_config_not_stale, view_values
 from nekro_agent.services.model_group_service import (
     assert_model_group_selectable,
     iter_model_group_ref_fields,
@@ -182,7 +184,7 @@ def _submitted_plugin_value(config_cls: type[ConfigBase], current_config: Config
     return getattr(draft, field_name)
 
 
-def _int_raise_denied(before: int, after: int, inherited: int) -> bool:
+def _int_raise_denied(before: float, after: float, inherited: float) -> bool:
     """整数型上限项：这次写入是否把这一层的生效值抬高了
 
     与 `routers/config.py` 的 `_int_raise_denied` 同一规则：`after > max(before, inherited)`
@@ -244,7 +246,13 @@ async def _assert_tenant_plugin_config_writes(plugin_key: str, instance_key: str
                 raise PermissionDeniedError(detail=f"配置项 {field_name} 租户只能调低，不能调高")
         elif field.annotation is int:
             inherited = int(global_values.get(field_name, before))
-            if _int_raise_denied(int(before), int(submitted), inherited):
+            # 标了 `zero_means_unlimited` 的项 0 是「不设上限」，按无穷大比（同核心配置的判据）
+            unlimited_zero = bool(extra.get("zero_means_unlimited"))
+
+            def rank(value: int, *, _unlimited: bool = unlimited_zero) -> float:
+                return math.inf if _unlimited and value == 0 else float(value)
+
+            if _int_raise_denied(rank(int(before)), rank(int(submitted)), rank(inherited)):
                 raise PermissionDeniedError(detail=f"配置项 {field_name} 租户只能调低，不能调高")
 
 
@@ -325,7 +333,10 @@ class PluginScopeResponse(BaseModel):
 
 
 class SavePluginConfigRequest(BaseModel):
+    """`base`：页面读取时每个改动项的值；带上就比对现值，有过期的项整批拒绝（`services/config_write_guard.py`）"""
+
     configs: Dict[str, str]
+    base: Optional[Dict[str, Any]] = None
 
 
 class BatchUpdateConfig(BaseModel):
@@ -528,11 +539,15 @@ async def get_plugin_instance_config_handler(
     租户身份下凭据一律为掩码。
     """
     await assert_plugin_scope_accessible(_current_user, instance_key)
+    return await _plugin_instance_config_view(_current_user, plugin_key, instance_key)
 
+
+async def _plugin_instance_config_view(user: DBUser, plugin_key: str, instance_key: str) -> List[Dict[str, Any]]:
+    """读接口给这个身份看的那份实例级插件配置（写侧比对读取时的值也按这一份取现值）"""
     configs = await get_plugin_instance_config(plugin_key, instance_key)
     if configs is None:
         raise PluginNotFoundError(plugin_id=plugin_key)
-    if get_tenant_scope(_current_user) is not None:
+    if get_tenant_scope(user) is not None:
         # 这里解析出来的是「全局值 + 本实例覆盖」，**未被覆盖的凭据字段回落的正是平台方
         # 全局配好的真实 Key**（`google_search` 的 API_KEY/CX、`github` 的 TOKEN 都是
         # `is_secret=True` 的字段）。作用域守卫只挡得住「读别人的实例」，挡不住
@@ -568,6 +583,10 @@ async def save_plugin_instance_config_handler(
         await _assert_tenant_plugin_config_writes(plugin_key, instance_key, configs)
         await assert_tenant_may_select_model_groups(_current_user, plugin_key, configs)
 
+    if body.base:
+        # 读取之后被别处改过的项整批拒绝（`services/config_write_guard.py`）；比的是读接口给这个身份的同一个视图
+        current_view = view_values(await _plugin_instance_config_view(_current_user, plugin_key, instance_key))
+        assert_config_not_stale(body.configs.keys(), body.base, current_view)
     success, error = await save_plugin_instance_config(plugin_key, instance_key, configs)
     if not success:
         raise ValidationError(reason=error or "实例级插件配置保存失败")

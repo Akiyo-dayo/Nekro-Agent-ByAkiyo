@@ -68,6 +68,28 @@ async def _init_memory_scheduler() -> None:
     payload_backfill_watcher.start()
 
 
+async def _init_worldbook_vectors() -> None:
+    """世界书语义触发：回填旧标记、确保向量集合、起后台同步的看护循环
+
+    Qdrant 不可用时只记 WARNING，不影响启动，看护循环之后会按退避重试。
+    """
+    from nekro_agent.services.worldbook import vectors as wb_vectors
+
+    try:
+        await wb_vectors.backfill_legacy_vectorized()
+    except Exception as e:
+        logger.warning(f"世界书存量向量激活回填失败（非致命，下次启动重试）: {e}")
+
+    try:
+        await wb_vectors.ensure_collection()
+    except Exception as e:
+        logger.warning(f"世界书向量集合初始化失败（可能 Qdrant 未启用）: {e}")
+
+    # 看护循环不跟着记忆总开关走：世界书的语义触发只借用记忆的嵌入模型组与 Qdrant，
+    # 记忆功能关着的部署同样可以用。没有待办时它每分钟只查一次库；第一轮先睡 30 秒。
+    wb_vectors.vector_sync_watcher.start()
+
+
 async def _init_kb_collection() -> None:
     """初始化知识库向量 Collection（工作区 + 全局）。"""
     try:
@@ -253,6 +275,16 @@ if _driver is not None:
         from nekro_agent.services.plugin.default_on import apply_default_on_plugins_at_startup
 
         apply_default_on_plugins_at_startup()
+
+        # 世界书预算从「每轮字数上限」换成按 token 计：旧值迁移一次（全局层只改内存，同样由下面那次
+        # 常规落盘写回；覆盖层文件各自原子写回）。见 `services/worldbook/budget_migration.py`
+        from nekro_agent.services.worldbook.budget_migration import migrate_worldbook_budget_at_startup
+
+        migrate_worldbook_budget_at_startup()
+
+        # 世界书语义触发的后台准备：回填旧条目 `ext.vectorized`、确保向量集合、起同步看护。
+        # 放在迁移之后（表结构已就绪），失败只记 WARNING，不影响启动。
+        await _init_worldbook_vectors()
 
         # 把配置文件里的存量模型组导入数据库，并据此重建 config.MODEL_GROUPS 运行时视图。
         # 必须紧跟迁移之后：适配器与插件初始化都会同步读 config.MODEL_GROUPS
@@ -656,6 +688,13 @@ if _driver is not None:
 
         await payload_backfill_watcher.stop()
         logger.debug(f"[shutdown] memory payload backfill watcher stopped in {time.perf_counter() - step_started_at:.3f}s")
+
+        try:
+            from nekro_agent.services.worldbook.vectors import vector_sync_watcher
+
+            await vector_sync_watcher.stop()
+        except Exception as e:
+            logger.warning(f"[shutdown] 世界书向量同步看护停止失败（非致命）: {e}")
 
         # 必须早于适配器清理：探活会调用适配器，适配器拆完再探活会抛一片噪声异常
         step_started_at = time.perf_counter()

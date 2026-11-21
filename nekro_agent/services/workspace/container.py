@@ -28,7 +28,7 @@ from nekro_agent.services.ssh_gateway.image_support import image_supports_gatewa
 from nekro_agent.services.ssh_gateway.registry import ContainerPeer
 from nekro_agent.services.workspace import safe_fs
 from nekro_agent.services.workspace.cc_credential import METADATA_TOKEN_KEY
-from nekro_agent.services.workspace.manager import WorkspaceService
+from nekro_agent.services.workspace.manager import CLAUDE_HOME_DIRNAME, ClaudeHome, WorkspaceService
 from nekro_agent.services.workspace.network_guard import (
     extract_network_ipv4,
     prepare_workspace_network,
@@ -163,40 +163,53 @@ async def _find_free_port() -> int:
     raise RuntimeError("无法在端口段内找到空闲端口")
 
 
-# ── bind 源：工作区目录与 `.claude_home` ─────────────────────────────────────
+# ── bind 源：工作区目录与 CC home ────────────────────────────────────────────
 #
-# 两个 bind 源都在容器可写的地方：`/workspace` 整个挂进容器，镜像的入口脚本在它对 appuser
-# 不可写时会 `chown -R appuser` 整个工作区，于是容器能把 `.claude_home` 改名、换成指向宿主
-# 任意目录的符号链接。Docker 挂 bind 源时会顺着链接走（测试部署上实测：源是指向宿主别处的
-# 链接时，挂进容器的是链接的目标），下一次启动就会把那个宿主目录以读写方式挂进容器。
+# 两个 bind 源：工作区目录挂到 `/workspace`，CC home 挂到 `~/.claude`。home 在宿主上在哪由
+# `WorkspaceService.claude_home` 定：
+# - 新布局 `{工作区根}/.nk-homes/<id>/claude`：在工作区目录之外，它的上级只有 NA 写得到，容器
+#   只看得到 home 本身——挂载点改名、删除在容器里都会得到 EBUSY，换不成链接；
+# - 旧布局 `{工作区}/.claude_home`：在读写挂载的 `/workspace` 里，镜像的入口脚本在工作区对
+#   appuser 不可写时会 `chown -R appuser` 整个工作区，于是容器能把 `.claude_home` 改名、换成
+#   指向宿主任意目录的符号链接。Docker 挂 bind 源时会顺着链接走（测试部署上实测：源是指向宿主
+#   别处的链接时，挂进容器的是链接的目标），下一次启动就会把那个宿主目录以读写方式挂进容器。
+#   旧布局在建容器（新建、重建）时迁到新位置（`WorkspaceService.migrate_claude_home`）；重启
+#   沿用容器创建时的挂载，不迁。已经迁过、工作区目录里又出现一份旧的（退回旧版本又升级回来，旧
+#   版本往里写过设置与网关钥匙）时，建容器、重启（停下来之后）、NA 启动复核都会把它整个挪到
+#   `.nk-homes/<id>/legacy-<时间>`（`WorkspaceService.retire_legacy_home`）。NA 宿主侧往 home 里
+#   写的地方与迁移由 `home_lock` 排开，旧布局的 home 只修不建（`ensure_claude_home`）。
 #
-# 所以启动（新建、重启）一律按「先停、再修、再核对、再启动」走：
+# 工作区目录本身仍在容器写得到的上级之外（工作区根是 NA 的目录），所以启动（新建、重启）一律按
+# 「先停、再修、再核对、再启动」走：
 # 1. 停掉这个工作区**所有**在跑的容器：不只是库里记的那一个，还有按标签
-#    （`nekro.workspace.id`）或挂载（挂了这个工作区目录）认出来的别的容器——并发启动留下的、
-#    升级前「健康检查超时 → 再启动」留下的孤儿、重建时没删掉的旧容器。新建时一律删掉，重启时
-#    除了要重启的那一个都删掉；删完还有在跑的就拒绝启动、记 ERROR。别的容器（不是这个工作区的）
-#    以读写方式挂着工作区目录或它的上级的，也拒绝启动（`_refuse_foreign_writers`，NA 自己与
-#    NapCat 放行）。之后到 Docker 挂载之间，没有任何别的能写这个工作区的容器在跑；
-# 2. 修：`init_workspace_dir` 把被换成链接或别的东西的 `.claude_home` 删掉、重建空目录
-#    （发现被换过记 ERROR）；
+#    （`nekro.workspace.id`）或挂载（挂了这个工作区目录或它的 home）认出来的别的容器——并发
+#    启动留下的、升级前「健康检查超时 → 再启动」留下的孤儿、重建时没删掉的旧容器。新建时一律
+#    删掉，重启时除了要重启的那一个都删掉；删完还有在跑的就拒绝启动、记 ERROR。别的容器（不是
+#    这个工作区的）以读写方式挂着工作区目录、home 或它们的上级的，也拒绝启动
+#    （`_refuse_foreign_writers`，放行 NA 自己；NapCat 见下；新建时排在迁移之前）。之后到 Docker
+#    挂载之间，没有任何别的能写这个工作区的容器在跑；
+# 2. 修：新建时先迁移旧布局（重启时只把多出来的旧 home 挪出工作区）；`init_workspace_dir` 把被
+#    换成链接或别的东西的旧 `.claude_home` 删掉、重建空目录（发现被换过记 ERROR）；
 # 3. 核对：两个 bind 源都按字面路径（不 `resolve()`）、不跟随链接地看一遍，不是普通目录就
 #    拒绝启动、记 ERROR；重启时还要核对容器里**已经记着**的挂载（`HostConfig.Binds` 与
-#    `Mounts`）没有预期之外的来源或目标（`_mount_mismatch`）——早先的版本按 `resolve()` 过的
-#    路径建过容器，被利用过的话宿主路径就固化在那里，重启照挂不误；
+#    `Mounts`）没有预期之外的来源或目标（`_mount_mismatch`，home 按当前布局比）——早先的版本按
+#    `resolve()` 过的路径建过容器，被利用过的话宿主路径就固化在那里，重启照挂不误；
 # 4. 启动。
 #
 # 新建、重启、重建、停止、删除按工作区串行：进程内一把 `asyncio.Lock`，库里一个可比较替换的
 # 过渡状态 `transitioning`（删除是 `deleting`）。**只支持单进程部署**：多个 worker 各有各的锁，
 # 库里的比较替换挡得住同时改状态，挡不住另一个进程直接动 Docker（运维文档 §3.5 写明）。
 #
+# NapCat：它只需要数据目录下的 `uploads`（NA 交给它发送的文件都先放进那里），控制台建的与随项目
+# 发布的 compose 文件都只把 `uploads` 只读挂给它，碰不到工作区。旧的挂法（读写挂着整个数据目录）
+# 这个版本还放行、每次启动记一条 WARNING，下一个版本起按别的容器一样拒绝。
+#
 # 仍然管不到的：有人在宿主上手动操作容器（容器的 `RestartPolicy` 是 `no`，Docker 自己不会
-# 重启它）；NapCat 容器以读写方式挂着整个 `DATA_DIR`（包括工作区），这里按「NapCat 视为可信」
-# 处理，收窄它的挂载放在后续版本；把 `.claude_home` 搬出 `/workspace`（容器里挂载点改名会得到
-# EBUSY，这一类竞争整个消失）也放在后续版本。
+# 重启它）。
 
 
 class UnsafeBindSourceError(RuntimeError):
-    """工作区目录或 `.claude_home` 不是普通目录（是符号链接或别的类型），拒绝把它挂进容器"""
+    """工作区目录或 CC home 不是普通目录（是符号链接或别的类型），拒绝把它挂进容器"""
 
 
 def _workspace_bind_path(workspace_id: int) -> Path:
@@ -211,8 +224,8 @@ def _workspace_bind_path(workspace_id: int) -> Path:
 async def _stop_if_running(docker: aiodocker.Docker, container_name: str | None) -> None:
     """停掉这个工作区还在跑的容器；容器不在、已经停了都不算错，停不掉就抛
 
-    调用方据「停不掉」放弃启动：旧容器还在跑的话，它能在核对之后、挂载之前把 `.claude_home`
-    换成链接。
+    调用方据「停不掉」放弃启动：旧容器还在跑的话，它能在核对之后、挂载之前把工作区里的东西
+    （旧布局的 `.claude_home`）换成链接。
     """
     if not container_name:
         return
@@ -229,12 +242,16 @@ async def _stop_if_running(docker: aiodocker.Docker, container_name: str | None)
 
 
 def _note_replaced_claude_home(workspace_id: int) -> None:
-    """容器停着的时候看一眼 `.claude_home`：被换成了链接或别的东西就记 ERROR
+    """容器停着的时候看一眼旧布局的 `.claude_home`：被换成了链接或别的东西就记 ERROR
 
     只记录，不修：修在随后的 `init_workspace_dir` 里做（删掉链接本身、重建空目录，
-    从不跟着链接走）。这是一条安全事件，运维要知道这个工作区的容器试过越界。
+    从不跟着链接走）。这是一条安全事件，运维要知道这个工作区的容器试过越界。新布局的 home
+    容器换不掉，不用看。
     """
-    kind = safe_fs.kind(_workspace_bind_path(workspace_id), (".claude_home",))
+    home = WorkspaceService.claude_home(workspace_id)
+    if not home.legacy:
+        return
+    kind = safe_fs.kind(home.base, home.parts)
     if kind not in (None, "dir"):
         logger.error(
             f"工作区 {workspace_id} 的 .claude_home 被换成了 {kind}（容器可能想把宿主目录挂进来），"
@@ -242,16 +259,36 @@ def _note_replaced_claude_home(workspace_id: int) -> None:
         )
 
 
-def _checked_bind_sources(workspace_id: int) -> Tuple[str, str]:
-    """启动前最后修一遍、核对两个 bind 源，返回 `(工作区目录, .claude_home)` 的字面路径
+def _tidy_home_at_startup(workspace_id: int) -> bool:
+    """NA 启动复核时看一眼这个工作区的 CC home；返回它是不是还在旧布局
 
-    只能在这个工作区没有容器在跑的时候调。先把 `.claude_home` 修成普通目录（是链接就删掉
-    链接本身重建，不跟着走；`init_workspace_dir` 修过一遍，这里兜住它之后的那几步），再核对：
-    任何一个不是普通目录（是链接、文件、不存在）就记 ERROR、抛 `UnsafeBindSourceError`，
-    绝不替它 `resolve()`。
+    已经在用新位置、工作区目录里又有一份旧的：挪出工作区。只在核对过挂载之后调（挂着旧路径当
+    home 的容器那时已经停掉）。还在旧布局的不动：在跑的容器挂着它，迁移要等「启动」或「重建」。
+    """
+    WorkspaceService.retire_legacy_home(workspace_id)
+    home = WorkspaceService.claude_home(workspace_id)
+    return home.legacy and safe_fs.kind(home.base, home.parts) == "dir"
+
+
+def _home_bind_path(home: ClaudeHome) -> Path:
+    """CC home 的绝对路径：与 `_workspace_bind_path` 一样只按字面展开，不 `resolve()`"""
+    return Path(os.path.abspath(str(home.path)))
+
+
+def _checked_bind_sources(workspace_id: int) -> Tuple[str, str]:
+    """启动前最后修一遍、核对两个 bind 源，返回 `(工作区目录, CC home)` 的字面路径
+
+    只能在这个工作区没有容器在跑的时候调。home 按当前布局（`WorkspaceService.claude_home`）：
+    先把它修成普通目录（旧布局是链接就删掉链接本身重建，不跟着走；`init_workspace_dir` 修过
+    一遍，这里兜住它之后的那几步），再核对：任何一个不是普通目录（是链接、文件、不存在，新布局
+    还包括上级 `.nk-homes`、`<id>` 两级）就记 ERROR、抛 `UnsafeBindSourceError`，绝不替它
+    `resolve()`。
     """
     ws_path = _workspace_bind_path(workspace_id)
-    safe_fs.ensure_dir(ws_path, (".claude_home",), replace_links=True)
+    # 工作区目录正常由 `init_workspace_dir` 建好；还没有就建（不让 Docker 以 root 替它建）。
+    # 它是链接或别的东西时这里建不了也不报错，下面的核对会拒绝
+    with contextlib.suppress(OSError):
+        ws_path.mkdir(parents=True, exist_ok=True)
     try:
         ws_stat = os.lstat(ws_path)
     except FileNotFoundError:
@@ -259,11 +296,15 @@ def _checked_bind_sources(workspace_id: int) -> Tuple[str, str]:
     if ws_stat is None or not stat.S_ISDIR(ws_stat.st_mode):
         logger.error(f"工作区 {workspace_id} 的目录不是普通目录（是链接、文件或不存在），拒绝启动容器: {ws_path}")
         raise UnsafeBindSourceError(f"工作区 {workspace_id} 的目录不是普通目录，拒绝启动容器")
-    kind = safe_fs.kind(ws_path, (".claude_home",))
+    # 工作区目录核对过了再修 home：旧布局的 home 在工作区目录里，先修的话会顺着换成链接的
+    # 工作区目录建到别处去
+    home = WorkspaceService.ensure_claude_home(WorkspaceService.claude_home(workspace_id))
+    # 逐级不跟随链接：途中任何一级是链接或不存在都得到 None
+    kind = safe_fs.kind(home.base, home.parts)
     if kind != "dir":
-        logger.error(f"工作区 {workspace_id} 的 .claude_home 不是普通目录（{kind or '不存在'}），拒绝启动容器")
-        raise UnsafeBindSourceError(f"工作区 {workspace_id} 的 .claude_home 不是普通目录，拒绝启动容器")
-    return str(ws_path), str(ws_path / ".claude_home")
+        logger.error(f"工作区 {workspace_id} 的 CC home 不是普通目录（{kind or '不存在'}），拒绝启动容器: {home.path}")
+        raise UnsafeBindSourceError(f"工作区 {workspace_id} 的 CC home 不是普通目录，拒绝启动容器")
+    return str(ws_path), str(_home_bind_path(home))
 
 
 # ── 同一工作区的所有容器 ─────────────────────────────────────────────────────
@@ -278,10 +319,12 @@ DELETING = "deleting"
 STALE_TRANSITION_SECONDS = 600
 # NA 启动时 inspect 失败（不是 404）的重试间隔（秒，逐次加长）
 _INSPECT_RETRY_DELAY = 0.5
-# 以读写方式挂着工作区上级目录、却允许它在跑的容器：NapCat（控制台建的带实例标签，compose 起的
-# 按服务名）；NA 自己按容器 ID / 名字认（见 `_refuse_foreign_writers`）
+# 按旧挂法读写挂着数据目录、这个版本还放行（记 WARNING）的 NapCat：控制台建的带实例标签，compose
+# 起的按服务名。NA 自己按容器 ID / 名字认（见 `_refuse_foreign_writers`）
 NAPCAT_INSTANCE_LABEL = "nekro.napcat.instance"
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
+# 随项目发布的 compose 文件里 NapCat 的服务名是 `nekro_napcat`；`napcat` 是常见的自写写法
+NAPCAT_COMPOSE_SERVICES = frozenset({"nekro_napcat", "napcat"})
 
 _workspace_locks: Dict[int, asyncio.Lock] = {}
 
@@ -377,15 +420,19 @@ async def _settle_failed(workspace: DBWorkspace, message: str) -> None:
 
 
 def _workspace_source_paths(workspace_id: int) -> Set[str]:
-    """这个工作区的 bind 源在容器的挂载里可能出现的写法：字面路径、解析后的路径，各自加 `.claude_home`
+    """这个工作区的 bind 源在容器的挂载里可能出现的写法：字面路径、解析后的路径
 
-    早先的版本按 `resolve()` 过的路径建过容器，两种都要认。
+    工作区目录、旧布局的 `.claude_home`、新布局的 home 都算（迁移前后建的容器都要认得出）。
+    早先的版本按 `resolve()` 过的路径建过容器，两种写法都要认。
     """
     literal = _workspace_bind_path(workspace_id)
+    new_home = _home_bind_path(WorkspaceService.new_claude_home(workspace_id))
     paths: Set[str] = set()
     for base in {literal, Path(os.path.realpath(str(literal)))}:
         paths.add(str(base))
-        paths.add(str(base / ".claude_home"))
+        paths.add(str(base / CLAUDE_HOME_DIRNAME))
+    for home in {new_home, Path(os.path.realpath(str(new_home)))}:
+        paths.add(str(home))
     return paths
 
 
@@ -497,17 +544,28 @@ def _same_directory(first: Path, second: Path) -> bool:
 
 
 def _is_workspace_source(source: str, workspace_id: int, tail: Tuple[str, ...]) -> bool:
-    """`source` 是不是 `<工作区根>/<id>` 再接 `tail`（不论工作区根是哪种写法）
+    """`source` 是不是 `<工作区根>/<id>` 再接 `tail`（不论工作区根是哪种写法）"""
+    return _is_under_workspace_root(source, workspace_id, (str(workspace_id), *tail))
+
+
+def _home_tail(home: ClaudeHome, workspace_id: int) -> Tuple[str, ...]:
+    """home 相对工作区根的那几级：旧布局 `(<id>, .claude_home)`，新布局 `(.nk-homes, <id>, claude)`"""
+    root = WorkspaceService.get_workspace_dir(workspace_id).parent
+    return (*home.base.relative_to(root).parts, *home.parts)
+
+
+def _is_under_workspace_root(source: str, workspace_id: int, need: Tuple[str, ...]) -> bool:
+    """`source` 是不是 `<工作区根>` 再接 `need` 这几级（不论工作区根是哪种写法）
 
     只在**工作区根**这一级按目录身份（`st_dev` / `st_ino`）比：工作区根及其上级是 NA 与部署者的
-    目录，换写法（数据目录经链接进入、docker-guard 改写成解析后的路径）都是同一个目录。工作区
-    里面的那几级（`<id>`、`.claude_home`）必须逐字相同、不许有 `..`——那里容器写得到，经它里面
-    的链接绕回来的写法，下一次启动 Docker 会顺着那个链接重新走一遍。
+    目录，换写法（数据目录经链接进入、docker-guard 改写成解析后的路径）都是同一个目录。工作区根
+    下面的那几级（`<id>`、`.claude_home`；新布局的 `.nk-homes/<id>/claude`）必须逐字相同、不许有
+    `..`——工作区里容器写得到，经它里面的链接绕回来的写法，下一次启动 Docker 会顺着那个链接重新
+    走一遍。
     """
     candidate = Path(source)
     if not candidate.is_absolute() or ".." in candidate.parts:
         return False
-    need = (str(workspace_id), *tail)
     parts = candidate.parts
     if len(parts) <= len(need) or tuple(parts[-len(need):]) != need:
         return False
@@ -527,10 +585,13 @@ def _mount_mismatch(info: Dict[str, Any], workspace_id: int) -> Optional[str]:
 
     判据：`Mounts`（Docker 实际挂上的，包括经 `HostConfig.Mounts` 声明、不出现在 `Binds` 里的）
     与 `HostConfig.Binds` 里的每一条 bind，目标只能是 `/workspace`、`~/.claude`、`/etc/localtime`
-    三者之一，来源必须是这个工作区目录 / 它的 `.claude_home` / 宿主的 `/etc/localtime`（只读）。
+    三者之一，来源必须是这个工作区目录 / 它**当前布局**的 CC home（`WorkspaceService.claude_home`）
+    / 宿主的 `/etc/localtime`（只读）。旧布局建的容器在 home 迁走之后就对不上了，要重建——正常
+    情况下迁移只在建容器时做，不会发生；对不上说明有人动过（例如容器把旧 `.claude_home` 删了）。
     缺哪一条不算不一致：早期版本建的容器本来就没有 `/etc/localtime`，NA 自己有没有这个文件
     也与宿主无关。Docker 自己管的卷（`volume` / `tmpfs`）没有宿主路径，不比。
     """
+    home_tail = _home_tail(WorkspaceService.claude_home(workspace_id), workspace_id)
     actual: List[Tuple[str, str, bool]] = []
     for mount in info.get("Mounts") or []:
         if str(mount.get("Type") or "bind") != "bind":
@@ -545,7 +606,7 @@ def _mount_mismatch(info: Dict[str, Any], workspace_id: int) -> Optional[str]:
         if destination == CONTAINER_WORKSPACE_PATH:
             ok = _is_workspace_source(source, workspace_id, ())
         elif destination == CLAUDE_HOME_MOUNT:
-            ok = _is_workspace_source(source, workspace_id, (".claude_home",))
+            ok = _is_under_workspace_root(source, workspace_id, home_tail)
         elif destination == LOCALTIME_MOUNT:
             ok = source == LOCALTIME_MOUNT and not writable
         else:
@@ -585,7 +646,7 @@ def _is_self(summary: Dict[str, Any], markers: Set[str]) -> bool:
 
 def _is_trusted_napcat(summary: Dict[str, Any]) -> bool:
     labels = summary.get("Labels") or {}
-    return NAPCAT_INSTANCE_LABEL in labels or str(labels.get(COMPOSE_SERVICE_LABEL) or "") == "napcat"
+    return NAPCAT_INSTANCE_LABEL in labels or str(labels.get(COMPOSE_SERVICE_LABEL) or "") in NAPCAT_COMPOSE_SERVICES
 
 
 def _ancestor_identities(path: Path) -> Tuple[Set[str], Set[Tuple[int, int]]]:
@@ -602,37 +663,58 @@ def _ancestor_identities(path: Path) -> Tuple[Set[str], Set[Tuple[int, int]]]:
     return names, inodes
 
 
-async def _refuse_foreign_writers(docker: aiodocker.Docker, workspace_id: int) -> None:
-    """在跑的别的容器以读写方式挂着这个工作区目录或它的上级：拒绝启动、记 ERROR
+def _writable_hit(summary: Dict[str, Any], names: Set[str], inodes: Set[Tuple[int, int]]) -> Optional[str]:
+    """容器以读写方式挂着的 bind 源里，第一个落在 `names` / `inodes` 上的；没有返回 None"""
+    for mount in summary.get("Mounts") or []:
+        if str(mount.get("Type") or "bind") != "bind" or not mount.get("RW"):
+            continue
+        source = str(mount.get("Source") or "")
+        if not source:
+            continue
+        hit = os.path.normpath(source) in names
+        if not hit:
+            with contextlib.suppress(OSError):
+                st = os.stat(source)
+                hit = (st.st_dev, st.st_ino) in inodes
+        if hit:
+            return source
+    return None
 
-    这样的容器能在核对之后、新容器挂载之前把 `.claude_home` 换掉。按来源的写法与目录身份
-    （`st_dev` / `st_ino`）认；只读挂载不算。放行 NA 自己（数据目录本来就挂在它身上）与
-    NapCat（视为可信，#257）。同一工作区的 CC 容器在这之前已经清场。
+
+async def _refuse_foreign_writers(docker: aiodocker.Docker, workspace_id: int) -> None:
+    """在跑的别的容器以读写方式挂着这个工作区目录、它的 CC home 或它们的上级：拒绝启动、记 ERROR
+
+    这样的容器能在核对之后、新容器挂载之前把 bind 源（工作区目录、旧布局的 `.claude_home`、
+    新布局 home 的上级）换掉。按来源的写法与目录身份（`st_dev` / `st_ino`）认；只读挂载不算。
+    放行 NA 自己（数据目录本来就挂在它身上）。NapCat 现在只挂 `uploads`（只读），碰不到这里；
+    还按旧的挂法读写挂着数据目录的 NapCat 这个版本还放行，记一条 WARNING（见本模块「bind 源」
+    一节）。同一工作区的 CC 容器在这之前已经清场。
     """
     names, inodes = _ancestor_identities(_workspace_bind_path(workspace_id))
+    home_names, home_inodes = _ancestor_identities(_home_bind_path(WorkspaceService.new_claude_home(workspace_id)))
+    names |= home_names
+    inodes |= home_inodes
     markers = _self_container_markers()
     offenders: List[str] = []
+    legacy_napcat: List[str] = []
     for container in await docker.containers.list():
         summary = _summary(container)
         if str(summary.get("State") or "running").lower() != "running":
             continue
-        if _is_self(summary, markers) or _is_trusted_napcat(summary):
+        if _is_self(summary, markers):
             continue
-        for mount in summary.get("Mounts") or []:
-            if str(mount.get("Type") or "bind") != "bind" or not mount.get("RW"):
-                continue
-            source = str(mount.get("Source") or "")
-            if not source:
-                continue
-            hit = os.path.normpath(source) in names
-            if not hit:
-                with contextlib.suppress(OSError):
-                    st = os.stat(source)
-                    hit = (st.st_dev, st.st_ino) in inodes
-            if hit:
-                label = ", ".join(sorted(_summary_names(summary))) or str(summary.get("Id") or "")[:12]
-                offenders.append(f"{label}（{source}）")
-                break
+        source = _writable_hit(summary, names, inodes)
+        if source is None:
+            continue
+        label = ", ".join(sorted(_summary_names(summary))) or str(summary.get("Id") or "")[:12]
+        (legacy_napcat if _is_trusted_napcat(summary) else offenders).append(f"{label}（{source}）")
+    if legacy_napcat:
+        logger.warning(
+            f"工作区 {workspace_id}：NapCat 容器还按旧的挂法以读写方式挂着数据目录: {legacy_napcat}。"
+            "这个版本还放行，下一个版本起会拒绝启动 CC 工作区。请把 NapCat 的挂载改成只挂数据目录下的 "
+            "uploads（只读）：控制台托管的 NapCat 在控制台里删掉容器再创建一次（QQ 登录态保留），compose 部署换用新版 "
+            "compose 文件里的写法",
+        )
     if offenders:
         logger.error(f"工作区 {workspace_id}：有别的容器以读写方式挂着工作区目录或它的上级，拒绝启动: {offenders}")
         raise WorkspaceContainerConflictError(
@@ -768,7 +850,15 @@ class SandboxContainerManager:
                 workspace.container_id = None  # type: ignore[assignment]
                 workspace.host_port = None  # type: ignore[assignment]
                 await workspace.save(update_fields=["container_name", "container_id", "host_port", "update_time"])
-            _note_replaced_claude_home(workspace.id)
+            # 以读写方式挂着工作区、home 或它们上级的别的容器：拒绝启动。放行的只有 NA 自己（还按旧
+            # 挂法挂着数据目录的 NapCat 这个版本也放行，见本模块「bind 源」一节）。排在迁移之前：
+            # 迁移要在没有任何别的容器写得到工作区目录与 `.nk-homes` 的时候做
+            await _refuse_foreign_writers(docker, workspace.id)
+            # 旧布局的 CC home 迁到工作区之外：这时这个工作区没有容器在跑、拿着锁，没有谁能动工作区
+            # 目录。旧 `.claude_home` 被换成了链接的在这里记 ERROR、换一个空的新 home；迁不动（例如
+            # 跨文件系统）就照旧按旧布局启动，下面的修复与核对都落在旧路径上；已经迁过、工作区目录里
+            # 又有一份旧的（退回旧版本又升级回来）就把它整个挪出工作区
+            await asyncio.to_thread(WorkspaceService.migrate_claude_home, workspace.id)
 
             # Docker 网络配置：默认把工作区放到专用网络上并在宿主侧切断内网访问。
             # 隔离未生效时（best_effort/off）退回改造前的形态——直接挂在 NA 所在的业务网络上。
@@ -795,8 +885,8 @@ class SandboxContainerManager:
             )
 
             # SSH 网关：总开关开着且隔离生效时，给这个容器发一把只开网关的钥匙。
-            # 钥匙与容器一起轮换：公钥按键写进 metadata，私钥写进
-            # `.claude_home/nk-ssh/id_gateway`。总开关关着（或隔离没生效）时，
+            # 钥匙与容器一起轮换：公钥按键写进 metadata，私钥写进 CC home 里的
+            # `nk-ssh/id_gateway`。总开关关着（或隔离没生效）时，
             # 删掉上次留下的文件与钥匙，容器里不会残留一份指向不存在的网关的配置。
             gateway_enabled = bool(config.SSH_GATEWAY_ENABLED)
             gateway_private_key: str | None = None
@@ -846,9 +936,7 @@ class SandboxContainerManager:
             # 两个 bind 源都按字面路径、不跟随链接地核对一遍，不是普通目录就拒绝启动（不 resolve）。
             # 修复已经在上面的 `init_workspace_dir` 里做过。这时这个工作区没有容器在跑——前提是
             # 上面清场删掉了**所有**按标签或挂载认出来的容器，而且这次启停拿着这个工作区的锁、
-            # 别的启动进不来；以读写方式挂着工作区上级目录的别的容器在下一行拒绝；放行的只有
-            # NA 自己与 NapCat（视为可信，见本模块「bind 源」一节）
-            await _refuse_foreign_writers(docker, workspace.id)
+            # 别的启动进不来；别的容器以读写方式挂着工作区、home 或它们上级的，清场之后已经拒绝过
             try:
                 ws_host_dir, claude_home_host_dir = _checked_bind_sources(workspace.id)
             except UnsafeBindSourceError as e:
@@ -1175,6 +1263,10 @@ class SandboxContainerManager:
             # 删完还有在跑的就放弃重启（异常由外层记成 failed）
             await _evict_workspace_containers(docker, workspace.id, keep_name=workspace.container_name)
             _note_replaced_claude_home(workspace.id)
+            # 重启不迁移；但已经在用新位置、工作区目录里又有一份旧 home 的（退回旧版本又升级回来），
+            # 容器停着的这会儿把它挪出工作区，免得重启后容器在 `/workspace` 里读到旧版本写下的凭据。
+            # 容器挂着旧路径当 home 的话，上面核对挂载时已经拒绝了
+            await asyncio.to_thread(WorkspaceService.retire_legacy_home, workspace.id)
 
             await WorkspaceService.init_workspace_dir(
                 workspace,
@@ -1184,10 +1276,17 @@ class SandboxContainerManager:
                 host_address=host_address,
             )
 
-            # 以读写方式挂着工作区上级目录的别的容器（NA 自己与 NapCat 除外）：拒绝重启
+            # 以读写方式挂着工作区、home 或它们上级的别的容器（NA 自己除外）：拒绝重启
             await _refuse_foreign_writers(docker, workspace.id)
             try:
                 _checked_bind_sources(workspace.id)
+                # 重启沿用容器记着的挂载：按**现在**的布局再比一次。停下来之后 home 的布局变了
+                # （例如旧容器把工作区里的 `.claude_home` 删掉了，home 落到了新位置），这份挂载就
+                # 不再指向刚修过、核对过的那个目录，只能重建
+                late_mismatch = _mount_mismatch(info, workspace.id)
+                if late_mismatch:
+                    logger.error(f"工作区 {workspace.id} 的容器 {workspace.container_name} 挂载与当前布局不一致，拒绝重启: {late_mismatch}")
+                    raise UnsafeBindSourceError(f"工作区 {workspace.id} 的容器挂载与预期不一致，请重建容器")
             except UnsafeBindSourceError as e:
                 # 容器保持停着：管理员在宿主上看过之后再重建
                 workspace.status = "failed"
@@ -1364,7 +1463,11 @@ class SandboxContainerManager:
            - 库里是 active 或残留的 transitioning（NA 在启停中途退出）：容器在跑就是 active，
              不在或没在跑就降级 stopped；
            - 库里是 stopped / failed 但容器在跑：没人看着它，停掉。
+        3. 核对完一个工作区，顺手看它的 CC home：已经在用新位置、工作区目录里又有一份旧的，挪出
+           工作区（`retire_legacy_home`；这时没有容器把旧路径挂成 home——挂着的上一步已经停掉）。
+           还在旧布局的工作区最后用一条日志列出来：它们要「启动」或「重建」一次才迁（重启不迁）。
         """
+        legacy_layout: List[int] = []
         docker = aiodocker.Docker()
         try:
             try:
@@ -1382,8 +1485,18 @@ class SandboxContainerManager:
                     except Exception:  # noqa: BLE001 - 行已经被删掉
                         continue
                     await SandboxContainerManager._recover_one(docker, workspace)
+                    try:
+                        if await asyncio.to_thread(_tidy_home_at_startup, workspace.id):
+                            legacy_layout.append(workspace.id)
+                    except Exception as exc:  # noqa: BLE001 - 收拾 home 失败不拦住启动
+                        logger.error(f"NA 启动时检查工作区 {workspace.id} 的 CC home 失败: {type(exc).__name__}: {exc}")
         finally:
             await docker.close()
+        if legacy_layout:
+            logger.warning(
+                f"这些 CC 工作区的 home 还在工作区目录里（旧布局）: {', '.join(map(str, legacy_layout))}。"
+                "在控制台对已停的点「启动」、对在跑的点「重建」，home 会挪到工作区目录之外（重启不迁）",
+            )
 
     @staticmethod
     async def _recover_one(docker: aiodocker.Docker, workspace: DBWorkspace) -> None:

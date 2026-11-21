@@ -69,6 +69,11 @@ import { useNotification } from '../../hooks/useNotification'
 import ActionButton from '../common/ActionButton'
 import IconActionButton from '../common/IconActionButton'
 import { describeTestFailure } from './testOutcome'
+import {
+  computeWorldbookBudget,
+  isSmallContextLength,
+  WORLDBOOK_OUTPUT_RESERVE_TOKENS,
+} from '../worldbook/budget'
 
 export type ModelGroupFormMode = 'create' | 'edit' | 'copy'
 
@@ -93,6 +98,11 @@ const EMPTY_CONFIG: ModelGroupConfig = {
   // 后端 `ModelConfigGroup.PREFILL_MODE` 的默认值就是 off。预填要服务商真的支持
   // 「把末尾 assistant 消息当作回答开头」，默认关是唯一不会让存量组突然改变请求形状的取值。
   PREFILL_MODE: 'off',
+  // 后端 `ModelConfigGroup.API_FORMAT` 的默认值就是 openai；只有明确声明 Gemini 原生的组才改。
+  API_FORMAT: 'openai',
+  // 0 = 未填：上下文按 32768 估，分词系数按模型名自动取。与后端默认一致。
+  CONTEXT_LENGTH: 0,
+  TOKEN_COUNT_FACTOR: 0,
 }
 
 /**
@@ -201,6 +211,9 @@ export default function ModelGroupFormDialog({
       ENABLE_VISION: initialConfig.ENABLE_VISION ?? false,
       ENABLE_COT: initialConfig.ENABLE_COT ?? false,
       PREFILL_MODE: initialConfig.PREFILL_MODE ?? 'off',
+      API_FORMAT: initialConfig.API_FORMAT ?? 'openai',
+      CONTEXT_LENGTH: initialConfig.CONTEXT_LENGTH ?? 0,
+      TOKEN_COUNT_FACTOR: initialConfig.TOKEN_COUNT_FACTOR ?? 0,
     })
     // 编辑时回显该组当下的可见性（存量 shared 的组不能被表单默认值偷偷改掉）；
     // 新建 / 复制一律回到 `DEFAULT_VISIBILITY`
@@ -218,6 +231,14 @@ export default function ModelGroupFormDialog({
   const { data: modelTypes = [] } = useQuery({
     queryKey: ['model-types'],
     queryFn: () => unifiedConfigApi.getModelTypes(),
+  })
+
+  // 全局层的百分比与上限；失败就不显示换算行，不打扰填写
+  const { data: worldbookBudget } = useQuery({
+    queryKey: ['worldbook-budget-basis', 'system'],
+    queryFn: () => unifiedConfigApi.getWorldbookBudgetBasis('system'),
+    retry: false,
+    enabled: open,
   })
 
   const getModelTypeIcon = (type: string | undefined) => {
@@ -260,6 +281,7 @@ export default function ModelGroupFormDialog({
         base_url: config.BASE_URL,
         api_key: config.API_KEY,
         proxy_url: config.CHAT_PROXY || undefined,
+        api_format: config.API_FORMAT ?? 'openai',
       })
       setModelOptions(models)
       if (models.length > 0) {
@@ -294,6 +316,7 @@ export default function ModelGroupFormDialog({
         presence_penalty: config.PRESENCE_PENALTY ?? undefined,
         frequency_penalty: config.FREQUENCY_PENALTY ?? undefined,
         extra_body: config.EXTRA_BODY ?? undefined,
+        api_format: config.API_FORMAT ?? 'openai',
       })
       setTestResult(item)
       if (item.success) {
@@ -393,6 +416,9 @@ export default function ModelGroupFormDialog({
       // 老组回显时可能没有这个键，按后端默认的 off 提交，不能漏成 undefined
       // （`_merge_payload` 只合并显式提交的字段，漏了就是保持原值，表单上看不出差别）。
       prefill_mode: config.PREFILL_MODE ?? 'off',
+      api_format: config.API_FORMAT ?? 'openai',
+      context_length: config.CONTEXT_LENGTH ?? 0,
+      token_count_factor: config.TOKEN_COUNT_FACTOR ?? 0,
       temperature: config.TEMPERATURE ?? null,
       top_p: config.TOP_P ?? null,
       top_k: config.TOP_K ?? null,
@@ -430,6 +456,25 @@ export default function ModelGroupFormDialog({
       : mode === 'edit'
         ? t('modelGroup.dialog.editTitle')
         : t('modelGroup.dialog.createTitle')
+
+  // 表单里正在填的上下文与系数；0 分别按 32768 与 1 算，与后端口径一致
+  const formContextLength = config.CONTEXT_LENGTH ?? 0
+  const formTokenFactor = config.TOKEN_COUNT_FACTOR ?? 0
+  const budgetContextLength =
+    formContextLength > 0
+      ? formContextLength
+      : (worldbookBudget?.default_context_length ?? 32768)
+  const budgetEstimate = worldbookBudget
+    ? computeWorldbookBudget(
+        worldbookBudget.percent,
+        worldbookBudget.cap_tokens,
+        budgetContextLength,
+        worldbookBudget.output_reserve
+      )
+    : 0
+  const budgetApproxChars = Math.round(
+    budgetEstimate / (0.78 * (formTokenFactor > 0 ? formTokenFactor : 1))
+  )
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
@@ -754,6 +799,80 @@ export default function ModelGroupFormDialog({
                 <MenuItem value="assistant">{t('modelGroup.form.prefillModeAssistant')}</MenuItem>
                 <MenuItem value="deepseek">{t('modelGroup.form.prefillModeDeepseek')}</MenuItem>
               </TextField>
+            )}
+            {/* 接口格式同样只对聊天组有意义：嵌入与绘图根本不走聊天入口 */}
+            {(config.MODEL_TYPE || 'chat') === 'chat' && (
+              <TextField
+                select
+                fullWidth
+                size={inputSize}
+                label={t('modelGroup.form.apiFormat')}
+                value={config.API_FORMAT ?? 'openai'}
+                onChange={e =>
+                  setConfig({
+                    ...config,
+                    API_FORMAT: e.target.value as 'openai' | 'gemini',
+                  })
+                }
+                helperText={t('modelGroup.helpers.apiFormat')}
+                sx={{ mt: 2, maxWidth: 560 }}
+              >
+                <MenuItem value="openai">{t('modelGroup.form.apiFormatOpenai')}</MenuItem>
+                <MenuItem value="gemini">{t('modelGroup.form.apiFormatGemini')}</MenuItem>
+              </TextField>
+            )}
+
+            <Stack direction={isMobile ? 'column' : 'row'} spacing={2} sx={{ mt: 2 }}>
+              <TextField
+                label={t('modelGroup.form.contextLength')}
+                type="number"
+                value={formContextLength}
+                onChange={e =>
+                  setConfig({
+                    ...config,
+                    CONTEXT_LENGTH: e.target.value === '' ? 0 : Number(e.target.value),
+                  })
+                }
+                fullWidth
+                size={inputSize}
+                inputProps={{ min: 0, max: 10_000_000, step: 1 }}
+                helperText={t('modelGroup.helpers.contextLength')}
+              />
+              <TextField
+                label={t('modelGroup.form.tokenCountFactor')}
+                type="number"
+                value={formTokenFactor}
+                onChange={e =>
+                  setConfig({
+                    ...config,
+                    TOKEN_COUNT_FACTOR: e.target.value === '' ? 0 : Number(e.target.value),
+                  })
+                }
+                fullWidth
+                size={inputSize}
+                inputProps={{ min: 0, max: 10, step: 0.01 }}
+                helperText={t('modelGroup.helpers.tokenCountFactor')}
+              />
+            </Stack>
+
+            {worldbookBudget && (
+              <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+                {t('modelGroup.helpers.budgetEstimate', {
+                  budget: budgetEstimate,
+                  approx: budgetApproxChars,
+                })}
+                {formTokenFactor === 0 &&
+                  ` ${t('modelGroup.helpers.budgetEstimateAutoFactor')}`}
+              </Typography>
+            )}
+            {/* 不拦：这么小的上下文本身是合法配置，只是世界书注入不了；后端保存与启动时也各记一条 WARNING */}
+            {isSmallContextLength(formContextLength) && (
+              <Alert severity="warning" sx={{ mt: 1 }}>
+                {t('modelGroup.helpers.smallContext', {
+                  contextLength: formContextLength,
+                  outputReserve: WORLDBOOK_OUTPUT_RESERVE_TOKENS,
+                })}
+              </Alert>
             )}
           </Box>
 

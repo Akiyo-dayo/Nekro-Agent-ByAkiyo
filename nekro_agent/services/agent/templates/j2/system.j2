@@ -1,15 +1,15 @@
-{% macro system_prompt(stable_static, channel_static, runtime_dynamic, affection_prompt, plugins_prompt, worldbook_prompt="", auxiliary_prompt="", ops_prompt="") %}
+{% macro system_prompt(stable_static, channel_static, runtime_dynamic, affection_prompt, plugins_prompt, worldbook_prompt="", auxiliary_prompt="", ops_prompt="", stable_prefix_order=False, deferred_prompt="", rp_block="") %}
 {{ stable_static }}
 
-{{ channel_static }}
+{% if rp_block %}{{ rp_block }}{% else %}{{ channel_static }}{% endif %}
 {% if auxiliary_prompt %}
 ## Additional Instructions
 {{ auxiliary_prompt }}
-{% endif %}{% if worldbook_prompt %}
+{% endif %}{% if not stable_prefix_order %}{% if worldbook_prompt and not rp_block %}
 {{ worldbook_prompt }}
 {% endif %}{% if affection_prompt %}
 {{ affection_prompt }}
-{% endif %}
+{% endif %}{% endif %}
 {{ runtime_dynamic }}
 
 ### Your Plugins:
@@ -19,4 +19,5 @@
 {%- if ops_prompt %}
 {{ ops_prompt }}
 {%- endif %}
+{%- if deferred_prompt %}{{ deferred_prompt }}{% endif %}
 {% endmacro %}

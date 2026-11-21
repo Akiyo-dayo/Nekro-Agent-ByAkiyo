@@ -29,9 +29,10 @@ import {
   type SummaryVersionItem,
 } from '../../services/api/memory'
 import MemoryNotFoundState from './MemoryNotFoundState'
+import SummaryDiffView from './SummaryDiffView'
 import SummarySourceChip from './SummarySourceChip'
 import { memoryErrorMessage } from './errorMessage'
-import { formatDateTime, truncateText } from './format'
+import { formatDateTime, formatShortDateTime, truncateText } from './format'
 import { channelNameOf, presetNameOf } from './scopeLabels'
 import { useMemoryScopeOptions } from './useMemoryScopeOptions'
 
@@ -45,6 +46,9 @@ import { useMemoryScopeOptions } from './useMemoryScopeOptions'
  * 编辑的并发保护用 `base_version`：提交时带打开这一版时的版本号，服务端发现已经
  * 不是最新版会回 409。这种情况不能悄悄丢掉运营写的内容，所以把被替换掉的原文放进
  * 一个可复制的折叠块里。
+ *
+ * 打开时只摊开最新一版：几版并排铺开看不出改了什么。「和上一版对比」逐句标出增删；
+ * 旧版本收进默认合上的历史抽屉，回滚也在那里。每一版用生成时间称呼，版号是次要信息。
  */
 
 interface SummaryDialogProps {
@@ -88,10 +92,14 @@ function SummaryVersionRow({
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+        {/* 用生成时间称呼一版；版号只作次要信息（回滚说的「回滚自第 N 版」要对得上它） */}
         <Typography variant="body2" fontWeight={700}>
-          {t('summaries.dialog.version', { version: version.version })}
+          {t('summaries.generatedAt', { time: formatShortDateTime(version.create_time) })}
         </Typography>
         <SummarySourceChip source={version.source} />
+        <Typography variant="caption" color="text.secondary">
+          {t('summaries.dialog.version', { version: version.version })}
+        </Typography>
         {version.source === 'rollback' && version.source_version !== null && (
           <Typography variant="caption" color="text.secondary">
             {t('summaries.dialog.rollbackFrom', { version: version.source_version })}
@@ -102,9 +110,6 @@ function SummaryVersionRow({
             {t('summaries.dialog.editedBy', { user: version.edited_by })}
           </Typography>
         )}
-        <Typography variant="caption" color="text.secondary">
-          {formatDateTime(version.create_time)}
-        </Typography>
         <Box sx={{ flex: 1 }} />
         {!isLatest && (
           <ActionButton
@@ -160,7 +165,11 @@ export default function SummaryDialog({
 
   const versions = versionsQuery.data?.versions ?? []
   const latest = versions[0] ?? null
+  const previous = versions[1] ?? null
+  const older = versions.slice(1)
   const paused = versionsQuery.data?.paused ?? false
+  const [showDiff, setShowDiff] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
 
   // 只在打开时载入一次：暂停开关会让这个查询重新取数，那不该把正在编辑的草稿冲掉
   useEffect(() => {
@@ -333,6 +342,33 @@ export default function SummaryDialog({
 
         <Divider />
 
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+          <Typography variant="subtitle2" fontWeight={700}>
+            {t('summaries.dialog.latestTitle')}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {t('summaries.generatedAt', { time: formatShortDateTime(latest.create_time) })}
+          </Typography>
+          <SummarySourceChip source={latest.source} />
+          <Box sx={{ flex: 1 }} />
+          {previous && (
+            <ActionButton tone="ghost" size="small" onClick={() => setShowDiff(value => !value)}>
+              {showDiff ? t('summaries.dialog.hideDiff') : t('summaries.dialog.compareWithPrevious')}
+            </ActionButton>
+          )}
+        </Box>
+        {showDiff && previous && (
+          <Box>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+              {t('summaries.dialog.diffCaption', {
+                previous: formatShortDateTime(previous.create_time),
+                latest: formatShortDateTime(latest.create_time),
+              })}
+            </Typography>
+            <SummaryDiffView before={previous.content} after={latest.content} />
+          </Box>
+        )}
+
         {conflict && (
           <Alert severity="info">{t('summaries.dialog.conflictReplaced')}</Alert>
         )}
@@ -382,33 +418,44 @@ export default function SummaryDialog({
           </ActionButton>
         </Box>
 
-        <Divider />
-
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-          <Typography variant="subtitle2" fontWeight={700}>
-            {t('summaries.dialog.historyTitle')}
-          </Typography>
-          <Box sx={{ flex: 1 }} />
-          <ActionButton
-            tone="ghost"
-            size="small"
-            disabled={versions.length < 2 || rollbackMutation.isPending}
-            onClick={() => rollbackMutation.mutate(undefined)}
+        {/* 旧版本收进历史抽屉，默认收着：打开详情先看到的只有最新一版 */}
+        {older.length > 0 && (
+          <Accordion
+            disableGutters
+            expanded={historyOpen}
+            onChange={(_event, expanded) => setHistoryOpen(expanded)}
+            sx={{ '&:before': { display: 'none' }, border: 1, borderColor: 'divider', borderRadius: 1 }}
           >
-            {t('summaries.dialog.rollbackPrevious')}
-          </ActionButton>
-        </Box>
-        <Stack spacing={1}>
-          {versions.map((version, index) => (
-            <SummaryVersionRow
-              key={version.id}
-              version={version}
-              isLatest={index === 0}
-              rollbackPending={rollbackMutation.isPending}
-              onRollback={() => rollbackMutation.mutate(version.version)}
-            />
-          ))}
-        </Stack>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+              <Typography variant="subtitle2" fontWeight={700}>
+                {t('summaries.dialog.historyDrawer', { count: older.length })}
+              </Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Stack spacing={1}>
+                <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+                  <ActionButton
+                    tone="ghost"
+                    size="small"
+                    disabled={rollbackMutation.isPending}
+                    onClick={() => rollbackMutation.mutate(undefined)}
+                  >
+                    {t('summaries.dialog.rollbackPrevious')}
+                  </ActionButton>
+                </Box>
+                {older.map(version => (
+                  <SummaryVersionRow
+                    key={version.id}
+                    version={version}
+                    isLatest={false}
+                    rollbackPending={rollbackMutation.isPending}
+                    onRollback={() => rollbackMutation.mutate(version.version)}
+                  />
+                ))}
+              </Stack>
+            </AccordionDetails>
+          </Accordion>
+        )}
       </Stack>
     )
   }

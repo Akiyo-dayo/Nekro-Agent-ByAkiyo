@@ -230,11 +230,22 @@ def _regex_script_from_rule(rule: Mapping[str, Any]) -> dict[str, Any]:
         script["trimStrings"] = trim
     # 「按原文判出的默认启用」而不是原文的 `disabled`：导入时因安全检查被停用的规则，
     # 只要管理员没有明确改过启用状态，导出就保持停用，不把它的停用状态当成一次编辑。
-    default_enabled = cleanup.rule_from_st_script(original)["enabled"]
+    if _is_html_display_rule(original):
+        # 输出 HTML 的规则：NA 里的「停用 / 只留正文 / 整段删掉」只决定 QQ 上怎么发，酒馆里这条规则照样
+        # 渲染网页。不管管理员在 NA 里怎么选、卡里原本是开是关，导出都保留原文的启用状态（早先导入时这类
+        # 规则存成停用，也不能因此在导出时把它关掉）。重新导入时 NA 里的选择回到默认，扩展页写明了这一点。
+        return script
+    default = cleanup.rule_from_st_script(original)
     enabled = bool(rule.get("enabled"))
-    if enabled != default_enabled:
+    if enabled != default["enabled"]:
         script["disabled"] = not enabled
     return script
+
+
+def _is_html_display_rule(original: Mapping[str, Any]) -> bool:
+    """酒馆原文的替换文字带 HTML：这条规则在 NA 里按「输出 HTML 的规则」处理"""
+    replace = original.get("replaceString")
+    return isinstance(replace, str) and cleanup.has_html_output(replace)
 
 
 def _apply_regex_scripts(result: dict[str, Any], card: DBPresetCard) -> None:

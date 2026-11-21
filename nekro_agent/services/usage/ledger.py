@@ -79,6 +79,7 @@ class LLMUsageDraft:
     model_name: str = ""
     stream_mode: bool = False
     token_input: int = 0
+    token_input_cached: int = 0
     token_output: int = 0
     token_total: int = 0
     status: LLMUsageStatus = LLMUsageStatus.SUCCESS
@@ -102,6 +103,7 @@ def record_llm_usage(
     model_name: str,
     stream_mode: bool,
     token_input: int = 0,
+    token_input_cached: int = 0,
     token_output: int = 0,
     token_total: int = 0,
     status: LLMUsageStatus = LLMUsageStatus.SUCCESS,
@@ -120,11 +122,14 @@ def record_llm_usage(
     """
     global _dropped_count  # noqa: PLW0603
     try:
+        normalized_input = max(0, int(token_input or 0))
         draft = LLMUsageDraft(
             context=context if context is not None else current_usage_context(),
             model_name=model_name,
             stream_mode=stream_mode,
-            token_input=max(0, int(token_input or 0)),
+            token_input=normalized_input,
+            # 命中数不能超过输入总数；输入为 0 时这一列也记 0（没输入就谈不上命中）。
+            token_input_cached=min(max(0, int(token_input_cached or 0)), normalized_input),
             token_output=max(0, int(token_output or 0)),
             token_total=max(0, int(token_total or 0)),
             status=status,
@@ -249,6 +254,7 @@ async def _write_record(draft: LLMUsageDraft) -> None:
             model_name=draft.model_name,
             stream_mode=draft.stream_mode,
             token_input=draft.token_input,
+            token_input_cached=draft.token_input_cached,
             token_output=draft.token_output,
             token_total=draft.token_total,
             token_input_rate=context.token_input_rate,

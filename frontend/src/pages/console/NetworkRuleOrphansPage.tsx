@@ -25,6 +25,7 @@ import {
   Stack,
   TextField,
   Typography,
+  useTheme,
 } from '@mui/material'
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded'
 import RefreshRoundedIcon from '@mui/icons-material/RefreshRounded'
@@ -34,6 +35,7 @@ import ActionButton from '../../components/common/ActionButton'
 import NekroDialog from '../../components/common/NekroDialog'
 import QueryErrorState from '../../components/common/QueryErrorState'
 import { useNotification } from '../../hooks/useNotification'
+import { CHIP_VARIANTS } from '../../theme/variants'
 import {
   CONSOLE_NETWORK_RULE_QUERY_KEYS,
   consoleNetworkRulesApi,
@@ -54,6 +56,7 @@ function CandidateCard({
   candidate: OrphanRuleCandidate
   onCleanup: (candidate: OrphanRuleCandidate) => void
 }) {
+  const theme = useTheme()
   const { t } = useTranslation('console-network-rules')
 
   return (
@@ -71,13 +74,21 @@ function CandidateCard({
         <Typography variant="subtitle2" fontWeight={700} sx={{ wordBreak: 'break-all' }}>
           {candidate.marker}
         </Typography>
-        <Chip size="small" variant="outlined" label={candidate.guard_label} />
         <Chip
           size="small"
-          color={VERDICT_TONE[candidate.verdict]}
-          label={t(`verdict.${candidate.verdict}`)}
+          label={candidate.guard_label}
+          sx={CHIP_VARIANTS.getPaletteChip(theme, 'default', true)}
         />
-        <Chip size="small" variant="outlined" label={t('ruleCount', { count: candidate.rule_count })} />
+        <Chip
+          size="small"
+          label={t(`verdict.${candidate.verdict}`)}
+          sx={CHIP_VARIANTS.getPaletteChip(theme, VERDICT_TONE[candidate.verdict], true)}
+        />
+        <Chip
+          size="small"
+          label={t('ruleCount', { count: candidate.rule_count })}
+          sx={CHIP_VARIANTS.getPaletteChip(theme, 'default', true)}
+        />
         <Box sx={{ flex: 1 }} />
         {candidate.verdict === 'orphan' && (
           <ActionButton tone="danger" size="small" onClick={() => onCleanup(candidate)}>
@@ -217,6 +228,8 @@ export default function NetworkRuleOrphansPage() {
         gap: 2,
         overflow: 'auto',
         boxSizing: 'border-box',
+        // 定高滚动列：子项按内容定高，不被压扁（见 SCROLL_COLUMN_STYLES）
+        '& > *': { flexShrink: 0 },
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>

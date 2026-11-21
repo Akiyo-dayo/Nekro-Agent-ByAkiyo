@@ -1,4 +1,5 @@
 import axios from './axios'
+import type { WorldbookBudgetInfo } from './worldbook'
 
 /**
  * 记忆管理接口
@@ -139,12 +140,74 @@ export interface ParagraphListItem {
   status: string
   is_frozen: boolean
   is_protected: boolean
+  /** 敏感事：只在来源频道里被想起；老后端没有这个键时按非敏感处理 */
+  is_sensitive?: boolean
   blocked_round_hits: number
   quarantined_at: string | null
   quarantine_reason: string
   create_time: string | null
   update_time: string | null
   person_accounts: string[]
+  /** 与 `person_accounts` 一一对应、顺序相同，带显示名；老后端没有这个键 */
+  persons?: PersonLabel[]
+  /** 所属事件；没归入任何事件时为空 */
+  episode_id?: number | null
+}
+
+/**
+ * 一段记忆里「涉及的人」的显示名
+ *
+ * `display_name` 是这个账号在来源频道里最近的昵称（没有就取好感记录里的）；`call_name` 是
+ * 好感里模型给这个人记的称呼——模型写的不可信内容，只当纯文本显示。查不到时都是空串。
+ */
+export interface PersonLabel {
+  account: string
+  display_name: string
+  call_name: string
+  name_source?: PersonNameSource
+}
+
+/**
+ * 昵称从哪来：`chat` 来源频道里的发言；`affection` 好感记录（好感域共用的「最近一次见到的
+ * 昵称」，可能是在别的群或私聊里看到的）；空串或缺省 = 没查到 / 老后端
+ */
+export type PersonNameSource = 'chat' | 'affection' | ''
+
+/** 「记忆里出现过的人」的一行；`account` 原样传给段落列表的 `person` 筛出来的就是这一组 */
+export interface MemoryPersonItem {
+  account: string
+  /** 并进这一行的全部账号（选了实例时同一个人的几个账号并成一行） */
+  accounts: string[]
+  display_name: string
+  call_name: string
+  name_source?: PersonNameSource
+  paragraph_count: number
+  last_paragraph_id: number
+}
+
+export interface MemoryPersonListResponse {
+  total: number
+  items: MemoryPersonItem[]
+}
+
+/**
+ * 按事件分组的一行
+ *
+ * `episode_id` 为空的那一行是「没归入任何事件」的段落；`visible` 为假表示段落还指着这个事件，
+ * 但事件已经没了或不在可见范围里，此时只有编号。
+ */
+export interface MemoryTopicItem {
+  episode_id: number | null
+  title: string
+  narrative_summary: string
+  paragraph_count: number
+  last_time: string | null
+  visible: boolean
+}
+
+export interface MemoryTopicListResponse {
+  total: number
+  items: MemoryTopicItem[]
 }
 
 export interface ParagraphListResponse {
@@ -185,6 +248,10 @@ export interface QuarantineListItem {
   quarantined_at: string | null
   quarantine_reason: string
   blocked_round_hits: number
+  /** 认知类型；只有段落行有，事件行为空 */
+  cognitive_type?: string | null
+  /** 知识类型；只有段落行有，事件行为空 */
+  knowledge_type?: string | null
 }
 
 export interface QuarantineListResponse {
@@ -195,6 +262,9 @@ export interface QuarantineListResponse {
 export interface MemoryPerson {
   account: string
   display_name: string
+  /** 好感里的称呼；老后端没有这个键 */
+  call_name?: string
+  name_source?: PersonNameSource
 }
 
 /**
@@ -219,12 +289,15 @@ export interface MemoryItemDetail {
   origin_channel_name?: string
   is_frozen?: boolean
   is_protected?: boolean
+  /** 敏感事：只在来源频道里被想起；老后端没有这个键时按非敏感处理 */
+  is_sensitive?: boolean
   base_weight?: number
   blocked_round_hits?: number
   quarantined_at?: string | null
   quarantine_reason?: string
   persons?: MemoryPerson[]
-  episode?: { id: number; title: string } | null
+  /** 所属事件；`visible` 为假时事件已经没了或不在可见范围，只给编号（老后端没有这个键） */
+  episode?: { id: number; title: string; visible?: boolean } | null
   reinforcement_count?: number
   workspace_id?: number
   instance_key?: string
@@ -294,12 +367,16 @@ export interface ParagraphFilterSelection {
   status?: MemoryStatusFilter
   frozen?: boolean | null
   protected?: boolean | null
+  /** 敏感筛选：`true` 只看敏感，`false` 不含敏感，不传 = 不筛 */
+  sensitive?: boolean
   cognitive_type?: string | null
   knowledge_type?: string | null
   time_from?: string | null
   time_to?: string | null
   q?: string | null
   origin_kind?: OriginKind | null
+  /** 所属事件：`none` 或事件 ID，与列表的 `episode` 参数相同 */
+  episode?: string | null
   sort?: MemorySort
   order?: MemoryOrder
   page?: number
@@ -373,6 +450,8 @@ export interface PromptRoundListItem {
   memory_block_chars: number
   summary_state: string
   summary_version: number | null
+  /** 这一轮注入的那一版摘要的生成时间；那一版已不保留时为空 */
+  summary_created_at?: string | null
   summary_chars: number
   affection_shown: boolean
   affection_chars: number
@@ -383,6 +462,8 @@ export interface PromptRoundListItem {
   worldbook_state: string
   worldbook_count: number
   worldbook_chars: number
+  /** 注入条目的 token 合计；旧行没有这个口径，为 null */
+  worldbook_tokens: number | null
   /**
    * 酒馆卡与高级槽位的本轮状态（门控结论、后置指令与预填的字数等）
    *
@@ -390,6 +471,12 @@ export interface PromptRoundListItem {
    * 自己收窄。老行上是空对象。
    */
   tavern_items?: Record<string, unknown>
+  /**
+   * 角色状态块的本轮状态（注入与否、token、被截掉的组等）
+   *
+   * 与 `tavern_items` 同样是不定形状的字典，只含计数与名字；没有记录时是空对象。
+   */
+  state_items?: Record<string, unknown>
   started_at: string | null
   finished_at: string | null
 }
@@ -406,20 +493,37 @@ export interface PromptRoundMemoryItem {
   preview: string
   chars: number
   renders: number
+  /** 与当时那几句对话的向量相似度；旧行或非语义命中没有这个字段 */
+  score?: number | null
 }
 
-/** 明细里的世界书条目；`type = 'worldbook'` 是注入的，`'worldbook_dropped'` 是被预算跳过的 */
+/** 明细里的世界书条目：注入的、命中了但没注入的，以及模型自己查过的 */
+export type PromptRoundWorldbookItemType =
+  | 'worldbook'
+  | 'worldbook_dropped'
+  | 'worldbook_lookup'
+
+/** 明细里的世界书条目；`type = 'worldbook'` 是注入的，`'worldbook_dropped'` 是命中了但没注入的，`'worldbook_lookup'` 是模型主动查的 */
 export interface PromptRoundWorldbookItem {
-  type: string
+  type: PromptRoundWorldbookItemType
   id: number
   /** 租户看不到的书（`status = 'hidden'`）没有这个键 */
   book_id?: number
   chars: number
+  /** 这一轮分词系数下的 token 数；旧行没有这个字段 */
+  tokens?: number | null
   position?: string
   trusted?: boolean
   renders?: number
-  /** 只有 `worldbook_dropped` 有：`global_chars` / `book_chars` / `max_entries` */
+  /**
+   * 注入行里 `semantic` 表示这一条是语义命中；被跳过的行是预算新行 `global_tokens` /
+   * `book_tokens` / `max_entries`（旧行 `global_chars` / `book_chars`），或用途与模板
+   * `state_only` / `template_unsupported` / `template_trap` / `template_error` /
+   * `template_empty` / `template_budget`
+   */
   reason?: string
+  /** 语义命中的相似度；旧行没有这个字段 */
+  score?: number
   /** active / disabled / quarantined / hard_deleted / hidden */
   status: string
   book_name: string
@@ -438,6 +542,8 @@ export interface PromptRoundDetail {
   render_count: number
   memory_state: string
   memory_items: PromptRoundMemoryItem[]
+  /** 这一轮记忆筛选的模型判定；旧后端没有这个键 */
+  memory_judge?: { mode: 'model' | 'fallback'; pool: number; kept: number } | null
   memory_block_chars: number
   cooldown_skipped: number
   summary_state: string
@@ -452,11 +558,32 @@ export interface PromptRoundDetail {
   worldbook_state: string
   worldbook_items: PromptRoundWorldbookItem[]
   worldbook_chars: number
+  /** 注入条目的 token 合计；旧行没有这个口径，为 null */
+  worldbook_tokens?: number | null
+  /** 这一轮的预算换算结果；旧行为空对象 */
+  worldbook_budget: WorldbookBudgetInfo | Record<string, never>
   /** 酒馆卡与高级槽位的本轮状态；形状同列表行，见上面的说明 */
   tavern_items?: Record<string, unknown>
+  /** 角色状态块的本轮状态；形状同列表行，见上面的说明 */
+  state_items?: Record<string, unknown>
   started_at: string | null
   finished_at: string | null
-  summary: Record<string, unknown>
+  summary: PromptRoundSummaryRef
+}
+
+/**
+ * 明细里「这一轮注入的那一版摘要」
+ *
+ * `state`：current（仍是最新版）/ outdated（之后又更新过）/ deleted（那一版已不保留）/ none。
+ * 那一版还在时带生成时间与正文。
+ */
+export interface PromptRoundSummaryRef {
+  id?: number | null
+  version?: number | null
+  state?: string
+  is_latest?: boolean
+  create_time?: string | null
+  content?: string
 }
 
 export interface ParagraphListParams {
@@ -467,10 +594,14 @@ export interface ParagraphListParams {
   status?: MemoryStatusFilter
   frozen?: boolean | null
   protected?: boolean | null
+  /** 敏感筛选：`true` 只看敏感，`false` 不含敏感，不传 = 不筛 */
+  sensitive?: boolean
   cognitive_type?: string
   knowledge_type?: string
   /** 来源类型；不传 = 全部 */
   origin_kind?: OriginKind
+  /** 所属事件：`none` = 没归入任何事件，数字 = 事件 ID；不传 = 不筛 */
+  episode?: string
   time_from?: string
   time_to?: string
   q?: string
@@ -479,6 +610,14 @@ export interface ParagraphListParams {
   page?: number
   page_size?: number
 }
+
+/** 「记忆里出现过的人」：与段落列表同一套筛选，去掉人这一项；`account_q` 只按账号匹配 */
+export type MemoryPersonListParams = Omit<ParagraphListParams, 'person' | 'sort' | 'order'> & {
+  account_q?: string
+}
+
+/** 按事件分组：与段落列表同一套筛选，去掉事件这一项 */
+export type MemoryTopicListParams = Omit<ParagraphListParams, 'episode' | 'sort' | 'order'>
 
 /** episode 不接受按人 / 认知类型 / 知识类型筛选，查询类型里索性不放这三项 */
 export interface EpisodeListParams {
@@ -516,6 +655,61 @@ export interface PromptRoundListParams {
   page_size?: number
 }
 
+/**
+ * 图谱节点：段落 / 事件 / 实体 / 关系，外加「人」（`memory_type === 'person'`，`ref_id` 为 0，
+ * 没有单条详情；账号、名字、段数在 `metadata` 里）
+ *
+ * 段落节点的 `metadata` 另带 `memory_status`（与列表同一套状态）、`is_milestone`（关系里程碑）
+ * 与 `origin_chat_key`。
+ */
+export interface MemoryGraphNode {
+  id: string
+  memory_type: string
+  ref_id: number
+  label: string
+  subtitle: string
+  status: string
+  cognitive_type: string | null
+  weight: number
+  size: number
+  importance: number
+  paragraph_id: number | null
+  metadata: Record<string, unknown>
+}
+
+export interface MemoryGraphEdge {
+  id: string
+  source: string
+  target: string
+  edge_type: string
+  label: string
+  weight: number
+  strength: number
+  status: string
+  cognitive_type: string | null
+  metadata: Record<string, unknown>
+}
+
+export interface MemoryGraphResponse {
+  generated_at: string
+  node_count: number
+  edge_count: number
+  nodes: MemoryGraphNode[]
+  edges: MemoryGraphEdge[]
+}
+
+/** 与段落列表同名同义的几项筛选，外加是否画失活的、最多画多少段 */
+export interface MemoryGraphParams {
+  partition?: MemoryPartition
+  chat_key?: string
+  preset_id?: number | null
+  person?: string
+  include_inactive?: boolean
+  time_from?: string
+  time_to?: string
+  limit?: number
+}
+
 /** 去掉空值；`0`、`false`、`'all'` 都保留 */
 function compact<T extends object>(params: T): Record<string, unknown> {
   return Object.fromEntries(
@@ -531,10 +725,38 @@ export const memoryApi = {
     return response.data
   },
 
+  /** 记忆图谱（只读）；节点详情用 `getItem` */
+  getGraph: async (params: MemoryGraphParams & MemoryScopeParams): Promise<MemoryGraphResponse> => {
+    const response = await axios.get<MemoryGraphResponse>('/memory/graph', {
+      params: compact(params),
+    })
+    return response.data
+  },
+
   listParagraphs: async (
     params: ParagraphListParams & MemoryScopeParams
   ): Promise<ParagraphListResponse> => {
     const response = await axios.get<ParagraphListResponse>('/memory/paragraphs', {
+      params: compact(params),
+    })
+    return response.data
+  },
+
+  /** 满足筛选的段落里出现过哪些人、各几段（只读，按段数倒序） */
+  listPersons: async (
+    params: MemoryPersonListParams & MemoryScopeParams
+  ): Promise<MemoryPersonListResponse> => {
+    const response = await axios.get<MemoryPersonListResponse>('/memory/persons', {
+      params: compact(params),
+    })
+    return response.data
+  },
+
+  /** 满足筛选的段落按所属事件分组（只读） */
+  listTopics: async (
+    params: MemoryTopicListParams & MemoryScopeParams
+  ): Promise<MemoryTopicListResponse> => {
+    const response = await axios.get<MemoryTopicListResponse>('/memory/topics', {
       params: compact(params),
     })
     return response.data

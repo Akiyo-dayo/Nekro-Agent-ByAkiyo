@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Box,
+  Checkbox,
+  FormControlLabel,
   Stack,
   Table,
   TableBody,
@@ -42,6 +44,17 @@ interface ImportDialogProps {
 
 const IMPORT_MAX_MIB = WORLDBOOK_IMPORT_MAX_BYTES / (1024 * 1024)
 
+/**
+ * 导入新书的表单初值：与世界书文件导入的后端默认一致，「扫描时带上说话人名字」默认开
+ *
+ * 手工建书的表单默认关（`DEFAULT_WORLDBOOK_BOOK_FORM`）；导入这份文件的人多半是从酒馆
+ * 搬过来的，那边新装默认就带名字。
+ */
+const IMPORT_BOOK_FORM: WorldbookBookFormState = {
+  ...DEFAULT_WORLDBOOK_BOOK_FORM,
+  scanNames: true,
+}
+
 function filenameWithoutExtension(filename: string): string {
   return filename.replace(/\.[^.]+$/, '')
 }
@@ -76,14 +89,17 @@ export default function ImportDialog({
 
   const inputRef = useRef<HTMLInputElement | null>(null)
   const [file, setFile] = useState<File | null>(null)
-  const [form, setForm] = useState<WorldbookBookFormState>({ ...DEFAULT_WORLDBOOK_BOOK_FORM })
+  const [form, setForm] = useState<WorldbookBookFormState>({ ...IMPORT_BOOK_FORM })
   const [report, setReport] = useState<WorldbookImportReport | null>(null)
+  // 正文里读名字的变量默认换成宏；只换输出名字的写法，导入说明里会列出换了哪些
+  const [rewriteNameVars, setRewriteNameVars] = useState(true)
 
   useEffect(() => {
     if (open) {
       setFile(null)
-      setForm({ ...DEFAULT_WORLDBOOK_BOOK_FORM })
+      setForm({ ...IMPORT_BOOK_FORM })
       setReport(null)
+      setRewriteNameVars(true)
     }
   }, [open])
 
@@ -107,11 +123,12 @@ export default function ImportDialog({
         return worldbookApi.importNewBook(
           file,
           bookFormToCreateRequest(form, fallbackName),
-          scope
+          scope,
+          rewriteNameVars
         )
       }
       if (!bookId) throw new Error(tCommon('messages.operationFailed'))
-      return worldbookApi.importIntoBook(bookId, file)
+      return worldbookApi.importIntoBook(bookId, file, rewriteNameVars)
     },
     onSuccess: result => {
       setReport(result)
@@ -278,6 +295,19 @@ export default function ImportDialog({
             {t('import.macroHint', { example: '{{char}}' })}
           </Typography>
 
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={rewriteNameVars}
+                onChange={event => setRewriteNameVars(event.target.checked)}
+              />
+            }
+            label={t('import.rewriteNameVars', {
+              userMacro: '{{user}}',
+              charMacro: '{{char}}',
+            })}
+          />
+
           {mode === 'new' && (
             <BookFields
               value={form}
@@ -287,6 +317,7 @@ export default function ImportDialog({
               scope={scope}
               presets={options?.presets ?? []}
               channels={options?.channels ?? []}
+              showScanNamesStDefault
             />
           )}
         </Stack>

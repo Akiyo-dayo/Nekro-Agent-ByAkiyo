@@ -1,17 +1,18 @@
-"""开场白：判据表的每一行、记录写法、发送失败与 `/reset`
+"""开场白：判据表的每一行、记录写法、旧初值的清理与 `/reset`
 
 判据表的核心是「记录与当前人设比」：记录相同就什么都不做；键不存在时用频道里有没有
-Bot 消息分老频道与新频道；`-1` 与另一个人设 ID 都发。这里逐行钉住，并跑真表确认
+Bot 消息分老频道与新频道；`-1` 与另一个人设 ID 都只记不发。这里逐行钉住，并跑真表确认
 `reset_channel` 写 `-1` 时不会丢掉 `data` 里的其它键。
 
-发送路径用打桩的 `send_agent_message`，只关心传了什么、记录写成了什么；真实发送在
-`tests/test_tavern_cleanup_send.py` 里与清理、输出过滤一起走。
+开场白不再发出：发送服务仍然打桩，用来断言「一次都没被调用」；记录照写，写记录时
+上一位人设留下的 `<initvar>` 初值被清掉。
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Optional
 
@@ -25,9 +26,11 @@ from nekro_agent.models.db_preset import DBPreset
 from nekro_agent.models.db_preset_card import DBPresetCard
 from nekro_agent.schemas.chat_message import ChatType
 from nekro_agent.services.agent import round_prompt as round_prompt_module
+from nekro_agent.services.chat.universal_chat_service import universal_chat_service
 from nekro_agent.services.memory import prompt_rounds
 from nekro_agent.services.tavern import greeting
 from nekro_agent.services.tavern import runtime as tavern_runtime
+from nekro_agent.services.tavern.cleanup_runtime import strip_variable_markup
 from nekro_agent.services.tavern.greeting import (
     GREETED_KEY,
     RESET_MARK,
@@ -35,6 +38,7 @@ from nekro_agent.services.tavern.greeting import (
     decide,
     maybe_greet,
     pick_greeting,
+    preview_greeting,
 )
 from nekro_agent.services.tavern.macros import MacroContext
 from nekro_agent.services.tavern.runtime import TavernRound
@@ -182,18 +186,13 @@ def _tavern(card: Optional[DBPresetCard], *, user_name: str = "阿明", char_nam
 
 
 class _SendRecorder:
+    """发送服务替身：开场白不再发出，用例只断言它一次都没被调用"""
+
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.error: Optional[Exception] = None
 
     async def __call__(self, **kwargs: Any) -> None:
         self.calls.append(kwargs)
-        if self.error is not None:
-            raise self.error
-
-    @property
-    def texts(self) -> list[str]:
-        return [str(call["messages"]) for call in self.calls]
 
 
 @pytest.fixture
@@ -203,7 +202,7 @@ def send_recorder(monkeypatch: pytest.MonkeyPatch) -> _SendRecorder:
     async def _record(**kwargs: Any) -> None:
         await recorder(**kwargs)
 
-    monkeypatch.setattr(greeting.universal_chat_service, "send_agent_message", _record)
+    monkeypatch.setattr(universal_chat_service, "send_agent_message", _record)
     return recorder
 
 
@@ -241,16 +240,16 @@ class TestDecisionTable:
         assert decision.send is False
         assert decision.record is True
 
-    async def test_missing_key_without_bot_message_sends(self, db: None) -> None:
+    async def test_missing_key_without_bot_message_records_without_sending(self, db: None) -> None:
         preset = await _preset()
         card = await _card(preset)
         channel = await _channel(preset_id=preset.id)
 
         decision = await decide(channel, preset.id, card, _config())
 
-        assert decision == GreetingDecision(send=True, text="你好，我是{{char}}。", record=True)
+        assert decision == GreetingDecision(send=False, text=None, record=True)
 
-    async def test_reset_mark_sends_even_with_bot_message(self, db: None) -> None:
+    async def test_reset_mark_records_without_sending(self, db: None) -> None:
         preset = await _preset()
         card = await _card(preset)
         channel = await _channel(data={GREETED_KEY: RESET_MARK}, preset_id=preset.id)
@@ -258,24 +257,23 @@ class TestDecisionTable:
 
         decision = await decide(channel, preset.id, card, _config())
 
-        assert decision.send is True
-        assert decision.record is True
+        assert decision == GreetingDecision(send=False, text=None, record=True)
 
-    async def test_other_preset_id_sends(self, db: None) -> None:
+    async def test_other_preset_id_records_without_sending(self, db: None) -> None:
         preset = await _preset()
         card = await _card(preset)
         channel = await _channel(data={GREETED_KEY: 77}, preset_id=preset.id)
 
         decision = await decide(channel, preset.id, card, _config())
 
-        assert decision.send is True
-        assert decision.record is True
+        assert decision == GreetingDecision(send=False, text=None, record=True)
 
-    async def test_greeting_switch_off_records_but_does_not_send(self, db: None) -> None:
+    async def test_greeting_switch_is_deprecated_and_records(self, db: None) -> None:
         preset = await _preset()
         card = await _card(preset)
         channel = await _channel(preset_id=preset.id)
 
+        # 开关已废弃：置 False 也照记，不再影响是否发送（发送本来就不会发生）
         decision = await decide(channel, preset.id, card, _config(PERSONA_GREETING_ENABLED=False))
 
         assert decision == GreetingDecision(send=False, text=None, record=True)
@@ -384,12 +382,55 @@ class TestPickGreeting:
         assert seen == [["第一条", "第二条"]]
 
 
-class TestMaybeGreet:
-    async def test_success_sends_and_writes_record(self, db: None, send_recorder: _SendRecorder) -> None:
+class TestGreetingInitvar:
+    """开场白里的 `<initvar>`：不再发出，写记录时清掉上一位人设留下的那份"""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("你好<initvar>\n时间: 早上\n</initvar>", "时间: 早上"),
+            ("<InitVar>a: 1</INITVAR>后文<initvar>b: 2</initvar>", "a: 1"),
+            ("< initvar >x: 1</ initvar >", "x: 1"),
+            ("<initvar>没闭合", None),
+            ("<initvar>  \n </initvar>", None),
+            ("没有块", None),
+            ("<initvars>a</initvars>", None),
+            ('<initvar a=1 b="x">y: 2</initvar>', "y: 2"),
+            ("<initvar/>前面是自闭合<initvar>z: 3</initvar>", "z: 3"),
+            ("<initvar><initvar>a: 1</initvar></initvar>", None),
+        ],
+    )
+    def test_extract(self, text: str, expected: Optional[str]) -> None:
+        assert greeting.extract_initvar_block(text) == expected
+
+    def test_too_long_is_not_kept(self) -> None:
+        body = "x" * (greeting.MAX_GREETING_INITVAR_CHARS + 1)
+
+        assert greeting.extract_initvar_block(f"<initvar>{body}</initvar>") is None
+        assert greeting.extract_initvar_block(f"<initvar>{body[:-1]}</initvar>") == body[:-1]
+
+    def test_unclosed_flood_is_linear(self) -> None:
+        started = time.thread_time()
+        greeting.extract_initvar_block("<initvar>" + "< initvar" * 50_000)
+        greeting.extract_initvar_block("<" * 200_000)
+
+        assert time.thread_time() - started < 2
+
+    def test_send_path_strips_the_block(self) -> None:
+        text = "你好，我是薄荷。\n<initvar>\n时间: 早上\n</initvar>"
+
+        assert strip_variable_markup(text) == "你好，我是薄荷。"
+        assert strip_variable_markup("开头<InitVar>a: 1</initvar>结尾") == "开头结尾"
+
+    @pytest.mark.parametrize("text", ["前<initvar a=1>x: 1</initvar>后", "前< InitVar >x: 1</ initvar >后"])
+    def test_what_is_stripped_is_also_taken(self, text: str) -> None:
+        assert strip_variable_markup(text) == "前后"
+        assert greeting.extract_initvar_block(text) == "x: 1"
+
+    async def test_first_round_does_not_write_an_initvar(self, db: None, send_recorder: _SendRecorder) -> None:
         preset = await _preset()
-        card = await _card(preset)
+        card = await _card(preset, greetings=["你好，我是{{char}}。<initvar>名字: {{char}}</initvar>"])
         channel = await _channel(preset_id=preset.id)
-        tavern = _tavern(card)
 
         sent = await maybe_greet(
             channel=channel,
@@ -397,15 +438,63 @@ class TestMaybeGreet:
             card=card,
             config=_config(),
             ctx=SimpleNamespace(adapter=object()),
-            tavern=tavern,
+            tavern=_tavern(card),
             one_time_code=CODE,
         )
 
-        assert sent is True
-        assert send_recorder.calls[0]["chat_key"] == channel.chat_key
-        assert send_recorder.calls[0]["messages"] == "你好，我是薄荷。"
-        assert send_recorder.calls[0]["record"] is True
-        assert send_recorder.calls[0]["ctx"] is not None
+        assert sent is False
+        assert send_recorder.calls == []
+        await channel.refresh_from_db()
+        assert greeting.GREETING_INITVAR_KEY not in channel._load_data()  # noqa: SLF001
+
+    async def test_switching_preset_clears_the_previous_initvar(self, db: None, send_recorder: _SendRecorder) -> None:
+        first_preset = await _preset("薄荷")
+        second_preset = await _preset("青柠")
+        second_card = await _card(second_preset, greetings=["<initvar>名字: 青柠</initvar>"])
+        channel = await _channel(
+            preset_id=second_preset.id,
+            data={
+                GREETED_KEY: first_preset.id,
+                greeting.GREETING_INITVAR_KEY: {"preset_id": first_preset.id, "text": "名字: 薄荷"},
+            },
+        )
+
+        sent = await maybe_greet(
+            channel=channel,
+            preset=second_preset,
+            card=second_card,
+            config=_config(),
+            ctx=SimpleNamespace(adapter=object()),
+            tavern=_tavern(second_card, char_name="青柠"),
+            one_time_code=CODE,
+        )
+
+        assert sent is False
+        assert send_recorder.calls == []
+        await channel.refresh_from_db()
+        data = channel._load_data()  # noqa: SLF001
+        assert greeting.GREETING_INITVAR_KEY not in data
+        assert data[GREETED_KEY] == second_preset.id
+
+
+class TestMaybeGreet:
+    async def test_new_channel_records_without_sending(self, db: None, send_recorder: _SendRecorder) -> None:
+        preset = await _preset()
+        card = await _card(preset)
+        channel = await _channel(preset_id=preset.id)
+
+        sent = await maybe_greet(
+            channel=channel,
+            preset=preset,
+            card=card,
+            config=_config(PERSONA_GREETING_ENABLED=True),
+            ctx=SimpleNamespace(adapter=object()),
+            tavern=_tavern(card),
+            one_time_code=CODE,
+        )
+
+        assert sent is False
+        assert send_recorder.calls == []
         await channel.refresh_from_db()
         assert channel._load_data()[GREETED_KEY] == preset.id  # noqa: SLF001
 
@@ -423,11 +512,17 @@ class TestMaybeGreet:
             channel=channel, preset=preset, card=card, config=_config(), ctx=ctx, tavern=tavern, one_time_code=CODE,
         )
 
-        assert first is True
+        assert first is False
         assert second is False
-        assert len(send_recorder.calls) == 1
+        assert send_recorder.calls == []
+        await channel.refresh_from_db()
+        assert channel._load_data()[GREETED_KEY] == preset.id  # noqa: SLF001
 
-    async def test_switching_preset_sends_again(self, db: None, send_recorder: _SendRecorder) -> None:
+    async def test_switching_preset_updates_record_without_sending(
+        self,
+        db: None,
+        send_recorder: _SendRecorder,
+    ) -> None:
         first_preset = await _preset("薄荷")
         first_card = await _card(first_preset)
         second_preset = await _preset("青柠")
@@ -454,9 +549,15 @@ class TestMaybeGreet:
             one_time_code=CODE,
         )
 
-        assert send_recorder.texts == ["你好，我是薄荷。", "换人设了"]
+        assert send_recorder.calls == []
+        await channel.refresh_from_db()
+        assert channel._load_data()[GREETED_KEY] == second_preset.id  # noqa: SLF001
 
-    async def test_greeting_switch_off_still_writes_record(self, db: None, send_recorder: _SendRecorder) -> None:
+    async def test_greeting_switch_is_deprecated_and_still_writes_record(
+        self,
+        db: None,
+        send_recorder: _SendRecorder,
+    ) -> None:
         preset = await _preset()
         card = await _card(preset)
         channel = await _channel(preset_id=preset.id)
@@ -476,49 +577,20 @@ class TestMaybeGreet:
         await channel.refresh_from_db()
         assert channel._load_data()[GREETED_KEY] == preset.id  # noqa: SLF001
 
-    async def test_send_failure_is_swallowed_and_not_retried(
-        self,
-        db: None,
-        send_recorder: _SendRecorder,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
+    async def test_preview_never_sends(self, db: None) -> None:
         preset = await _preset()
-        card = await _card(preset, greetings=["不要出现在日志里的开场白"])
-        channel = await _channel(preset_id=preset.id)
-        send_recorder.error = RuntimeError("协议端断线")
-        ctx = SimpleNamespace(adapter=object())
-        tavern = _tavern(card)
-
-        sent = await maybe_greet(
-            channel=channel, preset=preset, card=card, config=_config(), ctx=ctx, tavern=tavern, one_time_code=CODE,
-        )
-        retried = await maybe_greet(
-            channel=channel, preset=preset, card=card, config=_config(), ctx=ctx, tavern=tavern, one_time_code=CODE,
-        )
-
-        assert sent is False
-        assert retried is False
-        assert len(send_recorder.calls) == 1
-        await channel.refresh_from_db()
-        assert channel._load_data()[GREETED_KEY] == preset.id  # noqa: SLF001
-        assert "不要出现在日志里的开场白" not in caplog.text
-
-    async def test_user_macro_is_the_triggering_user(self, db: None, send_recorder: _SendRecorder) -> None:
-        preset = await _preset()
-        card = await _card(preset, greetings=["{{user}}，欢迎回来"])
+        card = await _card(preset)
         channel = await _channel(preset_id=preset.id)
 
-        await maybe_greet(
+        result = await preview_greeting(
             channel=channel,
             preset=preset,
             card=card,
-            config=_config(),
-            ctx=SimpleNamespace(adapter=object()),
-            tavern=_tavern(card, user_name="阿明"),
-            one_time_code=CODE,
+            config=_config(PERSONA_GREETING_ENABLED=True),
+            tavern=_tavern(card),
         )
 
-        assert send_recorder.texts == ["阿明，欢迎回来"]
+        assert result == {"will_send": False, "text": ""}
 
 
 class TestResetChannel:
@@ -546,7 +618,7 @@ class TestResetChannel:
         assert data["custom_channel_name"] == "旧名"
         assert data["auto_disable"] == {"keep": True}
 
-    async def test_reset_then_next_greeting_sends(
+    async def test_reset_then_next_round_only_records(
         self,
         db: None,
         send_recorder: _SendRecorder,
@@ -567,7 +639,7 @@ class TestResetChannel:
         monkeypatch.setattr(AgentCtx, "create_by_chat_key", staticmethod(_noop))
         await channel.reset_channel()
 
-        await maybe_greet(
+        sent = await maybe_greet(
             channel=channel,
             preset=preset,
             card=card,
@@ -577,7 +649,10 @@ class TestResetChannel:
             one_time_code=CODE,
         )
 
-        assert send_recorder.texts == ["你好，我是薄荷。"]
+        assert sent is False
+        assert send_recorder.calls == []
+        await channel.refresh_from_db()
+        assert channel._load_data()[GREETED_KEY] == preset.id  # noqa: SLF001
 
 
 # 预览与顺序用例只组装提示词，不碰数据库；这里把有副作用的外部步骤换成替身。
@@ -680,7 +755,7 @@ async def _install_round_prompt_fakes(
         return None
 
     async def _plugins(*_args: Any, **_kwargs: Any) -> Any:
-        return SimpleNamespace(system_prompt="", runtime_prompt="")
+        return SimpleNamespace(system_prompt="", runtime_prompt="", depth_blocks=[])
 
     async def _active(**_kwargs: Any) -> list[Any]:
         return []
@@ -693,6 +768,8 @@ async def _install_round_prompt_fakes(
             state="skipped",
             dropped=[],
             groups=SimpleNamespace(after_persona=[], before_history=[], at_depth={}),
+            budget=None,
+            tokens={},
         )
 
     async def _dialog() -> list[Any]:
@@ -735,7 +812,7 @@ async def _install_round_prompt_fakes(
 
 
 class TestRoundPrompt:
-    async def test_dry_run_reports_greeting_without_writing(
+    async def test_dry_run_reports_no_greeting_without_writing(
         self,
         monkeypatch: pytest.MonkeyPatch,
         send_recorder: _SendRecorder,
@@ -760,11 +837,11 @@ class TestRoundPrompt:
             dry_run=True,
         )
 
-        assert result.meta["greeting"] == {"will_send": True, "text": "阿明，欢迎"}
+        assert result.meta["greeting"] == {"will_send": False, "text": ""}
         assert channel._load_data()[GREETED_KEY] == RESET_MARK  # noqa: SLF001
         assert send_recorder.calls == []
 
-    async def test_greeting_is_sent_before_history_is_rendered(
+    async def test_greeting_check_runs_before_history_is_rendered(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -782,7 +859,7 @@ class TestRoundPrompt:
 
         async def _fake_greet(**_kwargs: Any) -> bool:
             order.append("greet")
-            return True
+            return False
 
         monkeypatch.setattr(round_prompt_module.tavern_greeting, "maybe_greet", _fake_greet)
 
@@ -799,6 +876,6 @@ class TestRoundPrompt:
 
 
 class TestConfigDefault:
-    def test_gate_defaults_are_on(self) -> None:
+    def test_tavern_gate_defaults(self) -> None:
         assert config.TAVERN_COMPAT_ENABLED is True
-        assert config.PERSONA_GREETING_ENABLED is True
+        assert config.PERSONA_GREETING_ENABLED is False
